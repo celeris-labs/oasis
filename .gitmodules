@@ -1,0 +1,13 @@
+[submodule "parcore"]
+	path = parcore
+	url = git@github.com:jonasdann/parcore
+	branch = unit-tests
+[submodule "coyote"]
+	path = coyote
+	url = https://github.com/fpgasystems/coyote
+[submodule "libstf"]
+	path = libstf
+	url = https://github.com/fpgasystems/libstf
+[submodule "vhsnunzip"]
+	path = vhsnunzip
+	url = https://github.com/lucat1/vhsnunzip
