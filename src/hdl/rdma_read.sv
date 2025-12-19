@@ -43,8 +43,12 @@ logic ack, last;
 // ------- State machine logic  ----------------------------------------------
 logic request_sent, received_ack, received_last;
 assign request_sent = sq_rd.ready && sq_rd.valid;
-assign received_ack = cq_rd.ready && cq_rd.valid && cq_rd.data.strm == STRM && cq_rd.data.dest == AXI_STRM_ID && cq_rd.data.opcode == OPCODE;
+// assign received_ack = cq_rd.ready && cq_rd.valid && cq_rd.data.strm == STRM && cq_rd.data.dest == AXI_STRM_ID;
+assign received_ack = cq_rd.ready && cq_rd.valid;
 assign received_last = out.ready && out.valid && out.last;
+
+logic trigger_point;
+assign trigger_point = cq_rd.ready && cq_rd.valid && cq_rd.data.opcode != 1;
 
 task reset();
     state <= ST_IDLE;
@@ -99,11 +103,14 @@ valid_i #(data64_t) size ();
 assign size.valid = request_sent;
 assign size.data = buffer.size;
 
-FixLast #(.DATABEAT_SIZE(DATABEAT_SIZE)) inst_fix_last (
+data64_t remaining;
+
+FixLast #(.NUM_ELEMENTS(DATABEAT_SIZE)) inst_fix_last (
     .clk(clk),
     .rst_n(rst_n),
 
     .size(size),
+    .rem(remaining),
 
     .in(out_inner),
     .out(out)
@@ -172,7 +179,11 @@ ila_rdma_read inst_ila_rdma_read (
 
     .probe19(state),
     .probe20(ack),
-    .probe21(last)
+    .probe21(last),
+
+    .probe22(remaining),
+    .probe23(trigger_point),
+    .probe24(size.valid)
 );
 `endif
 

@@ -8,7 +8,7 @@ class RDMATestCase(fpga_test_case.FPGATestCase):
     # verbose_logging = True
 
     def __init__(self, a) -> None:
-        n = 253
+        n = 4096
         self.data = [randint(-n, n) for _ in range(n)]
         self.data_type = fpga_stream.StreamType.SIGNED_INT_32
         self.data_width = fpga_stream.get_bytes_for_stream_type(self.data_type)
@@ -75,8 +75,9 @@ class RDMATestCase(fpga_test_case.FPGATestCase):
     def test_odd_rdma_reads(self):
         # Arrange
         self._set_in_out([
-            (13, self.len - 43),
-            (35, 78)
+            (13, self.len // 2),
+            (35, 78),
+            (0, 1025)
         ])
 
         # Act
