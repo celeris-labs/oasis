@@ -183,7 +183,8 @@ ila_rdma_read inst_ila_rdma_read (
 
     .probe22(remaining),
     .probe23(trigger_point),
-    .probe24(size.valid)
+    .probe24(size.valid),
+    .probe25(rdma_in.tlast)
 );
 `endif
 

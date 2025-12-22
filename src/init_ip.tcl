@@ -1,6 +1,6 @@
 create_ip -name ila -vendor xilinx.com -library ip -version 6.2 -module_name ila_rdma_read
 set_property -dict [list \
-    CONFIG.C_NUM_OF_PROBES {25} \
+    CONFIG.C_NUM_OF_PROBES {26} \
     CONFIG.C_EN_STRG_QUAL {1} \
     CONFIG.C_PROBE0_WIDTH {1} \
     CONFIG.C_PROBE1_WIDTH {1} \
@@ -27,4 +27,5 @@ set_property -dict [list \
     CONFIG.C_PROBE22_WIDTH {64} \
     CONFIG.C_PROBE23_WIDTH {1} \
     CONFIG.C_PROBE24_WIDTH {1} \
+    CONFIG.C_PROBE25_WIDTH {1} \
 ] [get_ips ila_rdma_read]
