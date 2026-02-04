@@ -1,6 +1,5 @@
-from coyote_test import fpga_test_case, fpga_stream
+from coyote_test import fpga_test_case, fpga_stream, fpga_register
 from random import randint
-import struct
 
 class RDMATestCase(fpga_test_case.FPGATestCase):
     alternative_vfpga_top_file = "rdma_read_test.sv"
@@ -28,11 +27,15 @@ class RDMATestCase(fpga_test_case.FPGATestCase):
     # buffers are a list of (len, vaddr)
     def _set_in_out(self, buffers: list[tuple[int, int]]) -> None:
         self.remote_rdma_write(0, fpga_stream.Stream(self.data_type, self.data))
-        inputs = [[int(x) * self.data_width for x in xs] for xs in buffers]
-        output = [self.data[vaddr:vaddr+len] for len, vaddr in buffers]
+        configs = [tuple(x * self.data_width for x in xs) for xs in buffers]
+        output = [self.data[vaddr:vaddr+len] for (len, vaddr) in buffers]
 
-        for input in inputs:
-            self.set_stream_input(0, fpga_stream.Stream(fpga_stream.StreamType.UNSIGNED_INT_64, input))
+        def pos_to_register(pos: int) -> bytearray:
+            return bytearray(pos.to_bytes(8, 'little'))
+
+        for (size, vaddr) in configs:
+            self.write_register(fpga_register.vFPGARegister(3, pos_to_register(vaddr)))
+            self.write_register(fpga_register.vFPGARegister(4, pos_to_register(size)))
         for out in output:
             self.set_expected_output(0, fpga_stream.Stream(self.data_type, out))
         
@@ -77,7 +80,7 @@ class RDMATestCase(fpga_test_case.FPGATestCase):
         self._set_in_out([
             (13, self.len // 2),
             (35, 78),
-            (0, 1025)
+            (0, 234)
         ])
 
         # Act

@@ -1,17 +1,21 @@
 `timescale 1ns / 1ps
 
-`include "parcore_types.svh"
-import parcore::rdma_buffer_t;
+import oasis::*;
 
 /* -- Tie-off unused interfaces and signals ----------------------------- */
-always_comb axi_ctrl.tie_off_s();
 always_comb notify.tie_off_m();
 always_comb sq_wr.tie_off_m();
 always_comb cq_wr.tie_off_s();
 
-always_comb axis_rrsp_send[0].tie_off_m();
-always_comb axis_rrsp_recv[0].tie_off_s();
-always_comb axis_rreq_send[0].tie_off_m();
+for (genvar I = 0; I < N_STRM_AXI; I++) begin
+    always_comb axis_host_recv[I].tie_off_s();
+end
+
+for (genvar I = 0; I < N_RDMA_AXI; I++) begin
+    always_comb axis_rrsp_send[I].tie_off_m();
+    always_comb axis_rrsp_recv[I].tie_off_s();
+    always_comb axis_rreq_send[I].tie_off_m();
+end
 
 // -- Fix clock and reset names ----------------------------------------- */
 logic clk;
@@ -20,29 +24,38 @@ logic rst_n;
 assign clk   = aclk;
 assign rst_n = aresetn;
 
-/* -- INPUT ------------------------------------------------------------- */
-
-AXI4S axi_host_recv_0 (.aclk(aclk), .aresetn(aresetn));
-`AXIS_ASSIGN(axis_host_recv[0], axi_host_recv_0)
-
-AXI4S axi_rreq_recv_0 (.aclk(aclk), .aresetn(aresetn));
-`AXIS_ASSIGN(axis_rreq_recv[0], axi_rreq_recv_0)
-
-data_i #(rdma_buffer_t) data_in ();
-AXIToData #(
-  .data_t(rdma_buffer_t)
-) inst_axi_to_ndata(
+/* -- CONFIG ------------------------------------------------------------ */
+write_config_i write_configs[1](.*);
+read_config_i  read_configs [1](.*);
+GlobalConfig #(
+    .SYSTEM_ID(OASIS_SYSTEM_ID),
+    .NUM_CONFIGS(1),
+    .ADDR_SPACE_SIZES({RDMA_READ_CONFIG_NUM_REGS})
+) inst_config (
     .clk(clk),
     .rst_n(rst_n),
 
-    .in(axi_host_recv_0),
-    .out(data_in)
+    .axi_ctrl(axi_ctrl),
+
+    .write_configs(write_configs),
+    .read_configs(read_configs)
 );
 
-ready_valid_i #(rdma_buffer_t) in ();
-assign data_in.ready = in.ready;
-assign in.valid = data_in.valid && data_in.keep;
-assign in.data = data_in.data;
+rdma_read_config_i conf(.*);
+RDMAReadConfig inst_rdma_read_config (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .write_config(write_configs[0]),
+    .read_config(read_configs[0]),
+
+    .out(conf)
+);
+
+/* -- INPUT ------------------------------------------------------------- */
+
+AXI4S axi_rreq_recv_0 (.aclk(aclk), .aresetn(aresetn));
+`AXIS_ASSIGN(axis_rreq_recv[0], axi_rreq_recv_0)
 
 /* -- OUTPUT ------------------------------------------------------------ */
 
@@ -66,8 +79,9 @@ RDMARead inst_rdma_read (
 
     .sq_rd(sq_rd),
     .cq_rd(cq_rd),
-    .rdma_in(axi_rreq_recv_0),
 
-    .in(in),
+    .conf(conf),
+
+    .in(axi_rreq_recv_0),
     .out(out)
 );

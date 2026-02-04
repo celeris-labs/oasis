@@ -1,10 +1,8 @@
 `timescale 1ns / 1ps
 
 `include "axi_macros.svh"
-`include "parcore_types.svh"
 
 import libstf::data8_t;
-import parcore::*;
 
 module RDMARead #(
     parameter AXI_DATA_BITS = 512,
@@ -16,15 +14,16 @@ module RDMARead #(
 
     metaIntf.m sq_rd,    // #(.STYPE(req_t))
     metaIntf.s cq_rd,    // #(.STYPE(ack_t))
-    AXI4S.s rdma_in,     // #(AXI_DATA_BITS)
+
+    rdma_read_config_i.s conf,
+
+    AXI4S.s in,     // #(AXI_DATA_BITS)
                          // NOTE: This must be axis_rreq_recv[AXI_STRM_ID]
-
-    ready_valid_i.s in,  // #(rdma_buffer_t)
-
     ndata_i.m out        // #(data8_t, DATABEAT_SIZE)
 );
 
 localparam RDMA_READ = 12;
+localparam RDMA_READ_ACK = 16;
 localparam STRM = STRM_RDMA;
 localparam OPCODE = RDMA_READ;
 
@@ -41,10 +40,11 @@ logic keep_ack, keep_last;
 logic ack, last;
 
 // ------- State machine logic  ----------------------------------------------
-logic request_sent, received_ack, received_last;
+logic request_sent, received_ack_sim, received_ack_hw, received_ack, received_last;
 assign request_sent = sq_rd.ready && sq_rd.valid;
-// assign received_ack = cq_rd.ready && cq_rd.valid && cq_rd.data.strm == STRM && cq_rd.data.dest == AXI_STRM_ID;
-assign received_ack = cq_rd.ready && cq_rd.valid;
+assign received_ack_sim = cq_rd.ready && cq_rd.valid && cq_rd.data.strm == STRM && cq_rd.data.dest == AXI_STRM_ID && cq_rd.data.opcode == RDMA_READ;
+assign received_ack_hw = cq_rd.ready && cq_rd.valid && cq_rd.data.remote && cq_rd.data.dest == AXI_STRM_ID && cq_rd.data.opcode == RDMA_READ_ACK;
+assign received_ack = received_ack_sim || received_ack_hw;
 assign received_last = out.ready && out.valid && out.last;
 
 logic trigger_point;
@@ -95,13 +95,13 @@ AXIToNData #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .in(rdma_in),
+    .in(in),
     .out(out_inner)
 );
 
 valid_i #(data64_t) size ();
 assign size.valid = request_sent;
-assign size.data = buffer.size;
+assign size.data = conf.size;
 
 data64_t remaining;
 
@@ -116,9 +116,6 @@ FixLast #(.NUM_ELEMENTS(DATABEAT_SIZE)) inst_fix_last (
     .out(out)
 );
 
-rdma_buffer_t buffer;
-assign buffer = in.data;
-
 always_comb begin
     sq_rd.data = '0; // Null everything else
 
@@ -132,21 +129,22 @@ always_comb begin
     sq_rd.data.pid  = 0;
     sq_rd.data.dest = AXI_STRM_ID;
 
-    sq_rd.data.len = buffer.size;
-    sq_rd.data.vaddr = buffer.vaddr;
+    // TODO: remove this rounding
+    sq_rd.data.len = (conf.size + 63) & ~63;
+    sq_rd.data.vaddr = conf.vaddr;
    
     // We always mark the transfer as last so we get
     // one acknowledgement per transfer!
     sq_rd.data.last = 1;
 
-    sq_rd.valid = (state == ST_IDLE) && in.valid && in.ready;
+    sq_rd.valid = (state == ST_IDLE) && conf.valid && conf.ready;
 end
 
 // Accept acks when we haven't received one for the current transaction.
 assign cq_rd.ready = ~keep_ack;
 // We can take in another input buffer to kick-off a read when we're not
 // already waiting for an in-progress read.
-assign in.ready = (state == ST_IDLE) && sq_rd.ready;
+assign conf.ready = (state == ST_IDLE) && sq_rd.ready;
 
 `ifdef SYNTHESIS
 ila_rdma_read inst_ila_rdma_read (
@@ -163,11 +161,11 @@ ila_rdma_read inst_ila_rdma_read (
     .probe7(cq_rd.valid),
     .probe8(cq_rd.data),
 
-    .probe9(rdma_in.tready),
-    .probe10(rdma_in.tvalid),
+    .probe9(in.tready),
+    .probe10(in.tvalid),
 
-    .probe11(in.ready),
-    .probe12(in.valid),
+    .probe11(conf.ready),
+    .probe12(conf.valid),
 
     .probe13(out.ready),
     .probe14(out.valid),
@@ -184,7 +182,7 @@ ila_rdma_read inst_ila_rdma_read (
     .probe22(remaining),
     .probe23(trigger_point),
     .probe24(size.valid),
-    .probe25(rdma_in.tlast)
+    .probe25(in.tlast)
 );
 `endif
 

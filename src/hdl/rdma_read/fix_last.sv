@@ -1,8 +1,6 @@
 `timescale 1ns / 1ps
 
-`include "axi_macros.svh"
-`include "parcore_types.svh"
-
+import lynxTypes::*;
 import libstf::data8_t;
 
 // Fixes the last signal on CARD/RDMA streams, which is set high every 4KiB,
@@ -34,10 +32,13 @@ always_ff @(posedge clk) begin
     end
 end
 
+logic[NUM_ELEMENTS - 1:0] last_keep;
+assign last_keep = ~({NUM_ELEMENTS{1'b1}} >> remaining[$clog2(NUM_ELEMENTS) - 1:0]);
+
 assign in.ready = out.ready;
 assign out.valid = in.valid;
 assign out.data = in.data;
-assign out.keep = in.keep;
+assign out.keep = remaining < NUM_ELEMENTS ? last_keep : {NUM_ELEMENTS{1'b1}};
 assign out.last = remaining <= NUM_ELEMENTS;
 
 assign rem = remaining;
