@@ -47,8 +47,8 @@ target_link_libraries(Oasis PRIVATE Coyote)
 target_include_directories(Oasis PRIVATE ${COYOTE_INCLUDE_DIRS})
 target_link_libraries(Oasis PRIVATE libstf)
 target_include_directories(Oasis PRIVATE ${LIBSTF_INCLUDE_DIRS})
-target_link_libraries(Oasis PRIVATE Parcore)
-target_include_directories(Oasis PRIVATE ${PARCORE_INCLUDE_DIRS})
+target_link_libraries(Oasis PUBLIC Parcore)
+target_include_directories(Oasis PUBLIC ${PARCORE_INCLUDE_DIRS})
 
 include(GNUInstallDirs)
 
