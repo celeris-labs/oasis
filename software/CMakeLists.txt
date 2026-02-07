@@ -20,8 +20,6 @@ else()
     endif()
 endif()
 
-option(OASIS_WITH_PROFILING "Include profling code around expensive calls to determine where time is being spent" OFF)
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -30,7 +28,6 @@ set_target_properties(Oasis PROPERTIES OUTPUT_NAME "oasis")
 
 target_sources(Oasis PRIVATE
     oasis/configuration.cpp
-    oasis/profiling.cpp
 )
 target_include_directories(Oasis
     PUBLIC
@@ -43,14 +40,6 @@ target_link_libraries(Oasis PRIVATE Coyote)
 target_include_directories(Oasis PRIVATE ${COYOTE_INCLUDE_DIRS})
 target_link_libraries(Oasis PRIVATE libstf)
 target_include_directories(Oasis PRIVATE ${LIBSTF_INCLUDE_DIRS})
-
-if (OASIS_WITH_PROFILING)
-    find_package(caliper REQUIRED)
-    target_compile_definitions(Oasis PRIVATE OASIS_WITH_PROFILING)
-
-    target_link_libraries(Oasis PRIVATE caliper)
-    target_include_directories(Oasis PRIVATE ${CALIPER_INCLUDE_DIR})
-endif()
 
 include(GNUInstallDirs)
 

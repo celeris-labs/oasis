@@ -1,8 +1,10 @@
 #include <cstring>
 #include <string>
 
+#include <libstf/profiling.hpp>
 #include <oasis/configuration.hpp>
-#include <oasis/profiling.hpp>
+
+using libstf::profiler;
 
 namespace oasis {
 
