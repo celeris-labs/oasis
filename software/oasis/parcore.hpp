@@ -25,6 +25,7 @@ using PageDecoderConfig = ::parcore::PageDecoderConfig;
 
 /* reader.hpp */
 using Reader = ::parcore::Reader;
+using FileReader = ::parcore::FileReader;
 
 } // namespace parcore
 } // namespace oasis
