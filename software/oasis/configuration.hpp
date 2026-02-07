@@ -5,6 +5,8 @@
 
 namespace oasis {
 
+constexpr const uint64_t OASIS_SYSTEM_ID = 0x44320bcab5312b33;
+
 constexpr const uint64_t RDMA_READ_CONFIG_NUM_REGS = 2;
 constexpr const uint64_t RDMA_READ_CONFIG_ID = 0x2f966a70f04c0e93;
 
