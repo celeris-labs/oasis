@@ -7,7 +7,7 @@ always_comb notify.tie_off_m();
 always_comb sq_wr.tie_off_m();
 always_comb cq_wr.tie_off_s();
 
-always_comb rq_rd.tie_off_m();
+always_comb rq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
 
 for (genvar I = 0; I < N_STRM_AXI; I++) begin
