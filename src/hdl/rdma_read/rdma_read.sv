@@ -3,9 +3,9 @@
 `include "axi_macros.svh"
 
 import libstf::data8_t;
+import lynxTypes::AXI_DATA_BITS;
 
 module RDMARead #(
-    parameter AXI_DATA_BITS = 512,
     parameter AXI_STRM_ID = 0,
     parameter DATABEAT_SIZE = AXI_DATA_BITS / 8
 ) (
@@ -17,7 +17,7 @@ module RDMARead #(
 
     rdma_read_config_i.s conf,
 
-    AXI4S.s in,     // #(AXI_DATA_BITS)
+    AXI4S.s in,          // #(AXI_DATA_BITS)
                          // NOTE: This must be axis_rreq_recv[AXI_STRM_ID]
     ndata_i.m out        // #(data8_t, DATABEAT_SIZE)
 );

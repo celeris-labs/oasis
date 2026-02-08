@@ -1,7 +1,7 @@
 from coyote_test import fpga_test_case, fpga_stream, fpga_register
 from random import randint
 
-class RDMATestCase(fpga_test_case.FPGATestCase):
+class RDMAReadTestCase(fpga_test_case.FPGATestCase):
     alternative_vfpga_top_file = "rdma_read_test.sv"
     debug_mode = True
     # verbose_logging = True

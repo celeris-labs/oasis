@@ -33,7 +33,7 @@ read_config_i  read_configs [1](.*);
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(1),
-    .ADDR_SPACE_SIZES({RDMA_READ_CONFIG_NUM_REGS})
+    .ADDR_SPACE_SIZES({RDMA_READ_CONFIG_REGS*1})
 ) inst_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -44,8 +44,10 @@ GlobalConfig #(
     .read_configs(read_configs)
 );
 
-rdma_read_config_i conf(.*);
-RDMAReadConfig inst_rdma_read_config (
+rdma_read_config_i conf[1](.*);
+RDMAReadConfig #(
+    .NUM_STREAMS(1)
+) inst_rdma_read_config (
     .clk(clk),
     .rst_n(rst_n),
 
@@ -83,7 +85,7 @@ RDMARead inst_rdma_read (
     .sq_rd(sq_rd),
     .cq_rd(cq_rd),
 
-    .conf(conf),
+    .conf(conf[0]),
 
     .in(axi_rreq_recv_0),
     .out(out)
