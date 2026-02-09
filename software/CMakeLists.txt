@@ -35,6 +35,7 @@ set_target_properties(Oasis PROPERTIES OUTPUT_NAME "oasis")
 
 target_sources(Oasis PRIVATE
     oasis/configuration.cpp
+    oasis/parcore/rdma_reader.cpp
 )
 target_include_directories(Oasis
     PUBLIC

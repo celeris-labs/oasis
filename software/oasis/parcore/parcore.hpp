@@ -1,10 +1,8 @@
 #pragma once
 
 #include <parcore/configuration.hpp>
-#include <parcore/file_reader.hpp>
 #include <parcore/metadata/metadata.hpp>
 #include <parcore/metadata/utils.hpp>
-#include <parcore/reader.hpp>
 
 namespace oasis {
 namespace parcore {
@@ -23,12 +21,6 @@ constexpr auto &from_file = ::parcore::metadata::from_file;
 /* configuration.hpp */
 using PageType = ::parcore::PageType;
 using PageDecoderConfig = ::parcore::PageDecoderConfig;
-
-/* reader.hpp */
-using Reader = ::parcore::Reader;
-
-/* file_reader.hpp */
-using FileReader = ::parcore::FileReader;
 
 } // namespace parcore
 } // namespace oasis
