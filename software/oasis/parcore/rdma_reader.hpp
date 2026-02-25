@@ -26,8 +26,7 @@ public:
              uintptr_t offset, libstf::stream_t stream = 0);
 
 private:
-  void send_page(const ColumnChunk &column_chunk, const Page &page,
-                 PageType page_type);
+  void send_page(const Page &page, PageType page_type) override;
 };
 
 } // namespace parcore

@@ -20,8 +20,7 @@ RDMAReader::RDMAReader(
 
 const std::string rdma_reader_prefix = "oasis::parcore::RDMAReader::";
 
-void RDMAReader::send_page(const ColumnChunk &column_chunk, const Page &page,
-                           PageType page_type) {
+void RDMAReader::send_page(const Page &page, PageType page_type) {
   Profiler::open_regions({rdma_reader_prefix + "send_page"});
   config.read(stream, offset + page.offset, page.size);
   Profiler::close_regions({rdma_reader_prefix + "send_page"});
