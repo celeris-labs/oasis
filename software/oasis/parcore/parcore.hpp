@@ -20,6 +20,7 @@ constexpr auto &from_file = ::parcore::metadata::from_file;
 
 /* configuration.hpp */
 using PageType = ::parcore::PageType;
+using ColumnChunkDecoderConfig = ::parcore::ColumnChunkDecoderConfig;
 using PageDecoderConfig = ::parcore::PageDecoderConfig;
 
 } // namespace parcore

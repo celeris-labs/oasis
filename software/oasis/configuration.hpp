@@ -16,8 +16,8 @@ constexpr const uint64_t RDMA_READ_CONFIG_ID = 0x2f966a70f04c0e93;
  */
 class RDMAReadConfig : public libstf::Config {
 public:
-  RDMAReadConfig(std::shared_ptr<coyote::cThread> cthread,
-                 uint32_t addr_offset);
+  RDMAReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
+                 uint32_t num_regs);
 
   /**
    * Triggers a remote read using the RDMARead module.
