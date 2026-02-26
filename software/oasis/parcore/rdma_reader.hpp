@@ -3,13 +3,13 @@
 #include "libstf/common.hpp"
 #include <cstdint>
 #include <oasis/configuration.hpp>
-#include <oasis/parcore/parcore.hpp>
-#include <parcore/base_reader.hpp>
+#include <parcore/configuration.hpp>
+#include <parcore/fpga/reader.hpp>
 
 namespace oasis {
 namespace parcore {
 
-class RDMAReader : public ::parcore::BaseReader {
+class RDMAReader : public ::parcore::fpga::HardwareReader {
 private:
   RDMAReadConfig config;
   uintptr_t offset;
@@ -21,12 +21,14 @@ public:
              std::shared_ptr<libstf::TLBManager> tlb_manager,
              std::shared_ptr<libstf::OutputBufferManager> output_buffer_manager,
              RDMAReadConfig rdma_config,
-             ColumnChunkDecoderConfig column_chunk_config,
-             PageDecoderConfig page_config, const Metadata &meta,
-             uintptr_t offset, libstf::stream_t stream = 0);
+             ::parcore::ColumnChunkDecoderConfig column_chunk_config,
+             ::parcore::PageDecoderConfig page_config,
+             const ::parcore::metadata::Metadata &meta, uintptr_t offset,
+             libstf::stream_t stream = 0);
 
 private:
-  void send_page(const Page &page, PageType page_type) override;
+  void send_page(const ::parcore::metadata::Page &page,
+                 ::parcore::PageType page_type) override;
 };
 
 } // namespace parcore
