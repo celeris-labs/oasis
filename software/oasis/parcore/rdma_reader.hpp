@@ -4,12 +4,12 @@
 #include <cstdint>
 #include <oasis/configuration.hpp>
 #include <oasis/parcore/parcore.hpp>
-#include <parcore/reader.hpp>
+#include <parcore/base_reader.hpp>
 
 namespace oasis {
 namespace parcore {
 
-class RDMAReader : public ::parcore::Reader {
+class RDMAReader : public ::parcore::BaseReader {
 private:
   RDMAReadConfig config;
   uintptr_t offset;

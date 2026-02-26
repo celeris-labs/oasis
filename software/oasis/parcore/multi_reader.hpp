@@ -5,11 +5,14 @@
 namespace oasis {
 namespace parcore {
 
-/* reader.hpp */
+/* multi_reader.hpp */
 using MultiReader = ::parcore::MultiReader;
 
-template <typename T>
-constexpr auto &make_multi_reader = ::parcore::make_multi_reader<T>;
+template <typename T, typename... Args>
+static inline std::shared_ptr<MultiReader> make_multi_reader(size_t count,
+                                                             Args &&...args) {
+  return std::move(::parcore::make_multi_reader<T>(count, args...));
+}
 
 } // namespace parcore
 } // namespace oasis

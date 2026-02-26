@@ -3,6 +3,8 @@
 
 using libstf::Profiler;
 
+const std::string prefix = "oasis::parcore::RDMAReader::";
+
 namespace oasis {
 namespace parcore {
 
@@ -14,16 +16,14 @@ RDMAReader::RDMAReader(
     RDMAReadConfig rdma_config, ColumnChunkDecoderConfig column_chunk_config,
     PageDecoderConfig page_config, const Metadata &meta,
     uintptr_t memory_offset, libstf::stream_t stream)
-    : Reader(cthread, memory_pool, tlb_manager, output_buffer_manager,
-             column_chunk_config, page_config, meta, stream),
+    : BaseReader(cthread, memory_pool, tlb_manager, output_buffer_manager,
+                 column_chunk_config, page_config, meta, stream),
       config(rdma_config), offset(memory_offset), stream(stream) {}
 
-const std::string rdma_reader_prefix = "oasis::parcore::RDMAReader::";
-
 void RDMAReader::send_page(const Page &page, PageType page_type) {
-  Profiler::open_regions({rdma_reader_prefix + "send_page"});
+  Profiler::open_regions({prefix + "send_page"});
   config.read(stream, offset + page.offset, page.size);
-  Profiler::close_regions({rdma_reader_prefix + "send_page"});
+  Profiler::close_regions({prefix + "send_page"});
 }
 
 } // namespace parcore
