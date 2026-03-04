@@ -1,34 +1,27 @@
 #pragma once
 
-#include "libstf/common.hpp"
-#include <cstdint>
 #include <oasis/configuration.hpp>
 #include <parcore/configuration.hpp>
-#include <parcore/fpga/reader.hpp>
+#include <parcore/hardware_reader.hpp>
 
 namespace oasis {
 namespace parcore {
 
-class RDMAReader : public ::parcore::fpga::HardwareReader {
-private:
-  std::shared_ptr<RDMAReadConfig> config_;
-  uintptr_t offset_;
-
+class RDMAReader : public ::parcore::HardwareReader {
 public:
   RDMAReader(
-      std::shared_ptr<coyote::cThread> cthread,
+      std::shared_ptr<::parcore::ColumnChunkDecoder> column_chunk_decoder,
       std::shared_ptr<libstf::MemoryPool> memory_pool,
-      std::shared_ptr<libstf::TLBManager> tlb_manager,
-      std::shared_ptr<libstf::OutputBufferManager> output_buffer_manager,
-      std::shared_ptr<::parcore::ColumnChunkDecoderConfig> column_chunk_config,
-      std::shared_ptr<::parcore::PageDecoderConfig> page_config,
-      std::shared_ptr<RDMAReadConfig> rdma_config,
-      const ::parcore::metadata::Metadata &meta, uintptr_t offset,
-      libstf::stream_t stream = 0);
+      std::shared_ptr<RDMAReadConfig> rdma_config, uintptr_t offset,
+      const ::parcore::metadata::Metadata &meta);
 
 private:
-  void send_page(const ::parcore::metadata::Page &page,
-                 ::parcore::PageType page_type) override;
+  std::shared_ptr<RDMAReadConfig> rdma_config_;
+  uintptr_t offset_;
+
+  std::shared_ptr<libstf::Buffer>
+  get_page_data(const ::parcore::metadata::Page &page,
+                ::parcore::PageType page_type) override;
 };
 
 } // namespace parcore
