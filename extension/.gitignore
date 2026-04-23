@@ -8,3 +8,8 @@ duckdb_unittest_tempdir/
 testext
 test/python/__pycache__/
 .Rhistory
+.venv
+vivado*.log
+vivado*.jou
+.cache
+build_hw

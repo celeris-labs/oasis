@@ -17,7 +17,7 @@ include_directories(src/include)
 # jemalloc is expected at ~/opt (installed via parcore/libstf/scripts/install_jemalloc.sh).
 # libstf's FindJemalloc.cmake needs it on CMAKE_PREFIX_PATH.
 list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/opt")
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libstf/software/cmake")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../libstf/software/cmake")
 
 # Block install(EXPORT ...) commands from parcore subdirectories so the targets
 # can be added to DuckDB's single export set without conflicts.
@@ -48,14 +48,14 @@ endmacro()
 #   * COYOTE_SIM_DIR=<abs path to parcore/build_hw> at runtime
 option(MAXIMUS_SIM "Link against Coyote simulation library (no FPGA required)" OFF)
 if(MAXIMUS_SIM)
-    add_subdirectory(parcore/coyote/sim/sw coyote_build EXCLUDE_FROM_ALL)
+    add_subdirectory(../parcore/coyote/sim/sw coyote_build EXCLUDE_FROM_ALL)
 else()
-    add_subdirectory(parcore/coyote/sw coyote_build EXCLUDE_FROM_ALL)
+    add_subdirectory(../parcore/coyote/sw coyote_build EXCLUDE_FROM_ALL)
 endif()
 
 # 2. libstf  (needs Coyote + jemalloc) — hoisted to top-level submodule so we
 # can pin a newer version than parcore's pinned commit.
-add_subdirectory(libstf/software libstf_build EXCLUDE_FROM_ALL)
+add_subdirectory(../libstf/software libstf_build EXCLUDE_FROM_ALL)
 
 # 3. Arrow (from vcpkg — installed as static, but parcore expects Arrow::arrow_shared)
 find_package(Arrow CONFIG REQUIRED)
@@ -66,7 +66,7 @@ endif()
 
 # 4. Parcore (needs Coyote + libstf + Arrow)
 set(PARCORE_INCLUDE_CPU OFF CACHE BOOL "Disable CPU-side Parquet reader in parcore" FORCE)
-add_subdirectory(parcore/software parcore_build EXCLUDE_FROM_ALL)
+add_subdirectory(../parcore/software parcore_build EXCLUDE_FROM_ALL)
 
 # ---------------------------------------------------------------------------
 # Extension

@@ -59,7 +59,7 @@ All extension code lives in the `duckdb` namespace.
 
 ## Submodules
 
-- `duckdb/` — full DuckDB source (tracks main branch)
-- `extension-ci-tools/` — shared build/CI infrastructure, makefiles, vcpkg overlays
+- `duckdb/` — full DuckDB source, pinned to the latest tagged release (see `docs/UPDATING.md` when bumping)
+- `extension-ci-tools/` — shared build/CI infrastructure, makefiles, vcpkg overlays; pinned to the branch matching the DuckDB release (e.g. `v1.5-variegata` for `v1.5.x`)
 
 Run `git submodule update --init --recursive` after cloning.

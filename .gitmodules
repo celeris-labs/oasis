@@ -10,11 +10,11 @@
 [submodule "vhsnunzip"]
 	path = vhsnunzip
 	url = https://github.com/lucat1/vhsnunzip
-[submodule "duckdb"]
-        path = extension/duckdb
-        url = https://github.com/duckdb/duckdb
-        branch = main
-[submodule "extension-ci-tools"]
-        path = extension/extension-ci-tools
-        url = https://github.com/duckdb/extension-ci-tools
-        branch = main
+[submodule "extension/duckdb"]
+	path = extension/duckdb
+	url = https://github.com/duckdb/duckdb
+	branch = v1.5.2
+[submodule "extension/extension-ci-tools"]
+	path = extension/extension-ci-tools
+	url = https://github.com/duckdb/extension-ci-tools
+	branch = v1.5-variegata
