@@ -1,0 +1,23 @@
+# name: test/sql/maximus.test
+# description: test maximus extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT maximus('Sam');
+----
+Catalog Error: Scalar Function with name maximus does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require maximus
+
+# Confirm the extension works
+query I
+SELECT maximus('Sam');
+----
+Maximus Sam 🐥
+
+query I
+SELECT maximus_openssl_version('Michael') ILIKE 'Maximus Michael, my linked OpenSSL version is OpenSSL%';
+----
+true

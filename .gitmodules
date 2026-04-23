@@ -1,7 +1,6 @@
 [submodule "parcore"]
 	path = parcore
-	url = git@github.com:jonasdann/parcore
-	branch = unit-tests
+	url = git@github.com:celeris-labs/parcore
 [submodule "coyote"]
 	path = coyote
 	url = https://github.com/fpgasystems/coyote
@@ -11,3 +10,11 @@
 [submodule "vhsnunzip"]
 	path = vhsnunzip
 	url = https://github.com/lucat1/vhsnunzip
+[submodule "duckdb"]
+        path = extension/duckdb
+        url = https://github.com/duckdb/duckdb
+        branch = main
+[submodule "extension-ci-tools"]
+        path = extension/extension-ci-tools
+        url = https://github.com/duckdb/extension-ci-tools
+        branch = main
