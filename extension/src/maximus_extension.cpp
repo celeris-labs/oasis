@@ -44,7 +44,6 @@ static void handle_fpga_interrupt(int value) {
 	obm->handle_fpga_interrupt(value);
 }
 
-
 namespace duckdb {
 
 static LogicalType ParcoreTypeToLogical(parcore::metadata::Type type) {
@@ -67,6 +66,7 @@ static LogicalType ParcoreTypeToLogical(parcore::metadata::Type type) {
 struct ParcoreBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
+	vector<size_t> elem_sizes;
 };
 
 unique_ptr<FunctionData> ParcoreBind(ClientContext &context, TableFunctionBindInput &input,
@@ -75,12 +75,12 @@ unique_ptr<FunctionData> ParcoreBind(ClientContext &context, TableFunctionBindIn
 	auto meta = parcore::metadata::from_file(parquet_file + ".meta");
 	names.assign(meta.column_names.begin(), meta.column_names.end());
 	if (meta.groups.empty()) { throw InvalidInputException("Parquet metadata contains no row groups"); }
-	for (auto &chunk : meta.groups[0].chunks) {
-		return_types.push_back(ParcoreTypeToLogical(chunk.type));
-	}
-
 
 	auto bind_data = make_uniq<ParcoreBindData>();
+	for (auto &chunk : meta.groups[0].chunks) {
+		return_types.push_back(ParcoreTypeToLogical(chunk.type));
+		bind_data->elem_sizes.push_back(libstf::size_of(parcore::metadata::to_libstf_type(chunk.type)));
+	}
 	bind_data->metadata	= meta;
 	bind_data->filename = parquet_file;
 
@@ -191,10 +191,9 @@ unique_ptr<LocalTableFunctionState> ParcoreInitLocal(ExecutionContext &context, 
 // single-column parquet until we generalise.
 static void ParcoreFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &gstate = data_p.global_state->Cast<ParcoreGlobalState>();
+	auto &bind = data_p.bind_data->Cast<ParcoreBindData>();
 
-	// Fixed-width for INT32. This is the one type-specific knob in the whole
-	// scan path — everything else is byte-level and generalises trivially.
-	constexpr size_t kElemSize = sizeof(int32_t);
+	const size_t kElemSize = bind.elem_sizes[0];
 
 	// If we've finished draining the current chunk's buffers, pull the next
 	// row group (or signal EOF). Reassigning current_buffers drops our refs
