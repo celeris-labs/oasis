@@ -19,7 +19,7 @@ class _Decoder:
 # For simplicity, we use Compression=None, Encoding=PLAIN so that data is
 # directly passed through.
 class RDMAParquetTestCase(fpga_test_case.FPGATestCase):
-    alternative_vfpga_top_file = "rdma_parquet_test.sv"
+    alternative_vfpga_top_file = "vfpga-tops/rdma_parquet_test.sv"
     debug_mode = True
     # verbose_logging = True
 
