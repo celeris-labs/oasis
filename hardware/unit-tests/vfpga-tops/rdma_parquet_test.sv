@@ -38,7 +38,7 @@ read_config_i  read_configs [2](.*);
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(2),
-    .ADDR_SPACE_SIZES({RDMA_READ_CONFIG_REGS*N_STREAMS, PAGE_DECODER_CONFIG_REGS*N_STREAMS})
+    .ADDR_SPACE_SIZES({NUM_RDMA_READ_CONFIG_REGS * N_STREAMS, PAGE_DECODER_CONFIG_NUM_REGS * N_STREAMS})
 ) inst_config (
     .clk(clk),
     .rst_n(rst_n),

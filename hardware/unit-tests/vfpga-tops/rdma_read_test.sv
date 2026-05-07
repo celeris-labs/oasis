@@ -10,6 +10,10 @@ always_comb cq_wr.tie_off_s();
 always_comb rq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
 
+for (genvar I = 1; I < N_STRM_AXI; I++) begin
+    always_comb axis_host_send[I].tie_off_m();
+end
+
 for (genvar I = 0; I < N_STRM_AXI; I++) begin
     always_comb axis_host_recv[I].tie_off_s();
 end
@@ -18,6 +22,10 @@ for (genvar I = 0; I < N_RDMA_AXI; I++) begin
     always_comb axis_rrsp_send[I].tie_off_m();
     always_comb axis_rrsp_recv[I].tie_off_s();
     always_comb axis_rreq_send[I].tie_off_m();
+end
+
+for (genvar I = 1; I < N_RDMA_AXI; I++) begin
+    always_comb axis_rreq_recv[I].tie_off_s();
 end
 
 // -- Fix clock and reset names ----------------------------------------- */
@@ -33,7 +41,7 @@ read_config_i  read_configs [1](.*);
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(1),
-    .ADDR_SPACE_SIZES({RDMA_READ_CONFIG_REGS*1})
+    .ADDR_SPACE_SIZES({NUM_RDMA_READ_CONFIG_REGS * 1})
 ) inst_config (
     .clk(clk),
     .rst_n(rst_n),

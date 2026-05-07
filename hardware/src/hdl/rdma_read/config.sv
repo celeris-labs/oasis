@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 import libstf::*;
-import oasis::RDMA_READ_CONFIG_REGS;
+import oasis::NUM_RDMA_READ_CONFIG_REGS;
 import oasis::RDMA_READ_CONFIG_ID;
 
 `include "libstf_macros.svh"
@@ -20,7 +20,7 @@ module RDMAReadConfig #(
 );
 
 localparam MAX_NUM_ENQUEUED_BUFFERS = 64;
-localparam NUM_WRITE_REGS = RDMA_READ_CONFIG_REGS;
+localparam NUM_WRITE_REGS = NUM_RDMA_READ_CONFIG_REGS;
 
 `RESET_RESYNC // Reset pipelining
 
