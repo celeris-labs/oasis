@@ -13,3 +13,4 @@ vivado*.log
 vivado*.jou
 .cache
 build_hw
+hs_err_*

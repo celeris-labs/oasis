@@ -20,7 +20,7 @@
 
 // Default vFPGA to assign cThreads to; for designs with one region (vFPGA) this
 // is the only possible value
-#define DEFAULT_VFPGA_ID 0
+#define DEFAULT_VFPGA_ID  0
 #define ENABLE_SIMULATION 1
 
 std::shared_ptr<libstf::OutputBufferManager> obm;
@@ -74,14 +74,16 @@ unique_ptr<FunctionData> ParcoreBind(ClientContext &context, TableFunctionBindIn
 	auto parquet_file = StringValue::Get(input.inputs[0]);
 	auto meta = parcore::metadata::from_file(parquet_file + ".meta");
 	names.assign(meta.column_names.begin(), meta.column_names.end());
-	if (meta.groups.empty()) { throw InvalidInputException("Parquet metadata contains no row groups"); }
+	if (meta.groups.empty()) {
+		throw InvalidInputException("Parquet metadata contains no row groups");
+	}
 
 	auto bind_data = make_uniq<ParcoreBindData>();
 	for (auto &chunk : meta.groups[0].chunks) {
 		return_types.push_back(ParcoreTypeToLogical(chunk.type));
 		bind_data->elem_sizes.push_back(libstf::size_of(parcore::metadata::to_libstf_type(chunk.type)));
 	}
-	bind_data->metadata	= meta;
+	bind_data->metadata = meta;
 	bind_data->filename = parquet_file;
 
 	return std::move(bind_data);
@@ -120,9 +122,11 @@ struct ParcoreGlobalState : public GlobalTableFunctionState {
 	// inside the buffers returned for the currently-in-flight chunk.
 	size_t next_group = 0;
 	size_t total_groups = 0;
-	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
+	std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> current_buffers;
+	// the index of the buffers
 	size_t current_buf_idx = 0;
-	size_t current_buf_byte_offset = 0;
+	// the idx within the buffers
+	size_t current_buf_offset = 0;
 };
 
 unique_ptr<GlobalTableFunctionState> ParcoreInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -176,6 +180,10 @@ unique_ptr<GlobalTableFunctionState> ParcoreInitGlobal(ClientContext &context, T
 
 	gstate->total_groups = bind_data.metadata.groups.size();
 
+	gstate->current_buffers.assign(bind_data.metadata.column_names.size(), {});
+	gstate->current_buf_idx = 0;
+	gstate->current_buf_offset = 0;
+
 	return std::move(gstate);
 }
 
@@ -186,68 +194,82 @@ unique_ptr<LocalTableFunctionState> ParcoreInitLocal(ExecutionContext &context, 
 	return make_uniq<ParcoreLocalState>();
 }
 
-// Crude zero-copy demo: assumes a single INT32 column (column 0). Other
-// columns in the bind's schema will be left uninitialised — feed an INT32
-// single-column parquet until we generalise.
+// Zero-copy multi-column scan. For each row group we enqueue every column,
+// then dequeue them in order (parcore's output queue is FIFO) and slice each
+// column's buffers in lockstep into STANDARD_VECTOR_SIZE-sized vectors. This
+// assumes parcore returns the same buffer layout (same buffer count, same
+// elements per buffer at each index) across all columns of a row group; we
+// assert this below.
 static void ParcoreFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &gstate = data_p.global_state->Cast<ParcoreGlobalState>();
 	auto &bind = data_p.bind_data->Cast<ParcoreBindData>();
 
-	const size_t kElemSize = bind.elem_sizes[0];
-
-	// If we've finished draining the current chunk's buffers, pull the next
-	// row group (or signal EOF). Reassigning current_buffers drops our refs
-	// to the previous chunk's buffers — any that are still aux-referenced by
-	// downstream operators stay alive via those refs; the rest get freed back
-	// to the pool. We don't need to know or care which is which.
-	if (gstate.current_buf_idx >= gstate.current_buffers.size()) {
+	// Pull in next row group cursor reached end, needs to be synchronised across columns
+	// assuming row groups have same element count across columns
+	if (gstate.current_buf_idx >= gstate.current_buffers[0].size()) {
 		if (gstate.next_group >= gstate.total_groups) {
 			output.SetCardinality(0);
 			return;
 		}
-		gstate.reader->enqueue_column_chunk(gstate.next_group, /*column=*/0);
-		gstate.current_buffers = gstate.reader->next_column_chunk(); // blocks on FPGA
+
+		for (size_t i = 0; i < bind.metadata.column_names.size(); i++) {
+			gstate.reader->enqueue_column_chunk(gstate.next_group, i);
+		}
+		for (size_t i = 0; i < bind.metadata.column_names.size(); i++) {
+			gstate.current_buffers[i] = gstate.reader->next_column_chunk(); // blocks on FPGA
+		}
+
 		gstate.current_buf_idx = 0;
-		gstate.current_buf_byte_offset = 0;
+		gstate.current_buf_offset = 0;
 		gstate.next_group++;
 	}
 
-	auto &buf = gstate.current_buffers[gstate.current_buf_idx];
-	size_t remaining_bytes = buf->size - gstate.current_buf_byte_offset;
-	size_t emit = std::min<size_t>(remaining_bytes / kElemSize, STANDARD_VECTOR_SIZE);
+	size_t const total_elements = gstate.current_buffers[0][gstate.current_buf_idx]->size / bind.elem_sizes[0];
+	size_t const remaining_elements = total_elements - gstate.current_buf_offset;
+	size_t const emit = std::min<size_t>(remaining_elements, STANDARD_VECTOR_SIZE);
+	for (size_t i = 0; i < gstate.current_buffers.size(); i++) {
+		const size_t kElemSize = bind.elem_sizes[i];
 
-	// The actual zero-copy handoff. Two things happen here:
-	//
-	//  1. FlatVector::SetData points the vector's raw data pointer directly
-	//     into the FPGA-written libstf buffer (+ byte offset for the
-	//     STANDARD_VECTOR_SIZE slice we're emitting this call). No memcpy,
-	//     no arrow intermediary.
-	//
-	//  2. SetAuxiliary hands the buffer's shared_ptr to DuckDB's Vector
-	//     lifetime slot (wrapped in LibstfBufferVectorBuffer, because
-	//     DuckDB's slot is typed to shared_ptr<VectorBuffer>, not our
-	//     shared_ptr<libstf::Buffer>). DuckDB copies this shared_ptr whenever
-	//     it copies the vector, so the underlying memory stays alive as long
-	//     as any downstream consumer references it.
-	//
-	// Two refcount holders protect the memory while it's in flight:
-	//   - gstate.current_buffers keeps it alive across scan calls while we
-	//     slice one FPGA chunk into multiple STANDARD_VECTOR_SIZE emissions
-	//     (auxiliary gets cleared on each output.Reset()).
-	//   - vector auxiliary (set here) keeps it alive for any downstream
-	//     consumer that holds onto the vector past our next scan call.
-	auto &vec = output.data[0];
-	vec.SetVectorType(VectorType::FLAT_VECTOR);
-	FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + gstate.current_buf_byte_offset);
-	vec.SetAuxiliary(make_buffer<LibstfBufferVectorBuffer>(buf));
+		auto &buf = gstate.current_buffers[i][gstate.current_buf_idx];
+		if (buf->size / kElemSize != total_elements) {
+			throw InternalException("parcore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
+			                        (unsigned long long)i, (unsigned long long)(buf->size / kElemSize),
+			                        (unsigned long long)total_elements);
+		}
+
+		// The actual zero-copy handoff. Two things happen here:ng
+		//
+		//  1. FlatVector::SetData points the vector's raw data pointer directly
+		//     into the FPGA-written libstf buffer (+ byte offset for the
+		//     STANDARD_VECTOR_SIZE slice we're emitting this call). No memcpy,
+		//     no arrow intermediary.
+		//
+		//  2. SetAuxiliary hands the buffer's shared_ptr to DuckDB's Vector
+		//     lifetime slot (wrapped in LibstfBufferVectorBuffer, because
+		//     DuckDB's slot is typed to shared_ptr<VectorBuffer>, not our
+		//     shared_ptr<libstf::Buffer>). DuckDB copies this shared_ptr whenever
+		//     it copies the vector, so the underlying memory stays alive as long
+		//     as any downstream consumer references it.
+		//
+		// Two refcount holders protect the memory while it's in flight:
+		//   - gstate.current_buffers keeps it alive across scan calls while we
+		//     slice one FPGA chunk into multiple STANDARD_VECTOR_SIZE emissions
+		//     (auxiliary gets cleared on each output.Reset()).
+		//   - vector auxiliary (set here) keeps it alive for any downstream
+		//     consumer that holds onto the vector past our next scan call.
+		auto &vec = output.data[i];
+		vec.SetVectorType(VectorType::FLAT_VECTOR);
+		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + gstate.current_buf_offset * kElemSize);
+		vec.SetAuxiliary(make_buffer<LibstfBufferVectorBuffer>(buf));
+	}
 
 	// Advance the cursor. If we hit the end of this buffer, step to the next
 	// one so the next scan call's `if` branch either keeps emitting or pulls
 	// a fresh chunk.
-	gstate.current_buf_byte_offset += emit * kElemSize;
-	if (gstate.current_buf_byte_offset >= buf->size) {
+	gstate.current_buf_offset += emit;
+	if (gstate.current_buf_offset >= total_elements) {
 		gstate.current_buf_idx++;
-		gstate.current_buf_byte_offset = 0;
+		gstate.current_buf_offset = 0;
 	}
 
 	output.SetCardinality(emit);
