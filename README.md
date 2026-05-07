@@ -10,13 +10,15 @@ The hardware component requires the Coyote, [libSTF](https://github.com/fpgasyst
 ParCore submodules to be loaded by either cloning this repo with submodules directly:
 
 ```bash
-git clone --recurse-submodules https://github.com/fpgasystems/Coyote
+git clone --recurse-submodules git@github.com:celeris-labs/oasis.git
 ```
 
 Or initializing the submodules as a step after cloning:
 
 ```bash
-git submodule update --init --recursive --remote
+git submodule update --init --remote
+cd coyote
+git submodule update --init --remote
 ```
 
 ## Hardware
