@@ -1,34 +1,33 @@
 cmake_minimum_required(VERSION 3.16)
 project(oasis
-  DESCRIPTION "Datalake-on-FPGA"
+  DESCRIPTION "Library for data processing SmartNIC"
   VERSION 0.1.0
   LANGUAGES CXX
 )
 
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR) 
-    add_subdirectory(../coyote/sw coyote)
-else()
-    if(NOT TARGET Coyote)
-        message(FATAL_ERROR "When Oasis is a subproject, parent must provide Coyote")
-    endif()
-endif()
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR) 
-    add_subdirectory(../libstf/software libstf)
-else()
-    if(NOT TARGET libstf)
-        message(FATAL_ERROR "When Oasis is a subproject, parent must provide libSTF")
-    endif()
-endif()
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR) 
-    add_subdirectory(../parcore/software parcore)
-else()
-    if(NOT TARGET parcore)
-        message(FATAL_ERROR "When Oasis is a subproject, parent must provide ParCore")
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(NOT TARGET Coyote)
+    find_package(Coyote QUIET)
+    if(NOT Coyote_FOUND)
+        add_subdirectory(../coyote/sw coyote)
     endif()
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT TARGET libstf)
+    find_package(libstf QUIET)
+    if(NOT libstf_FOUND)
+        add_subdirectory(../libstf/software libstf)
+    endif()
+endif()
+
+if(NOT TARGET parcore)
+    find_package(parcore QUIET)
+    if(NOT parcore_FOUND)
+        add_subdirectory(../parcore/software parcore)
+    endif()
+endif()
 
 add_library(oasis SHARED)
 
@@ -42,13 +41,8 @@ target_include_directories(oasis
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/oasis>
 )
 
-
-target_link_libraries(oasis PRIVATE Coyote)
-target_include_directories(oasis PRIVATE ${COYOTE_INCLUDE_DIRS})
-target_link_libraries(oasis PRIVATE libstf)
-target_include_directories(oasis PRIVATE ${LIBSTF_INCLUDE_DIRS})
-target_link_libraries(oasis PUBLIC parcore)
-target_include_directories(oasis PUBLIC ${PARCORE_INCLUDE_DIRS})
+target_link_libraries(oasis PRIVATE Coyote libstf parcore)
+target_include_directories(oasis PRIVATE ${COYOTE_INCLUDE_DIRS} ${LIBSTF_INCLUDE_DIRS} ${PARCORE_INCLUDE_DIRS})
 
 include(GNUInstallDirs)
 
