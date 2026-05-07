@@ -1,7 +1,6 @@
 [submodule "parcore"]
 	path = parcore
 	url = git@github.com:jonasdann/parcore
-	branch = unit-tests
 [submodule "coyote"]
 	path = coyote
 	url = https://github.com/fpgasystems/coyote
