@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-class MaximusExtension : public Extension {
+class OasisExtension : public Extension {
 public:
 	void Load(ExtensionLoader &db) override;
 	std::string Name() override;

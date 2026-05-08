@@ -1,6 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "maximus_extension.hpp"
+#include "oasis_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector_buffer.hpp"
@@ -287,17 +287,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(table_function);
 }
 
-void MaximusExtension::Load(ExtensionLoader &loader) {
+void OasisExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 
-std::string MaximusExtension::Name() {
-	return "maximus";
+std::string OasisExtension::Name() {
+	return "Oasis";
 }
 
-std::string MaximusExtension::Version() const {
-#ifdef EXT_VERSION_MAXIMUS
-	return EXT_VERSION_MAXIMUS;
+std::string OasisExtension::Version() const {
+#ifdef EXT_VERSION_OASIS
+	return EXT_VERSION_OASIS;
 #else
 	return "";
 #endif
@@ -306,7 +306,7 @@ std::string MaximusExtension::Version() const {
 } // namespace duckdb
 
 extern "C" {
-DUCKDB_CPP_EXTENSION_ENTRY(maximus, loader) {
+DUCKDB_CPP_EXTENSION_ENTRY(oasis, loader) {
 	duckdb::LoadInternal(loader);
 }
 }

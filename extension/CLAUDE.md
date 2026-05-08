@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-WIP DuckDB extension ("maximus") for running table scans of Parquet files on FPGAs, part of the maximus project. Built on the DuckDB extension template with CMake + Make, using DuckDB's `extension-ci-tools` submodule for build infrastructure.
+WIP DuckDB extension ("oasis") for running table scans of Parquet files on FPGAs, part of the Oasis project. Built on the DuckDB extension template with CMake + Make, using DuckDB's `extension-ci-tools` submodule for build infrastructure.
 
 ## Planned Flow
 
@@ -36,24 +36,24 @@ The built DuckDB shell at `./build/release/duckdb` has the extension statically 
 
 Tests use DuckDB's **SQLLogicTest** format in `test/sql/`. Run a specific test:
 ```bash
-./build/release/test/unittest "test/sql/maximus.test"
+./build/release/test/unittest "test/sql/oasis.test"
 ```
 
-SQLLogicTest syntax: `statement ok`, `statement error`, `query I` (one column), `query II` (two columns), etc. Use `require maximus` to ensure the extension is loaded.
+SQLLogicTest syntax: `statement ok`, `statement error`, `query I` (one column), `query II` (two columns), etc. Use `require oasis` to ensure the extension is loaded.
 
 ## Architecture
 
-- **Extension entry point**: `src/maximus_extension.cpp` — defines `MaximusExtension::Load()` which registers functions via `LoadInternal()`. The C entry point `DUCKDB_CPP_EXTENSION_ENTRY` calls `LoadInternal` for the loadable extension variant.
-- **Extension header**: `src/include/maximus_extension.hpp` — declares `MaximusExtension` (inherits `duckdb::Extension`).
+- **Extension entry point**: `src/oasis_extension.cpp` — defines `OasisExtension::Load()` which registers functions via `LoadInternal()`. The C entry point `DUCKDB_CPP_EXTENSION_ENTRY` calls `LoadInternal` for the loadable extension variant.
+- **Extension header**: `src/include/oasis_extension.hpp` — declares `OasisExtension` (inherits `duckdb::Extension`).
 - **Extension config**: `extension_config.cmake` — tells DuckDB's build system to load this extension and its tests.
 - **Dependencies**: OpenSSL linked via vcpkg (`vcpkg.json`). Add new vcpkg deps there and link in `CMakeLists.txt`.
 
 ### DuckDB Table Function Pattern
 
 The extension implements a table function using DuckDB's standard pattern:
-1. **Bind function** (`MaximusBind`) — validates inputs, determines output schema (column names/types), returns bind data
+1. **Bind function** (`OasisBind`) — validates inputs, determines output schema (column names/types), returns bind data
 2. **Init local** (`MyInitLocal`) — per-thread initialization (opens file handles, skips headers)
-3. **Scan function** (`MaximusScan`) — reads data into `DataChunk` up to `STANDARD_VECTOR_SIZE` rows per call; return 0 cardinality to signal EOF
+3. **Scan function** (`OasisScan`) — reads data into `DataChunk` up to `STANDARD_VECTOR_SIZE` rows per call; return 0 cardinality to signal EOF
 
 All extension code lives in the `duckdb` namespace.
 
