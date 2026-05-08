@@ -17,8 +17,6 @@ Or initializing the submodules as a step after cloning:
 
 ```bash
 git submodule update --init --remote
-cd coyote
-git submodule update --init --remote
 ```
 
 ## Hardware
@@ -50,6 +48,9 @@ is expected that the synthesis takes multiple hours to finish sometimes not prin
 the log for a while.
 
 ## Software
+The software consists of the Oasis library and a DuckDB extension.
+
+### Oasis library
 The software library can be built as follows:
 
 ```bash
@@ -60,6 +61,14 @@ cmake --build build -j
 
 If you want to install it to e.g., `~/opt`, you need to add `-DCMAKE_INSTALL_PREFIX=$HOME/opt` to 
 the first `cmake` command and execute `cmake --install build` after the build.
+
+### DuckDB extension
+The DuckDB Oasis extension can be built as follows:
+
+```bash
+cd extension
+make -j
+```
 
 ## License
 The Oasis code is licensed under the terms in 
