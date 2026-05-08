@@ -70,6 +70,8 @@ cd extension
 make -j
 ```
 
+More detail can be found in the `extension/README.md`.
+
 ## License
 The Oasis code is licensed under the terms in 
 [LICENSE.md](https://github.com/fpgasystems/libstf/blob/master/LICENSE.md), which corresponds to the 

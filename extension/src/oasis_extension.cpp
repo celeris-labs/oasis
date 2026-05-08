@@ -59,17 +59,17 @@ static LogicalType ParcoreTypeToLogical(parcore::metadata::Type type) {
 	case parcore::metadata::Type::BYTE_T:
 		return LogicalType::TINYINT;
 	default:
-		throw InternalException("Unsupported parcore type");
+		throw InternalException("Unsupported ParCore type");
 	}
 }
 
-struct ParcoreBindData : public TableFunctionData {
+struct OasisBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
 	vector<size_t> elem_sizes;
 };
 
-unique_ptr<FunctionData> ParcoreBind(ClientContext &context, TableFunctionBindInput &input,
+unique_ptr<FunctionData> OasisBind(ClientContext &context, TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types, vector<string> &names) {
 	auto parquet_file = StringValue::Get(input.inputs[0]);
 	auto meta = parcore::metadata::from_file(parquet_file + ".meta");
@@ -78,7 +78,7 @@ unique_ptr<FunctionData> ParcoreBind(ClientContext &context, TableFunctionBindIn
 		throw InvalidInputException("Parquet metadata contains no row groups");
 	}
 
-	auto bind_data = make_uniq<ParcoreBindData>();
+	auto bind_data = make_uniq<OasisBindData>();
 	for (auto &chunk : meta.groups[0].chunks) {
 		return_types.push_back(ParcoreTypeToLogical(chunk.type));
 		bind_data->elem_sizes.push_back(libstf::size_of(parcore::metadata::to_libstf_type(chunk.type)));
@@ -106,9 +106,9 @@ private:
 	std::shared_ptr<libstf::Buffer> buffer;
 };
 
-struct ParcoreGlobalState : public GlobalTableFunctionState {
-	// Parcore infra. All of this must outlive every scan call, so it lives on
-	// the global state (previously it was local to ParcoreInitGlobal and got
+struct OasisGlobalState : public GlobalTableFunctionState {
+	// ParCore infra. All of this must outlive every scan call, so it lives on
+	// the global state (previously it was local to OasisInitGlobal and got
 	// destroyed before the first scan). The obm itself stays a file-scope
 	// global due to the static-function interrupt callback limitation above.
 	std::shared_ptr<coyote::cThread> cthread;
@@ -129,10 +129,10 @@ struct ParcoreGlobalState : public GlobalTableFunctionState {
 	size_t current_buf_offset = 0;
 };
 
-unique_ptr<GlobalTableFunctionState> ParcoreInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->Cast<ParcoreBindData>();
+unique_ptr<GlobalTableFunctionState> OasisInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<OasisBindData>();
 
-	auto gstate = make_uniq<ParcoreGlobalState>();
+	auto gstate = make_uniq<OasisGlobalState>();
 
 	gstate->cthread = std::make_shared<coyote::cThread>(DEFAULT_VFPGA_ID, getpid(), 0, &handle_fpga_interrupt);
 
@@ -187,22 +187,22 @@ unique_ptr<GlobalTableFunctionState> ParcoreInitGlobal(ClientContext &context, T
 	return std::move(gstate);
 }
 
-struct ParcoreLocalState : public LocalTableFunctionState {};
+struct OasisLocalState : public LocalTableFunctionState {};
 
-unique_ptr<LocalTableFunctionState> ParcoreInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+unique_ptr<LocalTableFunctionState> OasisInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                      GlobalTableFunctionState *global_state_p) {
-	return make_uniq<ParcoreLocalState>();
+	return make_uniq<OasisLocalState>();
 }
 
 // Zero-copy multi-column scan. For each row group we enqueue every column,
-// then dequeue them in order (parcore's output queue is FIFO) and slice each
+// then dequeue them in order (ParCore's output queue is FIFO) and slice each
 // column's buffers in lockstep into STANDARD_VECTOR_SIZE-sized vectors. This
-// assumes parcore returns the same buffer layout (same buffer count, same
+// assumes ParCore returns the same buffer layout (same buffer count, same
 // elements per buffer at each index) across all columns of a row group; we
 // assert this below.
-static void ParcoreFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &gstate = data_p.global_state->Cast<ParcoreGlobalState>();
-	auto &bind = data_p.bind_data->Cast<ParcoreBindData>();
+static void OasisFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &gstate = data_p.global_state->Cast<OasisGlobalState>();
+	auto &bind = data_p.bind_data->Cast<OasisBindData>();
 
 	// Pull in next row group cursor reached end, needs to be synchronised across columns
 	// assuming row groups have same element count across columns
@@ -232,7 +232,7 @@ static void ParcoreFunction(ClientContext &context, TableFunctionInput &data_p, 
 
 		auto &buf = gstate.current_buffers[i][gstate.current_buf_idx];
 		if (buf->size / kElemSize != total_elements) {
-			throw InternalException("parcore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
+			throw InternalException("ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
 			                        (unsigned long long)i, (unsigned long long)(buf->size / kElemSize),
 			                        (unsigned long long)total_elements);
 		}
@@ -276,12 +276,12 @@ static void ParcoreFunction(ClientContext &context, TableFunctionInput &data_p, 
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	TableFunction table_function("parcore",              // function name
+	TableFunction table_function("oasis",              // function name
 	                             {LogicalType::VARCHAR}, // function arguments: parquet file path
-	                             ParcoreFunction,        // table function
-	                             ParcoreBind,            // bind function
-	                             ParcoreInitGlobal,      // init global function
-	                             ParcoreInitLocal        // init local function
+	                             OasisFunction,        // table function
+	                             OasisBind,            // bind function
+	                             OasisInitGlobal,      // init global function
+	                             OasisInitLocal        // init local function
 	);
 
 	loader.RegisterFunction(table_function);

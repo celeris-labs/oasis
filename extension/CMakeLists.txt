@@ -29,15 +29,15 @@ include_directories(src/include)
 #   * COYOTE_SIM_DIR=<abs path to parcore/build_hw> at runtime
 option(OASIS_SIM "Link against Coyote simulation library (no FPGA required)" ON)
 if (OASIS_SIM)
-    add_subdirectory(../coyote/sim/sw coyote)
+    find_package(CoyoteSimulation REQUIRED)
 else ()
-    find_package(Coyote)
+    find_package(Coyote REQUIRED)
 endif ()
 
-find_package(libstf)
+find_package(libstf REQUIRED)
 
-find_package(Arrow)
-find_package(parcore)
+find_package(Arrow REQUIRED)
+find_package(parcore REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Extension
