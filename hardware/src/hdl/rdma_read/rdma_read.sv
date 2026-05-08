@@ -5,6 +5,11 @@
 import libstf::data8_t;
 import lynxTypes::AXI_DATA_BITS;
 
+/*
+ * For RDMA transfers, Coyote currently leaves one last signal for every MTU (4K). This module 
+ * removes those and only leaves the last one of the transfer. This can be removed if we change this 
+ * behavior in Coyote.
+ */
 module RDMARead #(
     parameter AXI_STRM_ID = 0,
     parameter DATABEAT_SIZE = AXI_DATA_BITS / 8
