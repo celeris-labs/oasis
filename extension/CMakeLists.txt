@@ -27,9 +27,10 @@ include_directories(src/include)
 #   * parcore/build_hw/sim/ populated (run parcore/sim_setup.sh once)
 #   * xsim on PATH
 #   * COYOTE_SIM_DIR=<abs path to parcore/build_hw> at runtime
-option(OASIS_SIM "Link against Coyote simulation library (no FPGA required)" ON)
-if (OASIS_SIM)
+option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" ON)
+if (EN_SIMULATION)
     find_package(CoyoteSimulation REQUIRED)
+    add_compile_definitions(EN_SIMULATION)
 else ()
     find_package(Coyote REQUIRED)
 endif ()
@@ -38,17 +39,18 @@ find_package(libstf REQUIRED)
 
 find_package(Arrow REQUIRED)
 find_package(parcore REQUIRED)
+find_package(oasis REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Extension
 # ---------------------------------------------------------------------------
-set(EXTENSION_SOURCES src/oasis_extension.cpp)
+set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-target_link_libraries(${EXTENSION_NAME} Coyote libstf parcore)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} Coyote libstf parcore)
+target_link_libraries(${EXTENSION_NAME} Coyote libstf parcore oasis)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} Coyote libstf parcore oasis)
 
 install(
     TARGETS ${EXTENSION_NAME}

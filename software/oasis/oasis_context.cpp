@@ -39,7 +39,7 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool, size
     , tlb_manager_(std::make_shared<libstf::TLBManager>(cthread(), memory_pool_))
     , output_buffer_manager_(std::make_shared<libstf::OutputBufferManager>(cthread(),
                              global_config_.get_config<libstf::MemConfig>(),
-                             memory_pool_, tlb_manager_, obm_buffer_capacity)) {
+                             memory_pool_, tlb_manager_, 2, obm_buffer_capacity)) {
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());
     if (huge_pool) {
