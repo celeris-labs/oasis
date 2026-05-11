@@ -39,7 +39,7 @@ For synthesis, execute the following commands:
 ```bash
 mkdir build-hw
 cmake -S hardware -B build-hw
-nohup cmake --build build-hw --target project --target bitgen &> build-hw/bitgen.log &
+tmux new-session -d -s bitgen 'cmake --build build-hw --target project --target bitgen &> build-hw/bitgen.log'
 ```
 
 The command `nohup` runs the synthesis in the background in a way that the user can disconnect from 

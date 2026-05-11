@@ -39,7 +39,7 @@ target_sources(oasis PRIVATE
 target_include_directories(oasis
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/oasis>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(oasis PRIVATE Coyote libstf parcore)
