@@ -33,6 +33,7 @@ add_library(oasis SHARED)
 
 target_sources(oasis PRIVATE
     oasis/configuration.cpp
+    oasis/oasis_context.cpp
     oasis/parcore/rdma_reader.cpp
 )
 target_include_directories(oasis
