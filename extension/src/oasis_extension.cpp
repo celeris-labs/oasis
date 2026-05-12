@@ -2,6 +2,8 @@
 
 #include "oasis_extension.hpp"
 #include "oasis_scan.hpp"
+#include "oasis_mock_scan.hpp"
+
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
@@ -17,6 +19,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	);
 	table_function.projection_pushdown = true;
 	loader.RegisterFunction(table_function);
+
+	TableFunction mock_table_function("read_oasis_mock",
+	                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                  OasisMockScanFunction,
+	                                  OasisMockScanBind,
+	                                  OasisMockScanInitGlobal,
+	                                  OasisMockScanInitLocal);
+	loader.RegisterFunction(mock_table_function);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {
