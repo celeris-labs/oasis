@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0)
 project(oasis)
 
-set(CYT_DIR ${CMAKE_SOURCE_DIR}/../coyote)
+set(CYT_DIR ${CMAKE_SOURCE_DIR}/../parcore/coyote)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CYT_DIR}/cmake)
 
 find_package(CoyoteHW REQUIRED)
