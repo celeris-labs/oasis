@@ -18,6 +18,7 @@ set(EN_RDMA 1)
 set(N_RDMA_AXI 4)
 
 # Build with optimization, since timing closure with RDMA can be difficult
+set(COMP_CORES 64)
 set(BUILD_OPT 1)
 
 set(FDEV_NAME u55c)
@@ -28,7 +29,7 @@ set(TLBL_BITS 30)
 validation_checks_hw()
 
 load_apps (
-    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/src"
+    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src"
 )
 
 create_hw()
