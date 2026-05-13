@@ -1,12 +1,3 @@
 [submodule "parcore"]
 	path = parcore
-	url = git@github.com:jonasdann/parcore
-[submodule "coyote"]
-	path = coyote
-	url = https://github.com/fpgasystems/coyote
-[submodule "libstf"]
-	path = libstf
-	url = https://github.com/fpgasystems/libstf
-[submodule "vhsnunzip"]
-	path = vhsnunzip
-	url = https://github.com/lucat1/vhsnunzip
+	url = git@github.com:celeris-labs/parcore

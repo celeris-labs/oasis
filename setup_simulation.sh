@@ -1,8 +1,8 @@
 #!/bin/bash
 
 pushd hardware
-rm -rf build
-mkdir build
-pushd build
+rm -rf build-sim
+mkdir build-sim
+pushd build-sim
 /usr/bin/cmake ..
 make sim
