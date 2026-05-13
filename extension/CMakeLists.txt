@@ -45,16 +45,29 @@ find_package(oasis REQUIRED)
 # Extension
 # ---------------------------------------------------------------------------
 set(EXTENSION_SOURCES 
-	src/oasis_extension.cpp 
-	src/oasis_scan.cpp
-	src/oasis_mock_scan.cpp
+    src/oasis_extension.cpp 
+    src/oasis_scan.cpp
+    src/oasis_optimizer.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-target_link_libraries(${EXTENSION_NAME} Coyote libstf parcore oasis)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} Coyote libstf parcore oasis)
+target_link_libraries(${EXTENSION_NAME}
+    Coyote
+    libstf
+    parcore
+    oasis
+    ${OASIS_ARROW_TARGET}
+)
+
+target_link_libraries(${LOADABLE_EXTENSION_NAME}
+    Coyote
+    libstf
+    parcore
+    oasis
+    ${OASIS_ARROW_TARGET}
+)
 
 install(
     TARGETS ${EXTENSION_NAME}

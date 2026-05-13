@@ -2,31 +2,23 @@
 
 #include "oasis_extension.hpp"
 #include "oasis_scan.hpp"
-#include "oasis_mock_scan.hpp"
-
+#include "oasis_optimizer.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
 namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
-	TableFunction table_function("read_oasis",           // Function name
-	                             {LogicalType::VARCHAR}, // Function arguments: Parquet file path
-	                             OasisScanFunction,      // Table function
-	                             OasisScanBind,          // Bind function
-	                             OasisScanInitGlobal,    // Init global function
-	                             OasisScanInitLocal      // Init local function
-	);
+	TableFunction table_function("read_oasis",
+	                             {LogicalType::VARCHAR},
+	                             OasisScanFunction,
+	                             OasisScanBind,
+	                             OasisScanInitGlobal,
+	                             OasisScanInitLocal);
 	table_function.projection_pushdown = true;
 	loader.RegisterFunction(table_function);
 
-	TableFunction mock_table_function("read_oasis_mock",
-	                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                  OasisMockScanFunction,
-	                                  OasisMockScanBind,
-	                                  OasisMockScanInitGlobal,
-	                                  OasisMockScanInitLocal);
-	loader.RegisterFunction(mock_table_function);
+	RegisterOasisOptimizer(loader);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {

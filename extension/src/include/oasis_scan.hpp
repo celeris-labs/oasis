@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
 #include "oasis_context_cache_entry.hpp"
+#include "oasis_runtime_bloom.hpp"
 #include "parcore/column_chunk_decoder.hpp"
 #include "parcore/file_reader.hpp"
 #include "parcore/metadata/utils.hpp"
@@ -15,6 +16,12 @@ struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
 	vector<parcore::metadata::Type> parcore_types;
+	vector<string> column_names;
+
+	bool runtime_bloom_enabled = false;
+	string runtime_bloom_build_filename;
+	string runtime_bloom_build_key;
+	string runtime_bloom_probe_key;
 };
 
 struct OasisScanGlobalState : public GlobalTableFunctionState {
@@ -22,21 +29,28 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::shared_ptr<arrow::io::ReadableFile> file;
 	std::unique_ptr<parcore::FileReader> reader;
 
-	// ParCore column indices for the projected columns, in output order.
-	vector<size_t> column_ids;
+	vector<size_t> output_column_ids;
 
-	// Scan cursor: which row group we'll enqueue next, and where we are
-	// inside the buffers returned for the currently-in-flight chunk.
+	vector<size_t> scan_column_ids;
+
+	vector<size_t> output_to_scan_idx;
+
+	bool runtime_bloom_enabled = false;
+	size_t runtime_bloom_probe_col_id = DConstants::INVALID_INDEX;
+	size_t runtime_bloom_probe_scan_idx = DConstants::INVALID_INDEX;
+	std::shared_ptr<OasisRuntimeBloom> runtime_bloom;
+
 	size_t next_group = 0;
 	size_t total_groups = 0;
 	std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> current_buffers;
-	// the index of the buffers
+
 	size_t current_buf_idx = 0;
-	// the idx within the buffers
+
 	size_t current_buf_offset = 0;
 };
 
-struct OasisScanLocalState : public LocalTableFunctionState {};
+struct OasisScanLocalState : public LocalTableFunctionState {
+};
 
 unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types, vector<string> &names);
