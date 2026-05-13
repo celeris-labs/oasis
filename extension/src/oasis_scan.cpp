@@ -1,48 +1,160 @@
 #include "oasis_scan.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "oasis/oasis_context.hpp"
 #include "parcore/configuration.hpp"
+#include "parquet_reader.hpp"
+#include "parquet_types.h"
+#include "thrift_tools.hpp"
 
 namespace duckdb {
 
-static LogicalType ParcoreTypeToLogical(parcore::metadata::Type type) {
-	switch (type) {
-	case parcore::metadata::Type::INT32_T:
-		return LogicalType::INTEGER;
-	case parcore::metadata::Type::INT64_T:
-		return LogicalType::BIGINT;
-	case parcore::metadata::Type::FLOAT_T:
-		return LogicalType::FLOAT;
-	case parcore::metadata::Type::DOUBLE_T:
-		return LogicalType::DOUBLE;
-	case parcore::metadata::Type::BYTE_T:
-		return LogicalType::TINYINT;
-	case parcore::metadata::Type::BYTE_ARRAY:
-		return LogicalType::VARCHAR;
+static parcore::metadata::Type parquet_type_to_parcore(duckdb_parquet::Type::type t) {
+	switch (t) {
+	case duckdb_parquet::Type::BOOLEAN:
+		return parcore::metadata::Type::BYTE_T;
+	case duckdb_parquet::Type::INT32:
+        return parcore::metadata::Type::INT32_T;
+	case duckdb_parquet::Type::FLOAT:
+		return parcore::metadata::Type::FLOAT_T;
+	case duckdb_parquet::Type::INT64:
+        return parcore::metadata::Type::DOUBLE_T;
+	case duckdb_parquet::Type::DOUBLE:
+		return parcore::metadata::Type::INT64_T;
+	case duckdb_parquet::Type::BYTE_ARRAY:
+		return parcore::metadata::Type::BYTE_ARRAY;
 	default:
-		throw InternalException("Unsupported ParCore type: %d", static_cast<int>(type));
+		throw InvalidInputException("Parquet physical type %d not supported by ParCore", (int)t);
 	}
+}
+
+static parcore::metadata::Compression parquet_codec_to_parcore(duckdb_parquet::CompressionCodec::type c) {
+	switch (c) {
+	case duckdb_parquet::CompressionCodec::UNCOMPRESSED:
+		return parcore::metadata::Compression::RAW;
+	case duckdb_parquet::CompressionCodec::SNAPPY:
+		return parcore::metadata::Compression::SNAPPY;
+	default:
+		throw InvalidInputException("Parquet compression codec %d not supported by ParCore", (int)c);
+	}
+}
+
+static parcore::metadata::Metadata build_parcore_metadata(ClientContext &context, ParquetReader &parquet_reader) {
+	auto *file_meta = parquet_reader.GetFileMetadata();
+	auto &file_handle = parquet_reader.GetHandle();
+
+    // TODO: Remove the fetching of page meta data after adding a page header parser to the hardware
+	auto proto = duckdb_base_std::make_shared<ThriftFileTransport>(file_handle, false);
+	auto thrift_proto =
+	    make_uniq<duckdb_apache::thrift::protocol::TCompactProtocolT<ThriftFileTransport>>(proto);
+
+	parcore::metadata::Metadata meta;
+
+	for (auto &col : parquet_reader.columns) {
+		meta.column_names.push_back(col.name);
+	}
+
+	for (auto &rg : file_meta->row_groups) {
+		parcore::metadata::RowGroup parcore_rg;
+
+		for (auto &col_chunk : rg.columns) {
+			auto &cmd = col_chunk.meta_data;
+
+			parcore::metadata::ColumnChunk parcore_cc;
+			parcore_cc.type = parquet_type_to_parcore(cmd.type);
+			parcore_cc.num_values = static_cast<uint64_t>(cmd.num_values);
+			parcore_cc.compression = parquet_codec_to_parcore(cmd.codec);
+
+			// Walk page headers to collect individual pages
+			int64_t start_offset =
+			    cmd.__isset.dictionary_page_offset ? cmd.dictionary_page_offset : cmd.data_page_offset;
+			int64_t end_offset = start_offset + cmd.total_compressed_size;
+
+			proto->SetLocation(static_cast<idx_t>(start_offset));
+
+			uint64_t hybrid_num_values = 0;
+
+			while (proto->GetLocation() < static_cast<idx_t>(end_offset)) {
+				idx_t page_header_start = proto->GetLocation();
+
+				duckdb_parquet::PageHeader page_hdr;
+				page_hdr.read(thrift_proto.get());
+
+				idx_t page_data_offset = proto->GetLocation();
+				uint64_t page_size = static_cast<uint64_t>(page_hdr.compressed_page_size);
+
+				parcore::metadata::Page parcore_page;
+				parcore_page.offset = page_data_offset;
+				parcore_page.size = page_size;
+
+				if (page_hdr.type == duckdb_parquet::PageType::DICTIONARY_PAGE) {
+					parcore_page.encoding = parcore::metadata::Encoding::PLAIN;
+					parcore_page.num_values =
+					    static_cast<uint64_t>(page_hdr.dictionary_page_header.num_values);
+					parcore_cc.dictionary = parcore_page;
+				} else if (page_hdr.type == duckdb_parquet::PageType::DATA_PAGE) {
+					auto enc = page_hdr.data_page_header.encoding;
+					if (enc == duckdb_parquet::Encoding::RLE_DICTIONARY ||
+					    enc == duckdb_parquet::Encoding::PLAIN_DICTIONARY) {
+						parcore_page.encoding = parcore::metadata::Encoding::HYBRID;
+						parcore_page.num_values =
+						    static_cast<uint64_t>(page_hdr.data_page_header.num_values);
+						hybrid_num_values += parcore_page.num_values;
+					} else {
+						parcore_page.encoding = parcore::metadata::Encoding::PLAIN;
+						parcore_page.num_values =
+						    static_cast<uint64_t>(page_hdr.data_page_header.num_values);
+					}
+					parcore_cc.data.push_back(parcore_page);
+				} else if (page_hdr.type == duckdb_parquet::PageType::DATA_PAGE_V2) {
+					auto enc = page_hdr.data_page_header_v2.encoding;
+					if (enc == duckdb_parquet::Encoding::RLE_DICTIONARY ||
+					    enc == duckdb_parquet::Encoding::PLAIN_DICTIONARY) {
+						parcore_page.encoding = parcore::metadata::Encoding::HYBRID;
+						parcore_page.num_values =
+						    static_cast<uint64_t>(page_hdr.data_page_header_v2.num_values);
+						hybrid_num_values += parcore_page.num_values;
+					} else {
+						parcore_page.encoding = parcore::metadata::Encoding::PLAIN;
+						parcore_page.num_values =
+						    static_cast<uint64_t>(page_hdr.data_page_header_v2.num_values);
+					}
+					parcore_cc.data.push_back(parcore_page);
+				}
+
+				proto->SetLocation(page_data_offset + page_size);
+			}
+
+			parcore_cc.hybrid_num_values = hybrid_num_values;
+			parcore_rg.chunks.push_back(std::move(parcore_cc));
+		}
+
+		meta.groups.push_back(std::move(parcore_rg));
+	}
+
+	return meta;
 }
 
 unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types, vector<string> &names) {
 	auto parquet_file = StringValue::Get(input.inputs[0]);
-	auto meta = parcore::metadata::from_file(parquet_file + ".meta");
 
-	if (meta.groups.empty()) {
-		throw InvalidInputException("Parquet metadata contains no row groups");
-	}
+	ParquetOptions parquet_opts(context);
+	ParquetReader parquet_reader(context, OpenFileInfo {parquet_file}, parquet_opts);
 
 	auto bind_data = make_uniq<OasisScanBindData>();
 
-	for (size_t i = 0; i < meta.groups[0].chunks.size(); i++) {
-		auto &chunk = meta.groups[0].chunks[i];
-		names.push_back(meta.column_names[i]);
-		return_types.push_back(ParcoreTypeToLogical(chunk.type));
-		bind_data->parcore_types.push_back(chunk.type);
+	for (auto &col : parquet_reader.columns) {
+		names.push_back(col.name);
+		return_types.push_back(col.type);
 	}
-	bind_data->metadata = meta;
+
+	auto meta = build_parcore_metadata(context, parquet_reader);
+	if (meta.groups.empty()) {
+		throw InvalidInputException("Parquet file contains no row groups");
+	}
+	bind_data->metadata = std::move(meta);
 	bind_data->filename = parquet_file;
 
 	return std::move(bind_data);
@@ -79,6 +191,11 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
 			continue;
 		}
+		auto t = bind_data.metadata.groups[0].chunks[col_id].type;
+		if (!parcore::metadata::is_libstf_type(t)) {
+			throw InvalidInputException("Column '%s' has type BYTE_ARRAY which is not supported by ParCore",
+			                            bind_data.metadata.column_names[col_id].c_str());
+		}
 		gstate->column_ids.push_back(col_id);
 	}
 
@@ -95,7 +212,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 }
 
 // Zero-copy multi-column scan. For each row group we enqueue every column,
-// then dequeue them in order (ParCore's output queue is FIFO) and slice each
+// then dequeue them in order (ParCore's output queue is a FIFO) and slice each
 // column's buffers in lockstep into STANDARD_VECTOR_SIZE-sized vectors. This
 // assumes ParCore returns the same buffer layout (same buffer count, same
 // elements per buffer at each index) across all columns of a row group; we
@@ -124,15 +241,22 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 		gstate.next_group++;
 	}
 
+	auto elem_size = [&](size_t col_file_idx) -> size_t {
+		// next_group has already been incremented, so the in-flight group is next_group - 1.
+		auto t = bind.metadata.groups[gstate.next_group - 1].chunks[col_file_idx].type;
+		if (!parcore::metadata::is_libstf_type(t)) {
+			throw InternalException("Unsupported ParCore type %d in elem_size", (int)t);
+		}
+		return libstf::size_of(parcore::metadata::to_libstf_type(t));
+	};
+
 	size_t const col0_file_idx = gstate.column_ids[0];
 	size_t const total_elements =
-	    gstate.current_buffers[0][gstate.current_buf_idx]->size /
-	    libstf::size_of(parcore::metadata::to_libstf_type(bind.parcore_types[col0_file_idx]));
+	    gstate.current_buffers[0][gstate.current_buf_idx]->size / elem_size(col0_file_idx);
 	size_t const remaining_elements = total_elements - gstate.current_buf_offset;
 	size_t const emit = std::min<size_t>(remaining_elements, STANDARD_VECTOR_SIZE);
 	for (size_t i = 0; i < gstate.column_ids.size(); i++) {
-		const size_t kElemSize =
-		    libstf::size_of(parcore::metadata::to_libstf_type(bind.parcore_types[gstate.column_ids[i]]));
+		const size_t kElemSize = elem_size(gstate.column_ids[i]);
 
 		auto &buf = gstate.current_buffers[i][gstate.current_buf_idx];
 		if (buf->size / kElemSize != total_elements) {

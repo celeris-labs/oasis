@@ -12,6 +12,9 @@ set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 include_directories(src/include)
+include_directories(duckdb/extension/parquet/include)
+include_directories(duckdb/third_party/parquet)
+include_directories(duckdb/third_party/thrift)
 
 # ---------------------------------------------------------------------------
 # Dependencies

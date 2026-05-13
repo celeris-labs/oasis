@@ -22,7 +22,7 @@ struct OasisContextCacheEntry : public ObjectCacheEntry {
 	OasisContextCacheEntry() {
 #ifdef EN_SIMULATION
 		auto pool = std::make_shared<libstf::SimpleMemoryPool>();
-		oasis::OasisContext::init(std::move(pool), 1 << 16 /* 64KiB */);
+		oasis::OasisContext::init(std::move(pool), libstf::BYTES_PER_FPGA_TRANSFER);
 #else
 		auto pool = std::make_shared<libstf::HugePageMemoryPool>();
 		oasis::OasisContext::init(std::move(pool), 1 << 24 /* 16MiB */);

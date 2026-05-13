@@ -5,7 +5,7 @@
 #include "oasis_context_cache_entry.hpp"
 #include "parcore/column_chunk_decoder.hpp"
 #include "parcore/file_reader.hpp"
-#include "parcore/metadata/utils.hpp"
+#include "parcore/metadata/metadata.hpp"
 
 #include <parcore/reader.hpp>
 
@@ -14,7 +14,6 @@ namespace duckdb {
 struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
-	vector<parcore::metadata::Type> parcore_types;
 };
 
 struct OasisScanGlobalState : public GlobalTableFunctionState {
