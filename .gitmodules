@@ -1,16 +1,6 @@
 [submodule "parcore"]
 	path = parcore
 	url = git@github.com:celeris-labs/parcore
-[submodule "coyote"]
-	path = coyote
-	url = https://github.com/fpgasystems/coyote
-    fetchRecurseSubmodules = true
-[submodule "libstf"]
-	path = libstf
-	url = https://github.com/fpgasystems/libstf
-[submodule "vhsnunzip"]
-	path = vhsnunzip
-	url = https://github.com/lucat1/vhsnunzip
 [submodule "extension/duckdb"]
 	path = extension/duckdb
 	url = https://github.com/duckdb/duckdb

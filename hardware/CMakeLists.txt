@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0)
 project(oasis)
 
-set(CYT_DIR ${CMAKE_SOURCE_DIR}/../coyote)
+set(CYT_DIR ${CMAKE_SOURCE_DIR}/../parcore/coyote)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CYT_DIR}/cmake)
 
 find_package(CoyoteHW REQUIRED)
@@ -29,7 +29,7 @@ set(TLBL_BITS 30)
 validation_checks_hw()
 
 load_apps (
-    VFPGA_C0_0 "src ../libstf/hardware/src ../vhsnunzip/src ../parcore/hardware/src"
+    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src"
 )
 
 create_hw()
