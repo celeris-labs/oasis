@@ -38,7 +38,7 @@ project needs to be regenerated whenever new files are added (also for the depen
 For synthesis, execute the following command:
 
 ```bash
-./scripts/synthesize.sh
+./scripts/synthesize.sh [--no-rdma]
 ```
 
 The script spins off the synthesis in the background in a way that the user can disconnect from 

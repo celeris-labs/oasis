@@ -1,5 +1,13 @@
 #!/bin/bash
 
+cmake_args=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
+        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+    esac
+done
+
 pushd hardware
 
 # Finds the build directory with the highest number and starts the synthesis in a new directory with that number + 1
@@ -13,5 +21,5 @@ build_dir="build-$(printf '%02d' $((n + 1)))"
 echo Building bitstream in hardware/$build_dir...
 
 mkdir "$build_dir"
-cmake -S . -B "$build_dir"
+cmake -S . -B "$build_dir" "${cmake_args[@]}"
 tmux new-session -d -s "bitgen-$build_dir" "cmake --build $build_dir --target project --target bitgen &> $build_dir/bitgen.log"
