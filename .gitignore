@@ -1,11 +1,11 @@
 build*
-hardware/build
 
 # Generated unit test files
 hardware/unit-tests/diff/**
 hardware/unit-tests/sim_dump.vcd
 
 # Vivado generated files
+.Xil
 *.jou
 *.log
 *.str
