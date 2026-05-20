@@ -4,6 +4,7 @@ import oasis::*;
 import parcore::*;
 
 // -- Tie-off unused interfaces and signals --------------------------------------------------------
+`ifdef EN_RDMA
 always_comb rq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
 
@@ -18,10 +19,19 @@ for (genvar I = 0; I < N_RDMA_AXI; I++) begin
 end
 
 `ASSERT_ELAB(N_STRM_AXI == N_RDMA_AXI)
+`else
+always_comb sq_rd.tie_off_m();
+always_comb cq_rd.tie_off_s();
+`endif
 
 localparam NUM_STREAMS   = N_STRM_AXI;
 localparam DATABEAT_SIZE = AXI_DATA_BITS / 8;
+
+`ifdef EN_RDMA
 localparam NUM_CONFIGS   = 4;
+`else
+localparam NUM_CONFIGS   = 3;
+`endif
 
 // -- Fix clock and reset names --------------------------------------------------------------------
 logic clk;
@@ -34,7 +44,9 @@ assign rst_n = aresetn;
 write_config_i                write_configs[NUM_CONFIGS](.*);
 read_config_i                 read_configs [NUM_CONFIGS](.*);
 mem_config_i                  mem_conf[NUM_STREAMS](.*);
+`ifdef EN_RDMA
 rdma_read_config_i            rdma_conf[NUM_STREAMS](.*);
+`endif
 column_chunk_decoder_config_i column_chunk_conf[NUM_STREAMS](.*);
 page_decoder_config_i         page_conf[NUM_STREAMS](.*);
 
@@ -42,10 +54,12 @@ GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(NUM_CONFIGS),
     .ADDR_SPACE_SIZES({
-        NUM_STREAMS + 1, 
-        NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS,
+        NUM_STREAMS + 1,
         COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_STREAMS,
         PAGE_DECODER_CONFIG_REGS * NUM_STREAMS
+`ifdef EN_RDMA
+        , NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS
+`endif
     })
 ) inst_config (
     .clk(clk),
@@ -69,26 +83,14 @@ MemConfig #(
     .out(mem_conf)
 );
 
-RDMAReadConfig #(
-    .NUM_STREAMS(NUM_STREAMS)
-) inst_rdma_read_config (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .write_config(write_configs[1]),
-    .read_config(read_configs[1]),
-
-    .out(rdma_conf)
-);
-
 ColumnChunkDecoderConfig #(
     .NUM_DECODERS(NUM_STREAMS)
 ) inst_column_chunk_decoder_config (
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[2]),
-    .read_config(read_configs[2]),
+    .write_config(write_configs[1]),
+    .read_config(read_configs[1]),
 
     .out(column_chunk_conf)
 );
@@ -99,10 +101,23 @@ PageDecoderConfig #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[3]),
-    .read_config(read_configs[3]),
+    .write_config(write_configs[2]),
+    .read_config(read_configs[2]),
 
     .out(page_conf)
+);
+
+`ifdef EN_RDMA
+RDMAReadConfig #(
+    .NUM_STREAMS(NUM_STREAMS)
+) inst_rdma_read_config (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .write_config(write_configs[1]),
+    .read_config(read_configs[1]),
+
+    .out(rdma_conf)
 );
 
 // -- De-mux and arbiter the read send and completion queues ---------------------------------------
@@ -129,6 +144,7 @@ CQDemultiplexer #(
     .data_in(cq_rd),
     .data_out(cq_rd_strm)
 );
+`endif
 
 // -- Decoders -------------------------------------------------------------------------------------
 AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
@@ -138,8 +154,9 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin
     typed_ndata_i #(DATABEAT_SIZE)          typed_out();
     ndata_i       #(data8_t, DATABEAT_SIZE) out();
 
+`ifdef EN_RDMA
     // AXI4SR to AXI4S
-    `AXIS_ASSIGN(axis_rreq_recv[I], axi_in)  
+    `AXIS_ASSIGN(axis_rreq_recv[I], axi_in)
 
     RDMARead #(
         .AXI_STRM_ID(I),
@@ -156,6 +173,18 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin
         .in(axi_in),
         .out(decoder_in)
     );
+`else
+    // AXI4SR to AXI4S
+    `AXIS_ASSIGN(axis_host_recv[I], axi_in)
+
+    AXIToNData #(data8_t, DATABEAT_SIZE) inst_axi_to_ndata (
+        .clk(clk),
+        .rst_n(rst_n),
+
+        .in(axi_in),
+        .out(decoder_in)
+    );
+`endif
 
     ColumnChunkDecoder #(
         .DATABEAT_SIZE(DATABEAT_SIZE)
