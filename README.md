@@ -17,6 +17,7 @@ Or initializing the submodule as a step after cloning:
 
 ```bash
 git submodule update --init --recursive parcore
+git submodule update --init celeris
 ```
 
 ## Hardware
