@@ -6,7 +6,7 @@
 #include "oasis_runtime_bloom.hpp"
 #include "parcore/column_chunk_decoder.hpp"
 #include "parcore/file_reader.hpp"
-#include "parcore/metadata/utils.hpp"
+#include "parcore/metadata/metadata.hpp"
 
 #include <parcore/reader.hpp>
 
@@ -15,8 +15,6 @@ namespace duckdb {
 struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
-	vector<parcore::metadata::Type> parcore_types;
-	vector<string> column_names;
 
 	bool runtime_bloom_enabled = false;
 	string runtime_bloom_build_filename;
@@ -29,10 +27,8 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::shared_ptr<arrow::io::ReadableFile> file;
 	std::unique_ptr<parcore::FileReader> reader;
 
-	vector<size_t> output_column_ids;
-
+	vector<size_t> column_ids;
 	vector<size_t> scan_column_ids;
-
 	vector<size_t> output_to_scan_idx;
 
 	bool runtime_bloom_enabled = false;
@@ -45,7 +41,6 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> current_buffers;
 
 	size_t current_buf_idx = 0;
-
 	size_t current_buf_offset = 0;
 };
 

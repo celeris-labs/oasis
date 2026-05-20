@@ -12,5 +12,9 @@
     "C_Cpp.formatting": "clangFormat",
     "C_Cpp.clang_format_style": "file",
 
-    "cmake.sourceDirectory": "${workspaceFolder}/software",
+    "cmake.sourceDirectory": [
+        "${workspaceFolder}/software"
+    ],
+
+    "makefile.makeDirectory": "${workspaceFolder}/extension"
 }
