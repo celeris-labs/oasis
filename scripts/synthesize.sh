@@ -22,4 +22,4 @@ echo Building bitstream in hardware/$build_dir...
 
 mkdir "$build_dir"
 cmake -S . -B "$build_dir" "${cmake_args[@]}"
-tmux new-session -d -s "bitgen-$build_dir" "cmake --build $build_dir --target project --target bitgen &> $build_dir/bitgen.log"
+tmux new-session -d -s "bitgen-$build_dir" "cmake --build $build_dir --target project --target bitgen &> $build_dir/bitgen.log && $(dirname "$0")/generate_reports.sh $build_dir"
