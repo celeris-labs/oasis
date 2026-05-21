@@ -2,8 +2,8 @@
 // memory region for the Oasis extension's rdma:// filesystem.
 //
 // Layout of the region (matches RDMAFileSystem::LoadDirectory):
-//   uint64 count
-//   repeated count times:
+//   uint64 dir_size  // total bytes of the directory header (including this field)
+//   repeated until dir_size bytes consumed:
 //     uint64 name_len
 //     char[name_len] name
 //     uint64 offset    // absolute offset within the region
@@ -50,7 +50,7 @@ std::string basename(const std::string &path) {
  * Returns the byte size of the serialized directory header for the given file names.
  */
 uint64_t directory_header_byte_size(const std::vector<std::string> &names) {
-    uint64_t total = sizeof(uint64_t); // count
+    uint64_t total = sizeof(uint64_t); // dir_size
     for (const auto &name : names) {
         total += sizeof(uint64_t);     // name_len
         total += name.size();          // name bytes
@@ -207,7 +207,7 @@ int main(int argc, char *argv[]) {
 
     // Lay out the directory.
     uint8_t *p = mem;
-    write_header_value<uint64_t>(p, static_cast<uint64_t>(files.size()));
+    write_header_value<uint64_t>(p, dir_header_size);
 
     uint64_t              cursor = dir_header_size;
     std::vector<uint64_t> offsets(files.size());
