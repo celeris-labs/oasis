@@ -19,9 +19,9 @@ static parcore::metadata::Type parquet_type_to_parcore(duckdb_parquet::Type::typ
 	case duckdb_parquet::Type::FLOAT:
 		return parcore::metadata::Type::FLOAT_T;
 	case duckdb_parquet::Type::INT64:
-        return parcore::metadata::Type::DOUBLE_T;
+        return parcore::metadata::Type::INT64_T;
 	case duckdb_parquet::Type::DOUBLE:
-		return parcore::metadata::Type::INT64_T;
+		return parcore::metadata::Type::DOUBLE_T;
 	case duckdb_parquet::Type::BYTE_ARRAY:
 		return parcore::metadata::Type::BYTE_ARRAY;
 	default:
