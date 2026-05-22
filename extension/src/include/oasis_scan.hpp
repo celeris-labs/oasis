@@ -3,7 +3,6 @@
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
 #include "oasis_context_cache_entry.hpp"
-#include "oasis_runtime_bloom.hpp"
 #include "parcore/column_chunk_decoder.hpp"
 #include "parcore/file_reader.hpp"
 #include "parcore/metadata/metadata.hpp"
@@ -11,6 +10,8 @@
 #include <parcore/reader.hpp>
 
 namespace duckdb {
+
+struct OasisBloomMockState;
 
 struct OasisScanBindData : public TableFunctionData {
 	string filename;
@@ -34,7 +35,8 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	bool runtime_bloom_enabled = false;
 	size_t runtime_bloom_probe_col_id = DConstants::INVALID_INDEX;
 	size_t runtime_bloom_probe_scan_idx = DConstants::INVALID_INDEX;
-	std::shared_ptr<OasisRuntimeBloom> runtime_bloom;
+
+	std::shared_ptr<OasisBloomMockState> bloom_mock;
 
 	size_t next_group = 0;
 	size_t total_groups = 0;
@@ -56,5 +58,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
                                                        GlobalTableFunctionState *global_state_p);
 
 void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+
+bool OasisLoadNextRowGroupIfNeeded(OasisScanGlobalState &gstate);
 
 } // namespace duckdb

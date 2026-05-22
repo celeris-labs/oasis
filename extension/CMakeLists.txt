@@ -51,6 +51,8 @@ set(EXTENSION_SOURCES
     src/oasis_extension.cpp 
     src/oasis_scan.cpp
     src/oasis_optimizer.cpp
+    src/oasis_bloom_mock.cpp
+    src/oasis_parquet_metadata.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
