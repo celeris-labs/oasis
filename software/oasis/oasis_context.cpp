@@ -1,5 +1,7 @@
 #include "oasis/oasis_context.hpp"
 
+#include "parcore/configuration.hpp"
+
 #include <stdexcept>
 #include <unistd.h>
 
@@ -30,7 +32,22 @@ static void handle_fpga_interrupt(int value) {
     OasisContext::ctx().output_buffer_manager()->handle_fpga_interrupt(value);
 }
 
-OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t obm_buffer_capacity)
+static libstf::stream_mask_t computeManagedStreams(libstf::GlobalConfig &global_config) {
+    // Decoder streams are managed (the OBM pre-allocates / tops up buffers for them). When RDMA is
+    // wired in, there is one extra MemConfig stream past the decoders -- the bypass stream used by
+    // RDMAFileSystem -- and that one is unmanaged because its transfer size is known per request.
+    // Note: The instance is not ready at this point so we cannot call isRDMAEnabled(...)
+    auto mem_config = global_config.get_config<libstf::MemConfig>();
+    auto cc_config = global_config.get_config<parcore::ColumnChunkDecoderConfig>();
+    libstf::stream_mask_t managed = ~libstf::stream_mask_t(0);
+    if (mem_config->num_streams() > cc_config->num_decoders()) {
+        managed.reset(cc_config->num_decoders());
+    }
+    return managed;
+}
+
+OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
+                           size_t obm_buffer_capacity)
     : device_id_(DEFAULT_DEVICE_ID)
     , vfpga_id_(DEFAULT_VFPGA_ID)
     , memory_pool_(std::move(memory_pool))
@@ -39,7 +56,8 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool, size
     , tlb_manager_(std::make_shared<libstf::TLBManager>(cthread(), memory_pool_))
     , output_buffer_manager_(std::make_shared<libstf::OutputBufferManager>(cthread(),
                              global_config_.get_config<libstf::MemConfig>(),
-                             memory_pool_, tlb_manager_, 2, obm_buffer_capacity)) {
+                             memory_pool_, tlb_manager_,
+                             computeManagedStreams(global_config_), 2, obm_buffer_capacity)) {
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());
     if (huge_pool) {
@@ -81,6 +99,18 @@ std::shared_ptr<libstf::TLBManager> OasisContext::tlb_manager() {
 
 std::shared_ptr<libstf::OutputBufferManager> OasisContext::output_buffer_manager() {
     return output_buffer_manager_;
+}
+
+bool OasisContext::isRDMAEnabled() {
+    // The hardware exposes one MemConfig stream per column-chunk decoder plus an extra bypass
+    // stream when RDMA is wired in. If the counts match, RDMA wasn't synthesized into this shell.
+    auto mem_config = config<libstf::MemConfig>();
+    auto cc_config = config<parcore::ColumnChunkDecoderConfig>();
+    return !(mem_config->num_streams() == cc_config->num_decoders());
+}
+
+libstf::stream_t OasisContext::rdmaBypassStream() {
+    return config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
 }
 
 } // namespace oasis
