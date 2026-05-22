@@ -1,12 +1,17 @@
 #!/bin/bash
 
 cmake_args=()
-for arg in "$@"; do
-    case "$arg" in
+decoders=4
+while [ $# -gt 0 ]; do
+    case "$1" in
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
-        *) echo "Unknown argument: $arg" >&2; exit 1 ;;
+        --decoders) decoders="$2"; shift ;;
+        --decoders=*) decoders="${1#*=}" ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
+    shift
 done
+cmake_args+=(-DN_DECODERS="$decoders")
 
 pushd hardware
 

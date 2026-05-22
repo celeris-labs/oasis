@@ -29,8 +29,10 @@ localparam DATABEAT_SIZE = AXI_DATA_BITS / 8;
 
 `ifdef EN_RDMA
 localparam NUM_CONFIGS   = 4;
+localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `else
 localparam NUM_CONFIGS   = 3;
+localparam NUM_DECODERS  = NUM_STREAMS;
 `endif
 
 // -- Fix clock and reset names --------------------------------------------------------------------
@@ -47,16 +49,16 @@ mem_config_i                  mem_conf[NUM_STREAMS](.*);
 `ifdef EN_RDMA
 rdma_read_config_i            rdma_conf[NUM_STREAMS](.*);
 `endif
-column_chunk_decoder_config_i column_chunk_conf[NUM_STREAMS](.*);
-page_decoder_config_i         page_conf[NUM_STREAMS](.*);
+column_chunk_decoder_config_i column_chunk_conf[NUM_DECODERS](.*);
+page_decoder_config_i         page_conf[NUM_DECODERS](.*);
 
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(NUM_CONFIGS),
     .ADDR_SPACE_SIZES({
         NUM_STREAMS + 1,
-        COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_STREAMS,
-        PAGE_DECODER_CONFIG_REGS * NUM_STREAMS
+        COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_DECODERS,
+        PAGE_DECODER_CONFIG_REGS * NUM_DECODERS
 `ifdef EN_RDMA
         , NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS
 `endif
@@ -84,7 +86,7 @@ MemConfig #(
 );
 
 ColumnChunkDecoderConfig #(
-    .NUM_DECODERS(NUM_STREAMS)
+    .NUM_DECODERS(NUM_DECODERS)
 ) inst_column_chunk_decoder_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -96,7 +98,7 @@ ColumnChunkDecoderConfig #(
 );
 
 PageDecoderConfig #(
-    .NUM_DECODERS(NUM_STREAMS)
+    .NUM_DECODERS(NUM_DECODERS)
 ) inst_page_decoder_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -148,7 +150,7 @@ CQDemultiplexer #(
 
 // -- Decoders -------------------------------------------------------------------------------------
 AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
-for (genvar I = 0; I < NUM_STREAMS; I++) begin
+for (genvar I = 0; I < NUM_DECODERS; I++) begin
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
     ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in();
     typed_ndata_i #(DATABEAT_SIZE)          typed_out();
@@ -210,6 +212,41 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin
         .out(axi_out[I])
     );
 end
+
+// -- RDMA bypass stream (last stream slot, no decoder) --------------------------------------------
+`ifdef EN_RDMA
+localparam BYPASS_ID = NUM_STREAMS - 1;
+
+AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
+ndata_i #(data8_t, DATABEAT_SIZE) bypass_ndata();
+
+// AXI4SR to AXI4S
+`AXIS_ASSIGN(axis_rreq_recv[BYPASS_ID], axi_in)
+
+RDMARead #(
+    .AXI_STRM_ID(BYPASS_ID),
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_rdma_read_bypass (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .sq_rd(sq_rd_strm[BYPASS_ID]),
+    .cq_rd(cq_rd_strm[BYPASS_ID]),
+
+    .conf(rdma_conf[BYPASS_ID]),
+
+    .in(axi_in),
+    .out(bypass_ndata)
+);
+
+NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_bypass (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(bypass_ndata),
+    .out(axi_out[BYPASS_ID])
+);
+`endif
 
 // -- Output writer --------------------------------------------------------------------------------
 OutputWriter inst_output_writer (
