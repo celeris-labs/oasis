@@ -47,7 +47,7 @@ find_package(oasis REQUIRED)
 # ---------------------------------------------------------------------------
 # Extension
 # ---------------------------------------------------------------------------
-set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp)
+set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/regex.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

@@ -2,6 +2,7 @@
 
 #include "oasis_extension.hpp"
 #include "oasis_scan.hpp"
+#include "regex.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
@@ -17,6 +18,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	);
 	table_function.projection_pushdown = true;
 	loader.RegisterFunction(table_function);
+	ScalarFunction regex_function("regex_fpga",
+	                              {LogicalType::VARCHAR, LogicalType::VARCHAR}, // string, pattern
+	                              LogicalType::BOOLEAN, RegexFpgaFunction, RegexFpgaBind);
+	loader.RegisterFunction(regex_function);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {
