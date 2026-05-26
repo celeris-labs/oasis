@@ -86,6 +86,7 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	auto &ctx = oasis::OasisContext::ctx();
 
 	auto gstate = make_uniq<OasisScanGlobalState>();
+	gstate->metadata = &bind_data.metadata;
 
 	auto column_chunk_config = ctx.config<parcore::ColumnChunkDecoderConfig>();
 	auto page_config = ctx.config<parcore::PageDecoderConfig>();
@@ -171,9 +172,35 @@ bool OasisLoadNextRowGroupIfNeeded(OasisScanGlobalState &gstate) {
 		return false;
 	}
 
+	if (!gstate.metadata) {
+		throw InternalException("OASIS: missing metadata pointer in global scan state");
+	}
+
 	OASIS_SCAN_LOG("loading row-group=%llu", (unsigned long long)gstate.next_group);
 
+	auto &ctx = oasis::OasisContext::ctx();
+	auto bf_stream_config = ctx.config<libstf::StreamConfig>();
+
 	for (size_t col_id : gstate.scan_column_ids) {
+		auto const &chunk = gstate.metadata->groups[gstate.next_group].chunks[col_id];
+
+		if (!parcore::metadata::is_libstf_type(chunk.type)) {
+			throw InternalException("Unsupported ParCore type %d in OasisLoadNextRowGroupIfNeeded",
+			                        (int)chunk.type);
+		}
+
+		// Stream 0 always passes through the Bloom demux/mux in hardware.
+		// Normal read_oasis scans and software Bloom mock probe scans must
+		// explicitly select the bypass path.
+		//
+		// Hardware comment:
+		//   select = 0 -> bloom-filtered path
+		//   select = 1 -> bypass path
+		bf_stream_config->enqueue_stream_config(
+		    0,
+		    parcore::metadata::to_libstf_type(chunk.type),
+		    1);
+
 		gstate.reader->enqueue_column_chunk(gstate.next_group, col_id);
 	}
 

@@ -28,6 +28,9 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::shared_ptr<arrow::io::ReadableFile> file;
 	std::unique_ptr<parcore::FileReader> reader;
 
+	// Points to bind_data.metadata. The bind data lives for the lifetime of the scan.
+	const parcore::metadata::Metadata *metadata = nullptr;
+
 	vector<size_t> column_ids;
 	vector<size_t> scan_column_ids;
 	vector<size_t> output_to_scan_idx;

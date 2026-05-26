@@ -1,14 +1,21 @@
 #include "oasis_bloom_mock.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "duckdb/common/string_util.hpp"
+
+#include "libstf_buffer_vector_buffer.hpp"
 #include "oasis/oasis_context.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_parquet_metadata.hpp"
-#include "oasis_runtime_bloom.hpp"
 #include "parcore/configuration.hpp"
+#include "parcore/file_reader.hpp"
+#include "parquet_reader.hpp"
 
 #include <cstdio>
+#include <cstdint>
+#include <memory>
+#include <vector>
 
 namespace duckdb {
 
@@ -19,9 +26,12 @@ namespace duckdb {
 		fprintf(stderr, "\n");                                                                                          \
 	} while (0)
 
-struct OasisBloomMockState {
-	std::shared_ptr<OasisRuntimeBloom> runtime_bloom;
-};
+#define OASIS_SCAN_LOG(...)                                                                                            \
+	do {                                                                                                               \
+		fprintf(stderr, "[OASIS][SCAN] ");                                                                             \
+		fprintf(stderr, __VA_ARGS__);                                                                                  \
+		fprintf(stderr, "\n");                                                                                         \
+	} while (0)
 
 template <class NAME_VECTOR>
 static size_t FindColumnId(const NAME_VECTOR &names, const string &name) {
@@ -32,6 +42,64 @@ static size_t FindColumnId(const NAME_VECTOR &names, const string &name) {
 	}
 	throw BinderException("OASIS: column '%s' not found", name);
 }
+
+static uint64_t SplitMix64(uint64_t x) {
+	x += 0x9e3779b97f4a7c15ULL;
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+	return x ^ (x >> 31);
+}
+
+class OasisRuntimeBloom {
+public:
+	OasisRuntimeBloom(idx_t bit_count = 1 << 20, idx_t hash_count = 3)
+	    : bits((bit_count + 63) / 64, 0), bit_count(bit_count), hash_count(hash_count), inserted_count(0) {
+	}
+
+	void AddInt64(int64_t value) {
+		uint64_t x = static_cast<uint64_t>(value);
+		for (idx_t i = 0; i < hash_count; i++) {
+			auto h = SplitMix64(x + i * 0x9e3779b97f4a7c15ULL);
+			auto bit = h % bit_count;
+			bits[bit / 64] |= (1ULL << (bit % 64));
+		}
+		inserted_count++;
+	}
+
+	bool MayContainInt64(int64_t value) const {
+		uint64_t x = static_cast<uint64_t>(value);
+		for (idx_t i = 0; i < hash_count; i++) {
+			auto h = SplitMix64(x + i * 0x9e3779b97f4a7c15ULL);
+			auto bit = h % bit_count;
+			if ((bits[bit / 64] & (1ULL << (bit % 64))) == 0) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	idx_t InsertedCount() const {
+		return inserted_count;
+	}
+
+	idx_t BitCount() const {
+		return bit_count;
+	}
+
+	idx_t HashCount() const {
+		return hash_count;
+	}
+
+private:
+	std::vector<uint64_t> bits;
+	idx_t bit_count;
+	idx_t hash_count;
+	idx_t inserted_count;
+};
+
+struct OasisBloomMockState {
+	std::shared_ptr<OasisRuntimeBloom> bloom;
+};
 
 static int64_t ReadIntKey(const std::shared_ptr<libstf::Buffer> &buf, size_t row, parcore::metadata::Type type) {
 	switch (type) {
@@ -70,6 +138,18 @@ static size_t BufferElementCount(const std::shared_ptr<libstf::Buffer> &buf, par
 	return buf->size / elem_size;
 }
 
+static parcore::metadata::Metadata BuildMetadataForFile(ClientContext &context, const string &filename) {
+	ParquetOptions parquet_opts(context);
+	ParquetReader parquet_reader(context, OpenFileInfo {filename}, parquet_opts);
+
+	auto meta = BuildParcoreMetadata(context, parquet_reader);
+	if (meta.groups.empty()) {
+		throw InvalidInputException("OASIS Bloom build metadata contains no row groups: %s", filename);
+	}
+
+	return meta;
+}
+
 static std::shared_ptr<OasisRuntimeBloom> BuildRuntimeBloomFilter(ClientContext &context,
                                                                   const OasisScanBindData &probe_bind) {
 	auto build_file = probe_bind.runtime_bloom_build_filename;
@@ -79,17 +159,12 @@ static std::shared_ptr<OasisRuntimeBloom> BuildRuntimeBloomFilter(ClientContext 
 	OASIS_BLOOM_LOG("build file = %s", build_file.c_str());
 	OASIS_BLOOM_LOG("build key  = %s", build_key.c_str());
 
-	auto build_meta = BuildParcoreMetadataFromParquet(context, build_file);
-
-	if (build_meta.groups.empty()) {
-		throw InvalidInputException("OASIS Bloom build metadata contains no row groups: %s", build_file);
-	}
+	auto build_meta = BuildMetadataForFile(context, build_file);
 
 	size_t build_col_id = FindColumnId(build_meta.column_names, build_key);
 	auto build_type = build_meta.groups[0].chunks[build_col_id].type;
 
-	if (build_type != parcore::metadata::Type::INT32_T &&
-	    build_type != parcore::metadata::Type::INT64_T) {
+	if (build_type != parcore::metadata::Type::INT32_T && build_type != parcore::metadata::Type::INT64_T) {
 		throw InvalidInputException("OASIS runtime bloom build key must be INT32 or INT64 for MVP");
 	}
 
@@ -98,6 +173,7 @@ static std::shared_ptr<OasisRuntimeBloom> BuildRuntimeBloomFilter(ClientContext 
 
 	auto column_chunk_config = ctx.config<parcore::ColumnChunkDecoderConfig>();
 	auto page_config = ctx.config<parcore::PageDecoderConfig>();
+	auto bf_stream_config = ctx.config<libstf::StreamConfig>();
 
 	auto decoder = std::make_shared<parcore::ColumnChunkDecoder>(
 	    ctx.cthread(), ctx.tlb_manager(), ctx.output_buffer_manager(), column_chunk_config, page_config, 0);
@@ -113,6 +189,21 @@ static std::shared_ptr<OasisRuntimeBloom> BuildRuntimeBloomFilter(ClientContext 
 	auto bloom = std::make_shared<OasisRuntimeBloom>();
 
 	for (size_t group = 0; group < build_meta.groups.size(); group++) {
+		auto const &chunk = build_meta.groups[group].chunks[build_col_id];
+
+		if (!parcore::metadata::is_libstf_type(chunk.type)) {
+			throw InternalException("Unsupported ParCore type %d in BuildRuntimeBloomFilter", (int)chunk.type);
+		}
+
+		// IMPORTANT:
+		// The software Bloom build scan also uses ParCore stream 0.
+		// Stream 0 passes through the hardware Bloom demux/mux, so this
+		// CPU-side build scan must also select the bypass path.
+		bf_stream_config->enqueue_stream_config(
+		    0,
+		    parcore::metadata::to_libstf_type(chunk.type),
+		    1);
+
 		reader.enqueue_column_chunk(group, build_col_id);
 		auto buffers = reader.next_column_chunk();
 
@@ -141,7 +232,7 @@ static std::shared_ptr<OasisRuntimeBloom> BuildRuntimeBloomFilter(ClientContext 
 std::shared_ptr<OasisBloomMockState> InitializeOasisBloomMock(ClientContext &context,
                                                               const OasisScanBindData &probe_bind) {
 	auto state = std::make_shared<OasisBloomMockState>();
-	state->runtime_bloom = BuildRuntimeBloomFilter(context, probe_bind);
+	state->bloom = BuildRuntimeBloomFilter(context, probe_bind);
 	return state;
 }
 
@@ -149,7 +240,7 @@ void OasisScanFunctionBloomMock(ClientContext &context, TableFunctionInput &data
 	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
 	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
 
-	if (!gstate.bloom_mock || !gstate.bloom_mock->runtime_bloom) {
+	if (!gstate.bloom_mock || !gstate.bloom_mock->bloom) {
 		throw InternalException("OASIS Bloom mock state was not initialized");
 	}
 
@@ -173,7 +264,7 @@ void OasisScanFunctionBloomMock(ClientContext &context, TableFunctionInput &data
 			tested++;
 
 			int64_t key = ReadIntKey(key_buf, row, key_type);
-			if (!gstate.bloom_mock->runtime_bloom->MayContainInt64(key)) {
+			if (!gstate.bloom_mock->bloom->MayContainInt64(key)) {
 				continue;
 			}
 
@@ -192,9 +283,9 @@ void OasisScanFunctionBloomMock(ClientContext &context, TableFunctionInput &data
 		}
 
 		if (gstate.current_buf_offset >= total_elements) {
-			OASIS_BLOOM_LOG("bloom mock buffer done: tested=%llu passed=%llu",
-			                (unsigned long long)tested,
-			                (unsigned long long)passed);
+			OASIS_SCAN_LOG("bloom mock buffer done: tested=%llu passed=%llu",
+			               (unsigned long long)tested,
+			               (unsigned long long)passed);
 
 			gstate.current_buf_idx++;
 			gstate.current_buf_offset = 0;
