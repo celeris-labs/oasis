@@ -1,7 +1,7 @@
 #!/bin/bash
 
 cmake_args=()
-decoders=4
+decoders=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
@@ -22,7 +22,7 @@ for d in build-[0-9][0-9]; do
     num="${d#build-}"
     [ "$((10#$num))" -gt "$n" ] && n=$((10#$num))
 done
-build_dir="build-$(printf '%02d' $((n + 1)))"
+build_dir="$PWD/build-$(printf '%02d' $((n + 1)))"
 echo Building bitstream in hardware/$build_dir...
 
 mkdir "$build_dir"

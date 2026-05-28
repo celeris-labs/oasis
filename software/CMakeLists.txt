@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT TARGET Coyote)
     find_package(Coyote QUIET)
     if(NOT Coyote_FOUND)
-        add_subdirectory(../parcore/coyote/sw coyote)
+        add_subdirectory(../parcore/libstf/coyote/sw coyote)
     endif()
 endif()
 

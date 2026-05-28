@@ -1,14 +1,14 @@
 cmake_minimum_required(VERSION 3.0)
 project(oasis)
 
-set(CYT_DIR ${CMAKE_SOURCE_DIR}/../parcore/coyote)
+set(CYT_DIR ${CMAKE_SOURCE_DIR}/../parcore/libstf/coyote)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CYT_DIR}/cmake)
 
 find_package(CoyoteHW REQUIRED)
 
 # Number of ColumnChunkDecoders. The number of streams is equal to this in local mode. If RDMA is 
 # enabled, there will be an additional RDMA bypass stream for the RDMAFileSystem
-set(N_DECODERS 4 CACHE STRING "Number of ColumnChunkDecoders (default=4)")
+set(N_DECODERS 1 CACHE STRING "Number of ColumnChunkDecoders (default=1)")
 
 # Include Coyote's RDMA stack during synthesis (disable with -DENABLE_RDMA=OFF)
 option(ENABLE_RDMA "Enable RDMA stack" ON)

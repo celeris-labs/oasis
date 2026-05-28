@@ -16,6 +16,8 @@ git clone --recurse-submodules git@github.com:celeris-labs/oasis.git
 Or initializing the submodule as a step after cloning:
 
 ```bash
+git submodule update --init extension/duckdb
+git submodule update --init extension/extension-ci-tools
 git submodule update --init --recursive parcore
 git submodule update --init celeris
 ```
@@ -38,7 +40,7 @@ project needs to be regenerated whenever new files are added (also for the depen
 For synthesis, execute the following command:
 
 ```bash
-./scripts/synthesize.sh [--no-rdma]
+./scripts/synthesize.sh [--no-rdma] [--decoders <number-of-decoders>]
 ```
 
 The script spins off the synthesis in the background in a way that the user can disconnect from 
