@@ -198,6 +198,16 @@ unique_ptr<FileHandle> RDMAFileSystem::OpenFile(const string &path, FileOpenFlag
 	return make_uniq<RDMAFileHandle>(*this, path, flags, it->second.offset, it->second.size);
 }
 
+vector<OpenFileInfo> RDMAFileSystem::Glob(const string &path, FileOpener *opener) {
+	if (HasGlob(path)) {
+		throw NotImplementedException("RDMAFileSystem: glob patterns are not supported");
+	}
+	if (FileExists(path, opener)) {
+		return {OpenFileInfo(path)};
+	}
+	return {};
+}
+
 bool RDMAFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
 	if (!CanHandleFile(filename)) {
 		return false;
