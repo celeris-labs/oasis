@@ -24,8 +24,10 @@ always_comb sq_rd.tie_off_m();
 always_comb cq_rd.tie_off_s();
 `endif
 
-localparam NUM_STREAMS   = N_STRM_AXI;
-localparam DATABEAT_SIZE = AXI_DATA_BITS / 8;
+localparam NUM_STREAMS        = N_STRM_AXI;
+localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
+// MemConfig write side needs NUM_STREAMS+1 regs, read side needs 3 (ID, num_streams, max_enqueued).
+localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
 
 `ifdef EN_RDMA
 localparam NUM_CONFIGS   = 3;
@@ -49,13 +51,13 @@ mem_config_i                  mem_conf[NUM_STREAMS](.*);
 `ifdef EN_RDMA
 rdma_read_config_i            rdma_conf[NUM_STREAMS](.*);
 `endif
-ready_valid_i column_chunk_conf[NUM_DECODERS](.*); // #(column_chunk_conf_t)
+ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
 
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(NUM_CONFIGS),
     .ADDR_SPACE_SIZES({
-        NUM_STREAMS + 1,
+        MEM_CONFIG_NUM_REGS,
         COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_DECODERS
 `ifdef EN_RDMA
         , NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS
@@ -138,9 +140,9 @@ CQDemultiplexer #(
 AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 for (genvar I = 0; I < NUM_DECODERS; I++) begin
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
-    ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in();
-    typed_ndata_i #(DATABEAT_SIZE)          typed_out();
-    ndata_i       #(data8_t, DATABEAT_SIZE) out();
+    ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in(.*);
+    typed_ndata_i #(DATABEAT_SIZE)          typed_out(.*);
+    ndata_i       #(data8_t, DATABEAT_SIZE) out(.*);
 
 `ifdef EN_RDMA
     // AXI4SR to AXI4S
