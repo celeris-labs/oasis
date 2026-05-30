@@ -16,16 +16,23 @@ class cThread;
 
 namespace duckdb {
 
-class DatabaseInstance;
+class FileOpener;
 
 struct RDMADirEntry {
 	uint64_t offset;
 	uint64_t size;
 };
 
+struct RDMAParams {
+	std::string server;
+	uint16_t port;
+
+	static RDMAParams ReadFrom(optional_ptr<FileOpener> opener);
+};
+
 class RDMAFileSystem : public FileSystem {
 public:
-	explicit RDMAFileSystem(DatabaseInstance &db);
+	RDMAFileSystem();
 	~RDMAFileSystem() override;
 
 	static constexpr const char *URL_PREFIX = "rdma://";
@@ -55,10 +62,8 @@ public:
 
 private:
 	void RDMAReadRange(uint64_t remote_offset, void *dst, size_t size);
-	void EnsureInitialized();
+	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void LoadDirectory();
-
-	DatabaseInstance &instance;
 
 	// Guards first-time initialization and the `directory` map.
 	std::mutex init_mtx;
@@ -66,6 +71,10 @@ private:
 	// the OBM's per-stream FIFO stays aligned with the order of HW reads.
 	std::mutex mtx;
 	bool initialized = false;
+	// The server address/port the RDMA connection was first established with.
+	// Once initialized, the IP must not change for the lifetime of the
+	// filesystem (the connection is bound to that server).
+	RDMAParams init_params;
 
 	std::unordered_map<std::string, RDMADirEntry> directory;
 };

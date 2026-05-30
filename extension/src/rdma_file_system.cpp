@@ -4,10 +4,13 @@
 #include "rdma_file_system.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_opener.hpp"
+#include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
 #include "oasis/configuration.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis_context_cache_entry.hpp"
 
 #include <libstf/buffer.hpp>
 #include <libstf/output_buffer_manager.hpp>
@@ -37,26 +40,26 @@ T ReadLE(const uint8_t *src) {
 	return v;
 }
 
-string GetStringSetting(DatabaseInstance &instance, const string &key, const string &fallback) {
-	Value value;
-	if (instance.TryGetCurrentSetting(key, value) && !value.IsNull()) {
-		return value.ToString();
-	}
-	return fallback;
-}
-
-uint64_t GetUIntSetting(DatabaseInstance &instance, const string &key, uint64_t fallback) {
-	Value value;
-	if (instance.TryGetCurrentSetting(key, value) && !value.IsNull()) {
-		return value.GetValue<uint64_t>();
-	}
-	return fallback;
-}
-
 } // namespace
 
-RDMAFileSystem::RDMAFileSystem(DatabaseInstance &instance) : instance(instance) {
+RDMAParams RDMAParams::ReadFrom(optional_ptr<FileOpener> opener) {
+	RDMAParams params;
+	params.port = static_cast<uint16_t>(coyote::DEF_PORT);
+
+	Value value;
+	if (!FileOpener::TryGetCurrentSetting(opener, "rdma_server", value) || value.IsNull()) {
+		throw InvalidConfigurationException("rdma:// filesystem requires the RDMA server address to be set: "
+		                                    "run `SET rdma_server = '<ip-address>';` before using rdma:// paths");
+	}
+	params.server = value.ToString();
+
+	if (FileOpener::TryGetCurrentSetting(opener, "rdma_port", value) && !value.IsNull()) {
+		params.port = static_cast<uint16_t>(value.GetValue<uint64_t>());
+	}
+	return params;
 }
+
+RDMAFileSystem::RDMAFileSystem() = default;
 
 RDMAFileSystem::~RDMAFileSystem() = default;
 
@@ -64,26 +67,28 @@ bool RDMAFileSystem::CanHandleFile(const string &fpath) {
 	return fpath.rfind(URL_PREFIX, 0) == 0;
 }
 
-void RDMAFileSystem::EnsureInitialized() {
+void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	std::lock_guard<std::mutex> lock(init_mtx);
 	if (initialized) {
 		return;
 	}
 
-	auto &ctx = oasis::OasisContext::ctx();
+	auto params = RDMAParams::ReadFrom(opener);
+	auto db = FileOpener::TryGetDatabase(opener);
+	if (!db) {
+		throw IOException("rdma:// filesystem requires a database context to initialize");
+	}
+	auto &ctx = db->GetObjectCache().GetOrCreate<OasisContextCacheEntry>("oasis_context")->ctx();
 	if (!ctx.isRDMAEnabled()) {
-		throw IOException("rdma:// filesystem is unavailable: this FPGA shell was synthesized "
-		                  "without an RDMA bypass stream (rebuild with RDMA enabled to use "
-		                  "rdma:// paths)");
+		throw NotImplementedException("rdma:// filesystem is unavailable: this FPGA shell was "
+		                              "synthesized without an RDMA bypass stream (rebuild with "
+		                              "RDMA enabled to use rdma:// paths)");
 	}
 
-	auto server = GetStringSetting(instance, "rdma_server", "127.0.0.1");
-	auto port = static_cast<uint16_t>(GetUIntSetting(instance, "rdma_port", coyote::DEF_PORT));
-
 	auto coyote_thread = ctx.cthread();
-	if (!coyote_thread->initRDMA(RDMA_INIT_STUB_SIZE, port, server.c_str())) {
+	if (!coyote_thread->initRDMA(RDMA_INIT_STUB_SIZE, params.port, params.server.c_str())) {
 		coyote_thread.reset(); // Destroy cThread
-		throw IOException("Coyote initRDMA failed for server %s:%u", server, port);
+		throw IOException("Coyote initRDMA failed for server %s:%u", params.server, params.port);
 	}
 
 	LoadDirectory();
@@ -98,6 +103,7 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 		throw IOException("RDMA read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 
+	// EnsureInitialized has already created the OasisContext singleton.
 	auto &ctx = oasis::OasisContext::ctx();
 	auto obm = ctx.output_buffer_manager();
 	auto rdma_cfg = ctx.config<oasis::RDMAReadConfig>();
@@ -185,7 +191,7 @@ unique_ptr<FileHandle> RDMAFileSystem::OpenFile(const string &path, FileOpenFlag
 		throw IOException("rdma:// filesystem is read-only");
 	}
 
-	EnsureInitialized();
+	EnsureInitialized(opener);
 
 	auto name = path.substr(std::strlen(URL_PREFIX));
 	auto it = directory.find(name);
@@ -199,24 +205,36 @@ unique_ptr<FileHandle> RDMAFileSystem::OpenFile(const string &path, FileOpenFlag
 }
 
 vector<OpenFileInfo> RDMAFileSystem::Glob(const string &path, FileOpener *opener) {
-	if (HasGlob(path)) {
-		throw NotImplementedException("RDMAFileSystem: glob patterns are not supported");
+	if (!HasGlob(path)) {
+		if (FileExists(path, opener)) {
+			return {OpenFileInfo(path)};
+		}
+		return {};
 	}
-	if (FileExists(path, opener)) {
-		return {OpenFileInfo(path)};
+
+	EnsureInitialized(opener);
+
+	// Strip the rdma:// prefix to get the filename pattern.
+	auto pattern = path.substr(std::strlen(URL_PREFIX));
+
+	vector<OpenFileInfo> result;
+	for (auto &entry : directory) {
+		const auto &name = entry.first;
+		if (duckdb::Glob(name.c_str(), name.size(), pattern.c_str(), pattern.size())) {
+			result.emplace_back(string(URL_PREFIX) + name);
+		}
 	}
-	return {};
+	std::sort(result.begin(), result.end());
+	return result;
 }
 
 bool RDMAFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
 	if (!CanHandleFile(filename)) {
 		return false;
 	}
-	try {
-		EnsureInitialized();
-	} catch (...) {
-		return false;
-	}
+
+    EnsureInitialized(opener);
+
 	auto name = filename.substr(std::strlen(URL_PREFIX));
 	return directory.find(name) != directory.end();
 }

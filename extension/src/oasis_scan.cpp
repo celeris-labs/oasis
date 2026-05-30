@@ -97,13 +97,8 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
-
-	// Ensure OasisContext is initialized for this database instance.
-	ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>("oasis_context");
-	auto &ctx = oasis::OasisContext::ctx();
-
+	auto &ctx = ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>("oasis_context")->ctx();
 	auto gstate = make_uniq<OasisScanGlobalState>();
-
 	auto column_chunk_config = ctx.config<parcore::ColumnChunkDecoderConfig>();
 
 	gstate->decoder = std::make_shared<parcore::ColumnChunkDecoder>(

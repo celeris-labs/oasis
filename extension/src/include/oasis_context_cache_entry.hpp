@@ -29,6 +29,10 @@ struct OasisContextCacheEntry : public ObjectCacheEntry {
 #endif
 	}
 
+	oasis::OasisContext &ctx() {
+		return oasis::OasisContext::ctx();
+	}
+
 	~OasisContextCacheEntry() override {
 		oasis::OasisContext::shutdown();
 	}

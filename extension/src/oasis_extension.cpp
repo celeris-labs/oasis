@@ -28,16 +28,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(table_function);
 
 	// RDMA file system
-	config.AddExtensionOption("rdma_server", 
-                              "RDMA file server IP address", 
-                              LogicalType::VARCHAR, 
-                              Value("127.0.0.1"));
+	config.AddExtensionOption("rdma_server",
+                              "RDMA file server IP address (required; set via `SET rdma_server = '<ip-address>';`)",
+                              LogicalType::VARCHAR,
+                              Value(LogicalType::VARCHAR));
 	config.AddExtensionOption("rdma_port", 
                               "RDMA file server TCP port (for QP exchange)", 
                               LogicalType::UBIGINT,
 	                          Value::UBIGINT(static_cast<uint64_t>(coyote::DEF_PORT)));
 
-	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<RDMAFileSystem>(instance));
+	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<RDMAFileSystem>());
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {
