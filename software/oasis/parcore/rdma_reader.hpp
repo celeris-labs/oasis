@@ -18,8 +18,7 @@ class RDMAReader : public ::parcore::HardwareReader {
     std::shared_ptr<RDMAReadConfig> rdma_config_;
     uintptr_t                       offset_;
 
-    std::shared_ptr<libstf::Buffer> get_page_data(const ::parcore::metadata::Page &page,
-                                                  ::parcore::PageType page_type) override;
+    std::shared_ptr<libstf::Buffer> get_chunk_data(const ::parcore::metadata::ColumnChunk &column_chunk) override;
 };
 
 } // namespace parcore

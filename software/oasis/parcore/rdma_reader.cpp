@@ -15,11 +15,11 @@ RDMAReader::RDMAReader(std::shared_ptr<::parcore::ColumnChunkDecoder> column_chu
     : HardwareReader(std::move(column_chunk_decoder), std::move(memory_pool), meta),
       rdma_config_(std::move(rdma_config)), offset_(offset) {}
 
-std::shared_ptr<libstf::Buffer> RDMAReader::get_page_data(const ::parcore::metadata::Page &page,
-                                                          ::parcore::PageType page_type) {
-    Profiler::open_regions({prefix + "send_page"});
-    rdma_config_->read(decoder_, offset_ + page.offset, page.size);
-    Profiler::close_regions({prefix + "send_page"});
+std::shared_ptr<libstf::Buffer> RDMAReader::get_chunk_data(const ::parcore::metadata::ColumnChunk &column_chunk) {
+    Profiler::open_regions({prefix + "send_chunk"});
+    rdma_config_->read(decoder_, offset_ + column_chunk.offset,
+                       column_chunk.total_compressed_size);
+    Profiler::close_regions({prefix + "send_chunk"});
     return nullptr;
 }
 

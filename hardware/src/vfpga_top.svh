@@ -28,10 +28,10 @@ localparam NUM_STREAMS   = N_STRM_AXI;
 localparam DATABEAT_SIZE = AXI_DATA_BITS / 8;
 
 `ifdef EN_RDMA
-localparam NUM_CONFIGS   = 4;
+localparam NUM_CONFIGS   = 3;
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `else
-localparam NUM_CONFIGS   = 3;
+localparam NUM_CONFIGS   = 2;
 localparam NUM_DECODERS  = NUM_STREAMS;
 `endif
 
@@ -49,16 +49,14 @@ mem_config_i                  mem_conf[NUM_STREAMS](.*);
 `ifdef EN_RDMA
 rdma_read_config_i            rdma_conf[NUM_STREAMS](.*);
 `endif
-column_chunk_decoder_config_i column_chunk_conf[NUM_DECODERS](.*);
-page_decoder_config_i         page_conf[NUM_DECODERS](.*);
+ready_valid_i column_chunk_conf[NUM_DECODERS](.*); // #(column_chunk_conf_t)
 
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(NUM_CONFIGS),
     .ADDR_SPACE_SIZES({
         NUM_STREAMS + 1,
-        COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_DECODERS,
-        PAGE_DECODER_CONFIG_REGS * NUM_DECODERS
+        COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_DECODERS
 `ifdef EN_RDMA
         , NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS
 `endif
@@ -97,18 +95,6 @@ ColumnChunkDecoderConfig #(
     .out(column_chunk_conf)
 );
 
-PageDecoderConfig #(
-    .NUM_DECODERS(NUM_DECODERS)
-) inst_page_decoder_config (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .write_config(write_configs[2]),
-    .read_config(read_configs[2]),
-
-    .out(page_conf)
-);
-
 `ifdef EN_RDMA
 RDMAReadConfig #(
     .NUM_STREAMS(NUM_STREAMS)
@@ -116,8 +102,8 @@ RDMAReadConfig #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[3]),
-    .read_config(read_configs[3]),
+    .write_config(write_configs[2]),
+    .read_config(read_configs[2]),
 
     .out(rdma_conf)
 );
@@ -195,7 +181,6 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
         .rst_n(rst_n),
 
         .column_chunk_conf(column_chunk_conf[I]),
-        .page_conf(page_conf[I]),
 
         .in(decoder_in),
         .out(typed_out)
