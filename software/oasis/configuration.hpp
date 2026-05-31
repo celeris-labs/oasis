@@ -22,11 +22,14 @@ class RDMAReadConfig : public libstf::Config {
     /**
      * Triggers a remote read using the RDMARead module.
      *
+     * Offsets are relative to the base virtual address of the remote RDMA region. initRDMA must 
+     * have exchanged queue pairs before the first read().
+     *
      * @param stream The Coyote stream on which to perform the read.
-     * @param vaddr  The address at which the read should be performed.
+     * @param offset The offset, relative to the remote region's base vaddr, to read from.
      * @param size   The number of bytes to read.
      */
-    void read(libstf::stream_t stream, uintptr_t vaddr, size_t size);
+    void read(libstf::stream_t stream, size_t offset, size_t size);
 
     const libstf::stream_t num_streams() const;
 

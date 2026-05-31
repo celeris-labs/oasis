@@ -86,8 +86,11 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	}
 
 	auto coyote_thread = ctx.cthread();
-	if (!coyote_thread->initRDMA(RDMA_INIT_STUB_SIZE, params.port, params.server.c_str())) {
-		coyote_thread.reset(); // Destroy cThread
+	void *staging_buffer = nullptr;
+	if (!ctx.memory_pool()->allocate(RDMA_INIT_STUB_SIZE, &staging_buffer).ok()) {
+		throw IOException("Failed to allocate RDMA staging buffer of %u bytes", RDMA_INIT_STUB_SIZE);
+	}
+	if (!coyote_thread->initRDMA(RDMA_INIT_STUB_SIZE, params.port, params.server.c_str(), staging_buffer)) {
 		throw IOException("Coyote initRDMA failed for server %s:%u", params.server, params.port);
 	}
 
