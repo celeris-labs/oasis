@@ -64,7 +64,8 @@ public:
 private:
 	void RDMAReadRange(uint64_t remote_offset, void *dst, size_t size);
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
-	void LoadDirectory();
+	void LoadDirectory(optional_ptr<FileOpener> opener);
+	void LogDirectory(optional_ptr<FileOpener> opener, uint64_t dir_size);
 
 	// Guards first-time initialization and the `directory` map.
 	std::mutex init_mtx;

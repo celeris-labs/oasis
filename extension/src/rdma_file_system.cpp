@@ -1,11 +1,14 @@
-// Include DuckDB headers before any Coyote header: Coyote transitively pulls
-// <syslog.h>, which defines LOG_INFO / LOG_DEBUG as preprocessor macros that
-// collide with duckdb::LogLevel enum values inside DuckDB's logging headers.
+// Coyote transitively pulls <syslog.h>, which defines LOG_INFO / LOG_DEBUG as
+// preprocessor macros that collide with duckdb::LogLevel enum values. We include
+// DuckDB headers first so the enum is declared cleanly, then #undef the syslog
+// macros after the Coyote includes below so they don't corrupt LogLevel:: use
+// sites in this file.
 #include "rdma_file_system.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/function/scalar/string_common.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
 #include "oasis/configuration.hpp"
@@ -19,9 +22,14 @@
 #include <coyote/cThread.hpp>
 #include <coyote/cDefs.hpp>
 
+// <syslog.h> (pulled in by Coyote above) defines this as a numeric macros, which
+// otherwise turns `LogLevel::LOG_DEBUG` into `LogLevel::7` below.
+#undef LOG_INFO
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace duckdb {
@@ -94,7 +102,7 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 		throw IOException("Coyote initRDMA failed for server %s:%u", params.server, params.port);
 	}
 
-	LoadDirectory();
+	LoadDirectory(opener);
 	initialized = true;
 }
 
@@ -153,7 +161,7 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 	}
 }
 
-void RDMAFileSystem::LoadDirectory() {
+void RDMAFileSystem::LoadDirectory(optional_ptr<FileOpener> opener) {
 	// Step 1: Fetch the directory header size.
 	uint64_t dir_size = 0;
 	RDMAReadRange(0, &dir_size, sizeof(dir_size));
@@ -186,6 +194,45 @@ void RDMAFileSystem::LoadDirectory() {
 		parsed.emplace(std::move(name), RDMADirEntry {offset, size});
 	}
 	directory = std::move(parsed);
+
+	LogDirectory(opener, dir_size);
+}
+
+void RDMAFileSystem::LogDirectory(optional_ptr<FileOpener> opener, uint64_t dir_size) {
+	if (!opener) {
+		return;
+	}
+
+	// Skip building the (potentially large) listing entirely unless an INFO-level
+	// log would actually be emitted.
+	auto &logger = Logger::Get(*opener);
+	if (!logger.ShouldLog(DefaultLogType::NAME, LogLevel::LOG_INFO)) {
+		return;
+	}
+
+	std::vector<std::pair<std::string, RDMADirEntry>> entries(directory.begin(), directory.end());
+	std::sort(entries.begin(), entries.end(),
+	          [](const auto &a, const auto &b) { return a.first < b.first; });
+
+	size_t max_name_len = 0;
+	size_t max_offset_len = 0;
+	for (const auto &entry : entries) {
+		max_name_len = std::max(max_name_len, entry.first.size());
+		max_offset_len = std::max(max_offset_len, std::to_string(entry.second.offset).size());
+	}
+
+	std::ostringstream out;
+	out << "Loaded RDMA directory: " << entries.size() << " file(s), directory header " << dir_size << " Bytes";
+	for (size_t i = 0; i < entries.size(); ++i) {
+		const auto &name = entries[i].first;
+		const auto &dir_entry = entries[i].second;
+		std::string quoted = "\"" + name + "\"";
+		out << "\n  [" << i << "] " << std::left << std::setw(static_cast<int>(max_name_len + 2)) << quoted
+		    << " offset=" << std::right << std::setw(static_cast<int>(max_offset_len)) << dir_entry.offset
+		    << " size=" << dir_entry.size;
+	}
+
+	logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_INFO, out.str());
 }
 
 unique_ptr<FileHandle> RDMAFileSystem::OpenFile(const string &path, FileOpenFlags flags,
