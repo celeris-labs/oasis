@@ -284,4 +284,9 @@ int64_t RDMAFileSystem::GetFileSize(FileHandle &handle) {
 	return static_cast<int64_t>(handle.Cast<RDMAFileHandle>().size);
 }
 
+timestamp_t RDMAFileSystem::GetLastModifiedTime(FileHandle &handle) {
+	// The RDMA server data is immutable so just return 0.
+	return timestamp_t(0);
+}
+
 } // namespace duckdb

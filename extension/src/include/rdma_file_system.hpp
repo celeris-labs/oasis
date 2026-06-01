@@ -52,6 +52,7 @@ public:
 	void Seek(FileHandle &handle, idx_t location) override;
 	idx_t SeekPosition(FileHandle &handle) override;
 	int64_t GetFileSize(FileHandle &handle) override;
+	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
 
 	bool CanSeek() override {
 		return true;
