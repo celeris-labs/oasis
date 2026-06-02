@@ -246,16 +246,116 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin
 end
 
 // -- Bloom filter on stream 0 (with bypass) -------------------------------------------------------
-// The stream config's `select` chooses between the bloom-filtered path (0) and the bypass path (1)
-// per column chunk, so chunks that do not need filtering skip the bloom filter entirely.
-ready_valid_i #(select_t) bf_select();
+// The stream config's `select` chooses between the bloom-filtered path (0)
+// and the bypass path (1) per column chunk.
+//
+// The Bloomfilter is asymmetric:
+//   BUILD input  -> no output
+//   PROBE input  -> output
+//
+// Therefore:
+//   BF BUILD: select=0 -> demux select only
+//   BF PROBE: select=0 -> demux select + mux select
+//   BYPASS:   select=1 -> demux select + mux select
+//
+// Important:
+//   For output-producing phases, demux and mux selects are offered in parallel.
+//   We must not wait for the mux select before releasing the demux select,
+//   otherwise the mux may wait for data that can never arrive.
+ready_valid_i #(select_t) bf_conf_select();
+
 ready_valid_i #(select_t) bf_demux_select();
 ready_valid_i #(select_t) bf_mux_select();
 
-`CONFIG_SIGNALS_TO_INTF(bf_stream_conf[0].select, bf_select)
+`CONFIG_SIGNALS_TO_INTF(bf_stream_conf[0].select, bf_conf_select)
 assign bf_stream_conf[0].data_type_ready = 1'b1; // unused
 
-`READY_DUPLICATE(2, bf_select, {bf_demux_select, bf_mux_select})
+typedef enum logic {
+    BF_PHASE_BUILD,
+    BF_PHASE_PROBE
+} bf_phase_t;
+
+logic      bf_route_active;
+bf_phase_t bf_phase;
+
+select_t bf_route_select;
+logic    bf_route_is_bf;
+logic    bf_route_has_output;
+
+logic bf_demux_done;
+logic bf_mux_done;
+
+wire bf_conf_is_bf =
+    bf_conf_select.data == '0;
+
+wire bf_conf_has_output =
+    !bf_conf_is_bf || (bf_phase == BF_PHASE_PROBE);
+
+assign bf_conf_select.ready =
+    !bf_route_active;
+
+assign bf_demux_select.data =
+    bf_route_select;
+
+assign bf_demux_select.valid =
+    bf_route_active && !bf_demux_done;
+
+assign bf_mux_select.data =
+    bf_route_select;
+
+assign bf_mux_select.valid =
+    bf_route_active && bf_route_has_output && !bf_mux_done;
+
+always_ff @(posedge clk) begin
+    if (!rst_n) begin
+        bf_route_active     <= 1'b0;
+        bf_phase            <= BF_PHASE_BUILD;
+
+        bf_route_select     <= '0;
+        bf_route_is_bf      <= 1'b0;
+        bf_route_has_output <= 1'b0;
+
+        bf_demux_done       <= 1'b0;
+        bf_mux_done         <= 1'b0;
+    end else begin
+        if (!bf_route_active) begin
+            if (bf_conf_select.valid && bf_conf_select.ready) begin
+                bf_route_active     <= 1'b1;
+
+                bf_route_select     <= bf_conf_select.data;
+                bf_route_is_bf      <= bf_conf_is_bf;
+                bf_route_has_output <= bf_conf_has_output;
+
+                bf_demux_done       <= 1'b0;
+                bf_mux_done         <= !bf_conf_has_output;
+            end
+        end else begin
+            if (bf_demux_select.valid && bf_demux_select.ready) begin
+                bf_demux_done <= 1'b1;
+            end
+
+            if (bf_mux_select.valid && bf_mux_select.ready) begin
+                bf_mux_done <= 1'b1;
+            end
+
+            if ((bf_demux_done || (bf_demux_select.valid && bf_demux_select.ready)) &&
+                (bf_mux_done   || (bf_mux_select.valid   && bf_mux_select.ready))) begin
+
+                // Only Bloomfilter input chunks advance the BUILD/PROBE phase.
+                // Bypass chunks do not affect Bloomfilter phase state.
+                if (bf_route_is_bf) begin
+                    if (bf_phase == BF_PHASE_BUILD) begin
+                        bf_phase <= BF_PHASE_PROBE;
+                    end else begin
+                        bf_phase <= BF_PHASE_BUILD;
+                    end
+                end
+
+                bf_route_active <= 1'b0;
+            end
+        end
+    end
+end
 
 AXI4S axi_bf_in    (.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_out   (.aclk(clk), .aresetn(rst_n));
