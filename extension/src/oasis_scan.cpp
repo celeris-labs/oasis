@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "oasis/oasis_context.hpp"
+#include "column_reader.hpp"
 #include "parcore/configuration.hpp"
 #include "parquet_reader.hpp"
 #include "parquet_types.h"
@@ -14,11 +15,11 @@ static parcore::metadata::Type parquet_type_to_parcore(duckdb_parquet::Type::typ
 	case duckdb_parquet::Type::BOOLEAN:
 		return parcore::metadata::Type::BYTE_T;
 	case duckdb_parquet::Type::INT32:
-        return parcore::metadata::Type::INT32_T;
+		return parcore::metadata::Type::INT32_T;
 	case duckdb_parquet::Type::FLOAT:
 		return parcore::metadata::Type::FLOAT_T;
 	case duckdb_parquet::Type::INT64:
-        return parcore::metadata::Type::INT64_T;
+		return parcore::metadata::Type::INT64_T;
 	case duckdb_parquet::Type::DOUBLE:
 		return parcore::metadata::Type::DOUBLE_T;
 	case duckdb_parquet::Type::BYTE_ARRAY:
@@ -58,8 +59,8 @@ static parcore::metadata::Metadata build_parcore_metadata(ClientContext &context
 			parcore_cc.type = parquet_type_to_parcore(cmd.type);
 			parcore_cc.num_values = static_cast<uint64_t>(cmd.num_values);
 			parcore_cc.compression = parquet_codec_to_parcore(cmd.codec);
-			parcore_cc.offset = static_cast<uint64_t>(
-			    cmd.__isset.dictionary_page_offset ? cmd.dictionary_page_offset : cmd.data_page_offset);
+			parcore_cc.offset = static_cast<uint64_t>(cmd.__isset.dictionary_page_offset ? cmd.dictionary_page_offset
+			                                                                             : cmd.data_page_offset);
 			parcore_cc.total_compressed_size = static_cast<uint64_t>(cmd.total_compressed_size);
 
 			parcore_rg.chunks.push_back(std::move(parcore_cc));
@@ -102,32 +103,56 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	auto column_chunk_config = ctx.config<parcore::ColumnChunkDecoderConfig>();
 
 	gstate->decoder = std::make_shared<parcore::ColumnChunkDecoder>(
-	    ctx.cthread(), ctx.tlb_manager(), ctx.output_buffer_manager(),
-	    column_chunk_config, 0);
+	    ctx.cthread(), ctx.tlb_manager(), ctx.output_buffer_manager(), column_chunk_config, 0);
 
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto handle = fs.OpenFile(bind_data.filename, FileOpenFlags::FILE_FLAGS_READ);
 
-	gstate->reader =
+	gstate->hw_reader =
 	    std::make_unique<OasisReader>(gstate->decoder, ctx.memory_pool(), bind_data.metadata, std::move(handle));
 
 	gstate->total_groups = bind_data.metadata.groups.size();
 
+	ParquetOptions parquet_opts(context);
+	gstate->parquet_reader = make_uniq<ParquetReader>(context, OpenFileInfo {bind_data.filename}, parquet_opts);
+	auto &parquet_reader = *gstate->parquet_reader;
+
+	// Set up the thrift protocol, file handle and define/repeat buffers that the
+	// CPU ColumnReaders read through. We will scan every row group, in order.
+	vector<idx_t> groups_to_read;
+	groups_to_read.reserve(gstate->total_groups);
+	for (idx_t g = 0; g < gstate->total_groups; g++) {
+		groups_to_read.push_back(g);
+	}
+	parquet_reader.InitializeScan(context, gstate->scan_state, std::move(groups_to_read));
+
+	gstate->column_readers.reserve(input.column_ids.size());
+	gstate->column_ids.reserve(input.column_ids.size());
+
+	bool hw_idx_assigned = false;
 	for (auto col_id : input.column_ids) {
 		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
 			continue;
 		}
+		size_t i = gstate->column_ids.size();
 		auto t = bind_data.metadata.groups[0].chunks[col_id].type;
 		if (!parcore::metadata::is_libstf_type(t)) {
-			throw InvalidInputException("Column '%s' has type BYTE_ARRAY which is not supported by ParCore",
-			                            bind_data.metadata.column_names[col_id].c_str());
+			// cpu path: a real, type-dispatched column reader (nullptr marks hw columns)
+			gstate->column_readers.push_back(
+			    ColumnReader::CreateReader(parquet_reader, parquet_reader.root_schema->children[col_id]));
+		} else {
+			gstate->column_readers.push_back(nullptr);
+			if (!hw_idx_assigned) {
+				gstate->first_hw_col_idx = i;
+				hw_idx_assigned = true;
+			}
 		}
 		gstate->column_ids.push_back(col_id);
 	}
 
-	gstate->current_buffers.assign(gstate->column_ids.size(), {});
-	gstate->current_buf_idx = 0;
-	gstate->current_buf_offset = 0;
+	gstate->hw_buffers.assign(gstate->column_ids.size(), {});
+	gstate->hw_buf_idx = 0;
+	gstate->hw_buf_offset = 0;
 
 	return std::move(gstate);
 }
@@ -147,23 +172,38 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
 	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
 
-	// Pull in next row group cursor reached end, needs to be synchronised across columns
-	// assuming row groups have same element count across columns
-	if (gstate.current_buf_idx >= gstate.current_buffers[0].size()) {
+	// we only manage the cursors for the hw path
+	// columnreader/cpu decodes min(STD_VECTOR_SIZE, end of column chunk, end of file), which is what we do via our
+	// cursors too so without managing it the two should be compatible.
+	// columns are tested on wether they are cpu by checking wether column_readers[i] is a nullptr.
+
+	// check wether row group/column chunks is/are exhausted
+	if (gstate.hw_buf_idx >= gstate.hw_buffers[gstate.first_hw_col_idx].size()) {
+		// row groups are aligned, so this check can happen as soon as any column is exhausted, finish once pointer
+		// has moved past end
 		if (gstate.next_group >= gstate.total_groups) {
 			output.SetCardinality(0);
 			return;
 		}
 
-		for (size_t col_id : gstate.column_ids) {
-			gstate.reader->enqueue_column_chunk(gstate.next_group, col_id);
+		// advance all columns
+		// todo: only do this for supported, columns, reinitialise column readers at boundary
+		for (size_t i = 0; i < gstate.column_ids.size(); i++) {
+			if (gstate.column_readers[i] == nullptr) {
+				gstate.hw_reader->enqueue_column_chunk(gstate.next_group, gstate.column_ids[i]);
+			} else {
+				// column reader needs to be reinitialised for each new row group
+				gstate.column_readers[i]->InitializeRead(
+				    gstate.next_group, gstate.parquet_reader->GetFileMetadata()->row_groups[gstate.next_group].columns,
+				    *gstate.scan_state.thrift_file_proto);
+			}
 		}
 		for (size_t i = 0; i < gstate.column_ids.size(); i++) {
-			gstate.current_buffers[i] = gstate.reader->next_column_chunk(); // blocks on FPGA
+			gstate.hw_buffers[i] = gstate.hw_reader->next_column_chunk();
 		}
 
-		gstate.current_buf_idx = 0;
-		gstate.current_buf_offset = 0;
+		gstate.hw_buf_idx = 0;
+		gstate.hw_buf_offset = 0;
 		gstate.next_group++;
 	}
 
@@ -177,53 +217,72 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	};
 
 	size_t const col0_file_idx = gstate.column_ids[0];
-	size_t const total_elements =
-	    gstate.current_buffers[0][gstate.current_buf_idx]->size / elem_size(col0_file_idx);
-	size_t const remaining_elements = total_elements - gstate.current_buf_offset;
+	size_t const total_elements = gstate.hw_buffers[0][gstate.hw_buf_idx]->size / elem_size(col0_file_idx);
+	size_t const remaining_elements = total_elements - gstate.hw_buf_offset;
 	size_t const emit = std::min<size_t>(remaining_elements, STANDARD_VECTOR_SIZE);
+
+	// Scratch define/repeat buffers shared by the cpu column readers this call.
+	// Each ColumnReader::Read overwrites them, so a single zero up front is enough.
+	gstate.scan_state.define_buf.zero();
+	gstate.scan_state.repeat_buf.zero();
+	auto *define_ptr = reinterpret_cast<uint8_t *>(gstate.scan_state.define_buf.ptr);
+	auto *repeat_ptr = reinterpret_cast<uint8_t *>(gstate.scan_state.repeat_buf.ptr);
+
 	for (size_t i = 0; i < gstate.column_ids.size(); i++) {
-		const size_t kElemSize = elem_size(gstate.column_ids[i]);
+		if (gstate.column_readers[i] == nullptr) {
+			const size_t kElemSize = elem_size(gstate.column_ids[i]);
 
-		auto &buf = gstate.current_buffers[i][gstate.current_buf_idx];
-		if (buf->size / kElemSize != total_elements) {
-			throw InternalException(
-			    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
-			    (unsigned long long)i, (unsigned long long)(buf->size / kElemSize), (unsigned long long)total_elements);
+			auto &buf = gstate.hw_buffers[i][gstate.hw_buf_idx];
+			if (buf->size / kElemSize != total_elements) {
+				throw InternalException(
+				    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
+				    (unsigned long long)i, (unsigned long long)(buf->size / kElemSize),
+				    (unsigned long long)total_elements);
+			}
+
+			// The actual zero-copy handoff. Two things happen here:
+			//
+			//  1. FlatVector::SetData points the vector's raw data pointer directly
+			//     into the FPGA-written libstf buffer (+ byte offset for the
+			//     STANDARD_VECTOR_SIZE slice we're emitting this call). No memcpy,
+			//     no arrow intermediary.
+			//
+			//  2. SetAuxiliary hands the buffer's shared_ptr to DuckDB's Vector
+			//     lifetime slot (wrapped in LibstfBufferVectorBuffer, because
+			//     DuckDB's slot is typed to shared_ptr<VectorBuffer>, not our
+			//     shared_ptr<libstf::Buffer>). DuckDB copies this shared_ptr whenever
+			//     it copies the vector, so the underlying memory stays alive as long
+			//     as any downstream consumer references it.
+			//
+			// Two refcount holders protect the memory while it's in flight:
+			//   - gstate.current_buffers keeps it alive across scan calls while we
+			//     slice one FPGA chunk into multiple STANDARD_VECTOR_SIZE emissions
+			//     (auxiliary gets cleared on each output.Reset()).
+			//   - vector auxiliary (set here) keeps it alive for any downstream
+			//     consumer that holds onto the vector past our next scan call.
+			auto &vec = output.data[i];
+			vec.SetVectorType(VectorType::FLAT_VECTOR);
+			FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + gstate.hw_buf_offset * kElemSize);
+			vec.SetAuxiliary(make_buffer<LibstfBufferVectorBuffer>(buf));
+		} else {
+			// cpu path: decode `emit` values straight into the output vector.
+			auto &vec = output.data[i];
+			auto rows_read = gstate.column_readers[i]->Read(emit, define_ptr, repeat_ptr, vec);
+			if (rows_read != emit) {
+				throw InternalException(
+				    "ParCore cpu column %llu read %llu values, expected %llu (hw/cpu cursor desync)",
+				    (unsigned long long)i, (unsigned long long)rows_read, (unsigned long long)emit);
+			}
 		}
-
-		// The actual zero-copy handoff. Two things happen here:
-		//
-		//  1. FlatVector::SetData points the vector's raw data pointer directly
-		//     into the FPGA-written libstf buffer (+ byte offset for the
-		//     STANDARD_VECTOR_SIZE slice we're emitting this call). No memcpy,
-		//     no arrow intermediary.
-		//
-		//  2. SetAuxiliary hands the buffer's shared_ptr to DuckDB's Vector
-		//     lifetime slot (wrapped in LibstfBufferVectorBuffer, because
-		//     DuckDB's slot is typed to shared_ptr<VectorBuffer>, not our
-		//     shared_ptr<libstf::Buffer>). DuckDB copies this shared_ptr whenever
-		//     it copies the vector, so the underlying memory stays alive as long
-		//     as any downstream consumer references it.
-		//
-		// Two refcount holders protect the memory while it's in flight:
-		//   - gstate.current_buffers keeps it alive across scan calls while we
-		//     slice one FPGA chunk into multiple STANDARD_VECTOR_SIZE emissions
-		//     (auxiliary gets cleared on each output.Reset()).
-		//   - vector auxiliary (set here) keeps it alive for any downstream
-		//     consumer that holds onto the vector past our next scan call.
-		auto &vec = output.data[i];
-		vec.SetVectorType(VectorType::FLAT_VECTOR);
-		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + gstate.current_buf_offset * kElemSize);
-		vec.SetAuxiliary(make_buffer<LibstfBufferVectorBuffer>(buf));
 	}
 
 	// Advance the cursor. If we hit the end of this buffer, step to the next
 	// one so the next scan call's `if` branch either keeps emitting or pulls
 	// a fresh chunk.
-	gstate.current_buf_offset += emit;
-	if (gstate.current_buf_offset >= total_elements) {
-		gstate.current_buf_idx++;
-		gstate.current_buf_offset = 0;
+	gstate.hw_buf_offset += emit;
+	if (gstate.hw_buf_offset >= total_elements) {
+		gstate.hw_buf_idx++;
+		gstate.hw_buf_offset = 0;
 	}
 
 	output.SetCardinality(emit);
