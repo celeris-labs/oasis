@@ -56,8 +56,8 @@ RDMAParams RDMAParams::ReadFrom(optional_ptr<FileOpener> opener) {
 
 	Value value;
 	if (!FileOpener::TryGetCurrentSetting(opener, "rdma_server", value) || value.IsNull()) {
-		throw InvalidConfigurationException("rdma:// filesystem requires the RDMA server address to be set: "
-		                                    "run `SET rdma_server = '<ip-address>';` before using rdma:// paths");
+		throw InvalidConfigurationException("rdma:// filesystem requires the RDMA server ip address to be set: "
+		                                    "Run `SET rdma_server = '<ip-address>';`");
 	}
 	params.server = value.ToString();
 
@@ -81,17 +81,16 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 		return;
 	}
 
-	auto params = RDMAParams::ReadFrom(opener);
 	auto db = FileOpener::TryGetDatabase(opener);
 	if (!db) {
 		throw IOException("rdma:// filesystem requires a database context to initialize");
 	}
 	auto &ctx = db->GetObjectCache().GetOrCreate<OasisContextCacheEntry>("oasis_context")->ctx();
 	if (!ctx.isRDMAEnabled()) {
-		throw NotImplementedException("rdma:// filesystem is unavailable: this FPGA shell was "
-		                              "synthesized without an RDMA bypass stream (rebuild with "
-		                              "RDMA enabled to use rdma:// paths)");
+		throw NotImplementedException("rdma:// filesystem is unavailable: This FPGA shell was "
+		                              "synthesized without RDMA");
 	}
+    auto params = RDMAParams::ReadFrom(opener);
 
 	auto coyote_thread = ctx.cthread();
 	void *staging_buffer = nullptr;
@@ -106,7 +105,7 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	initialized = true;
 }
 
-void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t size) {
+void RDMAFileSystem::EnqueueRead(libstf::stream_t stream_id, uint64_t remote_offset, size_t size) {
 	if (size == 0) {
 		return;
 	}
@@ -114,10 +113,19 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 		throw IOException("RDMA read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 
+	auto &ctx = oasis::OasisContext::ctx();
+	auto rdma_cfg = ctx.config<oasis::RDMAReadConfig>();
+	rdma_cfg->read(stream_id, static_cast<uintptr_t>(remote_offset), size);
+}
+
+void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t size) {
+	if (size == 0) {
+		return;
+	}
+
 	// EnsureInitialized has already created the OasisContext singleton.
 	auto &ctx = oasis::OasisContext::ctx();
 	auto obm = ctx.output_buffer_manager();
-	auto rdma_cfg = ctx.config<oasis::RDMAReadConfig>();
 	auto bypass_stream = ctx.rdmaBypassStream();
 
 	// Serialize buffer-enqueue + CSR fire so the buffer at the front of the
@@ -128,8 +136,8 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 	{
 		std::lock_guard<std::mutex> lock(mtx);
 
-        // Trigger the remote read first because it has long latency.
-		rdma_cfg->read(bypass_stream, static_cast<uintptr_t>(remote_offset), size);
+		// Trigger the remote read first because it has long latency.
+		EnqueueRead(bypass_stream, remote_offset, size);
 
 		// The bypass stream is configured as unmanaged on the OBM. Pass the exact
 		// expected size so the OBM allocates a single right-sized buffer with
@@ -334,6 +342,13 @@ int64_t RDMAFileSystem::GetFileSize(FileHandle &handle) {
 timestamp_t RDMAFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	// The RDMA server data is immutable so just return 0.
 	return timestamp_t(0);
+}
+
+void RDMAFileHandle::ReadIntoStream(libstf::stream_t stream_id, uint64_t offset, size_t size) {
+	if (offset + size > this->size) {
+		throw IOException("Read past end of file %s", path);
+	}
+	RDMAFileSystem::EnqueueRead(stream_id, remote_offset + offset, size);
 }
 
 } // namespace duckdb

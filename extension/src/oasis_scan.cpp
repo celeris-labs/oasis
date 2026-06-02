@@ -105,14 +105,11 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	    ctx.cthread(), ctx.tlb_manager(), ctx.output_buffer_manager(),
 	    column_chunk_config, 0);
 
-	auto maybe_file = arrow::io::ReadableFile::Open(bind_data.filename);
-	if (!maybe_file.ok()) {
-		throw IOException(maybe_file.status().ToString());
-	}
-	gstate->file = *maybe_file;
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(bind_data.filename, FileOpenFlags::FILE_FLAGS_READ);
 
 	gstate->reader =
-	    std::make_unique<parcore::FileReader>(gstate->decoder, ctx.memory_pool(), bind_data.metadata, gstate->file);
+	    std::make_unique<OasisReader>(gstate->decoder, ctx.memory_pool(), bind_data.metadata, std::move(handle));
 
 	gstate->total_groups = bind_data.metadata.groups.size();
 

@@ -3,8 +3,8 @@
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
 #include "oasis_context_cache_entry.hpp"
+#include "oasis_reader.hpp"
 #include "parcore/column_chunk_decoder.hpp"
-#include "parcore/file_reader.hpp"
 #include "parcore/metadata/metadata.hpp"
 
 #include <parcore/reader.hpp>
@@ -18,8 +18,7 @@ struct OasisScanBindData : public TableFunctionData {
 
 struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::shared_ptr<parcore::ColumnChunkDecoder> decoder;
-	std::shared_ptr<arrow::io::ReadableFile> file;
-	std::unique_ptr<parcore::FileReader> reader;
+	std::unique_ptr<OasisReader> reader;
 
 	// ParCore column indices for the projected columns, in output order.
 	vector<size_t> column_ids;

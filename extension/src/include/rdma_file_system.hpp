@@ -61,6 +61,9 @@ public:
 		return false;
 	}
 
+public:
+	static void EnqueueRead(libstf::stream_t stream_id, uint64_t remote_offset, size_t size);
+
 private:
 	void RDMAReadRange(uint64_t remote_offset, void *dst, size_t size);
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
@@ -89,6 +92,11 @@ public:
 
 	void Close() override {
 	}
+
+    /**
+	 * Trigger an RDMA read of [offset, offset+size) into the given stream (no host buffer).
+     */
+	void ReadIntoStream(libstf::stream_t stream_id, uint64_t offset, size_t size);
 
 	uint64_t remote_offset;
 	uint64_t size;
