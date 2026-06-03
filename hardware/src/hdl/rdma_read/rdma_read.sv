@@ -28,7 +28,8 @@ module RDMARead #(
 );
 
 localparam RDMA_READ = 12;
-localparam RDMA_READ_ACK = 16;
+localparam RDMA_READ_ACK_1 = 15;
+localparam RDMA_READ_ACK_2 = 16;
 localparam STRM = STRM_RDMA;
 localparam OPCODE = RDMA_READ;
 
@@ -48,7 +49,7 @@ logic ack, last;
 logic request_sent, received_ack_sim, received_ack_hw, received_ack, received_last;
 assign request_sent = sq_rd.ready && sq_rd.valid;
 assign received_ack_sim = cq_rd.ready && cq_rd.valid && cq_rd.data.strm == STRM && cq_rd.data.dest == AXI_STRM_ID && cq_rd.data.opcode == RDMA_READ;
-assign received_ack_hw = cq_rd.ready && cq_rd.valid && cq_rd.data.remote && cq_rd.data.dest == AXI_STRM_ID && cq_rd.data.opcode == RDMA_READ_ACK;
+assign received_ack_hw = cq_rd.ready && cq_rd.valid && cq_rd.data.remote && cq_rd.data.dest == AXI_STRM_ID && (cq_rd.data.opcode == RDMA_READ_ACK_1 || cq_rd.data.opcode == RDMA_READ_ACK_2);
 assign received_ack = received_ack_sim || received_ack_hw;
 assign received_last = out.ready && out.valid && out.last;
 

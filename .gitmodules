@@ -4,3 +4,10 @@
 [submodule "celeris"]
 	path = celeris
 	url = git@github.com:celeris-labs/celeris.git
+[submodule "extension/duckdb"]
+	path = extension/duckdb
+	url = https://github.com/duckdb/duckdb
+[submodule "extension/extension-ci-tools"]
+	path = extension/extension-ci-tools
+	url = https://github.com/duckdb/extension-ci-tools
+	branch = v1.5-variegata

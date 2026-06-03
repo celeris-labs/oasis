@@ -16,6 +16,8 @@ git clone --recurse-submodules git@github.com:celeris-labs/oasis.git
 Or initializing the submodule as a step after cloning:
 
 ```bash
+git submodule update --init extension/duckdb
+git submodule update --init extension/extension-ci-tools
 git submodule update --init --recursive parcore
 git submodule update --init celeris
 ```
@@ -38,7 +40,7 @@ project needs to be regenerated whenever new files are added (also for the depen
 For synthesis, execute the following command:
 
 ```bash
-./scripts/synthesize.sh [--no-rdma]
+./scripts/synthesize.sh [--no-rdma] [--decoders <number-of-decoders>]
 ```
 
 The script spins off the synthesis in the background in a way that the user can disconnect from 
@@ -47,6 +49,9 @@ It is expected that the synthesis takes multiple hours to finish sometimes not p
 to the log for a while.
 
 ## Software
+The software consists of the Oasis software library and a DuckDB extension.
+
+### Oasis library
 The Oasis software library has dependencies on the Coyote, libSTF, and ParCore software libraries to 
 be installed or includes them from the submodules. In case they are not installed already, libSTF 
 also has a dependency on jemalloc that can be installed with `./parcore/libstf/scripts/install_jemalloc.sh` 
@@ -61,6 +66,17 @@ cmake --build software/build -j
 
 If you want to install it to e.g., `~/opt`, you need to add `-DCMAKE_INSTALL_PREFIX=$HOME/opt` to 
 the first `cmake` command and execute `cmake --install software/build` after the build.
+
+### DuckDB extension
+The DuckDB Oasis extension can be built as follows and requires the Oasis software library to be 
+installed first:
+
+```bash
+cd extension
+make -j
+```
+
+More detail can be found in the `extension/README.md`.
 
 ## License
 The Oasis code is licensed under the terms in 

@@ -1,0 +1,23 @@
+# name: test/sql/oasis.test
+# description: test Oasis extension
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT oasis('Sam');
+----
+Catalog Error: Scalar Function with name oasis does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require oasis
+
+# Confirm the extension works
+query I
+SELECT oasis('Sam');
+----
+Oasis Sam 🐥
+
+query I
+SELECT oasis_openssl_version('Michael') ILIKE 'Oasis Michael, my linked OpenSSL version is OpenSSL%';
+----
+true

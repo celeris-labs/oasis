@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT TARGET Coyote)
     find_package(Coyote QUIET)
     if(NOT Coyote_FOUND)
-        add_subdirectory(../parcore/coyote/sw coyote)
+        add_subdirectory(../parcore/libstf/coyote/sw coyote)
     endif()
 endif()
 
@@ -33,12 +33,13 @@ add_library(oasis SHARED)
 
 target_sources(oasis PRIVATE
     oasis/configuration.cpp
+    oasis/oasis_context.cpp
     oasis/parcore/rdma_reader.cpp
 )
 target_include_directories(oasis
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/oasis>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 target_link_libraries(oasis PRIVATE Coyote libstf parcore)
