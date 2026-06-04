@@ -2,10 +2,18 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "oasis/oasis_context.hpp"
 #include "parcore/configuration.hpp"
 #include "parquet_reader.hpp"
 #include "parquet_types.h"
+
+// oasis_scan.hpp transitively pulls in Coyote, which includes <syslog.h>. That
+// header defines LOG_INFO / LOG_DEBUG as numeric macros that collide with the
+// duckdb::LogLevel enum values, turning e.g. `LogLevel::LOG_DEBUG` into
+// `LogLevel::7`. #undef them so the LogLevel:: use sites below compile.
+#undef LOG_INFO
+#undef LOG_DEBUG
 
 namespace duckdb {
 
@@ -144,6 +152,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 // elements per buffer at each index) across all columns of a row group; we
 // assert this below.
 void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+    auto &logger = Logger::Get(context);
 	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
 	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
 
@@ -160,6 +169,14 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 		}
 		for (size_t i = 0; i < gstate.column_ids.size(); i++) {
 			gstate.current_buffers[i] = gstate.reader->next_column_chunk(); // blocks on FPGA
+
+            size_t const col_id = gstate.column_ids[i];
+            logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_DEBUG,
+                            StringUtil::Format("Hardware decoder for row group %llu, column %llu ('%s') returned %llu buffer(s)",
+                                                (unsigned long long) gstate.next_group, 
+                                                (unsigned long long) col_id,
+                                                bind.metadata.column_names[col_id].c_str(),
+                                                (unsigned long long) gstate.current_buffers[i].size()));
 		}
 
 		gstate.current_buf_idx = 0;
