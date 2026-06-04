@@ -104,8 +104,8 @@ RDMAReadConfig #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[2]),
-    .read_config(read_configs[2]),
+    .write_config(write_configs[1]),
+    .read_config(read_configs[1]),
 
     .out(rdma_conf)
 );
