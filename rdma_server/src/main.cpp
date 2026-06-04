@@ -184,6 +184,32 @@ int main(int argc, char *argv[]) {
 
     uint64_t region_size = dir_header_size + payload_total;
 
+    // Compute file offsets within the region.
+    std::vector<uint64_t> offsets(files.size());
+    {
+        uint64_t cursor = dir_header_size;
+        for (size_t i = 0; i < files.size(); ++i) {
+            offsets[i] = cursor;
+            cursor += sizes[i];
+        }
+    }
+
+    // Print the directory of hosted files before bringing up the connection.
+    std::cout << "Oasis RDMA Server: " << files.size() << " file(s), directory header "
+              << dir_header_size << " Bytes + payload " << payload_total << " Bytes = region "
+              << region_size << " Bytes, on port " << port << std::endl;
+    size_t max_name_len   = 0;
+    size_t max_offset_len = 0;
+    for (const auto &name : names) max_name_len = std::max(max_name_len, name.size());
+    for (const auto &off : offsets)
+        max_offset_len = std::max(max_offset_len, std::to_string(off).size());
+    for (size_t i = 0; i < files.size(); ++i) {
+        std::string quoted = "\"" + names[i] + "\"";
+        std::cout << "  [" << i << "] " << std::left << std::setw(max_name_len + 2) << quoted
+                  << " offset=" << std::right << std::setw(max_offset_len) << offsets[i]
+                  << " size=" << sizes[i] << std::endl;
+    }
+
     // Set up Coyote + RDMA in server mode (no server address).
     std::unique_ptr<coyote::cThread> coyote_thread;
     try {
@@ -209,16 +235,12 @@ int main(int argc, char *argv[]) {
     uint8_t *p = mem;
     write_header_value<uint64_t>(p, dir_header_size);
 
-    uint64_t              cursor = dir_header_size;
-    std::vector<uint64_t> offsets(files.size());
     for (size_t i = 0; i < files.size(); ++i) {
-        offsets[i] = cursor;
         write_header_value<uint64_t>(p, static_cast<uint64_t>(names[i].size()));
         std::memcpy(p, names[i].data(), names[i].size());
         p += names[i].size();
         write_header_value<uint64_t>(p, offsets[i]);
         write_header_value<uint64_t>(p, sizes[i]);
-        cursor += sizes[i];
     }
 
     // Copy file Bytes into the region at their assigned offsets.
@@ -235,21 +257,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    std::cout << "Oasis RDMA Server: Serving " << files.size() << " file(s), directory header "
-              << dir_header_size << " Bytes + payload " << payload_total << " Bytes = region "
-              << region_size << " Bytes, on port " << port << std::endl;
-    size_t max_name_len   = 0;
-    size_t max_offset_len = 0;
-    for (const auto &name : names) max_name_len = std::max(max_name_len, name.size());
-    for (const auto &off : offsets)
-        max_offset_len = std::max(max_offset_len, std::to_string(off).size());
-    for (size_t i = 0; i < files.size(); ++i) {
-        std::string quoted = "\"" + names[i] + "\"";
-        std::cout << "  [" << i << "] " << std::left << std::setw(max_name_len + 2) << quoted
-                  << " offset=" << std::right << std::setw(max_offset_len) << offsets[i]
-                  << " size=" << sizes[i] << std::endl;
-    }
-    std::cout << "Press Ctrl+C to exit." << std::endl;
+    std::cout << "Now serving... Press Ctrl+C to exit." << std::endl;
 
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
@@ -257,6 +265,6 @@ int main(int argc, char *argv[]) {
         pause();
     }
 
-    std::cout << "Oasis RDMA Server: Shutting down" << std::endl;
+    std::cout << "Shutting down!" << std::endl;
     return EXIT_SUCCESS;
 }
