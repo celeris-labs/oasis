@@ -4,11 +4,10 @@
 #include "libstf_buffer_vector_buffer.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_reader.hpp"
-#include "parquet_reader.hpp"
 #include "parcore/column_chunk_decoder.hpp"
 #include "parcore/metadata/metadata.hpp"
-
 #include <parcore/reader.hpp>
+#include "parquet_reader.hpp"
 
 namespace duckdb {
 

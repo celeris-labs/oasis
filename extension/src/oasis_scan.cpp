@@ -1,11 +1,10 @@
 #include "oasis_scan.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "oasis/oasis_context.hpp"
-#include "column_reader.hpp"
 #include "parcore/configuration.hpp"
 #include "parquet_reader.hpp"
+#include "column_reader.hpp"
 #include "parquet_types.h"
 
 namespace duckdb {

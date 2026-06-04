@@ -1,2 +1,2 @@
 #!/bin/bash
-COYOTE_SIM_DIR=$(pwd)/../parcore/hardware/build-sim ./build/release/duckdb
+COYOTE_SIM_DIR=$(pwd)/../hardware/build-sim ./build/release/duckdb
