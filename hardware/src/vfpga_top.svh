@@ -110,19 +110,6 @@ RDMAReadConfig #(
     .out(rdma_conf)
 );
 
-`ifdef EN_RDMA
-RDMAReadConfig #(
-    .NUM_STREAMS(NUM_STREAMS)
-) inst_rdma_read_config (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .write_config(write_configs[1]),
-    .read_config(read_configs[1]),
-
-    .out(rdma_conf)
-);
-
 // -- De-mux and arbiter the read send and completion queues ---------------------------------------
 metaIntf #(.STYPE(req_t)) sq_rd_strm [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 metaIntf #(.STYPE(ack_t)) cq_rd_strm [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
