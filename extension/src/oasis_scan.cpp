@@ -177,7 +177,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 // elements per buffer at each index) across all columns of a row group; we
 // assert this below.
 void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-    auto &logger = Logger::Get(context);
+	auto &logger = Logger::Get(context);
 	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
 	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
 
@@ -196,7 +196,6 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 		}
 
 		// advance all columns
-		// todo: only do this for supported, columns, reinitialise column readers at boundary
 		for (size_t i = 0; i < gstate.column_ids.size(); i++) {
 			if (gstate.column_readers[i] == nullptr) {
 				gstate.hw_reader->enqueue_column_chunk(gstate.next_group, gstate.column_ids[i]);
@@ -208,15 +207,18 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 			}
 		}
 		for (size_t i = 0; i < gstate.column_ids.size(); i++) {
-			gstate.hw_buffers[i] = gstate.hw_reader->next_column_chunk(); // blocks on FPGA
+			// only hw columns were enqueued. columndecoder cols only need the initialise and no second action.
+			if (gstate.column_readers[i] == nullptr) {
+				gstate.hw_buffers[i] = gstate.hw_reader->next_column_chunk(); // blocks on FPGA
 
-            size_t const col_id = gstate.column_ids[i];
-            logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_DEBUG,
-                            StringUtil::Format("Hardware decoder for row group %llu, column %llu ('%s') returned %llu buffer(s)",
-                                                (unsigned long long) gstate.next_group,
-                                                (unsigned long long) col_id,
-                                                bind.metadata.column_names[col_id].c_str(),
-                                                (unsigned long long) gstate.hw_buffers[i].size()));
+				size_t const col_id = gstate.column_ids[i];
+				logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_DEBUG,
+				                StringUtil::Format(
+				                    "Hardware decoder for row group %llu, column %llu ('%s') returned %llu buffer(s)",
+				                    (unsigned long long)gstate.next_group, (unsigned long long)col_id,
+				                    bind.metadata.column_names[col_id].c_str(),
+				                    (unsigned long long)gstate.hw_buffers[i].size()));
+			}
 		}
 
 		gstate.hw_buf_idx = 0;

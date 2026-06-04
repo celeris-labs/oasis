@@ -47,7 +47,7 @@ find_package(oasis REQUIRED)
 # ---------------------------------------------------------------------------
 # Extension
 # ---------------------------------------------------------------------------
-set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/rdma_file_system.cpp)
+set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/oasis_reader.cpp src/rdma_file_system.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -56,8 +56,8 @@ target_link_libraries(${EXTENSION_NAME} Coyote libstf parcore oasis)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} Coyote libstf parcore oasis)
 
 install(
-    TARGETS ${EXTENSION_NAME}
-    EXPORT "${DUCKDB_EXPORT_SET}"
-    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
+        TARGETS ${EXTENSION_NAME}
+        EXPORT "${DUCKDB_EXPORT_SET}"
+        LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+        ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
 )
