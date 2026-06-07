@@ -8,10 +8,20 @@ project(oasis
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" OFF)
+
 if(NOT TARGET Coyote)
-    find_package(Coyote QUIET)
-    if(NOT Coyote_FOUND)
-        add_subdirectory(../parcore/coyote/sw coyote)
+    if(EN_SIMULATION)
+        find_package(CoyoteSimulation QUIET)
+        if(NOT CoyoteSimulation_FOUND)
+            add_subdirectory(../parcore/coyote/sim/sw coyote)
+        endif()
+        add_compile_definitions(EN_SIMULATION)
+    else()
+        find_package(Coyote QUIET)
+        if(NOT Coyote_FOUND)
+            add_subdirectory(../parcore/coyote/sw coyote)
+        endif()
     endif()
 endif()
 
