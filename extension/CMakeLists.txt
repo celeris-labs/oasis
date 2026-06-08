@@ -47,11 +47,12 @@ find_package(oasis REQUIRED)
 # ---------------------------------------------------------------------------
 # Extension
 # ---------------------------------------------------------------------------
-set(EXTENSION_SOURCES 
-    src/oasis_extension.cpp 
+set(EXTENSION_SOURCES
+    src/oasis_extension.cpp
     src/oasis_scan.cpp
     src/oasis_optimizer.cpp
     src/oasis_bloom_mock.cpp
+    src/oasis_hardware_bloom.cpp
     src/oasis_parquet_metadata.cpp
 )
 

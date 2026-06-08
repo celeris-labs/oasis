@@ -6,11 +6,13 @@
 
 #include "oasis/oasis_context.hpp"
 #include "oasis_bloom_mock.hpp"
+#include "oasis_hardware_bloom.hpp"
 #include "oasis_parquet_metadata.hpp"
 #include "parcore/configuration.hpp"
 #include "parquet_reader.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -47,6 +49,16 @@ static size_t FindScanIndex(const vector<size_t> &scan_ids, size_t col_id) {
 		}
 	}
 	throw InternalException("OASIS: scan column mapping missing for column id %llu", (unsigned long long)col_id);
+}
+
+static bool UseHardwareBloomByDefault() {
+	auto env = std::getenv("OASIS_USE_SOFTWARE_BLOOM");
+	if (!env) {
+		return true;
+	}
+
+	string value(env);
+	return !(value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES");
 }
 
 unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBindInput &input,
@@ -92,7 +104,12 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	auto page_config = ctx.config<parcore::PageDecoderConfig>();
 
 	gstate->decoder = std::make_shared<parcore::ColumnChunkDecoder>(
-	    ctx.cthread(), ctx.tlb_manager(), ctx.output_buffer_manager(), column_chunk_config, page_config, 0);
+	    ctx.cthread(),
+	    ctx.tlb_manager(),
+	    ctx.output_buffer_manager(),
+	    column_chunk_config,
+	    page_config,
+	    0);
 
 	auto maybe_file = arrow::io::ReadableFile::Open(bind_data.filename);
 	if (!maybe_file.ok()) {
@@ -137,7 +154,19 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 		               bind_data.runtime_bloom_probe_key.c_str(),
 		               (unsigned long long)gstate->runtime_bloom_probe_col_id);
 
-		gstate->bloom_mock = InitializeOasisBloomMock(context, bind_data);
+		if (UseHardwareBloomByDefault()) {
+			OASIS_SCAN_LOG("using hardware bloom path");
+			gstate->hardware_bloom_enabled = true;
+
+			// Wichtig:
+			// Diese Funktion initialisiert nur den Hardware-Bloom-Smoke-Test.
+			// Sie gibt nichts zurück.
+			InitializeOasisHardwareBloom(context, bind_data);
+		} else {
+			OASIS_SCAN_LOG("using software bloom fallback because OASIS_USE_SOFTWARE_BLOOM is set");
+			gstate->hardware_bloom_enabled = false;
+			gstate->bloom_mock = InitializeOasisBloomMock(context, bind_data);
+		}
 	} else {
 		OASIS_SCAN_LOG("runtime bloom disabled for file=%s", bind_data.filename.c_str());
 	}
@@ -189,17 +218,19 @@ bool OasisLoadNextRowGroupIfNeeded(OasisScanGlobalState &gstate) {
 			                        (int)chunk.type);
 		}
 
-		// Stream 0 always passes through the Bloom demux/mux in hardware.
-		// Normal read_oasis scans and software Bloom mock probe scans must
-		// explicitly select the bypass path.
-		//
-		// Hardware comment:
-		//   select = 0 -> bloom-filtered path
-		//   select = 1 -> bypass path
+		// Normaler read_oasis-Scan muss am Bloomfilter vorbei.
+		// Hardware-Bloom nutzt eine eigene Scan-Funktion und ruft diesen Helper nicht auf.
+		uint8_t select = 1;
+
 		bf_stream_config->enqueue_stream_config(
 		    0,
 		    parcore::metadata::to_libstf_type(chunk.type),
-		    1);
+		    select);
+
+		OASIS_SCAN_LOG("stream config row_group=%llu col_id=%llu select=%u",
+		               (unsigned long long)gstate.next_group,
+		               (unsigned long long)col_id,
+		               (unsigned int)select);
 
 		gstate.reader->enqueue_column_chunk(gstate.next_group, col_id);
 	}
@@ -225,7 +256,7 @@ static void OasisScanFunctionZeroCopy(ClientContext &context, TableFunctionInput
 	}
 
 	auto elem_size = [&](size_t col_file_idx) -> size_t {
-		// next_group has already been incremented, so the in-flight group is next_group - 1.
+		// next_group wurde in OasisLoadNextRowGroupIfNeeded schon erhöht.
 		auto t = bind.metadata.groups[gstate.next_group - 1].chunks[col_file_idx].type;
 		if (!parcore::metadata::is_libstf_type(t)) {
 			throw InternalException("Unsupported ParCore type %d in elem_size", (int)t);
@@ -270,14 +301,15 @@ static void OasisScanFunctionZeroCopy(ClientContext &context, TableFunctionInput
 	output.SetCardinality(emit);
 }
 
-// Zero-copy multi-column scan. For each row group we enqueue every column,
-// then dequeue them in order because ParCore's output queue is a FIFO.
-// The Bloom mock path is intentionally implemented outside this file.
 void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
 
 	if (gstate.runtime_bloom_enabled) {
-		OasisScanFunctionBloomMock(context, data_p, output);
+		if (gstate.hardware_bloom_enabled) {
+			OasisScanFunctionBloomHardware(context, data_p, output);
+		} else {
+			OasisScanFunctionBloomMock(context, data_p, output);
+		}
 	} else {
 		OasisScanFunctionZeroCopy(context, data_p, output);
 	}

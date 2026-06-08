@@ -12,6 +12,7 @@
 namespace duckdb {
 
 struct OasisBloomMockState;
+struct OasisHardwareBloomState;
 
 struct OasisScanBindData : public TableFunctionData {
 	string filename;
@@ -36,10 +37,13 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	vector<size_t> output_to_scan_idx;
 
 	bool runtime_bloom_enabled = false;
+	bool hardware_bloom_enabled = false;
+
 	size_t runtime_bloom_probe_col_id = DConstants::INVALID_INDEX;
 	size_t runtime_bloom_probe_scan_idx = DConstants::INVALID_INDEX;
 
 	std::shared_ptr<OasisBloomMockState> bloom_mock;
+	std::shared_ptr<OasisHardwareBloomState> hardware_bloom;
 
 	size_t next_group = 0;
 	size_t total_groups = 0;
