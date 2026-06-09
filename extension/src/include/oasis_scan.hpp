@@ -1,10 +1,12 @@
 #pragma once
 
+#include "column_reader.hpp"
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
 #include "oasis/oasis_context.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "parcore/metadata/metadata.hpp"
+#include "parquet_reader.hpp"
 
 #include <atomic>
 
@@ -25,6 +27,8 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 
 	vector<size_t> column_ids;
 	vector<size_t> elem_sizes;
+	vector<bool> is_cpu_column;
+	bool has_cpu_columns = false;
 
 	// Row-group cursor: the next group to hand out. Claimed atomically by workers.
 	std::atomic<size_t> next_group {0};
@@ -45,8 +49,14 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 struct OasisScanLocalState : public LocalTableFunctionState {
 	unique_ptr<FileHandle> file_handle;
 
+	// CPU (string) decode path, per worker.
+	unique_ptr<ParquetReader> parquet_reader;
+	unique_ptr<ParquetReaderScanState> scan_state;
+	unique_ptr<ColumnReader> root_reader;
+
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 	size_t current_buf_offset = 0;
+	size_t current_group_num_rows = 0;
 
 	// Empty-projection path only (COUNT(*) etc.): Rows left to emit from the row group we last 
     // claimed. We never decode anything in this path -- the count comes straight from the Parquet 

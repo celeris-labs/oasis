@@ -1,5 +1,6 @@
 #include "oasis_scan.hpp"
 
+#include "column_reader.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "duckdb/logging/logger.hpp"
@@ -10,6 +11,7 @@
 #include "parquet_reader.hpp"
 #include "parquet_types.h"
 #include "rdma_file_system.hpp"
+#include "reader/struct_column_reader.hpp"
 
 // oasis_scan.hpp transitively pulls in Coyote, which includes <syslog.h>. That
 // header defines LOG_INFO / LOG_DEBUG as numeric macros that collide with the
@@ -145,12 +147,17 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			continue;
 		}
 		auto t = bind_data.metadata.groups[0].chunks[col_id].type;
-		if (!parcore::metadata::is_libstf_type(t)) {
-			throw InvalidInputException("Column '%s' has type BYTE_ARRAY which is not supported by ParCore",
-			                            bind_data.metadata.column_names[col_id].c_str());
-		}
 		gstate->column_ids.push_back(col_id);
-		gstate->elem_sizes.push_back(libstf::size_of(parcore::metadata::to_libstf_type(t)));
+		if (parcore::metadata::is_libstf_type(t)) {
+			// Hardware path: Fixed-width type the ParCore decoder handles.
+			gstate->is_cpu_column.push_back(false);
+			gstate->elem_sizes.push_back(libstf::size_of(parcore::metadata::to_libstf_type(t)));
+		} else {
+			// CPU path: Variable-length type (BYTE_ARRAY/string) decoded by DuckDB's ColumnReader.
+			gstate->is_cpu_column.push_back(true);
+			gstate->elem_sizes.push_back(0);
+			gstate->has_cpu_columns = true;
+		}
 	}
 
 	return std::move(gstate);
@@ -165,6 +172,20 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	// and the local source path reads from it on this worker thread.
 	auto &fs = FileSystem::GetFileSystem(context.client);
 	lstate->file_handle = fs.OpenFile(gstate.filename, FileOpenFlags::FILE_FLAGS_READ);
+
+	if (gstate.has_cpu_columns) {
+		ParquetOptions parquet_opts(context.client);
+		lstate->parquet_reader = make_uniq<ParquetReader>(context.client, OpenFileInfo {gstate.filename}, parquet_opts);
+		lstate->scan_state = make_uniq<ParquetReaderScanState>();
+
+		vector<idx_t> groups_to_read;
+		groups_to_read.reserve(gstate.total_groups);
+		for (idx_t g = 0; g < gstate.total_groups; g++) {
+			groups_to_read.push_back(g);
+		}
+		lstate->parquet_reader->InitializeScan(context.client, *lstate->scan_state, std::move(groups_to_read));
+		lstate->root_reader = std::move(lstate->scan_state->root_reader);
+	}
 
 	return std::move(lstate);
 }
@@ -198,9 +219,15 @@ static void DecodeGroup(oasis::OasisContext &ctx, OasisScanGlobalState &gstate, 
                         const OasisScanBindData &bind, size_t group) {
 	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
 
+	// Submit one query splinter per hardware column. CPU columns are skipped here and decoded inline.
 	std::vector<oasis::SplinterResultHandle> results;
 	results.reserve(gstate.column_ids.size());
 	for (size_t i = 0; i < gstate.column_ids.size(); i++) {
+		if (gstate.is_cpu_column[i]) {
+			results.emplace_back();
+			continue;
+		}
+
 		const auto &cc = bind.metadata.groups[group].chunks[gstate.column_ids[i]];
 		auto type = parcore::metadata::to_libstf_type(cc.type);
 
@@ -210,7 +237,7 @@ static void DecodeGroup(oasis::OasisContext &ctx, OasisScanGlobalState &gstate, 
 		if (decoded_size > buffer_capacity) {
 			throw NotImplementedException(
 			    "Column '%s' row group %llu decodes to %llu bytes, exceeding the %llu byte output "
-                "buffer capacity.",
+			    "buffer capacity.",
 			    bind.metadata.column_names[gstate.column_ids[i]].c_str(), (unsigned long long)group,
 			    (unsigned long long)decoded_size, (unsigned long long)buffer_capacity);
 		}
@@ -223,11 +250,20 @@ static void DecodeGroup(oasis::OasisContext &ctx, OasisScanGlobalState &gstate, 
 		results.push_back(ctx.scheduler().submit(std::move(splinter)));
 	}
 
-	// Collect each column's one buffer in submit order (restores per-column order even though
-	// splinters may finish on different streams out of order). Each splinter must yield exactly one
-	// buffer and then close -- that is the invariant the size check above protects.
+	// InitializeRead(...) does the page-header parsing / I/O positioning for the row group.
+	if (gstate.has_cpu_columns) {
+		lstate.root_reader->InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns,
+		                                   *lstate.scan_state->thrift_file_proto);
+	}
+
+	// Collect each hardware column's one buffer in submit order (restores per-column order even 
+    // though splinters may finish on different streams out of order). Each splinter must yield 
+    // exactly one buffer and then close -- that is the invariant the size check above protects.
 	lstate.current_buffers.assign(gstate.column_ids.size(), nullptr);
 	for (size_t i = 0; i < results.size(); i++) {
+		if (gstate.is_cpu_column[i]) {
+			continue;
+		}
 		auto batch = results[i].get_next_batch();
 		if (!batch) {
 			throw InternalException("Column %llu produced no output for row group %llu", 
@@ -262,6 +298,7 @@ static bool LoadNextGroup(oasis::OasisContext &ctx, OasisScanGlobalState &gstate
 	}
 	DecodeGroup(ctx, gstate, lstate, bind, group);
 	lstate.current_buf_offset = 0;
+	lstate.current_group_num_rows = bind.metadata.groups[group].chunks[0].num_values;
 	return true;
 }
 
@@ -305,18 +342,41 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 		return;
 	}
 
-	// When the current group's buffers are exhausted, decode the next group (one buffer per column).
-	if (lstate.current_buffers.empty() || !lstate.current_buffers[0]) {
+	// When the current group is fully emitted, decode/claim the next one.
+	if (lstate.current_group_num_rows == 0) {
 		if (!LoadNextGroup(ctx, gstate, lstate, bind)) {
 			output.SetCardinality(0);
 			return;
 		}
 	}
 
-	size_t const total_elements = lstate.current_buffers[0]->size / gstate.elem_sizes[0];
+	size_t const total_elements = lstate.current_group_num_rows;
 	size_t const remaining_elements = total_elements - lstate.current_buf_offset;
 	size_t const emit = std::min<size_t>(remaining_elements, STANDARD_VECTOR_SIZE);
+
+	// Scratch define/repeat buffers shared by this worker's CPU column readers for this call.
+	uint8_t *define_ptr = nullptr;
+	uint8_t *repeat_ptr = nullptr;
+	if (gstate.has_cpu_columns) {
+		lstate.scan_state->define_buf.zero();
+		lstate.scan_state->repeat_buf.zero();
+		define_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->define_buf.ptr);
+		repeat_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->repeat_buf.ptr);
+	}
+
 	for (size_t i = 0; i < gstate.column_ids.size(); i++) {
+		if (gstate.is_cpu_column[i]) {
+			auto &vec = output.data[i];
+			auto &child_reader = lstate.root_reader->Cast<StructColumnReader>().GetChildReader(gstate.column_ids[i]);
+			auto rows_read = child_reader.Read(emit, define_ptr, repeat_ptr, vec);
+			if (rows_read != emit) {
+				throw InternalException(
+				    "ParCore CPU column %llu read %llu values, expected %llu (HW/CPU cursor desync)",
+				    (unsigned long long)i, (unsigned long long)rows_read, (unsigned long long)emit);
+			}
+			continue;
+		}
+
 		const size_t kElemSize = gstate.elem_sizes[i];
 
 		auto &buf = lstate.current_buffers[i];
@@ -360,6 +420,7 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	if (lstate.current_buf_offset >= total_elements) {
 		lstate.current_buffers.assign(gstate.column_ids.size(), nullptr);
 		lstate.current_buf_offset = 0;
+		lstate.current_group_num_rows = 0;
 	}
 
 	output.SetCardinality(emit);
