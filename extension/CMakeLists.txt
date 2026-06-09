@@ -30,7 +30,7 @@ include_directories(duckdb/third_party/thrift)
 #   * parcore/build_hw/sim/ populated (run parcore/sim_setup.sh once)
 #   * xsim on PATH
 #   * COYOTE_SIM_DIR=<abs path to parcore/build_hw> at runtime
-option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" ON)
+option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" OFF)
 if (EN_SIMULATION)
     find_package(CoyoteSimulation REQUIRED)
     add_compile_definitions(EN_SIMULATION)
@@ -40,7 +40,6 @@ endif ()
 
 find_package(libstf REQUIRED)
 
-find_package(Arrow REQUIRED)
 find_package(parcore REQUIRED)
 find_package(oasis REQUIRED)
 
