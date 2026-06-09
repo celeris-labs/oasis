@@ -28,14 +28,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(table_function);
 
 	// RDMA file system
-	config.AddExtensionOption("rdma_server",
-                              "RDMA file server IP address (required; set via `SET rdma_server = '<ip-address>';`)",
-                              LogicalType::VARCHAR,
-                              Value(LogicalType::VARCHAR));
-	config.AddExtensionOption("rdma_port", 
-                              "RDMA file server TCP port (for QP exchange)", 
-                              LogicalType::UBIGINT,
+	config.AddExtensionOption("oasis_rdma_server",
+	                          "RDMA file server IP address (required; set via `SET oasis_rdma_server = '<ip-address>';`)",
+	                          LogicalType::VARCHAR, Value(LogicalType::VARCHAR));
+	config.AddExtensionOption("oasis_rdma_port", "RDMA file server TCP port (for QP exchange)", LogicalType::UBIGINT,
 	                          Value::UBIGINT(static_cast<uint64_t>(coyote::DEF_PORT)));
+
+	config.AddExtensionOption("oasis_scheduler_num_streams",
+	                          "Number of streams the scheduler drives (0 = all available)", LogicalType::UBIGINT,
+	                          Value::UBIGINT(0));
+	config.AddExtensionOption("oasis_scheduler_queue_depth",
+	                          "Max splinters in flight per stream (0 = hardware config-FIFO depth)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<RDMAFileSystem>());
 }

@@ -55,13 +55,13 @@ RDMAParams RDMAParams::ReadFrom(optional_ptr<FileOpener> opener) {
 	params.port = static_cast<uint16_t>(coyote::DEF_PORT);
 
 	Value value;
-	if (!FileOpener::TryGetCurrentSetting(opener, "rdma_server", value) || value.IsNull()) {
+	if (!FileOpener::TryGetCurrentSetting(opener, "oasis_rdma_server", value) || value.IsNull()) {
 		throw InvalidConfigurationException("rdma:// filesystem requires the RDMA server ip address to be set: "
-		                                    "Run `SET rdma_server = '<ip-address>';`");
+		                                    "Run `SET oasis_rdma_server = '<ip-address>';`");
 	}
 	params.server = value.ToString();
 
-	if (FileOpener::TryGetCurrentSetting(opener, "rdma_port", value) && !value.IsNull()) {
+	if (FileOpener::TryGetCurrentSetting(opener, "oasis_rdma_port", value) && !value.IsNull()) {
 		params.port = static_cast<uint16_t>(value.GetValue<uint64_t>());
 	}
 	return params;
@@ -90,7 +90,7 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 		throw NotImplementedException("rdma:// filesystem is unavailable: This FPGA shell was "
 		                              "synthesized without RDMA");
 	}
-    auto params = RDMAParams::ReadFrom(opener);
+	auto params = RDMAParams::ReadFrom(opener);
 
 	auto coyote_thread = ctx.cthread();
 	void *staging_buffer = nullptr;
@@ -105,7 +105,7 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	initialized = true;
 }
 
-void RDMAFileSystem::EnqueueRead(libstf::stream_t stream_id, uint64_t remote_offset, size_t size) {
+void RDMAFileSystem::EnqueueRead(uint64_t remote_offset, size_t size) {
 	if (size == 0) {
 		return;
 	}
@@ -115,7 +115,7 @@ void RDMAFileSystem::EnqueueRead(libstf::stream_t stream_id, uint64_t remote_off
 
 	auto &ctx = oasis::OasisContext::ctx();
 	auto rdma_cfg = ctx.config<oasis::RDMAReadConfig>();
-	rdma_cfg->read(stream_id, static_cast<uintptr_t>(remote_offset), size);
+	rdma_cfg->enqueue_read(ctx.rdmaBypassStream(), static_cast<uintptr_t>(remote_offset), size);
 }
 
 void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t size) {
@@ -137,7 +137,7 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 		std::lock_guard<std::mutex> lock(mtx);
 
 		// Trigger the remote read first because it has long latency.
-		EnqueueRead(bypass_stream, remote_offset, size);
+		EnqueueRead(remote_offset, size);
 
 		// The bypass stream is configured as unmanaged on the OBM. Pass the exact
 		// expected size so the OBM allocates a single right-sized buffer with
@@ -157,15 +157,14 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 		if (copied + buf->size > size) {
 			throw IOException("RDMA read overran requested size: requested %llu, already got %llu, "
 			                  "next chunk %llu",
-			                  (unsigned long long)size, (unsigned long long)copied,
-			                  (unsigned long long)buf->size);
+			                  (unsigned long long)size, (unsigned long long)copied, (unsigned long long)buf->size);
 		}
 		std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
 		copied += buf->size;
 	}
 	if (copied != size) {
-		throw IOException("RDMA read short transfer: requested %llu bytes, got %llu",
-		                  (unsigned long long)size, (unsigned long long)copied);
+		throw IOException("RDMA read short transfer: requested %llu bytes, got %llu", (unsigned long long)size,
+		                  (unsigned long long)copied);
 	}
 }
 
@@ -219,8 +218,7 @@ void RDMAFileSystem::LogDirectory(optional_ptr<FileOpener> opener, uint64_t dir_
 	}
 
 	std::vector<std::pair<std::string, RDMADirEntry>> entries(directory.begin(), directory.end());
-	std::sort(entries.begin(), entries.end(),
-	          [](const auto &a, const auto &b) { return a.first < b.first; });
+	std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
 
 	size_t max_name_len = 0;
 	size_t max_offset_len = 0;
@@ -291,7 +289,7 @@ bool RDMAFileSystem::FileExists(const string &filename, optional_ptr<FileOpener>
 		return false;
 	}
 
-    EnsureInitialized(opener);
+	EnsureInitialized(opener);
 
 	auto name = filename.substr(std::strlen(URL_PREFIX));
 	return directory.find(name) != directory.end();
@@ -342,13 +340,6 @@ int64_t RDMAFileSystem::GetFileSize(FileHandle &handle) {
 timestamp_t RDMAFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	// The RDMA server data is immutable so just return 0.
 	return timestamp_t(0);
-}
-
-void RDMAFileHandle::ReadIntoStream(libstf::stream_t stream_id, uint64_t offset, size_t size) {
-	if (offset + size > this->size) {
-		throw IOException("Read past end of file %s", path);
-	}
-	RDMAFileSystem::EnqueueRead(stream_id, remote_offset + offset, size);
 }
 
 } // namespace duckdb

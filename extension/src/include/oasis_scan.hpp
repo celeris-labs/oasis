@@ -2,12 +2,11 @@
 
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
+#include "oasis/oasis_context.hpp"
 #include "oasis_context_cache_entry.hpp"
-#include "oasis_reader.hpp"
-#include "parcore/column_chunk_decoder.hpp"
 #include "parcore/metadata/metadata.hpp"
 
-#include <parcore/reader.hpp>
+#include <atomic>
 
 namespace duckdb {
 
@@ -16,25 +15,44 @@ struct OasisScanBindData : public TableFunctionData {
 	parcore::metadata::Metadata metadata;
 };
 
+// Global scan state shared across all DuckDB worker threads of one read_oasis scan. Following
+// DuckDB's own Parquet reader, the only shared mutable state is the row-group cursor (an atomic
+// each worker claims a group from). Everything per-row-group lives in the local state so workers
+// never race on it.
 struct OasisScanGlobalState : public GlobalTableFunctionState {
-	std::shared_ptr<parcore::ColumnChunkDecoder> decoder;
-	std::unique_ptr<OasisReader> reader;
+	string filename;
+	oasis::OasisContext *ctx = nullptr;
 
-	// ParCore column indices for the projected columns, in output order.
 	vector<size_t> column_ids;
+	vector<size_t> elem_sizes;
 
-	// Scan cursor: which row group we'll enqueue next, and where we are
-	// inside the buffers returned for the currently-in-flight chunk.
-	size_t next_group = 0;
+	// Row-group cursor: the next group to hand out. Claimed atomically by workers.
+	std::atomic<size_t> next_group {0};
 	size_t total_groups = 0;
-	std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> current_buffers;
-	// the index of the buffers
-	size_t current_buf_idx = 0;
-	// the idx within the buffers
-	size_t current_buf_offset = 0;
+
+	idx_t MaxThreads() const override {
+		return total_groups == 0 ? 1 : total_groups;
+	}
 };
 
-struct OasisScanLocalState : public LocalTableFunctionState {};
+// Per-worker scan state. Owns this worker's file handle (DuckDB FileHandles are not safe to share
+// across threads) and, for the row group it is currently scanning, the decoded buffer per column it 
+// is slicing into vectors.
+//
+// One buffer per column chunk: a row group is decoded in full in hardware, each column yielding
+// exactly one buffer, and we then slice all columns' buffers in lockstep. The next group is loaded
+// only once the current buffers are fully emitted.
+struct OasisScanLocalState : public LocalTableFunctionState {
+	unique_ptr<FileHandle> file_handle;
+
+	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
+	size_t current_buf_offset = 0;
+
+	// Empty-projection path only (COUNT(*) etc.): Rows left to emit from the row group we last 
+    // claimed. We never decode anything in this path -- the count comes straight from the Parquet 
+    // metadata.
+	size_t empty_proj_remaining = 0;
+};
 
 unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types, vector<string> &names);

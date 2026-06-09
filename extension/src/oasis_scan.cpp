@@ -4,9 +4,12 @@
 #include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis/operator.hpp"
+#include "oasis/query_splinter.hpp"
 #include "parcore/configuration.hpp"
 #include "parquet_reader.hpp"
 #include "parquet_types.h"
+#include "rdma_file_system.hpp"
 
 // oasis_scan.hpp transitively pulls in Coyote, which includes <syslog.h>. That
 // header defines LOG_INFO / LOG_DEBUG as numeric macros that collide with the
@@ -22,11 +25,11 @@ static parcore::metadata::Type parquet_type_to_parcore(duckdb_parquet::Type::typ
 	case duckdb_parquet::Type::BOOLEAN:
 		return parcore::metadata::Type::BYTE_T;
 	case duckdb_parquet::Type::INT32:
-        return parcore::metadata::Type::INT32_T;
+		return parcore::metadata::Type::INT32_T;
 	case duckdb_parquet::Type::FLOAT:
 		return parcore::metadata::Type::FLOAT_T;
 	case duckdb_parquet::Type::INT64:
-        return parcore::metadata::Type::INT64_T;
+		return parcore::metadata::Type::INT64_T;
 	case duckdb_parquet::Type::DOUBLE:
 		return parcore::metadata::Type::DOUBLE_T;
 	case duckdb_parquet::Type::BYTE_ARRAY:
@@ -66,8 +69,8 @@ static parcore::metadata::Metadata build_parcore_metadata(ClientContext &context
 			parcore_cc.type = parquet_type_to_parcore(cmd.type);
 			parcore_cc.num_values = static_cast<uint64_t>(cmd.num_values);
 			parcore_cc.compression = parquet_codec_to_parcore(cmd.codec);
-			parcore_cc.offset = static_cast<uint64_t>(
-			    cmd.__isset.dictionary_page_offset ? cmd.dictionary_page_offset : cmd.data_page_offset);
+			parcore_cc.offset = static_cast<uint64_t>(cmd.__isset.dictionary_page_offset ? cmd.dictionary_page_offset
+			                                                                             : cmd.data_page_offset);
 			parcore_cc.total_compressed_size = static_cast<uint64_t>(cmd.total_compressed_size);
 
 			parcore_rg.chunks.push_back(std::move(parcore_cc));
@@ -103,22 +106,38 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	return std::move(bind_data);
 }
 
+static oasis::OasisContext &GetOasisContext(ClientContext &context) {
+	return ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>("oasis_context")->ctx();
+}
+
+// Applies the oasis_scheduler_num_streams / oasis_scheduler_queue_depth SET parameters to the live
+// scheduler. A value of 0 (the default) leaves the corresponding knob at its current value, so the
+// hardware defaults chosen at context init stay in effect until the user overrides them.
+static void ApplySchedulerSettings(ClientContext &context, oasis::Scheduler &scheduler) {
+	Value value;
+	if (context.TryGetCurrentSetting("oasis_scheduler_num_streams", value) && !value.IsNull()) {
+		auto streams = value.GetValue<uint64_t>();
+		if (streams > 0) {
+			scheduler.set_active_streams(static_cast<libstf::stream_t>(streams));
+		}
+	}
+	if (context.TryGetCurrentSetting("oasis_scheduler_queue_depth", value) && !value.IsNull()) {
+		auto depth = value.GetValue<uint64_t>();
+		if (depth > 0) {
+			scheduler.set_pipeline_depth(static_cast<size_t>(depth));
+		}
+	}
+}
+
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
-	auto &ctx = ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>("oasis_context")->ctx();
+	auto &ctx = GetOasisContext(context);
 	auto gstate = make_uniq<OasisScanGlobalState>();
-	auto column_chunk_config = ctx.config<parcore::ColumnChunkDecoderConfig>();
 
-	gstate->decoder = std::make_shared<parcore::ColumnChunkDecoder>(
-	    ctx.cthread(), ctx.tlb_manager(), ctx.output_buffer_manager(),
-	    column_chunk_config, 0);
+	ApplySchedulerSettings(context, ctx.scheduler());
 
-	auto &fs = FileSystem::GetFileSystem(context);
-	auto handle = fs.OpenFile(bind_data.filename, FileOpenFlags::FILE_FLAGS_READ);
-
-	gstate->reader =
-	    std::make_unique<OasisReader>(gstate->decoder, ctx.memory_pool(), bind_data.metadata, std::move(handle));
-
+	gstate->ctx = &ctx;
+	gstate->filename = bind_data.filename;
 	gstate->total_groups = bind_data.metadata.groups.size();
 
 	for (auto col_id : input.column_ids) {
@@ -131,77 +150,176 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			                            bind_data.metadata.column_names[col_id].c_str());
 		}
 		gstate->column_ids.push_back(col_id);
+		gstate->elem_sizes.push_back(libstf::size_of(parcore::metadata::to_libstf_type(t)));
 	}
-
-	gstate->current_buffers.assign(gstate->column_ids.size(), {});
-	gstate->current_buf_idx = 0;
-	gstate->current_buf_offset = 0;
 
 	return std::move(gstate);
 }
 
 unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                        GlobalTableFunctionState *global_state_p) {
-	return make_uniq<OasisScanLocalState>();
+	auto &gstate = global_state_p->Cast<OasisScanGlobalState>();
+	auto lstate = make_uniq<OasisScanLocalState>();
+
+	// Each worker owns its own file handle: DuckDB FileHandles are not safe to share across threads,
+	// and the local source path reads from it on this worker thread.
+	auto &fs = FileSystem::GetFileSystem(context.client);
+	lstate->file_handle = fs.OpenFile(gstate.filename, FileOpenFlags::FILE_FLAGS_READ);
+
+	return std::move(lstate);
 }
 
-// Zero-copy multi-column scan. For each row group we enqueue every column,
-// then dequeue them in order (ParCore's output queue is a FIFO) and slice each
-// column's buffers in lockstep into STANDARD_VECTOR_SIZE-sized vectors. This
-// assumes ParCore returns the same buffer layout (same buffer count, same
-// elements per buffer at each index) across all columns of a row group; we
-// assert this below.
-void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-    auto &logger = Logger::Get(context);
-	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
-	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
+// Builds the source operator for one column chunk. The transport (remote RDMA vs. local host DMA) is
+// chosen once, here, and hidden behind the SourceOperator interface; the scheduler never sees it.
+static std::unique_ptr<oasis::SourceOperator> MakeSource(oasis::OasisContext &ctx, OasisScanLocalState &lstate,
+                                                         const parcore::metadata::ColumnChunk &cc) {
+	if (auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get())) {
+		return std::make_unique<oasis::RDMASourceOperator>(rdma->remote_offset + cc.offset, cc.total_compressed_size);
+	}
 
-	// Pull in next row group cursor reached end, needs to be synchronised across columns
-	// assuming row groups have same element count across columns
-	if (gstate.current_buf_idx >= gstate.current_buffers[0].size()) {
-		if (gstate.next_group >= gstate.total_groups) {
+	// Host-copy path: read the compressed bytes into a libstf buffer on this worker thread. The
+	// LocalSourceOperator owns the buffer and DMAs it into the stream when the splinter runs.
+	void *ptr;
+	auto status = ctx.memory_pool()->allocate(cc.total_compressed_size, &ptr);
+	if (!status.ok()) {
+		throw IOException("Could not allocate input buffer: " + status.message());
+	}
+	auto buffer = libstf::make_buffer(ctx.memory_pool(), ptr, cc.total_compressed_size, cc.total_compressed_size);
+	lstate.file_handle->Read(buffer->ptr, cc.total_compressed_size, cc.offset);
+	return std::make_unique<oasis::LocalSourceOperator>(std::move(buffer));
+}
+
+// Submits one splinter per projected column of `group` to the shared scheduler and collects each
+// column's single decoded buffer into lstate.current_buffers (in projection order). We assume the
+// hardware emits exactly one output buffer per column chunk: OasisContextCacheEntry sizes the OBM's
+// auto-enqueued buffers to hold a whole DuckDB column chunk, and we reject any chunk whose decoded
+// size would overflow that buffer (which is what would otherwise force a multi-buffer split).
+static void DecodeGroup(oasis::OasisContext &ctx, OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
+                        const OasisScanBindData &bind, size_t group) {
+	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
+
+	std::vector<oasis::SplinterResultHandle> results;
+	results.reserve(gstate.column_ids.size());
+	for (size_t i = 0; i < gstate.column_ids.size(); i++) {
+		const auto &cc = bind.metadata.groups[group].chunks[gstate.column_ids[i]];
+		auto type = parcore::metadata::to_libstf_type(cc.type);
+
+		// Enforce the one-buffer-per-chunk invariant: the decoded output must fit in a single OBM
+		// buffer. num_values is the row count; elem_sizes[i] the decoded element width.
+		const size_t decoded_size = cc.num_values * gstate.elem_sizes[i];
+		if (decoded_size > buffer_capacity) {
+			throw NotImplementedException(
+			    "Column '%s' row group %llu decodes to %llu bytes, exceeding the %llu byte output "
+                "buffer capacity.",
+			    bind.metadata.column_names[gstate.column_ids[i]].c_str(), (unsigned long long)group,
+			    (unsigned long long)decoded_size, (unsigned long long)buffer_capacity);
+		}
+
+		oasis::QuerySplinter splinter;
+		splinter.operators.push_back(MakeSource(ctx, lstate, cc));
+		splinter.operators.push_back(
+		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
+		splinter.operators.push_back(std::make_unique<oasis::HostBufferSinkOperator>());
+		results.push_back(ctx.scheduler().submit(std::move(splinter)));
+	}
+
+	// Collect each column's one buffer in submit order (restores per-column order even though
+	// splinters may finish on different streams out of order). Each splinter must yield exactly one
+	// buffer and then close -- that is the invariant the size check above protects.
+	lstate.current_buffers.assign(gstate.column_ids.size(), nullptr);
+	for (size_t i = 0; i < results.size(); i++) {
+		auto batch = results[i].get_next_batch();
+		if (!batch) {
+			throw InternalException("Column %llu produced no output for row group %llu", 
+                                    (unsigned long long)i, (unsigned long long)group);
+		}
+		lstate.current_buffers[i] = std::move(*batch);
+	}
+}
+
+// Claims the next non-empty row group off the shared atomic cursor, returning its index (or
+// total_groups once all groups are consumed).
+static size_t ClaimNextNonEmptyGroup(OasisScanGlobalState &gstate, const OasisScanBindData &bind) {
+	while (true) {
+		size_t group = gstate.next_group.fetch_add(1);
+		if (group >= gstate.total_groups) {
+			return gstate.total_groups;
+		}
+		// Every column chunk in a row group shares its row count; take it from the first chunk.
+		if (bind.metadata.groups[group].chunks[0].num_values != 0) {
+			return group;
+		}
+	}
+}
+
+// Loads the next row group's buffers into lstate.current_buffers, claiming groups off the shared
+// cursor. Returns false once all groups are consumed. Each worker owns its group's buffers privately.
+static bool LoadNextGroup(oasis::OasisContext &ctx, OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
+                          const OasisScanBindData &bind) {
+	size_t group = ClaimNextNonEmptyGroup(gstate, bind);
+	if (group >= gstate.total_groups) {
+		return false;
+	}
+	DecodeGroup(ctx, gstate, lstate, bind, group);
+	lstate.current_buf_offset = 0;
+	return true;
+}
+
+// Emits cardinality only, for queries that project no columns (COUNT(*), EXISTS, etc.). DuckDB
+// derives the aggregate from the row counts we report, so there is nothing to decode: each worker
+// claims row groups off the shared cursor and emits their row counts (from the Parquet metadata)
+// in STANDARD_VECTOR_SIZE slices. The hardware is never touched.
+static void EmitOnlyCardinality(OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
+                                const OasisScanBindData &bind, DataChunk &output) {
+	// Claim the next group with rows off the shared cursor (ClaimNextNonEmptyGroup skips empty groups
+	// for us) or signal EOF once the groups run out.
+	if (lstate.empty_proj_remaining == 0) {
+		size_t group = ClaimNextNonEmptyGroup(gstate, bind);
+		if (group >= gstate.total_groups) {
 			output.SetCardinality(0);
 			return;
 		}
-
-		for (size_t col_id : gstate.column_ids) {
-			gstate.reader->enqueue_column_chunk(gstate.next_group, col_id);
-		}
-		for (size_t i = 0; i < gstate.column_ids.size(); i++) {
-			gstate.current_buffers[i] = gstate.reader->next_column_chunk(); // blocks on FPGA
-
-            size_t const col_id = gstate.column_ids[i];
-            logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_DEBUG,
-                            StringUtil::Format("Hardware decoder for row group %llu, column %llu ('%s') returned %llu buffer(s)",
-                                                (unsigned long long) gstate.next_group, 
-                                                (unsigned long long) col_id,
-                                                bind.metadata.column_names[col_id].c_str(),
-                                                (unsigned long long) gstate.current_buffers[i].size()));
-		}
-
-		gstate.current_buf_idx = 0;
-		gstate.current_buf_offset = 0;
-		gstate.next_group++;
+		// Every column chunk in a row group shares its row count; take it from the first chunk.
+		lstate.empty_proj_remaining = bind.metadata.groups[group].chunks[0].num_values;
 	}
 
-	auto elem_size = [&](size_t col_file_idx) -> size_t {
-		// next_group has already been incremented, so the in-flight group is next_group - 1.
-		auto t = bind.metadata.groups[gstate.next_group - 1].chunks[col_file_idx].type;
-		if (!parcore::metadata::is_libstf_type(t)) {
-			throw InternalException("Unsupported ParCore type %d in elem_size", (int)t);
-		}
-		return libstf::size_of(parcore::metadata::to_libstf_type(t));
-	};
+	size_t const emit = std::min<size_t>(lstate.empty_proj_remaining, STANDARD_VECTOR_SIZE);
+	lstate.empty_proj_remaining -= emit;
+	output.SetCardinality(emit);
+}
 
-	size_t const col0_file_idx = gstate.column_ids[0];
-	size_t const total_elements =
-	    gstate.current_buffers[0][gstate.current_buf_idx]->size / elem_size(col0_file_idx);
-	size_t const remaining_elements = total_elements - gstate.current_buf_offset;
+// Zero-copy multi-column scan. Each worker atomically claims a row group (LoadNextGroup), decoding
+// every projected column into exactly one buffer, then slices those buffers in lockstep into
+// STANDARD_VECTOR_SIZE-sized vectors. The one-buffer-per-column-chunk model holds because the OBM
+// buffers are sized to a whole DuckDB column chunk and DecodeGroup rejects any chunk that would
+// overflow them. All columns of a row group share the same element count, so the slices stay aligned.
+void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
+	auto &lstate = data_p.local_state->Cast<OasisScanLocalState>();
+	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
+	auto &ctx = *gstate.ctx;
+
+	// No projected columns (e.g. COUNT(*)): emit row counts from metadata, no decode.
+	if (gstate.column_ids.empty()) {
+		EmitOnlyCardinality(gstate, lstate, bind, output);
+		return;
+	}
+
+	// When the current group's buffers are exhausted, decode the next group (one buffer per column).
+	if (lstate.current_buffers.empty() || !lstate.current_buffers[0]) {
+		if (!LoadNextGroup(ctx, gstate, lstate, bind)) {
+			output.SetCardinality(0);
+			return;
+		}
+	}
+
+	size_t const total_elements = lstate.current_buffers[0]->size / gstate.elem_sizes[0];
+	size_t const remaining_elements = total_elements - lstate.current_buf_offset;
 	size_t const emit = std::min<size_t>(remaining_elements, STANDARD_VECTOR_SIZE);
 	for (size_t i = 0; i < gstate.column_ids.size(); i++) {
-		const size_t kElemSize = elem_size(gstate.column_ids[i]);
+		const size_t kElemSize = gstate.elem_sizes[i];
 
-		auto &buf = gstate.current_buffers[i][gstate.current_buf_idx];
+		auto &buf = lstate.current_buffers[i];
 		if (buf->size / kElemSize != total_elements) {
 			throw InternalException(
 			    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
@@ -223,24 +341,25 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 		//     as any downstream consumer references it.
 		//
 		// Two refcount holders protect the memory while it's in flight:
-		//   - gstate.current_buffers keeps it alive across scan calls while we
-		//     slice one FPGA chunk into multiple STANDARD_VECTOR_SIZE emissions
-		//     (auxiliary gets cleared on each output.Reset()).
+		//   - lstate.current_buffers holds the one buffer per column and keeps it
+		//     alive across scan calls while we slice it into multiple
+		//     STANDARD_VECTOR_SIZE emissions (auxiliary gets cleared on each
+		//     output.Reset()).
 		//   - vector auxiliary (set here) keeps it alive for any downstream
 		//     consumer that holds onto the vector past our next scan call.
 		auto &vec = output.data[i];
 		vec.SetVectorType(VectorType::FLAT_VECTOR);
-		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + gstate.current_buf_offset * kElemSize);
+		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_buf_offset * kElemSize);
 		vec.SetAuxiliary(make_buffer<LibstfBufferVectorBuffer>(buf));
 	}
 
-	// Advance the cursor. If we hit the end of this buffer, step to the next
-	// one so the next scan call's `if` branch either keeps emitting or pulls
-	// a fresh chunk.
-	gstate.current_buf_offset += emit;
-	if (gstate.current_buf_offset >= total_elements) {
-		gstate.current_buf_idx++;
-		gstate.current_buf_offset = 0;
+	// Advance the cursor. If we have emitted this group's last elements, release the buffers so the
+	// next scan call's `if` branch loads the next row group. Dropping our refs here lets each buffer
+	// free as soon as downstream consumers are done with it.
+	lstate.current_buf_offset += emit;
+	if (lstate.current_buf_offset >= total_elements) {
+		lstate.current_buffers.assign(gstate.column_ids.size(), nullptr);
+		lstate.current_buf_offset = 0;
 	}
 
 	output.SetCardinality(emit);

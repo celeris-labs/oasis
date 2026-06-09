@@ -17,13 +17,13 @@ RDMAReadConfig::RDMAReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
 
 const std::string rdma_read_prefix = "oasis::RDMAReadConfig::";
 
-void RDMAReadConfig::read(libstf::stream_t stream, size_t offset, size_t size) {
-    Profiler::open_regions({rdma_read_prefix + "read"});
+void RDMAReadConfig::enqueue_read(libstf::stream_t stream, size_t offset, size_t size) {
+    Profiler::open_regions({rdma_read_prefix + "enqueue_read"});
     auto base_vaddr = reinterpret_cast<uintptr_t>(cthread->getQpair()->remote.vaddr);
     auto reg_offset = stream * RDMA_READ_CONFIG_REGS;
     write_register(libstf::ConfigRegister(reg_offset + RDMA_READ_VADDR_ADDR, base_vaddr + offset));
     write_register(libstf::ConfigRegister(reg_offset + RDMA_READ_SIZE_ADDR, size));
-    Profiler::close_regions({rdma_read_prefix + "read"});
+    Profiler::close_regions({rdma_read_prefix + "enqueue_read"});
 }
 
 const libstf::stream_t RDMAReadConfig::num_streams() const { return num_streams_; }

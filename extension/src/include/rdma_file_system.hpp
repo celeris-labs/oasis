@@ -2,8 +2,6 @@
 
 #include "duckdb/common/file_system.hpp"
 
-#include <libstf/common.hpp>
-
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -61,10 +59,8 @@ public:
 		return false;
 	}
 
-public:
-	static void EnqueueRead(libstf::stream_t stream_id, uint64_t remote_offset, size_t size);
-
 private:
+	static void EnqueueRead(uint64_t remote_offset, size_t size);
 	void RDMAReadRange(uint64_t remote_offset, void *dst, size_t size);
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void LoadDirectory(optional_ptr<FileOpener> opener);
@@ -76,10 +72,6 @@ private:
 	// the OBM's per-stream FIFO stays aligned with the order of HW reads.
 	std::mutex mtx;
 	bool initialized = false;
-	// The server address/port the RDMA connection was first established with.
-	// Once initialized, the IP must not change for the lifetime of the
-	// filesystem (the connection is bound to that server).
-	RDMAParams init_params;
 
 	std::unordered_map<std::string, RDMADirEntry> directory;
 };
@@ -92,11 +84,6 @@ public:
 
 	void Close() override {
 	}
-
-    /**
-	 * Trigger an RDMA read of [offset, offset+size) into the given stream (no host buffer).
-     */
-	void ReadIntoStream(libstf::stream_t stream_id, uint64_t offset, size_t size);
 
 	uint64_t remote_offset;
 	uint64_t size;

@@ -34,7 +34,8 @@ add_library(oasis SHARED)
 target_sources(oasis PRIVATE
     oasis/configuration.cpp
     oasis/oasis_context.cpp
-    oasis/parcore/rdma_reader.cpp
+    oasis/operator.cpp
+    oasis/scheduler.cpp
 )
 target_include_directories(oasis
     PUBLIC
@@ -42,7 +43,8 @@ target_include_directories(oasis
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_link_libraries(oasis PRIVATE Coyote libstf parcore)
+find_package(Threads REQUIRED)
+target_link_libraries(oasis PRIVATE Coyote libstf parcore Threads::Threads)
 target_include_directories(oasis PRIVATE ${COYOTE_INCLUDE_DIRS} ${LIBSTF_INCLUDE_DIRS} ${PARCORE_INCLUDE_DIRS})
 
 include(GNUInstallDirs)

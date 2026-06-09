@@ -65,6 +65,8 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
     }
 
     output_buffer_manager_->flush_buffers();
+
+    scheduler_ = std::make_unique<Scheduler>(*this);
 }
 
 void OasisContext::init(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t obm_buffer_capacity) {
@@ -99,6 +101,10 @@ std::shared_ptr<libstf::TLBManager> OasisContext::tlb_manager() {
 
 std::shared_ptr<libstf::OutputBufferManager> OasisContext::output_buffer_manager() {
     return output_buffer_manager_;
+}
+
+Scheduler &OasisContext::scheduler() {
+    return *scheduler_;
 }
 
 bool OasisContext::isRDMAEnabled() {
