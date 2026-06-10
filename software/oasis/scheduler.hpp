@@ -67,14 +67,17 @@ class Scheduler {
     };
 
     // Per-stream pipeline: The list of in-flight splinters and the count of splinters currently
-    // enqueued on this stream. `enqueued` is the load-balancing metric. It is guarded by
-    // dispatch_mutex_ (not the stream mutex) so the dispatcher can read every stream's load while
-    // choosing the least-loaded one without taking per-stream locks. `in_flight`/`done` are guarded
-    // by the stream mutex.
+    // enqueued on this stream. `enqueued` is the load-balancing metric. It is atomic and held under
+    // no lock: the dispatcher bumps it when it places a splinter and the completion callback
+    // decrements it when a splinter finishes. Keeping it lock-free is what breaks the lock cycle --
+    // the callback must never take dispatch_mutex_ while the dispatcher holds dispatch_mutex_ and is
+    // waiting for the stream mutex (see dispatch_loop / the completion callback). As a load metric it
+    // tolerates being read slightly stale in pick_stream. `in_flight`/`done` are guarded by the
+    // stream mutex.
     struct StreamState {
         std::mutex          mutex;
         std::list<InFlight> in_flight;
-        size_t              enqueued = 0; // guarded by dispatch_mutex_
+        std::atomic<size_t> enqueued{0};
     };
 
     OasisContext                 &ctx_;
@@ -101,11 +104,13 @@ class Scheduler {
 
     // Applies a splinter on `stream` and registers its completion callback, parking it in the
     // stream's in-flight list. Called only by the dispatcher, with a slot already reserved
-    // (enqueued bumped) under dispatch_mutex_.
+    // (enqueued atomically bumped).
     void dispatch_to(libstf::stream_t stream, Pending &pending);
 
-    // Erases in-flight slots whose callback has run. Must be called holding ss.mutex.
-    void reap(StreamState &ss);
+    // Splices in-flight slots whose callback has run into `finished` (without destroying them, so
+    // the caller can destroy them outside the locks -- ~OutputHandle join()s the callback thread).
+    // Must be called holding ss.mutex.
+    void reap(StreamState &ss, std::list<InFlight> &finished);
 };
 
 } // namespace oasis
