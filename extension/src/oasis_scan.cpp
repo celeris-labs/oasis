@@ -216,7 +216,7 @@ static std::unique_ptr<oasis::SourceOperator> MakeSource(oasis::OasisContext &ct
 // hardware emits exactly one output buffer per column chunk: OasisContextCacheEntry sizes the OBM's
 // auto-enqueued buffers to hold a whole DuckDB column chunk, and we reject any chunk whose decoded
 // size would overflow that buffer (which is what would otherwise force a multi-buffer split).
-static void DecodeGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+static void DecodeGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                         OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
 	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
 
@@ -249,13 +249,11 @@ static void DecodeGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGloba
 		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
 		splinter.operators.push_back(std::make_unique<oasis::HostBufferSinkOperator>());
 		results.push_back(ctx.scheduler().submit(std::move(splinter)));
-        logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_DEBUG,
-		    StringUtil::Format("Submitted query splinter for row group %llu, column %llu ('%s'): "
-		                       "%llu values, %llu compressed bytes",
-		                       (unsigned long long)group, (unsigned long long)gstate.column_ids[i],
-		                       bind.metadata.column_names[gstate.column_ids[i]].c_str(),
-		                       (unsigned long long)cc.num_values,
-		                       (unsigned long long)cc.total_compressed_size));
+        DUCKDB_LOG_DEBUG(context, "Submitted query splinter for row group %llu, column %llu ('%s'): "
+		                          "%llu values, %llu compressed bytes",
+		                 (unsigned long long)group, (unsigned long long)gstate.column_ids[i],
+		                 bind.metadata.column_names[gstate.column_ids[i]].c_str(),
+		                 (unsigned long long)cc.num_values, (unsigned long long)cc.total_compressed_size);
 	}
 
 	// InitializeRead(...) does the page-header parsing / I/O positioning for the row group.
@@ -278,10 +276,9 @@ static void DecodeGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGloba
                                     (unsigned long long)i, (unsigned long long)group);
 		}
 		size_t const col_id = gstate.column_ids[i];
-		logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_DEBUG,
-		    StringUtil::Format("Hardware decoder for row group %llu, column %llu ('%s') returned batch",
-		                       (unsigned long long)group, (unsigned long long)col_id,
-		                       bind.metadata.column_names[col_id].c_str()));
+		DUCKDB_LOG_DEBUG(context, "Hardware decoder for row group %llu, column %llu ('%s') returned batch",
+		                 (unsigned long long)group, (unsigned long long)col_id,
+		                 bind.metadata.column_names[col_id].c_str());
 		lstate.current_buffers[i] = std::move(*batch);
 	}
 }
@@ -303,13 +300,13 @@ static size_t ClaimNextNonEmptyGroup(OasisScanGlobalState &gstate, const OasisSc
 
 // Loads the next row group's buffers into lstate.current_buffers, claiming groups off the shared
 // cursor. Returns false once all groups are consumed. Each worker owns its group's buffers privately.
-static bool LoadNextGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+static bool LoadNextGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                           OasisScanLocalState &lstate, const OasisScanBindData &bind) {
 	size_t group = ClaimNextNonEmptyGroup(gstate, bind);
 	if (group >= gstate.total_groups) {
 		return false;
 	}
-	DecodeGroup(logger, ctx, gstate, lstate, bind, group);
+	DecodeGroup(context, ctx, gstate, lstate, bind, group);
 	lstate.current_buf_offset = 0;
 	lstate.current_group_num_rows = bind.metadata.groups[group].chunks[0].num_values;
 	return true;
@@ -356,7 +353,7 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 
 	// When the current group is fully emitted, decode/claim the next one.
 	if (lstate.current_group_num_rows == 0) {
-		if (!LoadNextGroup(Logger::Get(context), ctx, gstate, lstate, bind)) {
+		if (!LoadNextGroup(context, ctx, gstate, lstate, bind)) {
 			output.SetCardinality(0);
 			return;
 		}
