@@ -4,6 +4,8 @@
 
 #include "parcore/configuration.hpp"
 
+#include <libstf/logging.hpp>
+
 #include <algorithm>
 
 namespace oasis {
@@ -15,9 +17,7 @@ libstf::stream_t default_num_streams(OasisContext &ctx) {
 }
 
 size_t default_pipeline_depth(OasisContext &ctx) {
-    // TODO: Remove this magic constant. We added the capability to the hardware recently.
-    // return ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
-    return 64;
+    return ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
 }
 
 } // namespace
@@ -199,6 +199,11 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         if (&*op != &sink) {
             op->apply(stream, ctx_);
         }
+    }
+
+    if (libstf::should_log(libstf::LogLevel::DEBUG)) {
+        libstf::log(libstf::LogLevel::DEBUG, "Enqueued %s to stream %u", 
+                    slot->splinter.to_string().c_str(), static_cast<unsigned>(stream));
     }
 }
 

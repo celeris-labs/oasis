@@ -85,7 +85,7 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	if (!db) {
 		throw IOException("rdma:// filesystem requires a database context to initialize");
 	}
-	auto &ctx = db->GetObjectCache().GetOrCreate<OasisContextCacheEntry>("oasis_context")->ctx();
+	auto &ctx = db->GetObjectCache().GetOrCreate<OasisContextCacheEntry>("oasis_context", *db)->ctx();
 	if (!ctx.isRDMAEnabled()) {
 		throw NotImplementedException("rdma:// filesystem is unavailable: This FPGA shell was "
 		                              "synthesized without RDMA");

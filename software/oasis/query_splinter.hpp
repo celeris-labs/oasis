@@ -5,6 +5,8 @@
 #include <cassert>
 #include <memory>
 #include <ostream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace oasis {
@@ -36,6 +38,12 @@ class QuerySplinter {
             os << *operators[i];
         }
         os << ")";
+    }
+
+    [[nodiscard]] std::string to_string() const {
+        std::ostringstream os;
+        print(os);
+        return os.str();
     }
 };
 

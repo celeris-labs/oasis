@@ -109,7 +109,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 }
 
 static oasis::OasisContext &GetOasisContext(ClientContext &context) {
-	return ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>("oasis_context")->ctx();
+	return ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>("oasis_context", *context.db)->ctx();
 }
 
 // Applies the oasis_scheduler_num_streams / oasis_scheduler_queue_depth SET parameters to the live
@@ -249,6 +249,13 @@ static void DecodeGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGloba
 		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
 		splinter.operators.push_back(std::make_unique<oasis::HostBufferSinkOperator>());
 		results.push_back(ctx.scheduler().submit(std::move(splinter)));
+        logger.WriteLog(DefaultLogType::NAME, LogLevel::LOG_DEBUG,
+		    StringUtil::Format("Submitted query splinter for row group %llu, column %llu ('%s'): "
+		                       "%llu values, %llu compressed bytes",
+		                       (unsigned long long)group, (unsigned long long)gstate.column_ids[i],
+		                       bind.metadata.column_names[gstate.column_ids[i]].c_str(),
+		                       (unsigned long long)cc.num_values,
+		                       (unsigned long long)cc.total_compressed_size));
 	}
 
 	// InitializeRead(...) does the page-header parsing / I/O positioning for the row group.

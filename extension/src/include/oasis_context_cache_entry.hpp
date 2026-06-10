@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/storage/object_cache.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis_log_sink.hpp"
 
 namespace duckdb {
 
@@ -26,7 +27,8 @@ struct OasisContextCacheEntry : public ObjectCacheEntry {
 	// 1 MiB fits that, so it covers Parquet files written with DuckDB's default row_group_size.
 	static constexpr size_t OBM_BUFFER_CAPACITY = 1ULL * 1024 * 1024;
 
-	OasisContextCacheEntry() {
+	explicit OasisContextCacheEntry(DatabaseInstance &db) : log_sink(db) {
+		libstf::set_log_sink(&log_sink);
 #ifdef EN_SIMULATION
 		// Simulation uses a small buffer to keep sim runtime/memory tractable. Sim test fixtures
 		// must use row groups small enough that a decoded column chunk fits in this single buffer.
@@ -44,7 +46,11 @@ struct OasisContextCacheEntry : public ObjectCacheEntry {
 
 	~OasisContextCacheEntry() override {
 		oasis::OasisContext::shutdown();
+		libstf::set_log_sink(nullptr);
 	}
+
+private:
+	OasisLogSink log_sink;
 };
 
 } // namespace duckdb
