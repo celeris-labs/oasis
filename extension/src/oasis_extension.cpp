@@ -25,6 +25,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             OasisScanInitLocal      // Init local function
 	);
 	table_function.projection_pushdown = true;
+	table_function.get_virtual_columns = OasisScanGetVirtualColumns;
 	loader.RegisterFunction(table_function);
 
 	// RDMA file system

@@ -143,7 +143,8 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	gstate->total_groups = bind_data.metadata.groups.size();
 
 	for (auto col_id : input.column_ids) {
-		if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+		if (col_id == COLUMN_IDENTIFIER_EMPTY) {
+			gstate->emit_cardinality_only = true;
 			continue;
 		}
 		auto t = bind_data.metadata.groups[0].chunks[col_id].type;
@@ -311,7 +312,7 @@ static bool LoadNextGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGlo
 // derives the aggregate from the row counts we report, so there is nothing to decode: each worker
 // claims row groups off the shared cursor and emits their row counts (from the Parquet metadata)
 // in STANDARD_VECTOR_SIZE slices. The hardware is never touched.
-static void EmitOnlyCardinality(OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
+static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
                                 const OasisScanBindData &bind, DataChunk &output) {
 	// Claim the next group with rows off the shared cursor (ClaimNextNonEmptyGroup skips empty groups
 	// for us) or signal EOF once the groups run out.
@@ -341,9 +342,8 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
 	auto &ctx = *gstate.ctx;
 
-	// No projected columns (e.g. COUNT(*)): emit row counts from metadata, no decode.
-	if (gstate.column_ids.empty()) {
-		EmitOnlyCardinality(gstate, lstate, bind, output);
+	if (gstate.emit_cardinality_only) {
+		EmitCardinalityOnly(gstate, lstate, bind, output);
 		return;
 	}
 
@@ -429,6 +429,15 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	}
 
 	output.SetCardinality(emit);
+}
+
+// Advertises the zero-width COLUMN_IDENTIFIER_EMPTY virtual column. For queries that consume no
+// column values (e.g., COUNT(*), EXISTS), DuckDB's optimizer projects this sentinel instead of 
+// anchoring the scan on a real column (LogicalGet::GetAnyColumn).
+virtual_column_map_t OasisScanGetVirtualColumns(ClientContext &, optional_ptr<FunctionData>) {
+	virtual_column_map_t result;
+	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
+	return result;
 }
 
 } // namespace duckdb

@@ -30,6 +30,9 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	vector<bool> is_cpu_column;
 	bool has_cpu_columns = false;
 
+	// True when the query consumes no column values (e.g. COUNT(*), EXISTS).
+	bool emit_cardinality_only = false;
+
 	// Row-group cursor: the next group to hand out. Claimed atomically by workers.
 	std::atomic<size_t> next_group {0};
 	size_t total_groups = 0;
@@ -73,5 +76,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
                                                        GlobalTableFunctionState *global_state_p);
 
 void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+
+virtual_column_map_t OasisScanGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data);
 
 } // namespace duckdb
