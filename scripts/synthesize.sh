@@ -1,5 +1,7 @@
 #!/bin/bash
 
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+
 cmake_args=()
 decoders=1
 while [ $# -gt 0 ]; do
@@ -27,4 +29,7 @@ echo Building bitstream in hardware/$build_dir...
 
 mkdir "$build_dir"
 cmake -S . -B "$build_dir" "${cmake_args[@]}"
-tmux new-session -d -s "bitgen-$build_dir" "cmake --build $build_dir --target project --target bitgen &> $build_dir/bitgen.log && $(dirname "$0")/generate_reports.sh $build_dir"
+
+build_cmd="cmake --build $build_dir --target project --target bitgen &> $build_dir/bitgen.log"
+report_cmd="$script_dir/generate_reports.sh $build_dir"
+tmux new-session -d -s "bitgen-$build_dir" "$build_cmd && $report_cmd"
