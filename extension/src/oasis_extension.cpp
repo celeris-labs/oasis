@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "oasis_extension.hpp"
+#include "oasis_profile.hpp"
 #include "oasis_scan.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_settings.hpp"
@@ -34,17 +35,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Max splinters in flight per stream (0 = hardware config-FIFO depth)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0), SetSchedulerQueueDepth);
 
-	TableFunction table_function("read_oasis",           // Function name
-	                             {LogicalType::VARCHAR}, // Function arguments: Parquet file path
-	                             OasisScanFunction,      // Table function
-	                             OasisScanBind,          // Bind function
-	                             OasisScanInitGlobal,    // Init global function
-	                             OasisScanInitLocal      // Init local function
-	);
-	table_function.projection_pushdown = true;
-	table_function.filter_pushdown = true;
-	table_function.get_virtual_columns = OasisScanGetVirtualColumns;
-	loader.RegisterFunction(table_function);
+	// Oasis scan table function
+	RegisterOasisScanFunction(loader);
 
 	// RDMA file system
 	config.AddExtensionOption(

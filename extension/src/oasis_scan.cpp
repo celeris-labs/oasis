@@ -4,6 +4,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "oasis/oasis_context.hpp"
 #include "oasis/operator.hpp"
 #include "oasis/query_splinter.hpp"
@@ -139,7 +140,8 @@ static std::unique_ptr<oasis::SourceOperator> MakeSource(oasis::OasisContext &ct
 
 // Every column chunk in a row group shares its row count. Take it from the first chunk.
 static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
-	return bind.metadata.groups[group].chunks[0].num_values;
+	const auto &chunks = bind.metadata.groups[group].chunks;
+	return chunks.empty() ? 0 : chunks[0].num_values;
 }
 
 // Submits one query splinter per projected hardware column of `group` to the shared scheduler,
@@ -265,6 +267,7 @@ static bool LoadNextGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	DecodeGroup(context, ctx, gstate, lstate, bind, group);
 	lstate.current_buf_offset = 0;
 	lstate.current_group_num_rows = RowGroupNumRows(bind, group);
+	lstate.current_group = group;
 	return true;
 }
 
@@ -288,6 +291,7 @@ static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalStat
 			return;
 		}
 		lstate.empty_proj_remaining = RowGroupNumRows(bind, group);
+		lstate.current_group = group;
 	}
 
 	size_t const emit = std::min<size_t>(lstate.empty_proj_remaining, STANDARD_VECTOR_SIZE);
@@ -396,6 +400,44 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	ApplyFilters(gstate, lstate, output);
 }
 
+unique_ptr<NodeStatistics> OasisScanCardinality(ClientContext &, const FunctionData *bind_data) {
+	auto &bind = bind_data->Cast<OasisScanBindData>();
+	idx_t total_rows = 0;
+	for (size_t group = 0; group < bind.metadata.groups.size(); group++) {
+		total_rows += RowGroupNumRows(bind, group);
+	}
+	return make_uniq<NodeStatistics>(total_rows);
+}
+
+unique_ptr<BaseStatistics> OasisScanStatistics(ClientContext &context, const FunctionData *bind_data,
+                                               column_t column_index) {
+	if (IsVirtualColumn(column_index)) {
+		return nullptr;
+	}
+	auto &bind = bind_data->Cast<OasisScanBindData>();
+	if (column_index >= bind.metadata.column_names.size()) {
+		return nullptr;
+	}
+	ParquetOptions parquet_opts(context);
+	ParquetReader reader(context, OpenFileInfo {bind.filename}, parquet_opts);
+	return reader.GetStatistics(context, bind.metadata.column_names[column_index]);
+}
+
+double OasisScanProgress(ClientContext &, const FunctionData *, const GlobalTableFunctionState *global_state) {
+	auto &gstate = global_state->Cast<OasisScanGlobalState>();
+	if (gstate.total_groups == 0) {
+		return 100.0;
+	}
+	double claimed = static_cast<double>(gstate.next_group.load());
+	double pct = 100.0 * claimed / static_cast<double>(gstate.total_groups);
+	return pct > 100.0 ? 100.0 : pct;
+}
+
+OperatorPartitionData OasisScanGetPartitionData(ClientContext &, TableFunctionGetPartitionInput &input) {
+	auto &lstate = input.local_state->Cast<OasisScanLocalState>();
+	return OperatorPartitionData(lstate.current_group);
+}
+
 // Advertises the zero-width COLUMN_IDENTIFIER_EMPTY virtual column. For queries that consume no
 // column values (e.g., COUNT(*), EXISTS), DuckDB's optimizer projects this sentinel instead of 
 // anchoring the scan on a real column (LogicalGet::GetAnyColumn).
@@ -403,6 +445,24 @@ virtual_column_map_t OasisScanGetVirtualColumns(ClientContext &, optional_ptr<Fu
 	virtual_column_map_t result;
 	result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));
 	return result;
+}
+
+void RegisterOasisScanFunction(ExtensionLoader &loader) {
+	TableFunction table_function("read_oasis",           // Function name
+	                             {LogicalType::VARCHAR}, // Function arguments: Parquet file path
+	                             OasisScanFunction,      // Table function
+	                             OasisScanBind,          // Bind function
+	                             OasisScanInitGlobal,    // Init global function
+	                             OasisScanInitLocal      // Init local function
+	);
+	table_function.projection_pushdown = true;
+	table_function.filter_pushdown = true;
+	table_function.get_virtual_columns = OasisScanGetVirtualColumns;
+	table_function.cardinality = OasisScanCardinality;
+	table_function.statistics = OasisScanStatistics;
+	table_function.table_scan_progress = OasisScanProgress;
+	table_function.get_partition_data = OasisScanGetPartitionData;
+	loader.RegisterFunction(table_function);
 }
 
 } // namespace duckdb

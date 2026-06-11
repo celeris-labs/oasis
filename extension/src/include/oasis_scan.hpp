@@ -86,23 +86,14 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 	size_t current_buf_offset = 0;
 	size_t current_group_num_rows = 0;
+	idx_t current_group = 0;
 
-	// Empty-projection path only (COUNT(*) etc.): Rows left to emit from the row group we last 
-    // claimed. We never decode anything in this path -- the count comes straight from the Parquet 
+	// Empty-projection path only (COUNT(*) etc.): Rows left to emit from the row group we last
+    // claimed. We never decode anything in this path -- the count comes straight from the Parquet
     // metadata.
 	size_t empty_proj_remaining = 0;
 };
 
-unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names);
-
-unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input);
-
-unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
-                                                       GlobalTableFunctionState *global_state_p);
-
-void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
-
-virtual_column_map_t OasisScanGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data);
+void RegisterOasisScanFunction(ExtensionLoader &loader);
 
 } // namespace duckdb
