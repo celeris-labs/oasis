@@ -53,4 +53,10 @@ private:
 	OasisLogSink log_sink;
 };
 
+inline oasis::OasisContext &GetOrCreateOasisContext(ClientContext &context) {
+	return ObjectCache::GetObjectCache(context)
+	    .GetOrCreate<OasisContextCacheEntry>("oasis_context", *context.db)
+	    ->ctx();
+}
+
 } // namespace duckdb

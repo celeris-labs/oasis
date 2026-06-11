@@ -8,13 +8,34 @@
 #include "parcore/metadata/metadata.hpp"
 #include "parquet_reader.hpp"
 
+#include "duckdb/planner/table_filter_state.hpp"
+
 #include <atomic>
 
 namespace duckdb {
 
+// Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across 
+// threads, so each worker owns its own (mirrors ParquetReader's per-scan-state scan_filters).
+struct OasisScanFilter {
+	OasisScanFilter(ClientContext &context, idx_t filter_idx, const TableFilter &filter)
+	    : filter_idx(filter_idx), filter(filter),
+	      filter_state(TableFilterState::Initialize(context, filter)) {
+	}
+
+	idx_t filter_idx;
+	const TableFilter &filter;
+	unique_ptr<TableFilterState> filter_state;
+};
+
 struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
+};
+
+struct ProjectedColumn {
+	size_t column_id;
+	size_t elem_size; // 0 for CPU (string) columns
+	bool is_cpu;      // variable-length column decoded on the CPU path, not the FPGA
 };
 
 // Global scan state shared across all DuckDB worker threads of one read_oasis scan. Following
@@ -25,13 +46,13 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	string filename;
 	oasis::OasisContext *ctx = nullptr;
 
-	vector<size_t> column_ids;
-	vector<size_t> elem_sizes;
-	vector<bool> is_cpu_column;
+	vector<ProjectedColumn> projected_columns;
 	bool has_cpu_columns = false;
 
 	// True when the query consumes no column values (e.g. COUNT(*), EXISTS).
 	bool emit_cardinality_only = false;
+
+	optional_ptr<TableFilterSet> filters;
 
 	// Row-group cursor: the next group to hand out. Claimed atomically by workers.
 	std::atomic<size_t> next_group {0};
@@ -52,10 +73,15 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 struct OasisScanLocalState : public LocalTableFunctionState {
 	unique_ptr<FileHandle> file_handle;
 
-	// CPU (string) decode path, per worker.
 	unique_ptr<ParquetReader> parquet_reader;
 	unique_ptr<ParquetReaderScanState> scan_state;
 	unique_ptr<ColumnReader> root_reader;
+
+	// Per-worker pushed-down filter states, built once at scan init from gstate.filters.
+	std::vector<OasisScanFilter> scan_filters;
+
+	// Reused selection vector for row-level filtering, so we don't reallocate per scan call.
+	SelectionVector filter_sel;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 	size_t current_buf_offset = 0;
