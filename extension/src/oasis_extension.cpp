@@ -17,6 +17,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	);
 	table_function.projection_pushdown = true;
 	table_function.filter_pushdown = true;
+	table_function.pushdown_complex_filter = OasisPushdownComplexFilter;
 	loader.RegisterFunction(table_function);
 }
 
