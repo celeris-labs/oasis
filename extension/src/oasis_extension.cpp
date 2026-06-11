@@ -16,6 +16,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             OasisScanInitLocal      // Init local function
 	);
 	table_function.projection_pushdown = true;
+	table_function.filter_pushdown = true;
 	loader.RegisterFunction(table_function);
 }
 

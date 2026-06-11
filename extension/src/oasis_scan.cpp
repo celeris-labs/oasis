@@ -2,6 +2,8 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "oasis/configuration.hpp"
 #include "oasis/oasis_context.hpp"
 #include "parcore/configuration.hpp"
 #include "parquet_reader.hpp"
@@ -19,9 +21,9 @@ static parcore::metadata::Type parquet_type_to_parcore(duckdb_parquet::Type::typ
 	case duckdb_parquet::Type::FLOAT:
 		return parcore::metadata::Type::FLOAT_T;
 	case duckdb_parquet::Type::INT64:
-        return parcore::metadata::Type::DOUBLE_T;
-	case duckdb_parquet::Type::DOUBLE:
 		return parcore::metadata::Type::INT64_T;
+	case duckdb_parquet::Type::DOUBLE:
+		return parcore::metadata::Type::DOUBLE_T;
 	case duckdb_parquet::Type::BYTE_ARRAY:
 		return parcore::metadata::Type::BYTE_ARRAY;
 	default:
@@ -37,6 +39,25 @@ static parcore::metadata::Compression parquet_codec_to_parcore(duckdb_parquet::C
 		return parcore::metadata::Compression::SNAPPY;
 	default:
 		throw InvalidInputException("Parquet compression codec %d not supported by ParCore", (int)c);
+	}
+}
+
+static oasis::FilterComparison filter_comparison_to_oasis(ExpressionType comparison) {
+	switch (comparison) {
+	case ExpressionType::COMPARE_EQUAL:
+		return oasis::FilterComparison::EQUAL;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return oasis::FilterComparison::NOT_EQUAL;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return oasis::FilterComparison::GREATER;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return oasis::FilterComparison::LOWER;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return oasis::FilterComparison::GREATER_EQUAL;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return oasis::FilterComparison::LOWER_EQUAL;
+	default:
+		throw InvalidInputException("Oasis hardware filter does not support comparison type %d", (int)comparison);
 	}
 }
 
@@ -197,6 +218,40 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			                            bind_data.metadata.column_names[col_id].c_str());
 		}
 		gstate->column_ids.push_back(col_id);
+	}
+
+	if (gstate->column_ids.size() != 1) {
+		throw InvalidInputException("Oasis hardware filtering currently requires exactly one projected column");
+	}
+	if (bind_data.metadata.groups[0].chunks[gstate->column_ids[0]].type != parcore::metadata::Type::INT64_T) {
+		throw InvalidInputException("Oasis hardware filtering currently supports only INT64 columns");
+	}
+
+	const bool no_filters = !input.filters || input.filters->filters.empty();
+	if (no_filters || input.filters->filters.size() != 1) {
+		if (no_filters) {
+			auto filter_config = ctx.config<oasis::FilterConfig>();
+			filter_config->configure(oasis::FilterComparison::ALWAYS_TRUE, 0);
+		} else {
+			throw InvalidInputException("Oasis hardware filtering currently requires one projected INT64 column and at most one filter");
+		}
+	} else {
+		auto &filter_entry = *input.filters->filters.begin();
+		if (filter_entry.first != gstate->column_ids[0]) {
+			throw InvalidInputException("Oasis hardware filtering currently requires filtering projected stream 0");
+		}
+		if (filter_entry.second->filter_type != TableFilterType::CONSTANT_COMPARISON) {
+			throw InvalidInputException("Oasis hardware filtering currently supports only constant comparisons");
+		}
+
+		auto &constant_filter = filter_entry.second->Cast<ConstantFilter>();
+		if (constant_filter.constant.IsNull()) {
+			throw InvalidInputException("Oasis hardware filtering does not support NULL constants");
+		}
+
+		auto filter_config = ctx.config<oasis::FilterConfig>();
+		filter_config->configure(filter_comparison_to_oasis(constant_filter.comparison_type),
+		                         constant_filter.constant.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>());
 	}
 
 	gstate->current_buffers.assign(gstate->column_ids.size(), {});

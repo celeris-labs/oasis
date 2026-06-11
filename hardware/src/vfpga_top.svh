@@ -2,6 +2,7 @@
 
 import oasis::*;
 import parcore::*;
+import common::*;
 
 // -- Tie-off unused interfaces and signals --------------------------------------------------------
 `ifdef EN_RDMA
@@ -28,9 +29,9 @@ localparam NUM_STREAMS   = N_STRM_AXI;
 localparam DATABEAT_SIZE = AXI_DATA_BITS / 8;
 
 `ifdef EN_RDMA
-localparam NUM_CONFIGS   = 4;
+localparam NUM_CONFIGS   = 5;
 `else
-localparam NUM_CONFIGS   = 3;
+localparam NUM_CONFIGS   = 4;
 `endif
 
 // -- Fix clock and reset names --------------------------------------------------------------------
@@ -56,7 +57,8 @@ GlobalConfig #(
     .ADDR_SPACE_SIZES({
         NUM_STREAMS + 1,
         COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_STREAMS,
-        PAGE_DECODER_CONFIG_REGS * NUM_STREAMS
+        PAGE_DECODER_CONFIG_REGS * NUM_STREAMS,
+        FILTER_NUM_CONFIG_REGS
 `ifdef EN_RDMA
         , NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS
 `endif
@@ -107,6 +109,17 @@ PageDecoderConfig #(
     .out(page_conf)
 );
 
+filter_config_i filter_conf[NUM_STREAMS][FILTER_OPS_PER_STREAM]();
+FilterConfig inst_filter_config (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .write_config(write_configs[3]),
+    .read_config(read_configs[3]),
+
+    .out(filter_conf)
+);
+
 `ifdef EN_RDMA
 RDMAReadConfig #(
     .NUM_STREAMS(NUM_STREAMS)
@@ -114,8 +127,8 @@ RDMAReadConfig #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[1]),
-    .read_config(read_configs[1]),
+    .write_config(write_configs[4]),
+    .read_config(read_configs[4]),
 
     .out(rdma_conf)
 );
@@ -147,7 +160,8 @@ CQDemultiplexer #(
 `endif
 
 // -- Decoders -------------------------------------------------------------------------------------
-AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S decoded_outputs [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S filtered_outputs[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 for (genvar I = 0; I < NUM_STREAMS; I++) begin
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
     ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in();
@@ -207,9 +221,20 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin
         .rst_n(rst_n),
 
         .in(out),
-        .out(axi_out[I])
+        .out(decoded_outputs[I])
     );
 end
+
+// -- Celeris filter -------------------------------------------------------------------------------
+FilterOperator inst_filter (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .axis_host_recv(decoded_outputs),
+    .axis_host_send(filtered_outputs),
+
+    .filter_conf(filter_conf)
+);
 
 // -- Output writer --------------------------------------------------------------------------------
 OutputWriter inst_output_writer (
@@ -222,6 +247,6 @@ OutputWriter inst_output_writer (
 
     .mem_config(mem_conf),
 
-    .data_in(axi_out),
+    .data_in(filtered_outputs),
     .data_out(axis_host_send)
 );

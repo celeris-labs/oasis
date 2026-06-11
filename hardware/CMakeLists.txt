@@ -33,8 +33,37 @@ set(TLBL_BITS 30)
 
 validation_checks_hw()
 
+# Build only the Celeris sources needed by FilterOperator. Loading the entire
+# Celeris RTL tree causes unrelated modules to interfere with Oasis dependencies.
+set(CELERIS_HW_DIR ${CMAKE_SOURCE_DIR}/../celeris/hardware)
+set(CELERIS_FILTER_BRIDGE_DIR ${CMAKE_BINARY_DIR}/celeris-filter-bridge)
+file(RELATIVE_PATH CELERIS_FILTER_BRIDGE_APP_DIR ${CMAKE_SOURCE_DIR} ${CELERIS_FILTER_BRIDGE_DIR})
+
+set(CELERIS_FILTER_SOURCES
+    ${CELERIS_HW_DIR}/src/hdl/common.sv
+    ${CELERIS_HW_DIR}/src/hdl/config/config_interfaces.sv
+    ${CELERIS_HW_DIR}/src/hdl/config/filter_config.sv
+    ${CELERIS_HW_DIR}/src/hdl/filter/filter_bitmask.sv
+    ${CELERIS_HW_DIR}/src/hdl/filter/filter_double_comparator.sv
+    ${CELERIS_HW_DIR}/src/hdl/filter/filter_int_comparator.sv
+    ${CELERIS_HW_DIR}/src/hdl/filter/filter_layer_combiner.sv
+    ${CELERIS_HW_DIR}/src/hdl/filter/filter_operator.sv
+    ${CELERIS_HW_DIR}/src/hdl/filter/filter_stream_combiner.sv
+    ${CELERIS_HW_DIR}/src/hdl/axi/axi_mask_macro.svh
+    ${CELERIS_HW_DIR}/src/hdl/axi/axi_shift_register.sv
+)
+
+file(COPY
+    ${CELERIS_FILTER_SOURCES}
+    DESTINATION ${CELERIS_FILTER_BRIDGE_DIR}/hdl
+)
+file(COPY
+    ${CELERIS_HW_DIR}/src/init_ip.tcl
+    DESTINATION ${CELERIS_FILTER_BRIDGE_DIR}
+)
+
 load_apps (
-    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src ../celeris/hardware/src"
+    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src ${CELERIS_FILTER_BRIDGE_APP_DIR}"
 )
 
 create_hw()
