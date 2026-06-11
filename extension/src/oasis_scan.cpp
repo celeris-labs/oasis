@@ -2,7 +2,10 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "oasis/configuration.hpp"
 #include "oasis/oasis_context.hpp"
 #include "parcore/configuration.hpp"
@@ -59,6 +62,141 @@ static oasis::FilterComparison filter_comparison_to_oasis(ExpressionType compari
 	default:
 		throw InvalidInputException("Oasis hardware filter does not support comparison type %d", (int)comparison);
 	}
+}
+
+struct OasisFilter {
+	oasis::FilterComparison comparison = oasis::FilterComparison::ALWAYS_TRUE;
+	std::array<uint64_t, oasis::FilterConfig::NUM_RHS> rhs = {};
+	std::array<uint64_t, oasis::FilterConfig::NUM_ADDITIONAL_RHS> additional_rhs = {};
+	uint8_t additional_rhs_mask = 0;
+};
+
+static uint64_t filter_constant_to_rhs(const Value &constant) {
+	if (constant.IsNull()) {
+		throw InvalidInputException("Oasis hardware filtering does not support NULL constants");
+	}
+	return static_cast<uint64_t>(constant.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>());
+}
+
+static OasisFilter translate_equality_list(const vector<Value> &values) {
+	constexpr size_t MAX_LIST_VALUES =
+	    oasis::FilterConfig::NUM_RHS + oasis::FilterConfig::NUM_ADDITIONAL_RHS;
+	if (values.size() < 2 || values.size() > MAX_LIST_VALUES) {
+		throw InvalidInputException("Oasis hardware IN filtering supports between 2 and %llu values",
+		                            static_cast<unsigned long long>(MAX_LIST_VALUES));
+	}
+
+	OasisFilter result;
+	result.comparison = values.size() == oasis::FilterConfig::NUM_RHS
+	                        ? oasis::FilterComparison::ONE_OF
+	                        : oasis::FilterComparison::IN_LIST;
+
+	for (size_t i = 0; i < values.size(); i++) {
+		auto rhs = filter_constant_to_rhs(values[i]);
+		if (i < oasis::FilterConfig::NUM_RHS) {
+			result.rhs[i] = rhs;
+		} else {
+			const auto additional_index = i - oasis::FilterConfig::NUM_RHS;
+			result.additional_rhs[additional_index] = rhs;
+			result.additional_rhs_mask |= uint8_t {1} << additional_index;
+		}
+	}
+	return result;
+}
+
+static OasisFilter translate_composite_filter(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &conjunction = filter.Cast<ConjunctionAndFilter>();
+		if (conjunction.child_filters.size() != 2) {
+			break;
+		}
+
+		const ConstantFilter *lower = nullptr;
+		const ConstantFilter *upper = nullptr;
+		for (const auto &child : conjunction.child_filters) {
+			if (child->filter_type != TableFilterType::CONSTANT_COMPARISON) {
+				break;
+			}
+			auto &constant = child->Cast<ConstantFilter>();
+			if (constant.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+				lower = &constant;
+			} else if (constant.comparison_type == ExpressionType::COMPARE_LESSTHAN ||
+			           constant.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+				upper = &constant;
+			}
+		}
+
+		if (lower && upper) {
+			auto comparison = upper->comparison_type == ExpressionType::COMPARE_LESSTHAN
+			                      ? oasis::FilterComparison::IN_RANGE
+			                      : oasis::FilterComparison::IN_BETWEEN;
+			return {comparison,
+			        {filter_constant_to_rhs(lower->constant), filter_constant_to_rhs(upper->constant)}};
+		}
+		break;
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conjunction = filter.Cast<ConjunctionOrFilter>();
+		if (conjunction.child_filters.size() < 2 ||
+		    conjunction.child_filters.size() >
+		        oasis::FilterConfig::NUM_RHS + oasis::FilterConfig::NUM_ADDITIONAL_RHS) {
+			break;
+		}
+
+		vector<Value> values;
+		for (const auto &child : conjunction.child_filters) {
+			if (child->filter_type != TableFilterType::CONSTANT_COMPARISON) {
+				break;
+			}
+			auto &constant = child->Cast<ConstantFilter>();
+			if (constant.comparison_type != ExpressionType::COMPARE_EQUAL) {
+				break;
+			}
+			values.push_back(constant.constant);
+			if (values.size() == conjunction.child_filters.size()) {
+				return translate_equality_list(values);
+			}
+		}
+		break;
+	}
+	case TableFilterType::IN_FILTER: {
+		auto &in_filter = filter.Cast<InFilter>();
+		return translate_equality_list(in_filter.values);
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &optional_filter = filter.Cast<OptionalFilter>();
+		if (optional_filter.child_filter) {
+			return translate_composite_filter(*optional_filter.child_filter);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+
+	throw InvalidInputException(
+	    "Oasis hardware filtering supports bounded ranges and equality lists with up to eight values");
+}
+
+static OasisFilter translate_filter(const TableFilter &filter) {
+	if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
+		auto &constant_filter = filter.Cast<ConstantFilter>();
+		return {filter_comparison_to_oasis(constant_filter.comparison_type),
+		        {filter_constant_to_rhs(constant_filter.constant), 0}};
+	}
+	return translate_composite_filter(filter);
+}
+
+static void configure_filter(oasis::FilterConfig &filter_config, const OasisFilter &filter) {
+	vector<oasis::FilterConfig::AdditionalRhs> additional_rhs;
+	if (filter.additional_rhs_mask != 0) {
+		additional_rhs.push_back({0, filter.additional_rhs, filter.additional_rhs_mask});
+	}
+	filter_config.configure(
+	    {{0, libstf::type_t::INT64_T, true}},
+	    {{0, 0, filter.comparison, filter.rhs}},
+	    additional_rhs);
 }
 
 static parcore::metadata::Metadata build_parcore_metadata(ClientContext &context, ParquetReader &parquet_reader) {
@@ -231,7 +369,7 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	if (no_filters || input.filters->filters.size() != 1) {
 		if (no_filters) {
 			auto filter_config = ctx.config<oasis::FilterConfig>();
-			filter_config->configure(oasis::FilterComparison::ALWAYS_TRUE, 0);
+			configure_filter(*filter_config, {oasis::FilterComparison::ALWAYS_TRUE, {0, 0}});
 		} else {
 			throw InvalidInputException("Oasis hardware filtering currently requires one projected INT64 column and at most one filter");
 		}
@@ -240,18 +378,9 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 		if (filter_entry.first != gstate->column_ids[0]) {
 			throw InvalidInputException("Oasis hardware filtering currently requires filtering projected stream 0");
 		}
-		if (filter_entry.second->filter_type != TableFilterType::CONSTANT_COMPARISON) {
-			throw InvalidInputException("Oasis hardware filtering currently supports only constant comparisons");
-		}
-
-		auto &constant_filter = filter_entry.second->Cast<ConstantFilter>();
-		if (constant_filter.constant.IsNull()) {
-			throw InvalidInputException("Oasis hardware filtering does not support NULL constants");
-		}
 
 		auto filter_config = ctx.config<oasis::FilterConfig>();
-		filter_config->configure(filter_comparison_to_oasis(constant_filter.comparison_type),
-		                         constant_filter.constant.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>());
+		configure_filter(*filter_config, translate_filter(*filter_entry.second));
 	}
 
 	gstate->current_buffers.assign(gstate->column_ids.size(), {});

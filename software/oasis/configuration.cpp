@@ -1,3 +1,4 @@
+#include <array>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -15,62 +16,131 @@ constexpr const uint32_t FILTER_CONTROL_ADDR             = 2;
 constexpr const uint32_t FILTER_ADDITIONAL_RHS_ADDR      = 3;
 constexpr const uint32_t FILTER_ADDITIONAL_RHS_MASK_ADDR = 4;
 
-constexpr const size_t FILTER_MAX_STREAMS        = 4;
-constexpr const size_t FILTER_NUM_LAYERS         = 3;
-constexpr const size_t FILTER_NUM_RHS            = 2;
-constexpr const size_t FILTER_NUM_ADDITIONAL_RHS = 6;
+static bool is_supported_filter_type(libstf::type_t type) {
+    return type == libstf::type_t::INT32_T || type == libstf::type_t::INT64_T ||
+           type == libstf::type_t::FLOAT_T || type == libstf::type_t::DOUBLE_T;
+}
 
 FilterConfig::FilterConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
                            uint32_t num_regs)
     : Config(cthread, addr_offset, num_regs), num_streams_(read_register(1).value()) {
-    if (num_streams_ == 0 || num_streams_ > FILTER_MAX_STREAMS) {
+    if (num_streams_ == 0 || num_streams_ > MAX_STREAMS) {
         throw std::runtime_error("Unsupported number of hardware filter streams");
     }
 }
 
-void FilterConfig::configure(FilterComparison comparison, int64_t rhs) {
+void FilterConfig::configure(const std::vector<Stream> &streams,
+                             const std::vector<Predicate> &predicates,
+                             const std::vector<AdditionalRhs> &additional_rhs,
+                             FilterMode mode) {
+    std::array<std::array<std::array<uint64_t, NUM_RHS>, NUM_LAYERS>, MAX_STREAMS>
+        rhs_values = {};
+    std::array<std::array<FilterComparison, NUM_LAYERS>, MAX_STREAMS> operators = {};
+    std::array<libstf::type_t, MAX_STREAMS> stream_types = {};
+    std::array<bool, MAX_STREAMS> stream_enabled = {};
+    std::array<std::array<uint64_t, NUM_ADDITIONAL_RHS>, NUM_LAYERS>
+        additional_rhs_values = {};
+    std::array<uint8_t, NUM_LAYERS> additional_rhs_masks = {};
+    std::array<bool, NUM_LAYERS> layer_has_predicate = {};
+
+    stream_types.fill(libstf::type_t::INT64_T);
+
+    for (const auto &predicate : predicates) {
+        if (predicate.stream >= num_streams_ || predicate.layer >= NUM_LAYERS) {
+            throw std::out_of_range("Filter predicate index is out of range");
+        }
+        layer_has_predicate[predicate.layer] = true;
+    }
+
     for (size_t stream = 0; stream < num_streams_; stream++) {
-        for (size_t layer = 0; layer < FILTER_NUM_LAYERS; layer++) {
-            for (size_t rhs_index = 0; rhs_index < FILTER_NUM_RHS; rhs_index++) {
-                const bool active_rhs = stream == 0 && layer == 0 && rhs_index == 0;
+        for (size_t layer = 0; layer < NUM_LAYERS; layer++) {
+            operators[stream][layer] = layer_has_predicate[layer]
+                                           ? FilterComparison::ALWAYS_TRUE
+                                           : FilterComparison::ALWAYS_FALSE;
+        }
+    }
+
+    for (const auto &stream : streams) {
+        if (stream.stream >= num_streams_) {
+            throw std::out_of_range("Filter stream index is out of range");
+        }
+        if (!is_supported_filter_type(stream.type)) {
+            throw std::invalid_argument("Unsupported filter stream type");
+        }
+        stream_types[stream.stream] = stream.type;
+        stream_enabled[stream.stream] = stream.enabled;
+    }
+
+    for (const auto &predicate : predicates) {
+        operators[predicate.stream][predicate.layer] = predicate.comparison;
+        rhs_values[predicate.stream][predicate.layer] = predicate.rhs;
+    }
+
+    for (const auto &additional : additional_rhs) {
+        if (additional.layer >= NUM_LAYERS) {
+            throw std::out_of_range("Filter additional RHS layer is out of range");
+        }
+        if (additional.mask >= (uint8_t {1} << NUM_ADDITIONAL_RHS)) {
+            throw std::out_of_range("Filter additional RHS mask is out of range");
+        }
+        additional_rhs_values[additional.layer] = additional.rhs;
+        additional_rhs_masks[additional.layer] = additional.mask;
+    }
+
+    for (size_t stream = 0; stream < num_streams_; stream++) {
+        for (size_t layer = 0; layer < NUM_LAYERS; layer++) {
+            for (size_t rhs_index = 0; rhs_index < NUM_RHS; rhs_index++) {
                 write_register(libstf::ConfigRegister(
-                    FILTER_RHS_ADDR, active_rhs ? static_cast<uint64_t>(rhs) : 0));
+                    FILTER_RHS_ADDR, rhs_values[stream][layer][rhs_index]));
             }
         }
     }
 
-    for (size_t layer = 0; layer < FILTER_NUM_LAYERS; layer++) {
+    for (size_t layer = 0; layer < NUM_LAYERS; layer++) {
         uint64_t operator_word = 0;
         for (size_t stream = 0; stream < num_streams_; stream++) {
-            auto op = FilterComparison::ALWAYS_TRUE;
-            if (stream == 0) {
-                op = layer == 0 ? comparison : FilterComparison::ALWAYS_FALSE;
-            }
-            operator_word |= static_cast<uint64_t>(op) << (stream * 8);
+            operator_word |= static_cast<uint64_t>(operators[stream][layer]) << (stream * 8);
         }
         write_register(libstf::ConfigRegister(FILTER_OPERATOR_ADDR, operator_word));
     }
 
-    for (size_t layer = 0; layer < FILTER_NUM_LAYERS; layer++) {
-        for (size_t slot = 0; slot < FILTER_NUM_ADDITIONAL_RHS; slot++) {
-            write_register(libstf::ConfigRegister(FILTER_ADDITIONAL_RHS_ADDR, 0));
+    for (const auto &layer_rhs : additional_rhs_values) {
+        for (const auto value : layer_rhs) {
+            write_register(libstf::ConfigRegister(FILTER_ADDITIONAL_RHS_ADDR, value));
         }
     }
-    write_register(libstf::ConfigRegister(FILTER_ADDITIONAL_RHS_MASK_ADDR, 0));
+
+    uint64_t additional_rhs_mask_word = 0;
+    for (size_t layer = 0; layer < NUM_LAYERS; layer++) {
+        additional_rhs_mask_word |= static_cast<uint64_t>(additional_rhs_masks[layer])
+                                    << (layer * 8);
+    }
+    write_register(
+        libstf::ConfigRegister(FILTER_ADDITIONAL_RHS_MASK_ADDR, additional_rhs_mask_word));
 
     const size_t stream_type_lsb = num_streams_;
     const size_t mode_lsb = stream_type_lsb + num_streams_ * 3;
     const size_t valid_bit = mode_lsb + 2;
 
-    uint64_t control_word = 1; // Stream 0 enabled.
+    uint64_t control_word = 0;
     for (size_t stream = 0; stream < num_streams_; stream++) {
-        control_word |= static_cast<uint64_t>(libstf::type_t::INT64_T)
+        control_word |= static_cast<uint64_t>(stream_enabled[stream]) << stream;
+        control_word |= (static_cast<uint64_t>(stream_types[stream]) & 0x7)
                         << (stream_type_lsb + stream * 3);
     }
+    control_word |= static_cast<uint64_t>(mode) << mode_lsb;
     control_word |= uint64_t {1} << valid_bit;
 
     // The control word commits the payload and must be written last.
     write_register(libstf::ConfigRegister(FILTER_CONTROL_ADDR, control_word));
+}
+
+void FilterConfig::configure(FilterComparison comparison, int64_t rhs) {
+    configure(
+        {{0, libstf::type_t::INT64_T, true}},
+        {{0, 0, comparison, {static_cast<uint64_t>(rhs), 0}}},
+        {},
+        FilterMode::FULL_MATERIALIZATION);
 }
 
 constexpr const uint32_t RDMA_READ_VADDR_ADDR = 0;
