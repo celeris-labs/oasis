@@ -154,11 +154,14 @@ SubmitColumnSplinters(ClientContext &context, oasis::OasisContext &ctx, OasisSca
                       OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
 	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
 
-	std::vector<oasis::SplinterResultHandle> results;
-	results.reserve(gstate.projected_columns.size());
-	for (const auto &col : gstate.projected_columns) {
+	// Phase 1: Build every hardware column's splinter.
+	std::vector<oasis::QuerySplinter> splinters;
+	std::vector<size_t> splinter_slot;
+	splinters.reserve(gstate.projected_columns.size());
+	splinter_slot.reserve(gstate.projected_columns.size());
+	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
-			results.emplace_back();
 			continue;
 		}
 
@@ -181,12 +184,17 @@ SubmitColumnSplinters(ClientContext &context, oasis::OasisContext &ctx, OasisSca
 		splinter.operators.push_back(
 		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
 		splinter.operators.push_back(std::make_unique<oasis::HostBufferSinkOperator>());
-		results.push_back(ctx.scheduler().submit(std::move(splinter)));
-		DUCKDB_LOG_DEBUG(context, "Submitted query splinter for row group %llu, column %llu ('%s'): "
-		                          "%llu values, %llu compressed bytes",
-		                 (unsigned long long)group, (unsigned long long)col.column_id,
-		                 bind.metadata.column_names[col.column_id].c_str(), (unsigned long long)cc.num_values,
-		                 (unsigned long long)cc.total_compressed_size);
+		splinters.push_back(std::move(splinter));
+		splinter_slot.push_back(i);
+	}
+
+	// Phase 2: Submit the whole row group at once.
+	auto handles = ctx.scheduler().submit(std::move(splinters));
+    DUCKDB_LOG_DEBUG(context, "Submitted %llu QuerySplinters for row group %llu.",
+		             (unsigned long long)splinter_slot.size(), (unsigned long long)group);
+	std::vector<oasis::SplinterResultHandle> results(gstate.projected_columns.size());
+	for (size_t k = 0; k < handles.size(); k++) {
+		results[splinter_slot[k]] = std::move(handles[k]);
 	}
 	return results;
 }
