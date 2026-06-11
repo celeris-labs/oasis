@@ -5,6 +5,10 @@
 #include "oasis_optimizer.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/database.hpp"
+
+#include <coyote/cDefs.hpp>
 
 namespace duckdb {
 
@@ -16,6 +20,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             OasisScanInitGlobal,
 	                             OasisScanInitLocal);
 	table_function.projection_pushdown = true;
+	table_function.get_virtual_columns = OasisScanGetVirtualColumns;
 	loader.RegisterFunction(table_function);
 
 	RegisterOasisOptimizer(loader);

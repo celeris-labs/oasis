@@ -22,36 +22,29 @@ include_directories(duckdb/third_party/thrift)
 
 # Both parcore/coyote/sw and parcore/coyote/sim/sw declare a target named
 # "Coyote" — the former opens a real FPGA char device, the latter spawns
-# Vivado xsim in the background and pipes to it. Swap the subdirectory to
-# switch between real hardware and simulation; everything downstream
-# (libstf, ParCore) links to "Coyote" without caring which one it got.
-#
-# For simulation you also need:
-#   * parcore/build_hw/sim/ populated (run parcore/sim_setup.sh once)
-#   * xsim on PATH
-#   * COYOTE_SIM_DIR=<abs path to parcore/build_hw> at runtime
+# Vivado xsim in the background and pipes to it. Swap the package to switch
+# between real hardware and simulation; everything downstream links to "Coyote".
 option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" ON)
-if (EN_SIMULATION)
+set(EN_SIMULATION ON CACHE BOOL "Link against Coyote simulation library (no FPGA required)" FORCE)
+if(EN_SIMULATION)
     find_package(CoyoteSimulation REQUIRED)
     add_compile_definitions(EN_SIMULATION)
-else ()
+else()
     find_package(Coyote REQUIRED)
-endif ()
+endif()
 
 find_package(libstf REQUIRED)
-
-find_package(Arrow REQUIRED)
 find_package(parcore REQUIRED)
 find_package(oasis REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Extension
 # ---------------------------------------------------------------------------
+
 set(EXTENSION_SOURCES
     src/oasis_extension.cpp
     src/oasis_scan.cpp
     src/oasis_optimizer.cpp
-    src/oasis_bloom_mock.cpp
     src/oasis_hardware_bloom.cpp
     src/oasis_parquet_metadata.cpp
 )

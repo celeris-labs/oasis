@@ -39,96 +39,37 @@ static parcore::metadata::Compression parquet_codec_to_parcore(duckdb_parquet::C
 }
 
 parcore::metadata::Metadata BuildParcoreMetadata(ClientContext &context, ParquetReader &parquet_reader) {
-	auto *file_meta = parquet_reader.GetFileMetadata();
-	auto &file_handle = parquet_reader.GetHandle();
+        (void)context;
 
-	// TODO: Remove this page metadata fetch after adding a page header parser to the hardware.
-	auto proto = duckdb_base_std::make_shared<ThriftFileTransport>(file_handle, false);
-	auto thrift_proto =
-	    make_uniq<duckdb_apache::thrift::protocol::TCompactProtocolT<ThriftFileTransport>>(proto);
+        auto *file_meta = parquet_reader.GetFileMetadata();
 
-	parcore::metadata::Metadata meta;
+        parcore::metadata::Metadata meta;
 
-	for (auto &col : parquet_reader.columns) {
-		meta.column_names.push_back(col.name);
-	}
+        for (auto &col : parquet_reader.columns) {
+                meta.column_names.push_back(col.name);
+        }
 
-	for (auto &rg : file_meta->row_groups) {
-		parcore::metadata::RowGroup parcore_rg;
+        for (auto &rg : file_meta->row_groups) {
+                parcore::metadata::RowGroup parcore_rg;
 
-		for (auto &col_chunk : rg.columns) {
-			auto &cmd = col_chunk.meta_data;
+                for (auto &col_chunk : rg.columns) {
+                        auto &cmd = col_chunk.meta_data;
 
-			parcore::metadata::ColumnChunk parcore_cc;
-			parcore_cc.type = parquet_type_to_parcore(cmd.type);
-			parcore_cc.num_values = static_cast<uint64_t>(cmd.num_values);
-			parcore_cc.compression = parquet_codec_to_parcore(cmd.codec);
+                        parcore::metadata::ColumnChunk parcore_cc;
+                        parcore_cc.type = parquet_type_to_parcore(cmd.type);
+                        parcore_cc.num_values = static_cast<uint64_t>(cmd.num_values);
+                        parcore_cc.compression = parquet_codec_to_parcore(cmd.codec);
+                        parcore_cc.offset = static_cast<uint64_t>(
+                            cmd.__isset.dictionary_page_offset ? cmd.dictionary_page_offset : cmd.data_page_offset);
+                        parcore_cc.total_compressed_size = static_cast<uint64_t>(cmd.total_compressed_size);
 
-			int64_t start_offset =
-			    cmd.__isset.dictionary_page_offset ? cmd.dictionary_page_offset : cmd.data_page_offset;
-			int64_t end_offset = start_offset + cmd.total_compressed_size;
+                        parcore_rg.chunks.push_back(std::move(parcore_cc));
+                }
 
-			proto->SetLocation(static_cast<idx_t>(start_offset));
+                meta.groups.push_back(std::move(parcore_rg));
+        }
 
-			uint64_t hybrid_num_values = 0;
-
-			while (proto->GetLocation() < static_cast<idx_t>(end_offset)) {
-				duckdb_parquet::PageHeader page_hdr;
-				page_hdr.read(thrift_proto.get());
-
-				idx_t page_data_offset = proto->GetLocation();
-				uint64_t page_size = static_cast<uint64_t>(page_hdr.compressed_page_size);
-
-				parcore::metadata::Page parcore_page;
-				parcore_page.offset = page_data_offset;
-				parcore_page.size = page_size;
-
-				if (page_hdr.type == duckdb_parquet::PageType::DICTIONARY_PAGE) {
-					parcore_page.encoding = parcore::metadata::Encoding::PLAIN;
-					parcore_page.num_values =
-					    static_cast<uint64_t>(page_hdr.dictionary_page_header.num_values);
-					parcore_cc.dictionary = parcore_page;
-				} else if (page_hdr.type == duckdb_parquet::PageType::DATA_PAGE) {
-					auto enc = page_hdr.data_page_header.encoding;
-					if (enc == duckdb_parquet::Encoding::RLE_DICTIONARY ||
-					    enc == duckdb_parquet::Encoding::PLAIN_DICTIONARY) {
-						parcore_page.encoding = parcore::metadata::Encoding::HYBRID;
-						parcore_page.num_values =
-						    static_cast<uint64_t>(page_hdr.data_page_header.num_values);
-						hybrid_num_values += parcore_page.num_values;
-					} else {
-						parcore_page.encoding = parcore::metadata::Encoding::PLAIN;
-						parcore_page.num_values =
-						    static_cast<uint64_t>(page_hdr.data_page_header.num_values);
-					}
-					parcore_cc.data.push_back(parcore_page);
-				} else if (page_hdr.type == duckdb_parquet::PageType::DATA_PAGE_V2) {
-					auto enc = page_hdr.data_page_header_v2.encoding;
-					if (enc == duckdb_parquet::Encoding::RLE_DICTIONARY ||
-					    enc == duckdb_parquet::Encoding::PLAIN_DICTIONARY) {
-						parcore_page.encoding = parcore::metadata::Encoding::HYBRID;
-						parcore_page.num_values =
-						    static_cast<uint64_t>(page_hdr.data_page_header_v2.num_values);
-						hybrid_num_values += parcore_page.num_values;
-					} else {
-						parcore_page.encoding = parcore::metadata::Encoding::PLAIN;
-						parcore_page.num_values =
-						    static_cast<uint64_t>(page_hdr.data_page_header_v2.num_values);
-					}
-					parcore_cc.data.push_back(parcore_page);
-				}
-
-				proto->SetLocation(page_data_offset + page_size);
-			}
-
-			parcore_cc.hybrid_num_values = hybrid_num_values;
-			parcore_rg.chunks.push_back(std::move(parcore_cc));
-		}
-
-		meta.groups.push_back(std::move(parcore_rg));
-	}
-
-	return meta;
+        return meta;
 }
 
 parcore::metadata::Metadata BuildParcoreMetadataFromParquet(ClientContext &context, const string &filename) {

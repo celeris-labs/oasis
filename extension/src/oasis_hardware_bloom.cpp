@@ -8,19 +8,19 @@
 #include "oasis/oasis_context.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_parquet_metadata.hpp"
+#include "oasis/query_splinter.hpp"
 
 #include "libstf/common.hpp"
 #include "libstf/configuration.hpp"
 #include "parcore/configuration.hpp"
-#include "parcore/file_reader.hpp"
 #include "parquet_reader.hpp"
 
-#include <arrow/io/file.h>
 
 #include <algorithm>
 #include <bitset>
 #include <cstdio>
 #include <cstdint>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <unordered_set>
@@ -200,6 +200,38 @@ static void EnqueueBloomStreamConfig(const char *reason, parcore::metadata::Type
         );
 }
 
+static std::unique_ptr<oasis::SourceOperator>
+MakeLocalSource(oasis::OasisContext &ctx, const string &filename, const parcore::metadata::ColumnChunk &cc) {
+        if (cc.total_compressed_size == 0) {
+                throw InvalidInputException("OASIS hardware Bloom: column chunk has zero compressed size");
+        }
+
+        void *ptr = nullptr;
+        auto status = ctx.memory_pool()->allocate(cc.total_compressed_size, &ptr);
+        if (!status.ok()) {
+                throw IOException("Could not allocate Bloom input buffer: " + status.message());
+        }
+
+        auto buffer = libstf::make_buffer(ctx.memory_pool(), ptr, cc.total_compressed_size, cc.total_compressed_size);
+
+        std::ifstream file(filename, std::ios::binary);
+        if (!file) {
+                throw IOException("Could not open Bloom input file: " + filename);
+        }
+
+        file.seekg(static_cast<std::streamoff>(cc.offset), std::ios::beg);
+        if (!file) {
+                throw IOException("Could not seek Bloom input file: " + filename);
+        }
+
+        file.read(reinterpret_cast<char *>(buffer->ptr), static_cast<std::streamsize>(cc.total_compressed_size));
+        if (file.gcount() != static_cast<std::streamsize>(cc.total_compressed_size)) {
+                throw IOException("Could not read complete Bloom input column chunk from file: " + filename);
+        }
+
+        return std::make_unique<oasis::LocalSourceOperator>(std::move(buffer));
+}
+
 static void ConfigureBloomOutputStream0Only(uint32_t first_last_beat, uint32_t second_last_beat) {
         auto &ctx = oasis::OasisContext::ctx();
 
@@ -289,10 +321,6 @@ void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &
 
         OASIS_HW_BLOOM_LOG("running one-shot hardware bloom test from read_oasis join path");
 
-        if (!gstate.metadata) {
-                throw InternalException("OASIS hardware Bloom: missing metadata pointer");
-        }
-
         if (bind.runtime_bloom_build_filename.empty() || bind.runtime_bloom_build_key.empty() ||
             bind.runtime_bloom_probe_key.empty()) {
                 throw InternalException("OASIS hardware Bloom: runtime bloom bind fields are incomplete");
@@ -344,43 +372,56 @@ void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &
                            (unsigned long long)first_last_beat,
                            (unsigned long long)second_last_beat);
 
-        auto column_chunk_config = ctx.config<parcore::ColumnChunkDecoderConfig>();
-        auto page_config = ctx.config<parcore::PageDecoderConfig>();
+        auto build_libstf_type = parcore::metadata::to_libstf_type(build_type);
+        auto probe_libstf_type = parcore::metadata::to_libstf_type(probe_type);
 
-        auto build_decoder = std::make_shared<parcore::ColumnChunkDecoder>(
-            ctx.cthread(),
-            ctx.tlb_manager(),
-            ctx.output_buffer_manager(),
-            column_chunk_config,
-            page_config,
-            0);
+        oasis::QuerySplinter splinter;
 
-        auto maybe_build_file = arrow::io::ReadableFile::Open(bind.runtime_bloom_build_filename);
-        if (!maybe_build_file.ok()) {
-                throw IOException(maybe_build_file.status().ToString());
-        }
-        auto build_file = *maybe_build_file;
+        splinter.operators.push_back(std::make_unique<oasis::CallbackOperator>(
+            "configure-bloom-output-stream0",
+            [first_last_beat, second_last_beat](libstf::stream_t stream, oasis::OasisContext &) {
+                    if (stream != 0) {
+                            throw InternalException("OASIS hardware Bloom splinter was not scheduled on stream 0");
+                    }
+                    ConfigureBloomOutputStream0Only(first_last_beat, second_last_beat);
+            }));
 
-        parcore::FileReader build_reader(build_decoder, ctx.memory_pool(), build_meta, build_file);
-
-        ConfigureBloomOutputStream0Only(first_last_beat, second_last_beat);
-
-        OASIS_HW_BLOOM_LOG("enqueue BUILD side via ColumnChunkDecoder: group=0 col=%llu",
+        OASIS_HW_BLOOM_LOG("enqueue BUILD side through scheduler: group=0 col=%llu",
                            (unsigned long long)build_col_id);
 
-        EnqueueBloomStreamConfig("before build_reader.enqueue_column_chunk_no_output", build_type);
-        build_reader.enqueue_column_chunk_no_output(0, build_col_id);
+        splinter.operators.push_back(std::make_unique<oasis::StreamConfigOperator>(
+            build_libstf_type,
+            0 // 0 = Bloomfilter path
+        ));
+        splinter.operators.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
+            build_chunk.compression,
+            build_chunk.num_values,
+            build_libstf_type));
+        splinter.operators.push_back(MakeLocalSource(ctx, bind.runtime_bloom_build_filename, build_chunk));
 
-        OASIS_HW_BLOOM_LOG("BUILD enqueued. Not reading build output because build phase should not produce stream0 rows.");
-
-        OASIS_HW_BLOOM_LOG("enqueue PROBE side via ColumnChunkDecoder: group=0 col=%llu",
+        OASIS_HW_BLOOM_LOG("enqueue PROBE side through scheduler: group=0 col=%llu",
                            (unsigned long long)probe_col_id);
 
-        EnqueueBloomStreamConfig("before probe_reader.enqueue_column_chunk", probe_type);
-        gstate.reader->enqueue_column_chunk(0, probe_col_id);
+        splinter.operators.push_back(std::make_unique<oasis::StreamConfigOperator>(
+            probe_libstf_type,
+            0 // 0 = Bloomfilter path
+        ));
+        splinter.operators.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
+            probe_chunk.compression,
+            probe_chunk.num_values,
+            probe_libstf_type));
+        splinter.operators.push_back(MakeLocalSource(ctx, bind.filename, probe_chunk));
 
-        OASIS_HW_BLOOM_LOG("waiting for hardware Bloom output on stream 0 through FileReader::next_column_chunk()");
-        auto buffers = gstate.reader->next_column_chunk();
+        splinter.operators.push_back(std::make_unique<oasis::HostBufferSinkOperator>());
+
+        OASIS_HW_BLOOM_LOG("submit Bloom BUILD+PROBE splinter pinned to stream 0");
+        auto result = ctx.scheduler().submit_to_stream(0, std::move(splinter));
+
+        OASIS_HW_BLOOM_LOG("waiting for hardware Bloom output on stream 0 through Scheduler result");
+        std::vector<std::shared_ptr<libstf::Buffer>> buffers;
+        while (auto batch = result.get_next_batch()) {
+                buffers.push_back(std::move(*batch));
+        }
 
         size_t total_bytes = 0;
         for (size_t i = 0; i < buffers.size(); i++) {

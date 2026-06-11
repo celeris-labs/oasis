@@ -5,6 +5,10 @@ import parcore::*;
 import libstf::*;
 import common::*;
 
+initial begin
+    $display("%0t [OASIS_SIM] vfpga_top debug compiled", $time);
+end
+
 // -- Tie-off unused interfaces and signals --------------------------------------------------------
 `ifdef EN_RDMA
 always_comb rq_rd.tie_off_s();
@@ -24,6 +28,8 @@ end
 `else
 always_comb sq_rd.tie_off_m();
 always_comb cq_rd.tie_off_s();
+always_comb sq_wr.tie_off_m();
+always_comb cq_wr.tie_off_s();
 `endif
 
 localparam NUM_STREAMS   = N_STRM_AXI;
@@ -32,7 +38,7 @@ localparam DATABEAT_SIZE = AXI_DATA_BITS / 8;
 `ifdef EN_RDMA
 localparam NUM_CONFIGS     = 6;
 `else
-localparam NUM_CONFIGS     = 5;
+localparam NUM_CONFIGS     = 4;
 `endif
 
 localparam STREAM_CFG_REGS = 2;
@@ -51,8 +57,8 @@ mem_config_i                  mem_conf[NUM_STREAMS](.*);
 `ifdef EN_RDMA
 rdma_read_config_i            rdma_conf[NUM_STREAMS](.*);
 `endif
-column_chunk_decoder_config_i column_chunk_conf[NUM_STREAMS](.*);
-page_decoder_config_i         page_conf[NUM_STREAMS](.*);
+ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_STREAMS](clk, rst_n);
+decoder_profile_t              column_chunk_profile[NUM_STREAMS];
 bloomfilter_config_i          bloomfilter_conf();
 stream_config_i               bf_stream_conf[1](.*);
 
@@ -62,7 +68,6 @@ GlobalConfig #(
     .ADDR_SPACE_SIZES({
         NUM_STREAMS + 1,
         COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_STREAMS,
-        PAGE_DECODER_CONFIG_REGS * NUM_STREAMS,
         BLOOMFILTER_NUM_CONFIG_REGS,
         STREAM_CFG_REGS
 `ifdef EN_RDMA
@@ -100,19 +105,8 @@ ColumnChunkDecoderConfig #(
     .write_config(write_configs[1]),
     .read_config(read_configs[1]),
 
-    .out(column_chunk_conf)
-);
-
-PageDecoderConfig #(
-    .NUM_DECODERS(NUM_STREAMS)
-) inst_page_decoder_config (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .write_config(write_configs[2]),
-    .read_config(read_configs[2]),
-
-    .out(page_conf)
+    .out(column_chunk_conf),
+    .profile(column_chunk_profile)
 );
 
 bloomfilter_perf_counters_t bf_perf_counters;
@@ -120,8 +114,8 @@ BFConfig inst_bf_config (
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[3]),
-    .read_config(read_configs[3]),
+    .write_config(write_configs[2]),
+    .read_config(read_configs[2]),
 
     .out(bloomfilter_conf),
 
@@ -134,8 +128,8 @@ StreamConfig #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[4]),
-    .read_config(read_configs[4]),
+    .write_config(write_configs[3]),
+    .read_config(read_configs[3]),
 
     .out(bf_stream_conf)
 );
@@ -147,8 +141,8 @@ RDMAReadConfig #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[5]),
-    .read_config(read_configs[5]),
+    .write_config(write_configs[3]),
+    .read_config(read_configs[3]),
 
     .out(rdma_conf)
 );
@@ -226,11 +220,11 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin
         .clk(clk),
         .rst_n(rst_n),
 
-        .column_chunk_conf(column_chunk_conf[I]),
-        .page_conf(page_conf[I]),
+        .conf(column_chunk_conf[I]),
 
         .in(decoder_in),
-        .out(typed_out)
+        .out(typed_out),
+        .profile(column_chunk_profile[I])
     );
 
     // Discard typed
@@ -357,6 +351,7 @@ always_ff @(posedge clk) begin
     end
 end
 
+AXI4S axi_bf_in_raw(.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_in    (.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_out   (.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_bypass(.aclk(clk), .aresetn(rst_n));
@@ -370,8 +365,72 @@ AXIDemultiplexer #(
     .select(bf_demux_select),
 
     .in(decoded_axi[0]),
-    .out({axi_bf_in, axi_bf_bypass})
+    .out({axi_bf_in_raw, axi_bf_bypass})
 );
+
+// Inline TLAST injector for the Bloomfilter input stream.
+// Software configures absolute beat indices for BUILD end and PROBE end.
+logic [31:0] bf_last_inject_beat_count;
+logic        bf_last_inject_hit_first;
+logic        bf_last_inject_hit_second;
+logic        bf_last_inject_hit;
+
+assign axi_bf_in_raw.tready = axi_bf_in.tready;
+
+assign axi_bf_in.tdata  = axi_bf_in_raw.tdata;
+assign axi_bf_in.tkeep  = axi_bf_in_raw.tkeep;
+assign axi_bf_in.tvalid = axi_bf_in_raw.tvalid;
+
+assign bf_last_inject_hit_first =
+    bloomfilter_conf.last_inject_enable &&
+    axi_bf_in_raw.tvalid &&
+    axi_bf_in_raw.tready &&
+    (bf_last_inject_beat_count == bloomfilter_conf.last_inject_first_beat);
+
+assign bf_last_inject_hit_second =
+    bloomfilter_conf.last_inject_enable &&
+    axi_bf_in_raw.tvalid &&
+    axi_bf_in_raw.tready &&
+    (bf_last_inject_beat_count == bloomfilter_conf.last_inject_second_beat);
+
+assign bf_last_inject_hit =
+    bf_last_inject_hit_first || bf_last_inject_hit_second;
+
+assign axi_bf_in.tlast =
+    axi_bf_in_raw.tlast || bf_last_inject_hit;
+
+always_ff @(posedge clk) begin
+    if (!rst_n) begin
+        bf_last_inject_beat_count <= 32'd0;
+    end else if (!bloomfilter_conf.last_inject_enable) begin
+        bf_last_inject_beat_count <= 32'd0;
+    end else if (axi_bf_in_raw.tvalid && axi_bf_in_raw.tready) begin
+        if (bf_last_inject_hit_second) begin
+            bf_last_inject_beat_count <= 32'd0;
+        end else begin
+            bf_last_inject_beat_count <= bf_last_inject_beat_count + 32'd1;
+        end
+    end
+end
+
+// SIM DEBUG: Bloom input/output progress
+always_ff @(posedge clk) begin
+    if (rst_n) begin
+        if (axi_bf_in_raw.tvalid && axi_bf_in_raw.tready) begin
+            $display("%0t [OASIS_SIM] BF_IN_RAW beat=%0d raw_last=%0b injected_last=%0b",
+                     $time, bf_last_inject_beat_count, axi_bf_in_raw.tlast, axi_bf_in.tlast);
+        end
+        if (bf_last_inject_hit_first) begin
+            $display("%0t [OASIS_SIM] BF_TLAST_FIRST beat=%0d", $time, bf_last_inject_beat_count);
+        end
+        if (bf_last_inject_hit_second) begin
+            $display("%0t [OASIS_SIM] BF_TLAST_SECOND beat=%0d", $time, bf_last_inject_beat_count);
+        end
+        if (axi_bf_out.tvalid && axi_bf_out.tready) begin
+            $display("%0t [OASIS_SIM] BF_OUT beat last=%0b", $time, axi_bf_out.tlast);
+        end
+    end
+end
 
 data_i #(tuple_mask_t) bf_probe_mat();
 assign bf_probe_mat.ready = 1'b1; // drain mask, the operator pipeline relies on it being consumed

@@ -5,6 +5,7 @@
 #include "libstf/memory_pool.hpp"
 #include "libstf/output_buffer_manager.hpp"
 #include "libstf/tlb_manager.hpp"
+#include "oasis/scheduler.hpp"
 
 #include <memory>
 #include <mutex>
@@ -27,10 +28,20 @@ public:
     std::shared_ptr<libstf::TLBManager> tlb_manager();
     std::shared_ptr<libstf::OutputBufferManager> output_buffer_manager();
 
+    Scheduler &scheduler();
+
     template <typename T>
     std::shared_ptr<T> config() {
         return global_config_.get_config<T>();
     }
+
+    bool isRDMAEnabled();
+
+    /**
+     * Id of the RDMA bypass stream -- the last MemConfig stream, sitting past the decoders. Only 
+     * valid when isRDMAEnabled() is true.
+     */
+    libstf::stream_t rdmaBypassStream();
 
     int device_id() const { return device_id_; }
     int vfpga_id() const { return vfpga_id_; }
@@ -47,6 +58,7 @@ private:
     libstf::GlobalConfig global_config_;
     std::shared_ptr<libstf::TLBManager> tlb_manager_;
     std::shared_ptr<libstf::OutputBufferManager> output_buffer_manager_;
+    std::unique_ptr<Scheduler> scheduler_;
 
     OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t obm_buffer_capacity);
     ~OasisContext() = default;
