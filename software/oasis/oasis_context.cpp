@@ -1,7 +1,9 @@
 #include "oasis/oasis_context.hpp"
 
+#include "oasis/configuration.hpp"
 #include "parcore/configuration.hpp"
 
+#include <sstream>
 #include <stdexcept>
 #include <unistd.h>
 
@@ -58,6 +60,14 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
                              global_config_.get_config<libstf::MemConfig>(),
                              memory_pool_, tlb_manager_,
                              computeManagedStreams(global_config_), 2, obm_buffer_capacity)) {
+    // Verify the bitstream loaded on the device is actually an Oasis system.
+    if (global_config_.system_id() != OASIS_SYSTEM_ID) {
+        std::ostringstream msg;
+        msg << "Hardware design on device is not an Oasis system: expected system id 0x" << std::hex
+            << OASIS_SYSTEM_ID << " but device reports 0x" << global_config_.system_id();
+        throw std::runtime_error(msg.str());
+    }
+
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());
     if (huge_pool) {
