@@ -92,6 +92,29 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
     return SplinterResultHandle(std::move(channel));
 }
 
+std::vector<SplinterResultHandle> Scheduler::submit(std::vector<QuerySplinter> splinters) {
+    std::vector<SplinterResultHandle> handles;
+    handles.reserve(splinters.size());
+
+    // Build the channels (and thus handles) outside the lock; only the queue push needs it.
+    std::vector<std::shared_ptr<SplinterResultChannel>> channels;
+    channels.reserve(splinters.size());
+    for (size_t i = 0; i < splinters.size(); ++i) {
+        auto channel = std::make_shared<SplinterResultChannel>();
+        handles.emplace_back(channel);
+        channels.push_back(std::move(channel));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(dispatch_mutex_);
+        for (size_t i = 0; i < splinters.size(); ++i) {
+            queue_.push_back(Pending{std::move(splinters[i]), std::move(channels[i])});
+        }
+    }
+    dispatch_cv_.notify_one();
+    return handles;
+}
+
 std::optional<libstf::stream_t> Scheduler::pick_stream() const {
     const libstf::stream_t active = std::max<libstf::stream_t>(active_streams_.load(), 1);
     const size_t           depth  = queue_depth_.load();

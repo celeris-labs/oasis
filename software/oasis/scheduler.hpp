@@ -44,6 +44,9 @@ class Scheduler {
 
     SplinterResultHandle submit(QuerySplinter splinter);
 
+    // Enqueues every splinter under a single lock acquisition so they are contiguous in the queue.
+    std::vector<SplinterResultHandle> submit(std::vector<QuerySplinter> splinters);
+
     [[nodiscard]] libstf::stream_t num_streams() const { return num_streams_; }
 
     void                           set_active_streams(libstf::stream_t active);
