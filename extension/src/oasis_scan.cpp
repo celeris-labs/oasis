@@ -299,27 +299,15 @@ static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalStat
 	output.SetCardinality(emit);
 }
 
-// Zero-copy multi-column scan. Each worker atomically claims a row group (LoadNextGroup), decoding
-// every projected column into exactly one buffer, then slices those buffers in lockstep into
-// STANDARD_VECTOR_SIZE-sized vectors. The one-buffer-per-column-chunk model holds because the OBM
-// buffers are sized to a whole DuckDB column chunk and DecodeGroup rejects any chunk that would
-// overflow them. All columns of a row group share the same element count, so the slices stay aligned.
-void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
-	auto &lstate = data_p.local_state->Cast<OasisScanLocalState>();
-	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
-	auto &ctx = *gstate.ctx;
-
-	if (gstate.emit_cardinality_only) {
-		EmitCardinalityOnly(gstate, lstate, bind, output);
-		return;
-	}
-
+// Emits the next STANDARD_VECTOR_SIZE-sized slice of the current row group into `output` (decoding
+// or claiming a new group as needed), zero-copy. Returns the number of rows written before filtering,
+// or 0 at end-of-data.
+static size_t EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                           OasisScanLocalState &lstate, const OasisScanBindData &bind, DataChunk &output) {
 	// When the current group is fully emitted, decode/claim the next one.
 	if (lstate.current_group_num_rows == 0) {
 		if (!LoadNextGroup(context, ctx, gstate, lstate, bind)) {
-			output.SetCardinality(0);
-			return;
+			return 0; // EOF.
 		}
 	}
 
@@ -386,8 +374,8 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	}
 
 	// Advance the cursor. If we have emitted this group's last elements, release the buffers so the
-	// next scan call's `if` branch loads the next row group. Dropping our refs here lets each buffer
-	// free as soon as downstream consumers are done with it.
+	// next call's `if` branch loads the next row group. Dropping our refs here lets each buffer free as
+	// soon as downstream consumers are done with it.
 	lstate.current_buf_offset += emit;
 	if (lstate.current_buf_offset >= total_elements) {
 		lstate.current_buffers.assign(gstate.projected_columns.size(), nullptr);
@@ -396,8 +384,39 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	}
 
 	output.SetCardinality(emit);
+	return emit;
+}
 
-	ApplyFilters(gstate, lstate, output);
+// Zero-copy multi-column scan. Each worker atomically claims a row group (LoadNextGroup), decoding
+// every projected column into exactly one buffer, then slices those buffers in lockstep into
+// STANDARD_VECTOR_SIZE-sized vectors. The one-buffer-per-column-chunk model holds because the OBM
+// buffers are sized to a whole DuckDB column chunk and DecodeGroup rejects any chunk that would
+// overflow them. All columns of a row group share the same element count, so the slices stay aligned.
+//
+// We loop over slices until at least one row survives the pushed-down filters or we hit true EOF.
+// This is required for correctness: DuckDB treats a scan call that returns an empty chunk as
+// end-of-data for that thread, so returning a fully-filtered-out slice would silently truncate.
+void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
+	auto &lstate = data_p.local_state->Cast<OasisScanLocalState>();
+	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
+	auto &ctx = *gstate.ctx;
+
+	if (gstate.emit_cardinality_only) {
+		EmitCardinalityOnly(gstate, lstate, bind, output);
+		return;
+	}
+
+	while (true) {
+		output.Reset();
+		if (EmitOneSlice(context, ctx, gstate, lstate, bind, output) == 0) {
+			output.SetCardinality(0); // EOF.
+			return;
+		}
+		if (ApplyFilters(gstate, lstate, output) > 0) {
+			return;
+		}
+	}
 }
 
 unique_ptr<NodeStatistics> OasisScanCardinality(ClientContext &, const FunctionData *bind_data) {
