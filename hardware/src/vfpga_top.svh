@@ -52,13 +52,14 @@ mem_config_i                  mem_conf[NUM_STREAMS](.*);
 rdma_read_config_i            rdma_conf[NUM_STREAMS](.*);
 `endif
 ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
+decoder_profile_t                    profile[NUM_DECODERS];
 
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(NUM_CONFIGS),
     .ADDR_SPACE_SIZES({
         MEM_CONFIG_NUM_REGS,
-        COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_DECODERS
+        COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS)
 `ifdef EN_RDMA
         , NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS
 `endif
@@ -94,7 +95,9 @@ ColumnChunkDecoderConfig #(
     .write_config(write_configs[1]),
     .read_config(read_configs[1]),
 
-    .out(column_chunk_conf)
+    .out(column_chunk_conf),
+
+    .profile(profile)
 );
 
 `ifdef EN_RDMA
@@ -182,10 +185,12 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
         .clk(clk),
         .rst_n(rst_n),
 
-        .column_chunk_conf(column_chunk_conf[I]),
+        .conf(column_chunk_conf[I]),
 
         .in(decoder_in),
-        .out(typed_out)
+        .out(typed_out),
+
+        .profile(profile[I])
     );
 
     // Discard typed

@@ -38,6 +38,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
 
+	// Stream profiler readout table function
+	RegisterOasisProfileFunction(loader);
+
 	// RDMA file system
 	config.AddExtensionOption(
 	    "oasis_rdma_server",
