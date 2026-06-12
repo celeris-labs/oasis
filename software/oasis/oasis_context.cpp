@@ -3,6 +3,8 @@
 #include "oasis/configuration.hpp"
 #include "parcore/configuration.hpp"
 
+#include <libstf/profiling.hpp>
+
 #include <sstream>
 #include <stdexcept>
 #include <unistd.h>
@@ -81,6 +83,12 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
 
 void OasisContext::init(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t obm_buffer_capacity) {
     std::call_once(init_flag_, [memory_pool = std::move(memory_pool), obm_buffer_capacity]() mutable {
+        // Configure and start Caliper before constructing the context: the constructor flushes buffers
+        // and starts the scheduler, both of which can fire interrupts whose Profiler regions
+        // (handle_fpga_interrupt, enqueue_buffer_for_stream, ...) we want captured. No-ops unless libstf
+        // was built with -DLIBSTF_WITH_PROFILING=ON.
+        libstf::Profiler::init();
+        libstf::Profiler::start();
         instance_ = new OasisContext(std::move(memory_pool), obm_buffer_capacity);
     });
 }
@@ -88,6 +96,7 @@ void OasisContext::init(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t 
 void OasisContext::shutdown() {
     delete instance_;
     instance_ = nullptr;
+    libstf::Profiler::flush();
 }
 
 OasisContext &OasisContext::ctx() {

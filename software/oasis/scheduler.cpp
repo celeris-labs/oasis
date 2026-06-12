@@ -5,12 +5,15 @@
 #include "parcore/configuration.hpp"
 
 #include <libstf/logging.hpp>
+#include <libstf/profiling.hpp>
 
 #include <algorithm>
 
 namespace oasis {
 
 namespace {
+
+const std::string profiler_prefix = "oasis::Scheduler::";
 
 libstf::stream_t default_num_streams(OasisContext &ctx) {
     return ctx.config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
@@ -83,16 +86,19 @@ Scheduler::~Scheduler() {
 }
 
 SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
+    libstf::Profiler::open_regions({profiler_prefix + "submit"});
     auto channel = std::make_shared<SplinterResultChannel>();
     {
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         queue_.push_back(Pending{std::move(splinter), channel});
     }
     dispatch_cv_.notify_one();
+    libstf::Profiler::close_regions({profiler_prefix + "submit"});
     return SplinterResultHandle(std::move(channel));
 }
 
 std::vector<SplinterResultHandle> Scheduler::submit(std::vector<QuerySplinter> splinters) {
+    libstf::Profiler::open_regions({profiler_prefix + "submit_batch"});
     std::vector<SplinterResultHandle> handles;
     handles.reserve(splinters.size());
 
@@ -112,6 +118,7 @@ std::vector<SplinterResultHandle> Scheduler::submit(std::vector<QuerySplinter> s
         }
     }
     dispatch_cv_.notify_one();
+    libstf::Profiler::close_regions({profiler_prefix + "submit_batch"});
     return handles;
 }
 
@@ -137,6 +144,7 @@ std::optional<libstf::stream_t> Scheduler::pick_stream() const {
 void Scheduler::dispatch_loop() {
     std::unique_lock<std::mutex> lock(dispatch_mutex_);
     while (true) {
+        libstf::Profiler::open_regions({profiler_prefix + "dispatch_loop"});
         // Reap finished slots so freed capacity is visible to pick_stream below. Cheap to sweep all
         // active streams; the dispatcher is the sole reaper, so ~OutputHandle stays on this thread.
         //
@@ -166,6 +174,7 @@ void Scheduler::dispatch_loop() {
 
         // Park until there is a queued splinter *and* a stream with a free slot, or until shutdown.
         if (!stream) {
+            libstf::Profiler::close_regions({profiler_prefix + "dispatch_loop"});
             if (stop_ && queue_.empty()) {
                 return;
             }
@@ -182,6 +191,7 @@ void Scheduler::dispatch_loop() {
         lock.unlock();
         dispatch_to(*stream, pending);
         lock.lock();
+        libstf::Profiler::close_regions({profiler_prefix + "dispatch_loop"});
     }
 }
 
@@ -201,6 +211,7 @@ void Scheduler::reap(StreamState &ss, std::list<InFlight> &finished) {
 }
 
 void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
+    libstf::Profiler::open_regions({profiler_prefix + "dispatch_to"});
     StreamState &ss = *streams_[stream];
 
     // Park the splinter in the in-flight list; the iterator is stable for the callback to flag
@@ -258,9 +269,10 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
     }
 
     if (libstf::should_log(libstf::LogLevel::DEBUG)) {
-        libstf::log(libstf::LogLevel::DEBUG, "Enqueued %s to stream %u", 
+        libstf::log(libstf::LogLevel::DEBUG, "Enqueued %s to stream %u",
                     slot->splinter.to_string().c_str(), static_cast<unsigned>(stream));
     }
+    libstf::Profiler::close_regions({profiler_prefix + "dispatch_to"});
 }
 
 } // namespace oasis
