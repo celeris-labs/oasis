@@ -30,6 +30,7 @@ struct OasisScanFilter {
 struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
+	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
 };
 
 struct ProjectedColumn {

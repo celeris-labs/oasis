@@ -48,6 +48,8 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	bind_data->metadata = std::move(meta);
 	bind_data->filename = parquet_file;
 
+	bind_data->parquet_metadata = parquet_reader.metadata;
+
 	return std::move(bind_data);
 }
 
@@ -85,6 +87,7 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                        GlobalTableFunctionState *global_state_p) {
 	auto &gstate = global_state_p->Cast<OasisScanGlobalState>();
+	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
 	auto lstate = make_uniq<OasisScanLocalState>();
 
 	// Each worker owns its own file handle: DuckDB FileHandles are not safe to share across threads,
@@ -96,7 +99,8 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
     // used for row-group skipping (RowGroupMatchesFilters). The CPU decode path additionally drives 
     // this reader's child readers in OasisScanFunction.
 	ParquetOptions parquet_opts(context.client);
-	lstate->parquet_reader = make_uniq<ParquetReader>(context.client, OpenFileInfo {gstate.filename}, parquet_opts);
+	lstate->parquet_reader = make_uniq<ParquetReader>(context.client, OpenFileInfo {gstate.filename}, 
+                                                      parquet_opts, bind_data.parquet_metadata);
 	lstate->scan_state = make_uniq<ParquetReaderScanState>();
 
 	vector<idx_t> groups_to_read;
