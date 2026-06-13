@@ -25,12 +25,6 @@ class OasisContext;
  * Bridges unbounded query concurrency to the fixed stream count. Callers submit QuerySplinters and
  * get a future in return. The scheduler owns the streams.
  *
- * submit() pushes the given splinter onto an unbounded queue and returns instantly with a future.
- * A dispatcher thread drains that queue: It pops the head and dispatches it to the *least-loaded*
- * stream -- the active stream with the fewest splinters currently in-flight. If every active stream
- * is at pipeline_depth() already, the dispatcher parks until a completion frees a slot, then
- * dispatches the head there.
- *
  * Two knobs are tunable at runtime: the number of *active* streams (the span the dispatcher load-
  * balances across) and the per-stream pipeline depth.
  */
@@ -42,10 +36,10 @@ class Scheduler {
     Scheduler(const Scheduler &)            = delete;
     Scheduler &operator=(const Scheduler &) = delete;
 
+    // Expands the splinter into its flows and pushes each onto an unbounded queue, returning 
+    // instantly with a future. The splinter completes (its single result channel closes) only once 
+    // every flow has drained.
     SplinterResultHandle submit(QuerySplinter splinter);
-
-    // Enqueues every splinter under a single lock acquisition so they are contiguous in the queue.
-    std::vector<SplinterResultHandle> submit(std::vector<QuerySplinter> splinters);
 
     [[nodiscard]] libstf::stream_t num_streams() const { return num_streams_; }
 
@@ -56,23 +50,32 @@ class Scheduler {
     [[nodiscard]] size_t pipeline_depth() const { return queue_depth_.load(); }
 
   private:
-    // One in-flight splinter on a stream. It owns the splinter (and thus its OutputHandle and any
-    // staged input) until reaped.
-    struct InFlight {
-        QuerySplinter splinter;
-        bool          done = false;
-    };
-
-    // A queued splinter waiting for the dispatcher to place it on a stream.
-    struct Pending {
-        QuerySplinter                          splinter;
+    struct SplinterCompletion {
         std::shared_ptr<SplinterResultChannel> channel;
+        std::atomic<size_t>                    outstanding_sinks;
     };
 
-    // Per-stream pipeline: The list of in-flight splinters and the count of splinters currently
-    // enqueued on this stream. `enqueued` is the load-balancing metric. It is atomic and held under
-    // no lock: the dispatcher bumps it when it places a splinter and the completion callback
-    // decrements it when a splinter finishes. Keeping it lock-free is what breaks the lock cycle --
+    // One in-flight flow on a stream. It owns the flow's operators and OutputHandle(s) (one per
+    // sink) until reaped, plus a shared pointer to the splinter's completion record.
+    struct InFlight {
+        OperatorFlow                                       flow;
+        std::vector<std::shared_ptr<libstf::OutputHandle>> handles;
+        std::shared_ptr<SplinterCompletion>                completion;
+        std::atomic<size_t>                                flow_outstanding{0};
+        bool                                               done = false;
+    };
+
+    // A queued flow waiting for the dispatcher to place it on a stream. Carries the shared
+    // completion record of the splinter it belongs to.
+    struct Pending {
+        OperatorFlow                        flow;
+        std::shared_ptr<SplinterCompletion> completion;
+    };
+
+    // Per-stream pipeline: The list of in-flight flows and the count of flows currently enqueued on
+    // this stream. `enqueued` is the load-balancing metric. It is atomic and held under no lock: the
+    // dispatcher bumps it when it places a flow and the flow's last completion callback decrements
+    // it when the flow finishes. Keeping it lock-free is what breaks the lock cycle --
     // the callback must never take dispatch_mutex_ while the dispatcher holds dispatch_mutex_ and is
     // waiting for the stream mutex (see dispatch_loop / the completion callback). As a load metric it
     // tolerates being read slightly stale in pick_stream. `in_flight`/`done` are guarded by the
@@ -105,7 +108,7 @@ class Scheduler {
     // full. Must be called holding dispatch_mutex_.
     std::optional<libstf::stream_t> pick_stream() const;
 
-    // Applies a splinter on `stream` and registers its completion callback, parking it in the
+    // Applies a flow on `stream` and registers a completion callback per sink, parking it in the
     // stream's in-flight list. Called only by the dispatcher, with a slot already reserved
     // (enqueued atomically bumped).
     void dispatch_to(libstf::stream_t stream, Pending &pending);

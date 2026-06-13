@@ -90,14 +90,20 @@ class DecodeColumnChunkOperator final : public Operator {
  * Sink that writes the stream's output to host buffers. apply() acquires the OutputHandle from the
  * OutputBufferManager; the scheduler reads the decoded buffers off handle() once the hardware has written.
  */
-class HostBufferSinkOperator final : public Operator {
+class LocalSinkOperator final : public Operator {
   public:
+    // `tag` identifies this QuerySplinter's output to the consumer. The scheduler forwards it 
+    // verbatim with each batch it pushes onto the result channel.
+    explicit LocalSinkOperator(size_t tag = 0) : tag_(tag) {}
+
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
 
     [[nodiscard]] const std::shared_ptr<libstf::OutputHandle> &handle() const { return handle_; }
+    [[nodiscard]] size_t                                       tag() const { return tag_; }
 
   private:
+    size_t                                tag_;
     std::shared_ptr<libstf::OutputHandle> handle_;
 };
 

@@ -8,6 +8,7 @@
 #include <libstf/profiling.hpp>
 
 #include <algorithm>
+#include <cassert>
 
 namespace oasis {
 
@@ -46,7 +47,7 @@ void Scheduler::set_pipeline_depth(size_t depth) {
 }
 
 Scheduler::~Scheduler() {
-    // Stop the dispatcher first so no new splinters are placed while we tear down.
+    // Stop the dispatcher first so no new flows are placed while we tear down.
     {
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         stop_ = true;
@@ -54,7 +55,7 @@ Scheduler::~Scheduler() {
     dispatch_cv_.notify_one();
     dispatcher_.join();
 
-    // The dispatcher is gone, but splinters it already placed may still be in flight with callbacks
+    // The dispatcher is gone, but flows it already placed may still be in flight with callbacks
     // pending. Wait until every slot's callback has run, then reap. Erasing only after `done`
     // guarantees ~OutputHandle (which joins the callback thread) never runs while that callback is
     // still executing. The callback signals dispatch_cv_, so wait on that.
@@ -85,41 +86,39 @@ Scheduler::~Scheduler() {
     }
 }
 
+namespace {
+
+size_t count_sinks(const QuerySplinter &splinter) {
+    size_t sinks = 0;
+    for (const auto &flow : splinter.streams) {
+        for (const auto &op : flow) {
+            if (dynamic_cast<const LocalSinkOperator *>(op.get()) != nullptr) {
+                ++sinks;
+            }
+        }
+    }
+    return sinks;
+}
+
+} // namespace
+
 SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
     libstf::Profiler::open_regions({profiler_prefix + "submit"});
-    auto channel = std::make_shared<SplinterResultChannel>();
+    auto channel    = std::make_shared<SplinterResultChannel>();
+    auto completion = std::make_shared<SplinterCompletion>();
+    completion->channel = channel;
+    completion->outstanding_sinks.store(count_sinks(splinter), std::memory_order_relaxed);
+
     {
+        // Push every flow contiguously so the splinter's flows stay together in the queue.
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
-        queue_.push_back(Pending{std::move(splinter), channel});
+        for (auto &flow : splinter.streams) {
+            queue_.push_back(Pending{std::move(flow), completion});
+        }
     }
     dispatch_cv_.notify_one();
     libstf::Profiler::close_regions({profiler_prefix + "submit"});
     return SplinterResultHandle(std::move(channel));
-}
-
-std::vector<SplinterResultHandle> Scheduler::submit(std::vector<QuerySplinter> splinters) {
-    libstf::Profiler::open_regions({profiler_prefix + "submit_batch"});
-    std::vector<SplinterResultHandle> handles;
-    handles.reserve(splinters.size());
-
-    // Build the channels (and thus handles) outside the lock; only the queue push needs it.
-    std::vector<std::shared_ptr<SplinterResultChannel>> channels;
-    channels.reserve(splinters.size());
-    for (size_t i = 0; i < splinters.size(); ++i) {
-        auto channel = std::make_shared<SplinterResultChannel>();
-        handles.emplace_back(channel);
-        channels.push_back(std::move(channel));
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(dispatch_mutex_);
-        for (size_t i = 0; i < splinters.size(); ++i) {
-            queue_.push_back(Pending{std::move(splinters[i]), std::move(channels[i])});
-        }
-    }
-    dispatch_cv_.notify_one();
-    libstf::Profiler::close_regions({profiler_prefix + "submit_batch"});
-    return handles;
 }
 
 std::optional<libstf::stream_t> Scheduler::pick_stream() const {
@@ -172,7 +171,7 @@ void Scheduler::dispatch_loop() {
             stream = pick_stream();
         }
 
-        // Park until there is a queued splinter *and* a stream with a free slot, or until shutdown.
+        // Park until there is a queued flow *and* a stream with a free slot, or until shutdown.
         if (!stream) {
             libstf::Profiler::close_regions({profiler_prefix + "dispatch_loop"});
             if (stop_ && queue_.empty()) {
@@ -214,63 +213,81 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
     libstf::Profiler::open_regions({profiler_prefix + "dispatch_to"});
     StreamState &ss = *streams_[stream];
 
-    // Park the splinter in the in-flight list; the iterator is stable for the callback to flag
-    // `done`. The dispatcher already reserved the slot (atomically bumped `enqueued`).
-    std::list<InFlight>::iterator slot;
+    // Park the flow in the in-flight list; the iterator is stable for the callbacks to flag `done`
+    // and accumulate handles. The dispatcher already reserved the slot (atomically bumped `enqueued`).
+    std::vector<LocalSinkOperator *> sinks;
+    std::list<InFlight>::iterator    slot;
     {
         std::lock_guard<std::mutex> lock(ss.mutex);
-        slot =
-            ss.in_flight.insert(ss.in_flight.end(), InFlight{std::move(pending.splinter), false});
+        slot             = ss.in_flight.emplace(ss.in_flight.end());
+        slot->flow       = std::move(pending.flow);
+        slot->completion = pending.completion;
+        for (auto &op : slot->flow) {
+            if (auto *s = dynamic_cast<LocalSinkOperator *>(op.get())) {
+                sinks.push_back(s);
+            }
+        }
+        slot->flow_outstanding.store(sinks.size(), std::memory_order_relaxed);
+        slot->handles.reserve(sinks.size());
     }
-    const auto &channel = pending.channel;
+    assert(!sinks.empty() && "flow has no sink");
+    SplinterCompletion *completion = slot->completion.get();
 
-    // The sink must apply first (acquire the OutputHandle) so the completion callback can be
+    // Each sink must `apply()` first (acquire its OutputHandle) so its completion callback can be
     // registered *before* the source triggers the transfer. add_callback is not retroactive: if
     // mark_done fired first, the callback would be lost.
-    HostBufferSinkOperator &sink = slot->splinter.sink();
-    sink.apply(stream, ctx_);
-    libstf::OutputHandle *handle = sink.handle().get();
+    for (LocalSinkOperator *sink : sinks) {
+        sink->apply(stream, ctx_);
+        slot->handles.push_back(sink->handle());
+        libstf::OutputHandle *handle = sink->handle().get();
+        size_t                tag    = sink->tag();
 
-    // Resolve off the dispatcher's critical path: The callback fires on the handle's own thread
-    // (via the FPGA interrupt path) once the transfer is done. It drains the output into the
-    // channel then closes the channel, flags the slot done, releases the stream's pipeline slot
-    // (decrement enqueued), and wakes the dispatcher, which reaps the
-    // slot (and destroys the handle) on its own thread.
-    handle->add_callback([this, &ss, stream, slot, channel, handle](libstf::stream_t) {
-        while (handle->stream_has_more_output(stream)) {
-            channel->push_batch(handle->get_next_stream_output(stream));
-        }
-        channel->close();
+        // The callback fires on the handle's own thread (via the hardware interrupt path) once this
+        // sink's transfer is done. It drains the output into the splinter's channel (tagged), then:
+        //  - decrements the splinter-wide sink count, closing the channel on the last one (the
+        //    splinter's single completion);
+        //  - decrements this flow's own sink count, and when that hits zero flags the slot reapable,
+        //    frees the pipeline slot, and wakes the dispatcher to reap (and destroy the handles) on
+        //    its own thread.
+        // Both counters are atomic, so this never nests dispatch_mutex_ with ss.mutex. acq_rel makes
+        // the channel pushes happen-before the observed close/done.
+        handle->add_callback([this, &ss, stream, slot, completion, handle, tag](libstf::stream_t) {
+            while (handle->stream_has_more_output(stream)) {
+                completion->channel->push_batch(tag, handle->get_next_stream_output(stream));
+            }
+            // Whole-splinter close: exactly once, by whichever sink (across all flows) finishes last.
+            if (completion->outstanding_sinks.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                completion->channel->close();
+            }
 
-        // Flag the slot reapable and free the pipeline slot. `enqueued` is atomic so this never
-        // nests with ss.mutex. The dispatcher reaps `done` slots but now destroys them (and join()s
-        // this thread) only *after* dropping its locks, so this thread can always finish even if the
-        // reap races us here.
-        {
-            std::lock_guard<std::mutex> slock(ss.mutex);
-            slot->done = true;
-        }
-        ss.enqueued.fetch_sub(1, std::memory_order_relaxed);
+            // Per-flow done: when this flow's last sink drains, flag the slot reapable and free the
+            // pipeline slot. The dispatcher reaps `done` slots but destroys them (and join()s this
+            // thread) only *after* dropping its locks, so this thread can always finish even if the
+            // reap races us here.
+            if (slot->flow_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                {
+                    std::lock_guard<std::mutex> slock(ss.mutex);
+                    slot->done = true;
+                }
+                ss.enqueued.fetch_sub(1, std::memory_order_relaxed);
 
-        // Wake the dispatcher. Take dispatch_mutex_ on its own (ss.mutex already released, no
-        // nesting) so the wakeup pairs with the dispatcher's wait and cannot be lost between its
-        // predicate check and dispatch_cv_.wait().
-        {
-            std::lock_guard<std::mutex> dlock(dispatch_mutex_);
-        }
-        dispatch_cv_.notify_one();
-    });
+                {
+                    std::lock_guard<std::mutex> dlock(dispatch_mutex_);
+                }
+                dispatch_cv_.notify_one();
+            }
+        });
+    }
 
-    // Now apply the rest of the operators
-    for (auto &op : slot->splinter.operators) {
-        if (&*op != &sink) {
+    for (auto &op : slot->flow) {
+        if (dynamic_cast<LocalSinkOperator *>(op.get()) == nullptr) {
             op->apply(stream, ctx_);
         }
     }
 
     if (libstf::should_log(libstf::LogLevel::DEBUG)) {
-        libstf::log(libstf::LogLevel::DEBUG, "Enqueued %s to stream %u",
-                    slot->splinter.to_string().c_str(), static_cast<unsigned>(stream));
+        libstf::log(libstf::LogLevel::DEBUG, "Enqueued flow to stream %u",
+                    static_cast<unsigned>(stream));
     }
     libstf::Profiler::close_regions({profiler_prefix + "dispatch_to"});
 }

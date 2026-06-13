@@ -92,13 +92,15 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	struct PendingGroup {
 		size_t group = 0;
 		size_t num_rows = 0;
-		std::vector<oasis::SplinterResultHandle> results;
+		// The whole row group is one QuerySplinter with one result handle. Batches arrive tagged 
+        // with their projection index and are placed into hw_buffers by tag.
+		oasis::SplinterResultHandle result;
+		size_t hw_columns_remaining = 0;
 		std::vector<std::vector<unique_ptr<Vector>>> cpu_slices;
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
 
-		// One-shot wake guard for the current BLOCKED return: Only the first channel to fire calls 
-        // InterruptState::Callback(), so a single BLOCKED return yields exactly one Reschedule() 
-        // even if several channels complete at once.
+		// One-shot wake guard for the current BLOCKED return: Only the first ready signal fires
+        // InterruptState::Callback(), so a single BLOCKED return yields exactly one Reschedule().
 		std::shared_ptr<std::atomic_flag> wake_guard = std::make_shared<std::atomic_flag>();
 	};
 

@@ -58,12 +58,14 @@ void DecodeColumnChunkOperator::print(std::ostream &os) const {
        << ", type=" << type_ << ")";
 }
 
-void HostBufferSinkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
+void LocalSinkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     libstf::stream_mask_t mask;
     mask.set(stream);
     handle_ = ctx.output_buffer_manager()->acquire_output_handle(mask);
 }
 
-void HostBufferSinkOperator::print(std::ostream &os) const { os << "HostBufferSink()"; }
+void LocalSinkOperator::print(std::ostream &os) const {
+    os << "HostBufferSink(tag=" << tag_ << ")";
+}
 
 } // namespace oasis
