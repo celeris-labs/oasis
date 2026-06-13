@@ -1,5 +1,8 @@
 #include "oasis_hardware_bloom.hpp"
 
+#undef LOG_INFO
+#undef LOG_DEBUG
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -15,6 +18,8 @@
 #include "parcore/configuration.hpp"
 #include "parquet_reader.hpp"
 
+#undef LOG_INFO
+#undef LOG_DEBUG
 
 #include <algorithm>
 #include <bitset>
@@ -23,7 +28,8 @@
 #include <fstream>
 #include <limits>
 #include <memory>
-#include <unordered_set>
+#include <mutex>
+#include <vector>
 
 namespace duckdb {
 
@@ -179,27 +185,6 @@ static uint64_t DecodedAxiBeatsForColumnChunk(const parcore::metadata::ColumnChu
         return beats;
 }
 
-static void EnqueueBloomStreamConfig(const char *reason, parcore::metadata::Type type) {
-        if (!parcore::metadata::is_libstf_type(type)) {
-                throw InvalidInputException("OASIS hardware Bloom only supports libstf-compatible key types for now");
-        }
-
-        auto &ctx = oasis::OasisContext::ctx();
-        auto bf_stream_config = ctx.config<libstf::StreamConfig>();
-
-        auto libstf_type = parcore::metadata::to_libstf_type(type);
-
-        OASIS_HW_BLOOM_LOG("StreamConfig reason=%s stream=0 type=%d select=0",
-                           reason,
-                           (int)libstf_type);
-
-        bf_stream_config->enqueue_stream_config(
-            0,
-            libstf_type,
-            0 // 0 = Bloomfilter path, 1 = Bypass
-        );
-}
-
 static std::unique_ptr<oasis::SourceOperator>
 MakeLocalSource(oasis::OasisContext &ctx, const string &filename, const parcore::metadata::ColumnChunk &cc) {
         if (cc.total_compressed_size == 0) {
@@ -253,68 +238,60 @@ static void ConfigureBloomOutputStream0Only(uint32_t first_last_beat, uint32_t s
                            (unsigned long long)bf_config->hash_table_size());
 }
 
-static idx_t MaterializeInt64BuffersToDuckDBOutput(const std::vector<std::shared_ptr<libstf::Buffer>> &buffers,
-                                                   DataChunk &output) {
+static idx_t EmitBloomBuffersZeroCopy(OasisHardwareBloomState &hb, DataChunk &output) {
         if (output.data.empty()) {
                 throw InternalException("OASIS hardware Bloom: DuckDB output has no columns");
         }
 
-        output.data[0].SetVectorType(VectorType::FLAT_VECTOR);
-        auto out_data = FlatVector::GetData<int64_t>(output.data[0]);
-        auto &validity = FlatVector::Validity(output.data[0]);
+        std::lock_guard<std::mutex> lock(hb.consume_mutex);
 
-        idx_t written = 0;
+        while (hb.current_buffer_idx < hb.buffers.size()) {
+                auto &buf = hb.buffers[hb.current_buffer_idx];
 
-        for (size_t buffer_idx = 0; buffer_idx < buffers.size() && written < STANDARD_VECTOR_SIZE; buffer_idx++) {
-                auto &buffer = buffers[buffer_idx];
-
-                if (!buffer) {
+                if (!buf) {
                         throw InternalException("OASIS hardware Bloom: received null output buffer");
                 }
 
-                if ((buffer->size % sizeof(int64_t)) != 0) {
+                if ((buf->size % sizeof(int64_t)) != 0) {
                         throw InternalException("OASIS hardware Bloom: output buffer size is not a multiple of int64 size");
                 }
 
-                auto values = reinterpret_cast<const int64_t *>(buffer->ptr);
-                size_t values_in_buffer = buffer->size / sizeof(int64_t);
+                const size_t values_in_buffer = buf->size / sizeof(int64_t);
 
-                size_t remaining_capacity = STANDARD_VECTOR_SIZE - written;
-                size_t values_to_copy = std::min(values_in_buffer, remaining_capacity);
-
-                for (size_t i = 0; i < values_to_copy; i++) {
-                        out_data[written++] = values[i];
+                if (hb.current_buffer_offset >= values_in_buffer) {
+                        hb.current_buffer_idx++;
+                        hb.current_buffer_offset = 0;
+                        continue;
                 }
+
+                const size_t remaining_values = values_in_buffer - hb.current_buffer_offset;
+                const idx_t emit = static_cast<idx_t>(std::min<size_t>(remaining_values, STANDARD_VECTOR_SIZE));
+
+                auto &vec = output.data[0];
+                vec.SetVectorType(VectorType::FLAT_VECTOR);
+                FlatVector::SetData(
+                    vec,
+                    reinterpret_cast<data_ptr_t>(buf->ptr) + hb.current_buffer_offset * sizeof(int64_t));
+                vec.SetAuxiliary(make_buffer<LibstfBufferVectorBuffer>(buf));
+                FlatVector::Validity(vec).SetAllValid(emit);
+
+                hb.current_buffer_offset += emit;
+                if (hb.current_buffer_offset >= values_in_buffer) {
+                        hb.current_buffer_idx++;
+                        hb.current_buffer_offset = 0;
+                }
+
+                output.SetCardinality(emit);
+                return emit;
         }
 
-        validity.SetAllValid(written);
-
-        OASIS_HW_BLOOM_LOG("materialized %llu INT64 values into DuckDB output chunk",
-                           (unsigned long long)written);
-
-        return written;
+        output.SetCardinality(0);
+        return 0;
 }
 
-void InitializeOasisHardwareBloom(ClientContext &context, const OasisScanBindData &probe_bind) {
-        (void)context;
-
-        OASIS_HW_BLOOM_LOG("initializing hardware bloom smoke-test");
-        OASIS_HW_BLOOM_LOG("build file = %s", probe_bind.runtime_bloom_build_filename.c_str());
-        OASIS_HW_BLOOM_LOG("build key  = %s", probe_bind.runtime_bloom_build_key.c_str());
-        OASIS_HW_BLOOM_LOG("probe key  = %s", probe_bind.runtime_bloom_probe_key.c_str());
-}
-
-void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+static void ExecuteHardwareBloomOnce(ClientContext &context, TableFunctionInput &data_p, OasisHardwareBloomState &hb) {
         auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
         auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
-
-        static std::unordered_set<OasisScanGlobalState *> already_ran;
-
-        if (already_ran.find(&gstate) != already_ran.end()) {
-                output.SetCardinality(0);
-                return;
-        }
-        already_ran.insert(&gstate);
 
         ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>("oasis_context");
         auto &ctx = oasis::OasisContext::ctx();
@@ -345,9 +322,6 @@ void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &
                 OASIS_HW_BLOOM_LOG("WARNING: build key type=%d probe key type=%d differ", (int)build_type, (int)probe_type);
         }
 
-        // The current hardware BloomfilterOperator consumes data64_t keys.
-        // The Celeris example also asserts INT64_T for both build/probe keys.
-        // Keep the MVP strict to avoid feeding packed INT32 data into a data64_t Bloomfilter.
         if (build_type != parcore::metadata::Type::INT64_T) {
                 throw InvalidInputException("OASIS hardware Bloom smoke-test currently supports INT64 build keys only");
         }
@@ -389,10 +363,7 @@ void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &
         OASIS_HW_BLOOM_LOG("enqueue BUILD side through scheduler: group=0 col=%llu",
                            (unsigned long long)build_col_id);
 
-        splinter.operators.push_back(std::make_unique<oasis::StreamConfigOperator>(
-            build_libstf_type,
-            0 // 0 = Bloomfilter path
-        ));
+        splinter.operators.push_back(std::make_unique<oasis::StreamConfigOperator>(build_libstf_type, 0));
         splinter.operators.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
             build_chunk.compression,
             build_chunk.num_values,
@@ -402,10 +373,7 @@ void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &
         OASIS_HW_BLOOM_LOG("enqueue PROBE side through scheduler: group=0 col=%llu",
                            (unsigned long long)probe_col_id);
 
-        splinter.operators.push_back(std::make_unique<oasis::StreamConfigOperator>(
-            probe_libstf_type,
-            0 // 0 = Bloomfilter path
-        ));
+        splinter.operators.push_back(std::make_unique<oasis::StreamConfigOperator>(probe_libstf_type, 0));
         splinter.operators.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
             probe_chunk.compression,
             probe_chunk.num_values,
@@ -418,18 +386,22 @@ void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &
         auto result = ctx.scheduler().submit_to_stream(0, std::move(splinter));
 
         OASIS_HW_BLOOM_LOG("waiting for hardware Bloom output on stream 0 through Scheduler result");
-        std::vector<std::shared_ptr<libstf::Buffer>> buffers;
+
+        hb.buffers.clear();
+        hb.current_buffer_idx = 0;
+        hb.current_buffer_offset = 0;
+
         while (auto batch = result.get_next_batch()) {
-                buffers.push_back(std::move(*batch));
+                hb.buffers.push_back(std::move(*batch));
         }
 
         size_t total_bytes = 0;
-        for (size_t i = 0; i < buffers.size(); i++) {
-                total_bytes += buffers[i]->size;
+        for (size_t i = 0; i < hb.buffers.size(); i++) {
+                total_bytes += hb.buffers[i]->size;
                 OASIS_HW_BLOOM_LOG("hardware Bloom output buffer[%llu] ptr=%p size=%llu",
                                    (unsigned long long)i,
-                                   buffers[i]->ptr,
-                                   (unsigned long long)buffers[i]->size);
+                                   hb.buffers[i]->ptr,
+                                   (unsigned long long)hb.buffers[i]->size);
         }
 
         auto bf_config = ctx.config<OasisBFConfig>();
@@ -440,10 +412,37 @@ void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &
                            (unsigned long long)bf_config->fetch_probe_idle_cycles());
 
         OASIS_HW_BLOOM_LOG("HARDWARE BLOOM ANSWER RECEIVED: buffers=%llu total_bytes=%llu",
-                           (unsigned long long)buffers.size(),
+                           (unsigned long long)hb.buffers.size(),
                            (unsigned long long)total_bytes);
-
-        auto cardinality = MaterializeInt64BuffersToDuckDBOutput(buffers, output);
-        output.SetCardinality(cardinality);
 }
+
+void InitializeOasisHardwareBloom(ClientContext &context, const OasisScanBindData &probe_bind) {
+        (void)context;
+
+        OASIS_HW_BLOOM_LOG("initializing hardware bloom");
+        OASIS_HW_BLOOM_LOG("build file = %s", probe_bind.runtime_bloom_build_filename.c_str());
+        OASIS_HW_BLOOM_LOG("build key  = %s", probe_bind.runtime_bloom_build_key.c_str());
+        OASIS_HW_BLOOM_LOG("probe key  = %s", probe_bind.runtime_bloom_probe_key.c_str());
+}
+
+void OasisScanFunctionBloomHardware(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+        auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
+
+        if (!gstate.hardware_bloom) {
+                throw InternalException("OASIS hardware Bloom state is not initialized");
+        }
+
+        auto &hb = *gstate.hardware_bloom;
+
+        if (!hb.executed.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(hb.launch_mutex);
+                if (!hb.executed.load(std::memory_order_relaxed)) {
+                        ExecuteHardwareBloomOnce(context, data_p, hb);
+                        hb.executed.store(true, std::memory_order_release);
+                }
+        }
+
+        EmitBloomBuffersZeroCopy(hb, output);
+}
+
 } // namespace duckdb

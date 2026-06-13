@@ -8,8 +8,13 @@
 #include "parcore/metadata/metadata.hpp"
 #include "parquet_reader.hpp"
 
+#undef LOG_INFO
+#undef LOG_DEBUG
+
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 namespace duckdb {
 
@@ -25,10 +30,6 @@ struct OasisScanBindData : public TableFunctionData {
         string runtime_bloom_probe_key;
 };
 
-// Global scan state shared across all DuckDB worker threads of one read_oasis scan. Following
-// DuckDB's own Parquet reader, the only shared mutable state is the row-group cursor (an atomic
-// each worker claims a group from). Everything per-row-group lives in the local state so workers
-// never race on it.
 struct OasisScanGlobalState : public GlobalTableFunctionState {
         string filename;
         oasis::OasisContext *ctx = nullptr;
@@ -45,10 +46,8 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 
         std::shared_ptr<OasisHardwareBloomState> hardware_bloom;
 
-        // True when the query consumes no column values (e.g. COUNT(*), EXISTS).
         bool emit_cardinality_only = false;
 
-        // Row-group cursor: the next group to hand out. Claimed atomically by workers.
         std::atomic<size_t> next_group {0};
         size_t total_groups = 0;
 
@@ -57,17 +56,9 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
         }
 };
 
-// Per-worker scan state. Owns this worker's file handle (DuckDB FileHandles are not safe to share
-// across threads) and, for the row group it is currently scanning, the decoded buffer per column it
-// is slicing into vectors.
-//
-// One buffer per column chunk: a row group is decoded in full in hardware, each column yielding
-// exactly one buffer, and we then slice all columns' buffers in lockstep. The next group is loaded
-// only once the current buffers are fully emitted.
 struct OasisScanLocalState : public LocalTableFunctionState {
         unique_ptr<FileHandle> file_handle;
 
-        // CPU (string) decode path, per worker.
         unique_ptr<ParquetReader> parquet_reader;
         unique_ptr<ParquetReaderScanState> scan_state;
         unique_ptr<ColumnReader> root_reader;
@@ -76,9 +67,6 @@ struct OasisScanLocalState : public LocalTableFunctionState {
         size_t current_buf_offset = 0;
         size_t current_group_num_rows = 0;
 
-        // Empty-projection path only (COUNT(*) etc.): Rows left to emit from the row group we last
-        // claimed. We never decode anything in this path -- the count comes straight from the Parquet
-        // metadata.
         size_t empty_proj_remaining = 0;
 };
 

@@ -20,10 +20,6 @@
 #include <cstring>
 #include <limits>
 
-// oasis_scan.hpp transitively pulls in Coyote, which includes <syslog.h>. That
-// header defines LOG_INFO / LOG_DEBUG as numeric macros that collide with the
-// duckdb::LogLevel enum values, turning e.g. `LogLevel::LOG_DEBUG` into
-// `LogLevel::7`. #undef them so the LogLevel:: use sites below compile.
 #undef LOG_INFO
 #undef LOG_DEBUG
 
@@ -161,9 +157,6 @@ static oasis::OasisContext &GetOasisContext(ClientContext &context) {
         return ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>("oasis_context")->ctx();
 }
 
-// Applies the oasis_scheduler_num_streams / oasis_scheduler_queue_depth SET parameters to the live
-// scheduler. A value of 0 (the default) leaves the corresponding knob at its current value, so the
-// hardware defaults chosen at context init stay in effect until the user overrides them.
 static void ApplySchedulerSettings(ClientContext &context, oasis::Scheduler &scheduler) {
         Value value;
         if (context.TryGetCurrentSetting("oasis_scheduler_num_streams", value) && !value.IsNull()) {
@@ -200,11 +193,9 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
                 auto t = bind_data.metadata.groups[0].chunks[col_id].type;
                 gstate->column_ids.push_back(col_id);
                 if (parcore::metadata::is_libstf_type(t)) {
-                        // Hardware path: Fixed-width type the ParCore decoder handles.
                         gstate->is_cpu_column.push_back(false);
                         gstate->elem_sizes.push_back(libstf::size_of(parcore::metadata::to_libstf_type(t)));
                 } else {
-                        // CPU path: Variable-length type (BYTE_ARRAY/string) decoded by DuckDB's ColumnReader.
                         gstate->is_cpu_column.push_back(true);
                         gstate->elem_sizes.push_back(0);
                         gstate->has_cpu_columns = true;
@@ -224,6 +215,7 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
                 if (UseHardwareBloomByDefault()) {
                         OASIS_SCAN_LOG("using hardware bloom path");
                         gstate->hardware_bloom_enabled = true;
+                        gstate->hardware_bloom = std::make_shared<OasisHardwareBloomState>();
                         InitializeOasisHardwareBloom(context, bind_data);
                 } else {
                         throw NotImplementedException("OASIS software Bloom mock was removed; unset OASIS_USE_SOFTWARE_BLOOM");
@@ -240,8 +232,6 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
         auto &gstate = global_state_p->Cast<OasisScanGlobalState>();
         auto lstate = make_uniq<OasisScanLocalState>();
 
-        // Each worker owns its own file handle: DuckDB FileHandles are not safe to share across threads,
-        // and the local source path reads from it on this worker thread.
         auto &fs = FileSystem::GetFileSystem(context.client);
         lstate->file_handle = fs.OpenFile(gstate.filename, FileOpenFlags::FILE_FLAGS_READ);
 
@@ -262,8 +252,6 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
         return std::move(lstate);
 }
 
-// Builds the source operator for one column chunk. The transport (remote RDMA vs. local host DMA) is
-// chosen once, here, and hidden behind the SourceOperator interface; the scheduler never sees it.
 static std::unique_ptr<oasis::SourceOperator> MakeSource(oasis::OasisContext &ctx, OasisScanLocalState &lstate,
                                                          const parcore::metadata::ColumnChunk &cc) {
         const uint64_t offset = ColumnChunkFileOffset(cc);
@@ -283,13 +271,8 @@ static std::unique_ptr<oasis::SourceOperator> MakeSource(oasis::OasisContext &ct
         return std::make_unique<oasis::LocalSourceOperator>(std::move(buffer));
 }
 
-// Submits one splinter per projected hardware column of `group` to the shared scheduler and collects
-// all decoded output batches for each column. The OBM may split a decoded column chunk into multiple
-// output buffers; this function merges those buffers into one contiguous libstf::Buffer so the
-// downstream DuckDB vector handoff can keep slicing one buffer per projected column.
 static void DecodeGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                         OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
-        // Submit one query splinter per hardware column. CPU columns are skipped here and decoded inline.
         std::vector<oasis::SplinterResultHandle> results;
         results.reserve(gstate.column_ids.size());
         for (size_t i = 0; i < gstate.column_ids.size(); i++) {
@@ -303,8 +286,6 @@ static void DecodeGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGloba
 
                 oasis::QuerySplinter splinter;
 
-                // Stream 0 is physically routed through the Bloomfilter/bypass block. Normal scans
-                // must use select=1 there. On streams >0 StreamConfigOperator is a no-op.
                 splinter.operators.push_back(std::make_unique<oasis::StreamConfigOperator>(type, 1));
                 splinter.operators.push_back(
                     std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
@@ -313,15 +294,11 @@ static void DecodeGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGloba
                 results.push_back(ctx.scheduler().submit(std::move(splinter)));
         }
 
-        // InitializeRead(...) does the page-header parsing / I/O positioning for the row group.
         if (gstate.has_cpu_columns) {
                 lstate.root_reader->InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns,
                                                    *lstate.scan_state->thrift_file_proto);
         }
 
-        // Collect each hardware column in submit order (restores per-column order even though splinters
-        // may finish on different streams out of order). A single decoded column chunk may produce
-        // multiple OBM buffers, so collect until the expected decoded byte count has arrived.
         lstate.current_buffers.assign(gstate.column_ids.size(), nullptr);
         for (size_t i = 0; i < results.size(); i++) {
                 if (gstate.is_cpu_column[i]) {
@@ -381,23 +358,18 @@ static void DecodeGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGloba
         }
 }
 
-// Claims the next non-empty row group off the shared atomic cursor, returning its index (or
-// total_groups once all groups are consumed).
 static size_t ClaimNextNonEmptyGroup(OasisScanGlobalState &gstate, const OasisScanBindData &bind) {
         while (true) {
                 size_t group = gstate.next_group.fetch_add(1);
                 if (group >= gstate.total_groups) {
                         return gstate.total_groups;
                 }
-                // Every column chunk in a row group shares its row count; take it from the first chunk.
                 if (bind.metadata.groups[group].chunks[0].num_values != 0) {
                         return group;
                 }
         }
 }
 
-// Loads the next row group's buffers into lstate.current_buffers, claiming groups off the shared
-// cursor. Returns false once all groups are consumed. Each worker owns its group's buffers privately.
 static bool LoadNextGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                           OasisScanLocalState &lstate, const OasisScanBindData &bind) {
         size_t group = ClaimNextNonEmptyGroup(gstate, bind);
@@ -410,21 +382,14 @@ static bool LoadNextGroup(Logger &logger, oasis::OasisContext &ctx, OasisScanGlo
         return true;
 }
 
-// Emits cardinality only, for queries that project no columns (COUNT(*), EXISTS, etc.). DuckDB
-// derives the aggregate from the row counts we report, so there is nothing to decode: each worker
-// claims row groups off the shared cursor and emits their row counts (from the Parquet metadata)
-// in STANDARD_VECTOR_SIZE slices. The hardware is never touched.
 static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
                                 const OasisScanBindData &bind, DataChunk &output) {
-        // Claim the next group with rows off the shared cursor (ClaimNextNonEmptyGroup skips empty groups
-        // for us) or signal EOF once the groups run out.
         if (lstate.empty_proj_remaining == 0) {
                 size_t group = ClaimNextNonEmptyGroup(gstate, bind);
                 if (group >= gstate.total_groups) {
                         output.SetCardinality(0);
                         return;
                 }
-                // Every column chunk in a row group shares its row count; take it from the first chunk.
                 lstate.empty_proj_remaining = bind.metadata.groups[group].chunks[0].num_values;
         }
 
@@ -433,10 +398,6 @@ static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalStat
         output.SetCardinality(emit);
 }
 
-// Multi-column scan. Each worker atomically claims a row group (LoadNextGroup), decoding every
-// projected hardware column into a contiguous merged buffer, then slicing those buffers in lockstep
-// into STANDARD_VECTOR_SIZE-sized vectors. All columns of a row group share the same element count,
-// so the slices stay aligned.
 void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
         auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
         auto &lstate = data_p.local_state->Cast<OasisScanLocalState>();
@@ -456,7 +417,6 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
                 return;
         }
 
-        // When the current group is fully emitted, decode/claim the next one.
         if (lstate.current_group_num_rows == 0) {
                 if (!LoadNextGroup(Logger::Get(context), ctx, gstate, lstate, bind)) {
                         output.SetCardinality(0);
@@ -468,7 +428,6 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
         size_t const remaining_elements = total_elements - lstate.current_buf_offset;
         size_t const emit = std::min<size_t>(remaining_elements, STANDARD_VECTOR_SIZE);
 
-        // Scratch define/repeat buffers shared by this worker's CPU column readers for this call.
         uint8_t *define_ptr = nullptr;
         uint8_t *repeat_ptr = nullptr;
         if (gstate.has_cpu_columns) {
@@ -503,35 +462,12 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
                             (unsigned long long)i, (unsigned long long)(buf->size / kElemSize), (unsigned long long)total_elements);
                 }
 
-                // The actual zero-copy handoff. Two things happen here:
-                //
-                //  1. FlatVector::SetData points the vector's raw data pointer directly
-                //     into the merged libstf buffer (+ byte offset for the
-                //     STANDARD_VECTOR_SIZE slice we're emitting this call).
-                //
-                //  2. SetAuxiliary hands the buffer's shared_ptr to DuckDB's Vector
-                //     lifetime slot (wrapped in LibstfBufferVectorBuffer, because
-                //     DuckDB's slot is typed to shared_ptr<VectorBuffer>, not our
-                //     shared_ptr<libstf::Buffer>). DuckDB copies this shared_ptr whenever
-                //     it copies the vector, so the underlying memory stays alive as long
-                //     as any downstream consumer references it.
-                //
-                // Two refcount holders protect the memory while it's in flight:
-                //   - lstate.current_buffers holds the one merged buffer per column and keeps it
-                //     alive across scan calls while we slice it into multiple
-                //     STANDARD_VECTOR_SIZE emissions (auxiliary gets cleared on each
-                //     output.Reset()).
-                //   - vector auxiliary (set here) keeps it alive for any downstream
-                //     consumer that holds onto the vector past our next scan call.
                 auto &vec = output.data[i];
                 vec.SetVectorType(VectorType::FLAT_VECTOR);
                 FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_buf_offset * kElemSize);
                 vec.SetAuxiliary(make_buffer<LibstfBufferVectorBuffer>(buf));
         }
 
-        // Advance the cursor. If we have emitted this group's last elements, release the buffers so the
-        // next scan call's `if` branch loads the next row group. Dropping our refs here lets each buffer
-        // free as soon as downstream consumers are done with it.
         lstate.current_buf_offset += emit;
         if (lstate.current_buf_offset >= total_elements) {
                 lstate.current_buffers.assign(gstate.column_ids.size(), nullptr);
@@ -542,9 +478,6 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
         output.SetCardinality(emit);
 }
 
-// Advertises the zero-width COLUMN_IDENTIFIER_EMPTY virtual column. For queries that consume no
-// column values (e.g., COUNT(*), EXISTS), DuckDB's optimizer projects this sentinel instead of
-// anchoring the scan on a real column (LogicalGet::GetAnyColumn).
 virtual_column_map_t OasisScanGetVirtualColumns(ClientContext &, optional_ptr<FunctionData>) {
         virtual_column_map_t result;
         result.insert(make_pair(COLUMN_IDENTIFIER_EMPTY, TableColumn("", LogicalType::BOOLEAN)));

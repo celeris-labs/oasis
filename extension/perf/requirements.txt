@@ -1,0 +1,4 @@
+duckdb
+pyarrow
+numpy
+matplotlib
