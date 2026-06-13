@@ -320,6 +320,10 @@ static void DecodeCpuColumns(OasisScanGlobalState &gstate, OasisScanLocalState &
 				throw InternalException("ParCore CPU column %llu read %llu values, expected %llu (decode desync)",
 				                        (unsigned long long)i, (unsigned long long)rows_read, (unsigned long long)emit);
 			}
+
+			// Since we retain every slice's vector until emit, flatten here so each slice owns its 
+            // own data and stops aliasing that shared scratch state.
+			vec->Flatten(emit);
 			slices.push_back(std::move(vec));
 		}
 	}
