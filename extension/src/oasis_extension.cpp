@@ -34,6 +34,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("oasis_scheduler_queue_depth",
 	                          "Max splinters in flight per stream (0 = hardware config-FIFO depth)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0), SetSchedulerQueueDepth);
+	config.AddExtensionOption(
+	    "oasis_scan_groups_in_flight",
+	    "Row groups a single read_oasis scan keeps submitted but not yet collected, overlapping "
+	    "submission with collection. Split across the scan's worker threads (each worker keeps "
+	    "ceil(value / threads) groups in flight but at least 1).",
+	    LogicalType::UBIGINT, Value::UBIGINT(16));
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);

@@ -12,6 +12,7 @@
 #include "duckdb/planner/table_filter_state.hpp"
 
 #include <atomic>
+#include <deque>
 
 namespace duckdb {
 
@@ -60,6 +61,8 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::atomic<size_t> next_group {0};
 	size_t total_groups = 0;
 
+	size_t groups_in_flight_per_worker = 1;
+
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
 	}
@@ -98,7 +101,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
         // even if several channels complete at once.
 		std::shared_ptr<std::atomic_flag> wake_guard = std::make_shared<std::atomic_flag>();
 	};
-	unique_ptr<PendingGroup> pending;
+
+	std::deque<unique_ptr<PendingGroup>> inflight;
+
+	bool groups_exhausted = false;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 

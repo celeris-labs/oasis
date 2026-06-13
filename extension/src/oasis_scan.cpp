@@ -5,6 +5,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "oasis/oasis_context.hpp"
 #include "oasis/operator.hpp"
@@ -67,6 +69,14 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	gstate->filename = bind_data.filename;
 	gstate->total_groups = bind_data.metadata.groups.size();
 	gstate->filters = input.filters;
+
+	// Split the scan-wide groups-in-flight budget across the worker threads this scan will run on.
+	Value groups_in_flight_val;
+	context.TryGetCurrentSetting("oasis_scan_groups_in_flight", groups_in_flight_val);
+	size_t const groups_in_flight = groups_in_flight_val.IsNull() ? 16 : groups_in_flight_val.GetValue<uint64_t>();
+	size_t const num_threads =
+	    std::max<size_t>(1, static_cast<size_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
+	gstate->groups_in_flight_per_worker = std::max<size_t>(1, (groups_in_flight + num_threads - 1) / num_threads);
 
 	for (auto col_id : input.column_ids) {
 		if (col_id == COLUMN_IDENTIFIER_EMPTY) {
@@ -418,40 +428,46 @@ enum class LoadResult : uint8_t {
 	EXHAUSTED
 };
 
-// Drives the async load of the next row group. On the first call for a group it claims one off the
-// shared cursor and submits it (lstate.pending). Then and in later calls it polls the hardware
-// channels. Once every hardware column is ready it moves the buffers/CPU slices into the current_*
-// fields and clears pending, returning LOADED. If any hardware column is still outstanding it arms
-// readiness callbacks and returns BLOCKED. Returns EXHAUSTED when no group remains.
-static LoadResult LoadNextGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
-                                OasisScanLocalState &lstate, const OasisScanBindData &bind, InterruptState interrupt_state) {
-	// Submit phase: Start a group if none is in flight.
-	if (!lstate.pending) {
+static void TopUpInflight(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                          OasisScanLocalState &lstate, const OasisScanBindData &bind) {
+	while (!lstate.groups_exhausted && lstate.inflight.size() < gstate.groups_in_flight_per_worker) {
 		size_t group = ClaimNextMatchingGroup(context, gstate, lstate, bind);
 		if (group >= gstate.total_groups) {
-			return LoadResult::EXHAUSTED;
+			lstate.groups_exhausted = true;
+			break;
 		}
-		lstate.pending = BeginGroup(context, ctx, gstate, lstate, bind, group);
+		lstate.inflight.push_back(BeginGroup(context, ctx, gstate, lstate, bind, group));
 	}
+}
 
-	// Poll phase: Collect the hardware buffers without blocking. If any column is still 
+static LoadResult LoadNextGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                                OasisScanLocalState &lstate, const OasisScanBindData &bind, InterruptState interrupt_state) {
+	// Submit phase: Keep the pipeline full so later groups decode in hardware while we collect the head.
+	TopUpInflight(context, ctx, gstate, lstate, bind);
+
+	if (lstate.inflight.empty()) {
+		return LoadResult::EXHAUSTED;
+	}
+	auto &head = *lstate.inflight.front();
+
+	// Poll phase: Collect the head group's hardware buffers without blocking. If any column is still
     // outstanding, arm readiness callbacks and return BLOCKED so the worker thread is released.
 	//
-	// Arming and polling race against the completion thread, so we loop: The loop terminates 
-    // because each iteration either collects at least one more column or successfully arms every 
+	// Arming and polling race against the completion thread, so we loop: The loop terminates
+    // because each iteration either collects at least one more column or successfully arms every
     // remaining one.
-	while (!TryCollectColumnChunks(context, gstate, bind, *lstate.pending)) {
-		if (ArmReadinessCallbacks(gstate, *lstate.pending, interrupt_state)) {
+	while (!TryCollectColumnChunks(context, gstate, bind, head)) {
+		if (ArmReadinessCallbacks(gstate, head, interrupt_state)) {
 			return LoadResult::BLOCKED;
 		}
 	}
 
-	lstate.current_buffers = std::move(lstate.pending->hw_buffers);
-	lstate.current_cpu_slices = std::move(lstate.pending->cpu_slices);
+	lstate.current_buffers = std::move(head.hw_buffers);
+	lstate.current_cpu_slices = std::move(head.cpu_slices);
 	lstate.current_buf_offset = 0;
-	lstate.current_group_num_rows = lstate.pending->num_rows;
-	lstate.current_group = lstate.pending->group;
-	lstate.pending.reset();
+	lstate.current_group_num_rows = head.num_rows;
+	lstate.current_group = head.group;
+	lstate.inflight.pop_front();
 	return LoadResult::LOADED;
 }
 
