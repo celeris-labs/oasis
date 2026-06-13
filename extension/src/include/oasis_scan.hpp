@@ -4,6 +4,7 @@
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis/splinter_result.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "parcore/metadata/metadata.hpp"
 #include "parquet_reader.hpp"
@@ -83,6 +84,21 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 	// Reused selection vector for row-level filtering, so we don't reallocate per scan call.
 	SelectionVector filter_sel;
+
+	// Async (BLOCKED) state for the row group this worker has submitted but not yet collected.
+	struct PendingGroup {
+		size_t group = 0;
+		size_t num_rows = 0;
+		std::vector<oasis::SplinterResultHandle> results;
+		std::vector<std::vector<unique_ptr<Vector>>> cpu_slices;
+		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
+
+		// One-shot wake guard for the current BLOCKED return: Only the first channel to fire calls 
+        // InterruptState::Callback(), so a single BLOCKED return yields exactly one Reschedule() 
+        // even if several channels complete at once.
+		std::shared_ptr<std::atomic_flag> wake_guard = std::make_shared<std::atomic_flag>();
+	};
+	unique_ptr<PendingGroup> pending;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 
