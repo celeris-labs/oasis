@@ -1,5 +1,6 @@
 #include "oasis_scan.hpp"
 
+#include "coalesced_fetcher.hpp"
 #include "column_reader.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
@@ -16,6 +17,8 @@
 #include "filter_pushdown.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <limits>
 #include <vector>
 
 // oasis_scan.hpp transitively pulls in Coyote, which includes <syslog.h>. That
@@ -122,23 +125,34 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	return std::move(lstate);
 }
 
-// Builds the source operator for one column chunk. The transport (remote RDMA vs. local host DMA) is
-// chosen once, here, and hidden behind the SourceOperator interface; the scheduler never sees it.
-static std::unique_ptr<oasis::SourceOperator> MakeSource(oasis::OasisContext &ctx, OasisScanLocalState &lstate,
-                                                         const parcore::metadata::ColumnChunk &cc) {
-	if (auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get())) {
-		return std::make_unique<oasis::RDMASourceOperator>(rdma->remote_offset + cc.offset, cc.total_compressed_size);
+static std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdma,
+                                                             const parcore::metadata::ColumnChunk &cc) {
+	return std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + cc.offset, cc.total_compressed_size);
+}
+
+static std::unique_ptr<oasis::SourceOperator>
+MakeHostSource(oasis::OasisContext &ctx, const CoalescedFetcher::RangeView &view) {
+	if ((reinterpret_cast<uintptr_t>(view.data()) % 64) == 0) {
+		// Zero-copy for aligned ranges: A libstf::Buffer that describes just this chunk's slice, 
+        // owning a shared_ptr to the whole coalesced allocation so the backing bytes stay alive for 
+        // the splinter's lifetime.
+		auto *slice_ptr = static_cast<uint8_t *>(view.buffer->ptr) + view.offset;
+		size_t capacity = view.buffer->capacity - view.offset;
+		// Custom deleter keeps the parent coalesced buffer alive and frees only the wrapper struct.
+		auto parent = view.buffer;
+		std::shared_ptr<libstf::Buffer> slice(new libstf::Buffer {slice_ptr, view.size, capacity},
+		                                      [parent](libstf::Buffer *b) { delete b; });
+		return std::make_unique<oasis::LocalSourceOperator>(std::move(slice));
 	}
 
-	// Host-copy path: read the compressed bytes into a libstf buffer on this worker thread. The
-	// LocalSourceOperator owns the buffer and DMAs it into the stream when the splinter runs.
+	// TODO: REMOVE unaligned slice: Copy it out into its own aligned buffer.
 	void *ptr;
-	auto status = ctx.memory_pool()->allocate(cc.total_compressed_size, &ptr);
+	auto status = ctx.memory_pool()->allocate(view.size, &ptr);
 	if (!status.ok()) {
 		throw IOException("Could not allocate input buffer: " + status.message());
 	}
-	auto buffer = libstf::make_buffer(ctx.memory_pool(), ptr, cc.total_compressed_size, cc.total_compressed_size);
-	lstate.file_handle->Read(buffer->ptr, cc.total_compressed_size, cc.offset);
+	std::memcpy(ptr, view.data(), view.size);
+	auto buffer = libstf::make_buffer(ctx.memory_pool(), ptr, view.size, view.size);
 	return std::make_unique<oasis::LocalSourceOperator>(std::move(buffer));
 }
 
@@ -157,12 +171,14 @@ static std::vector<oasis::SplinterResultHandle>
 SubmitColumnSplinters(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                       OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
 	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
+	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
 
-	// Phase 1: Build every hardware column's splinter.
-	std::vector<oasis::QuerySplinter> splinters;
-	std::vector<size_t> splinter_slot;
-	splinters.reserve(gstate.projected_columns.size());
-	splinter_slot.reserve(gstate.projected_columns.size());
+	// Phase 0: Collect the column chunks that will be decoded in hardware and fetch them.
+	std::vector<size_t> hw_slot; // projection indices of the hardware columns, in order
+	std::vector<const parcore::metadata::ColumnChunk *> hw_chunks;
+	hw_slot.reserve(gstate.projected_columns.size());
+	hw_chunks.reserve(gstate.projected_columns.size());
+
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
@@ -170,7 +186,6 @@ SubmitColumnSplinters(ClientContext &context, oasis::OasisContext &ctx, OasisSca
 		}
 
 		const auto &cc = bind.metadata.groups[group].chunks[col.column_id];
-		auto type = parcore::metadata::to_libstf_type(cc.type);
 
 		// Enforce the one-buffer-per-chunk invariant: the decoded output must fit in a single OBM
 		// buffer. num_values is the row count, col.elem_size the decoded element width.
@@ -183,18 +198,63 @@ SubmitColumnSplinters(ClientContext &context, oasis::OasisContext &ctx, OasisSca
 			    (unsigned long long)decoded_size, (unsigned long long)buffer_capacity);
 		}
 
+		hw_slot.push_back(i);
+		hw_chunks.push_back(&cc);
+	}
+
+	CoalescedFetcher::GroupSpan group_span {0, 0};
+	if (!rdma) {
+		// Full byte span of the row group: [min chunk offset, max chunk end) over ALL chunks.
+		uint64_t span_begin = std::numeric_limits<uint64_t>::max();
+		uint64_t span_end = 0;
+		for (const auto &cc : bind.metadata.groups[group].chunks) {
+			span_begin = std::min<uint64_t>(span_begin, cc.offset);
+			span_end = std::max<uint64_t>(span_end, cc.offset + cc.total_compressed_size);
+		}
+		if (span_end > span_begin) {
+			group_span = {span_begin, span_end - span_begin};
+		}
+	}
+
+	std::vector<CoalescedFetcher::RangeHandle> host_handles;
+	CoalescedFetcher fetcher(*lstate.file_handle, ctx.memory_pool(), group_span);
+	if (!rdma) {
+		host_handles.reserve(hw_chunks.size());
+		for (const auto *cc : hw_chunks) {
+			host_handles.push_back(fetcher.Register(cc->offset, cc->total_compressed_size));
+		}
+
+		fetcher.Fetch();
+		DUCKDB_LOG_DEBUG(context, "Coalesced %llu column chunk(s) into %llu read(s) (%llu bytes) for row group %llu.",
+		                 (unsigned long long)fetcher.num_ranges(), (unsigned long long)fetcher.num_reads(),
+		                 (unsigned long long)fetcher.bytes_fetched(), (unsigned long long)group);
+	}
+
+	// Phase 1: Build every hardware column's splinter, drawing host inputs from the coalesced buffers.
+	std::vector<oasis::QuerySplinter> splinters;
+	std::vector<size_t> splinter_slot;
+	splinters.reserve(hw_slot.size());
+	splinter_slot.reserve(hw_slot.size());
+	for (size_t k = 0; k < hw_slot.size(); k++) {
+		const auto &cc = *hw_chunks[k];
+		auto type = parcore::metadata::to_libstf_type(cc.type);
+
 		oasis::QuerySplinter splinter;
-		splinter.operators.push_back(MakeSource(ctx, lstate, cc));
+		if (rdma) {
+			splinter.operators.push_back(MakeRDMASource(*rdma, cc));
+		} else {
+			splinter.operators.push_back(MakeHostSource(ctx, fetcher.Resolve(host_handles[k])));
+		}
 		splinter.operators.push_back(
 		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
 		splinter.operators.push_back(std::make_unique<oasis::HostBufferSinkOperator>());
 		splinters.push_back(std::move(splinter));
-		splinter_slot.push_back(i);
+		splinter_slot.push_back(hw_slot[k]);
 	}
 
 	// Phase 2: Submit the whole row group at once.
 	auto handles = ctx.scheduler().submit(std::move(splinters));
-    DUCKDB_LOG_DEBUG(context, "Submitted %llu QuerySplinters for row group %llu.",
+    DUCKDB_LOG_DEBUG(context, "Submitted %llu QuerySplinter(s) for row group %llu.",
 		             (unsigned long long)splinter_slot.size(), (unsigned long long)group);
 	std::vector<oasis::SplinterResultHandle> results(gstate.projected_columns.size());
 	for (size_t k = 0; k < handles.size(); k++) {
