@@ -226,17 +226,58 @@ static void CollectColumnBuffers(ClientContext &context, OasisScanGlobalState &g
 	}
 }
 
-// Decodes one row group: submit a splinter per hardware column, initialize the CPU/string readers,
-// then collect the decoded buffers.
+// Fully decodes every CPU/string column of `group` into per-slice Vectors held in
+// lstate.current_cpu_slices (indexed [projection_index][slice]).
+static void DecodeCpuColumns(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, size_t num_rows) {
+	lstate.current_cpu_slices.clear();
+	lstate.current_cpu_slices.resize(gstate.projected_columns.size());
+	if (!gstate.has_cpu_columns) {
+		return;
+	}
+
+	auto *define_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->define_buf.ptr);
+	auto *repeat_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->repeat_buf.ptr);
+
+	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+		const auto &col = gstate.projected_columns[i];
+		if (!col.is_cpu) {
+			continue;
+		}
+		auto &child_reader = lstate.root_reader->Cast<StructColumnReader>().GetChildReader(col.column_id);
+
+		auto &slices = lstate.current_cpu_slices[i];
+		for (size_t off = 0; off < num_rows; off += STANDARD_VECTOR_SIZE) {
+			size_t const emit = std::min<size_t>(num_rows - off, STANDARD_VECTOR_SIZE);
+
+			// The reader writes into define/repeat scratch as a side effect; zero per slice so a short
+			// final slice can't inherit a previous slice's levels.
+			lstate.scan_state->define_buf.zero();
+			lstate.scan_state->repeat_buf.zero();
+
+			auto vec = make_uniq<Vector>(child_reader.Type());
+			auto rows_read = child_reader.Read(emit, define_ptr, repeat_ptr, *vec);
+			if (rows_read != emit) {
+				throw InternalException("ParCore CPU column %llu read %llu values, expected %llu (decode desync)",
+				                        (unsigned long long)i, (unsigned long long)rows_read, (unsigned long long)emit);
+			}
+			slices.push_back(std::move(vec));
+		}
+	}
+}
+
+// Decodes one row group: submit a splinter per hardware column, then fully decode the CPU/string
+// columns (overlapping with the FPGA round trip) before blocking to collect the hardware buffers.
 static void DecodeGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                         OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
 	auto results = SubmitColumnSplinters(context, ctx, gstate, lstate, bind, group);
 
-	// InitializeRead(...) does the page-header parsing / I/O positioning for the CPU/string columns.
+	// InitializeRead(...) does the page-header parsing / I/O positioning for the CPU/string columns,
+	// then DecodeCpuColumns drains them in full. Both run while the FPGA splinters are in flight.
 	if (gstate.has_cpu_columns) {
 		lstate.root_reader->InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns,
 		                                   *lstate.scan_state->thrift_file_proto);
 	}
+	DecodeCpuColumns(gstate, lstate, RowGroupNumRows(bind, group));
 
 	CollectColumnBuffers(context, gstate, lstate, bind, group, results);
 }
@@ -327,27 +368,12 @@ static size_t EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx, Oas
 	size_t const remaining_elements = total_elements - lstate.current_buf_offset;
 	size_t const emit = std::min<size_t>(remaining_elements, STANDARD_VECTOR_SIZE);
 
-	// Scratch define/repeat buffers shared by this worker's CPU column readers for this call.
-	uint8_t *define_ptr = nullptr;
-	uint8_t *repeat_ptr = nullptr;
-	if (gstate.has_cpu_columns) {
-		lstate.scan_state->define_buf.zero();
-		lstate.scan_state->repeat_buf.zero();
-		define_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->define_buf.ptr);
-		repeat_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->repeat_buf.ptr);
-	}
+	size_t const slice_idx = lstate.current_buf_offset / STANDARD_VECTOR_SIZE;
 
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
-			auto &vec = output.data[i];
-			auto &child_reader = lstate.root_reader->Cast<StructColumnReader>().GetChildReader(col.column_id);
-			auto rows_read = child_reader.Read(emit, define_ptr, repeat_ptr, vec);
-			if (rows_read != emit) {
-				throw InternalException(
-				    "ParCore CPU column %llu read %llu values, expected %llu (HW/CPU cursor desync)",
-				    (unsigned long long)i, (unsigned long long)rows_read, (unsigned long long)emit);
-			}
+			output.data[i].Reference(*lstate.current_cpu_slices[i][slice_idx]);
 			continue;
 		}
 
@@ -391,6 +417,8 @@ static size_t EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx, Oas
 	lstate.current_buf_offset += emit;
 	if (lstate.current_buf_offset >= total_elements) {
 		lstate.current_buffers.assign(gstate.projected_columns.size(), nullptr);
+		lstate.current_cpu_slices.clear();
+		lstate.current_cpu_slices.resize(gstate.projected_columns.size());
 		lstate.current_buf_offset = 0;
 		lstate.current_group_num_rows = 0;
 	}

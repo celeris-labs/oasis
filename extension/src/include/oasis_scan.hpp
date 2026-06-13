@@ -85,6 +85,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	SelectionVector filter_sel;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
+
+	// Fully-decoded CPU/string columns for the current row group, indexed [projection_index][slice].
+	std::vector<std::vector<unique_ptr<Vector>>> current_cpu_slices;
+
 	size_t current_buf_offset = 0;
 	size_t current_group_num_rows = 0;
 	idx_t current_group = 0;
