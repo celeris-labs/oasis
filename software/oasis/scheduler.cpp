@@ -36,6 +36,28 @@ Scheduler::Scheduler(OasisContext &ctx)
     dispatcher_ = std::thread([this] { dispatch_loop(); });
 }
 
+std::shared_ptr<PrefetchRegistry> Scheduler::get_or_create_prefetch_registry(const void *executor_key) {
+    std::lock_guard<std::mutex> g(prefetch_mutex_);
+    auto it = prefetch_registries_.find(executor_key);
+    if (it != prefetch_registries_.end()) {
+        return it->second;
+    }
+    auto reg = std::make_shared<PrefetchRegistry>();
+    prefetch_registries_.emplace(executor_key, reg);
+    return reg;
+}
+
+std::shared_ptr<PrefetchRegistry> Scheduler::find_prefetch_registry(const void *executor_key) {
+    std::lock_guard<std::mutex> g(prefetch_mutex_);
+    auto it = prefetch_registries_.find(executor_key);
+    return it == prefetch_registries_.end() ? nullptr : it->second;
+}
+
+void Scheduler::drop_prefetch_registry(const void *executor_key) {
+    std::lock_guard<std::mutex> g(prefetch_mutex_);
+    prefetch_registries_.erase(executor_key);
+}
+
 void Scheduler::set_active_streams(libstf::stream_t active) {
     active_streams_ = std::clamp<libstf::stream_t>(active, 1, num_streams_);
     dispatch_cv_.notify_one(); // A wider span may unblock a parked dispatcher.
@@ -102,7 +124,7 @@ size_t count_sinks(const QuerySplinter &splinter) {
 
 } // namespace
 
-SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
+SplinterResultHandle Scheduler::submit(QuerySplinter splinter, PrefetchNode *prefetch_key, bool last) {
     libstf::Profiler::open_regions({profiler_prefix + "submit"});
     auto channel    = std::make_shared<SplinterResultChannel>();
     auto completion = std::make_shared<SplinterCompletion>();
@@ -117,6 +139,15 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
         }
     }
     dispatch_cv_.notify_one();
+
+    // `last` marks this scan's final splinter for `prefetch_key`: now that the predecessor has stopped
+    // submitting, start prefetch for every dependent scan that just became ready. The scheduler owns
+    // this policy -- the scan only reports the event. Fired after enqueueing this splinter's flows so
+    // the predecessor's own tail is queued ahead of the successors' warmup.
+    if (last && prefetch_key) {
+        prefetch_key->notify_dependents_last_splinter();
+    }
+
     libstf::Profiler::close_regions({profiler_prefix + "submit"});
     return SplinterResultHandle(std::move(channel));
 }

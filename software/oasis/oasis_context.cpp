@@ -106,6 +106,10 @@ OasisContext &OasisContext::ctx() {
     return *instance_;
 }
 
+bool OasisContext::is_initialized() {
+    return instance_ != nullptr;
+}
+
 std::shared_ptr<libstf::MemoryPool> OasisContext::memory_pool() {
     return memory_pool_;
 }

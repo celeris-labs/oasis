@@ -40,6 +40,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "submission with collection. Split across the scan's worker threads (each worker keeps "
 	    "ceil(value / threads) groups in flight but at least 1).",
 	    LogicalType::UBIGINT, Value::UBIGINT(16));
+	config.AddExtensionOption(
+	    "oasis_scan_prefetch_groups",
+	    "Row groups a read_oasis scan warms on the FPGA across pipeline boundaries: submitted from "
+	    "global state when the scan's dependencies clear (or at schedule time for a root scan), so its "
+	    "window is warm before the pipeline executes. Defaults to oasis_scan_groups_in_flight; 0 "
+	    "disables cross-pipeline prefetch.",
+	    LogicalType::UBIGINT, Value(LogicalType::UBIGINT));
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);

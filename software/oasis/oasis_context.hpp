@@ -22,6 +22,7 @@ public:
     static void init(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t obm_buffer_capacity);
     static void shutdown();
     static OasisContext &ctx();
+    static bool is_initialized();
 
     std::shared_ptr<libstf::MemoryPool> memory_pool();
     std::shared_ptr<coyote::cThread> cthread();

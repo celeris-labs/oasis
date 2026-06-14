@@ -11,8 +11,11 @@
 
 #include "duckdb/planner/table_filter_state.hpp"
 
+#include "oasis/prefetch_registry.hpp"
+
 #include <atomic>
 #include <deque>
+#include <mutex>
 
 namespace duckdb {
 
@@ -41,6 +44,9 @@ struct ProjectedColumn {
 	bool is_cpu;      // variable-length column decoded on the CPU path, not the FPGA
 };
 
+// Defined below; the global state owns one for schedule-time / cross-pipeline prefetch.
+struct OasisScanLocalState;
+
 // Global scan state shared across all DuckDB worker threads of one read_oasis scan. Following
 // DuckDB's own Parquet reader, the only shared mutable state is the row-group cursor (an atomic
 // each worker claims a group from). Everything per-row-group lives in the local state so workers
@@ -62,6 +68,35 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	size_t total_groups = 0;
 
 	size_t groups_in_flight_per_worker = 1;
+
+	// --- Dependency-aware cross-pipeline prefetch (see prefetch_registry.hpp) ---
+
+	// The query's Executor pointer, used to key this scan's per-query PrefetchRegistry. Set in
+	// OasisScanInitGlobal.
+	const void *executor_key = nullptr;
+
+	// This scan's node in the per-query registry. Owned by the registry (per-query lifetime); this is
+	// a non-owning handle. Set during the Phase 2 schedule-time wiring pass. nullptr until then (and
+	// always nullptr if the prefetch hook is not installed).
+	oasis::PrefetchNode *prefetch_node = nullptr;
+
+	// How many row groups to warm when this scan's prefetch fires (oasis_scan_prefetch_groups,
+	// capped at total_groups). 0 disables prefetch for this scan.
+	size_t prefetch_groups = 0;
+
+	// A global-state-owned worker context (own file handle + readers) used to build and submit the
+	// prefetch window from outside any pipeline's local-state lifetime. Its `inflight` deque holds the
+	// warm PendingGroups until live workers adopt them. Guarded by prefetch_mutex.
+	std::mutex prefetch_mutex;
+	unique_ptr<OasisScanLocalState> prefetch_worker;
+	// Set once the prefetch window has been submitted (PrefetchNode::submit ran). Read by live
+	// workers' cold-start check.
+	std::atomic<bool> prefetch_submitted {false};
+
+	// Guards the one-time "this scan submitted its last splinter" event (Phase 3). The shared cursor
+	// makes last-splinter a single well-defined event (whichever worker claims the final group); this
+	// flag ensures exactly one worker fires the dependents' decrement.
+	std::atomic_flag last_splinter_fired = ATOMIC_FLAG_INIT;
 
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
@@ -99,6 +134,11 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<std::vector<unique_ptr<Vector>>> cpu_slices;
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
 
+		// True for a prefetched group whose hardware splinter was submitted from global state but
+		// whose CPU/string columns have NOT been decoded yet (no local reader was available at
+		// prefetch time). The worker that adopts it decodes them lazily before first use.
+		bool cpu_decode_deferred = false;
+
 		// One-shot wake guard for the current BLOCKED return: Only the first ready signal fires
         // InterruptState::Callback(), so a single BLOCKED return yields exactly one Reschedule().
 		std::shared_ptr<std::atomic_flag> wake_guard = std::make_shared<std::atomic_flag>();
@@ -107,6 +147,12 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	std::deque<unique_ptr<PendingGroup>> inflight;
 
 	bool groups_exhausted = false;
+
+	// Cold-start yield bookkeeping (Phase 5). A worker yields (BLOCKED) on its very first entry only
+	// when nothing has been prefetched for this scan yet and it could not fill any group; once it has
+	// kept at least one group in flight it never takes the cold-yield path again.
+	bool warmed_up = false;
+	bool adopted_prefetch = false; // this worker has already drained gstate's prefetch window
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 
