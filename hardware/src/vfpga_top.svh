@@ -147,6 +147,23 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
     typed_ndata_i #(DATABEAT_SIZE)          typed_out(.*);
     ndata_i       #(data8_t, DATABEAT_SIZE) out(.*);
 
+    // 4K-deep URAM input FIFO on axi_in (width = AXI_DATA_BITS)
+    // We add this because Coyote has no per-stream FIFOs so performance degrades when streams have
+    // significant backpressure.
+    AXI4S axi_in_fifo(.aclk(aclk), .aresetn(aresetn));
+    FIFOAXI #(
+        .DEPTH(4096),
+        .DATA_WIDTH(AXI_DATA_BITS)
+    ) inst_axi_in_fifo (
+        .clk(clk),
+        .rst_n(rst_n),
+
+        .i_data(axi_in),
+        .o_data(axi_in_fifo),
+
+        .filling_level()
+    );
+
 `ifdef EN_RDMA
     // AXI4SR to AXI4S
     `AXIS_ASSIGN(axis_rreq_recv[I], axi_in)
@@ -163,7 +180,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
 
         .conf(rdma_conf[I]),
 
-        .in(axi_in),
+        .in(axi_in_fifo),
         .out(decoder_in)
     );
 `else
@@ -174,7 +191,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
         .clk(clk),
         .rst_n(rst_n),
 
-        .in(axi_in),
+        .in(axi_in_fifo),
         .out(decoder_in)
     );
 `endif
