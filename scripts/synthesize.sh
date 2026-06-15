@@ -30,6 +30,10 @@ echo Building bitstream in hardware/$build_dir...
 mkdir "$build_dir"
 cmake -S . -B "$build_dir" "${cmake_args[@]}"
 
+util_dir="$script_dir/util"
 build_cmd="cmake --build $build_dir --target project --target bitgen &> $build_dir/bitgen.log"
-report_cmd="$script_dir/generate_reports.sh $build_dir"
-tmux new-session -d -s "bitgen-$build_dir" "$build_cmd && $report_cmd"
+report_cmd="$util_dir/generate_reports.sh $build_dir"
+# Analyze, save to analysis.txt, and email it (email needs BOT_GMAIL_USER,
+# BOT_GMAIL_PASSWORD and BOT_RECIPIENT_EMAIL in the environment; skipped if unset).
+analyze_cmd="$util_dir/analyze_reports.sh $build_dir | tee $build_dir/analysis.txt | { $util_dir/send_report_email.sh || echo 'report email skipped/failed (check BOT_GMAIL_USER, BOT_GMAIL_PASSWORD, BOT_RECIPIENT_EMAIL)'; }"
+tmux new-session -d -s "bitgen-$build_dir" "$build_cmd && $report_cmd && $analyze_cmd"
