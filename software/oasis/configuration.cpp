@@ -1,5 +1,3 @@
-#include <array>
-#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -21,6 +19,14 @@ static bool is_supported_filter_type(libstf::type_t type) {
            type == libstf::type_t::FLOAT_T || type == libstf::type_t::DOUBLE_T;
 }
 
+PipelineConfig::PipelineConfig(std::shared_ptr<coyote::cThread> cthread,
+                               uint32_t addr_offset, uint32_t num_regs)
+    : Config(cthread, addr_offset, num_regs) {}
+
+void PipelineConfig::set_filter_enabled(bool enabled) {
+    write_register(libstf::ConfigRegister(0, enabled));
+}
+
 FilterConfig::FilterConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
                            uint32_t num_regs)
     : Config(cthread, addr_offset, num_regs), num_streams_(read_register(1).value()) {
@@ -33,15 +39,19 @@ void FilterConfig::configure(const std::vector<Stream> &streams,
                              const std::vector<Predicate> &predicates,
                              const std::vector<AdditionalRhs> &additional_rhs,
                              FilterMode mode) {
-    std::array<std::array<std::array<uint64_t, NUM_RHS>, NUM_LAYERS>, MAX_STREAMS>
-        rhs_values = {};
-    std::array<std::array<FilterComparison, NUM_LAYERS>, MAX_STREAMS> operators = {};
+    using LayerRhs = std::array<std::array<uint64_t, NUM_RHS>, NUM_LAYERS>;
+    using LayerOps = std::array<FilterComparison, NUM_LAYERS>;
+
+    std::array<LayerRhs, MAX_STREAMS> rhs_values = {};
+    std::array<LayerOps, MAX_STREAMS> operators = {};
     std::array<libstf::type_t, MAX_STREAMS> stream_types = {};
     std::array<bool, MAX_STREAMS> stream_enabled = {};
-    std::array<std::array<uint64_t, NUM_ADDITIONAL_RHS>, NUM_LAYERS>
-        additional_rhs_values = {};
+    std::array<std::array<uint64_t, NUM_ADDITIONAL_RHS>, NUM_LAYERS> additional_rhs_values = {};
     std::array<uint8_t, NUM_LAYERS> additional_rhs_masks = {};
     std::array<bool, NUM_LAYERS> layer_has_predicate = {};
+    auto write = [&](uint32_t address, uint64_t value) {
+        write_register(libstf::ConfigRegister(address, value));
+    };
 
     stream_types.fill(libstf::type_t::INT64_T);
 
@@ -90,8 +100,7 @@ void FilterConfig::configure(const std::vector<Stream> &streams,
     for (size_t stream = 0; stream < num_streams_; stream++) {
         for (size_t layer = 0; layer < NUM_LAYERS; layer++) {
             for (size_t rhs_index = 0; rhs_index < NUM_RHS; rhs_index++) {
-                write_register(libstf::ConfigRegister(
-                    FILTER_RHS_ADDR, rhs_values[stream][layer][rhs_index]));
+                write(FILTER_RHS_ADDR, rhs_values[stream][layer][rhs_index]);
             }
         }
     }
@@ -101,12 +110,12 @@ void FilterConfig::configure(const std::vector<Stream> &streams,
         for (size_t stream = 0; stream < num_streams_; stream++) {
             operator_word |= static_cast<uint64_t>(operators[stream][layer]) << (stream * 8);
         }
-        write_register(libstf::ConfigRegister(FILTER_OPERATOR_ADDR, operator_word));
+        write(FILTER_OPERATOR_ADDR, operator_word);
     }
 
     for (const auto &layer_rhs : additional_rhs_values) {
         for (const auto value : layer_rhs) {
-            write_register(libstf::ConfigRegister(FILTER_ADDITIONAL_RHS_ADDR, value));
+            write(FILTER_ADDITIONAL_RHS_ADDR, value);
         }
     }
 
@@ -115,8 +124,7 @@ void FilterConfig::configure(const std::vector<Stream> &streams,
         additional_rhs_mask_word |= static_cast<uint64_t>(additional_rhs_masks[layer])
                                     << (layer * 8);
     }
-    write_register(
-        libstf::ConfigRegister(FILTER_ADDITIONAL_RHS_MASK_ADDR, additional_rhs_mask_word));
+    write(FILTER_ADDITIONAL_RHS_MASK_ADDR, additional_rhs_mask_word);
 
     const size_t stream_type_lsb = num_streams_;
     const size_t mode_lsb = stream_type_lsb + num_streams_ * 3;
@@ -131,16 +139,7 @@ void FilterConfig::configure(const std::vector<Stream> &streams,
     control_word |= static_cast<uint64_t>(mode) << mode_lsb;
     control_word |= uint64_t {1} << valid_bit;
 
-    // The control word commits the payload and must be written last.
-    write_register(libstf::ConfigRegister(FILTER_CONTROL_ADDR, control_word));
-}
-
-void FilterConfig::configure(FilterComparison comparison, int64_t rhs) {
-    configure(
-        {{0, libstf::type_t::INT64_T, true}},
-        {{0, 0, comparison, {static_cast<uint64_t>(rhs), 0}}},
-        {},
-        FilterMode::FULL_MATERIALIZATION);
+    write(FILTER_CONTROL_ADDR, control_word); // Commits the payload.
 }
 
 constexpr const uint32_t RDMA_READ_VADDR_ADDR = 0;

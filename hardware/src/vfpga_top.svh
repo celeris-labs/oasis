@@ -29,9 +29,9 @@ localparam NUM_STREAMS   = N_STRM_AXI;
 localparam DATABEAT_SIZE = AXI_DATA_BITS / 8;
 
 `ifdef EN_RDMA
-localparam NUM_CONFIGS   = 5;
+localparam NUM_CONFIGS   = 6;
 `else
-localparam NUM_CONFIGS   = 4;
+localparam NUM_CONFIGS   = 5;
 `endif
 
 // -- Fix clock and reset names --------------------------------------------------------------------
@@ -58,7 +58,8 @@ GlobalConfig #(
         NUM_STREAMS + 1,
         COLUMN_CHUNK_DECODER_CONFIG_REGS * NUM_STREAMS,
         PAGE_DECODER_CONFIG_REGS * NUM_STREAMS,
-        FILTER_NUM_CONFIG_REGS
+        FILTER_NUM_CONFIG_REGS,
+        PIPELINE_CONFIG_REGS
 `ifdef EN_RDMA
         , NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS
 `endif
@@ -120,6 +121,17 @@ FilterConfig inst_filter_config (
     .out(filter_conf)
 );
 
+logic filter_enabled;
+PipelineConfig inst_pipeline_config (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .write_config(write_configs[4]),
+    .read_config(read_configs[4]),
+
+    .filter_enabled(filter_enabled)
+);
+
 `ifdef EN_RDMA
 RDMAReadConfig #(
     .NUM_STREAMS(NUM_STREAMS)
@@ -127,8 +139,8 @@ RDMAReadConfig #(
     .clk(clk),
     .rst_n(rst_n),
 
-    .write_config(write_configs[4]),
-    .read_config(read_configs[4]),
+    .write_config(write_configs[5]),
+    .read_config(read_configs[5]),
 
     .out(rdma_conf)
 );
@@ -161,7 +173,9 @@ CQDemultiplexer #(
 
 // -- Decoders -------------------------------------------------------------------------------------
 AXI4S decoded_outputs [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S filter_inputs   [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 AXI4S filtered_outputs[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S pipeline_outputs[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 for (genvar I = 0; I < NUM_STREAMS; I++) begin
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
     ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in();
@@ -230,11 +244,32 @@ FilterOperator inst_filter (
     .clk(clk),
     .rst_n(rst_n),
 
-    .axis_host_recv(decoded_outputs),
+    .axis_host_recv(filter_inputs),
     .axis_host_send(filtered_outputs),
 
     .filter_conf(filter_conf)
 );
+
+for (genvar I = 0; I < NUM_STREAMS; I++) begin
+    assign filter_inputs[I].tdata  = decoded_outputs[I].tdata;
+    assign filter_inputs[I].tkeep  = decoded_outputs[I].tkeep;
+    assign filter_inputs[I].tlast  = decoded_outputs[I].tlast;
+    assign filter_inputs[I].tvalid = filter_enabled && decoded_outputs[I].tvalid;
+
+    assign decoded_outputs[I].tready =
+        filter_enabled ? filter_inputs[I].tready : pipeline_outputs[I].tready;
+    assign filtered_outputs[I].tready =
+        filter_enabled ? pipeline_outputs[I].tready : 1'b0;
+
+    assign pipeline_outputs[I].tdata =
+        filter_enabled ? filtered_outputs[I].tdata : decoded_outputs[I].tdata;
+    assign pipeline_outputs[I].tkeep =
+        filter_enabled ? filtered_outputs[I].tkeep : decoded_outputs[I].tkeep;
+    assign pipeline_outputs[I].tlast =
+        filter_enabled ? filtered_outputs[I].tlast : decoded_outputs[I].tlast;
+    assign pipeline_outputs[I].tvalid =
+        filter_enabled ? filtered_outputs[I].tvalid : decoded_outputs[I].tvalid;
+end
 
 // -- Output writer --------------------------------------------------------------------------------
 OutputWriter inst_output_writer (
@@ -247,6 +282,6 @@ OutputWriter inst_output_writer (
 
     .mem_config(mem_conf),
 
-    .data_in(filtered_outputs),
+    .data_in(pipeline_outputs),
     .data_out(axis_host_send)
 );

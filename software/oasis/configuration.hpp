@@ -15,6 +15,7 @@ constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A515;
 
 constexpr const uint64_t RDMA_READ_CONFIG_REGS = 2;
 constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
+constexpr const uint64_t PIPELINE_CONFIG_ID    = 0x7d9c6e10b5a3f201;
 
 enum class FilterComparison : uint8_t {
     ALWAYS_TRUE   = 0,
@@ -34,6 +35,16 @@ enum class FilterComparison : uint8_t {
 enum class FilterMode : uint8_t {
     FULL_MATERIALIZATION = 0,
     BITMASK              = 1,
+};
+
+class PipelineConfig : public libstf::Config {
+  public:
+    PipelineConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
+                   uint32_t num_regs);
+
+    void set_filter_enabled(bool enabled);
+
+    static constexpr uint64_t ID = PIPELINE_CONFIG_ID;
 };
 
 class FilterConfig : public libstf::Config {
@@ -69,8 +80,6 @@ class FilterConfig : public libstf::Config {
                    const std::vector<Predicate> &predicates,
                    const std::vector<AdditionalRhs> &additional_rhs = {},
                    FilterMode mode = FilterMode::FULL_MATERIALIZATION);
-
-    void configure(FilterComparison comparison, int64_t rhs);
 
     static constexpr uint64_t ID = 5;
 
