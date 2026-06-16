@@ -92,7 +92,8 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	size_t const prefetch_groups =
 	    prefetch_groups_val.IsNull() ? groups_in_flight : prefetch_groups_val.GetValue<uint64_t>();
 	gstate->prefetch_groups = std::min<size_t>(prefetch_groups, gstate->total_groups);
-	gstate->executor_key = &context.GetExecutor();
+	gstate->bind_data = &bind_data;
+	gstate->source_op = input.op.get();
 
 	for (auto col_id : input.column_ids) {
 		if (col_id == COLUMN_IDENTIFIER_EMPTY) {
@@ -111,33 +112,18 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	}
 
 	// Cardinality-only scans (COUNT(*), EXISTS) decode nothing and never touch the FPGA, so there is
-	// no window to warm. input.op is the source operator pointer that keys the prefetch node; without
-	// it the Phase 2 hook cannot match this scan, so skip prefetch too.
+	// no window to warm. input.op is the source operator the executor matches in PrefetchNextPipelines;
+	// without it this scan can never be warmed, so disable prefetch.
 	if (gstate->emit_cardinality_only || !input.op) {
 		gstate->prefetch_groups = 0;
 	}
 
-	// Register this scan's prefetch node in the per-query registry and build the global-state prefetch
-	// worker so its window can be submitted later (at schedule time for a root scan, or when a
-	// predecessor's last splinter clears this scan's dependencies). Edge/dependency-count wiring
-	// happens in the Phase 2 schedule hook once every scan is registered.
+	// Build the global-state prefetch worker so this scan's window can be submitted later, when a
+	// predecessor pipeline drains and the executor fires OasisScanPrefetch on this source. The first
+	// scan of a query has no predecessor and cold-starts (its window is never submitted).
 	if (gstate->prefetch_groups > 0) {
 		gstate->prefetch_worker = make_uniq<OasisScanLocalState>();
 		InitScanWorker(context, *gstate, bind_data, *gstate->prefetch_worker);
-
-		auto registry = ctx.scheduler().get_or_create_prefetch_registry(gstate->executor_key);
-		// Key the node by the source operator pointer -- the one identifier both InitGlobal (input.op)
-		// and the Phase 2 hook (pipeline->GetSource()) observe for the same scan.
-		auto &node = registry->get_or_create(input.op.get());
-		gstate->prefetch_node = &node;
-
-		auto *gstate_ptr = gstate.get();
-		auto *ctx_ptr = &ctx;
-		auto *client_ptr = &context;
-		auto *bind_ptr = &bind_data;
-		node.set_submit([client_ptr, ctx_ptr, gstate_ptr, bind_ptr]() {
-			SubmitPrefetchWindow(*client_ptr, *ctx_ptr, *gstate_ptr, *bind_ptr);
-		});
 	}
 
 	return std::move(gstate);
@@ -467,25 +453,53 @@ static size_t ClaimNextMatchingGroup(ClientContext &context, OasisScanGlobalStat
 // Submits this scan's prefetch window: claims up to gstate.prefetch_groups matching row groups off
 // the shared cursor and HW-submits each (CPU decode deferred), parking the warm PendingGroups in the
 // global-state prefetch worker's inflight deque for live workers to adopt. Runs exactly once per
-// scan, driven by PrefetchNode::submit_once -- either at schedule time (root scan) or when a
-// predecessor's last splinter clears this scan's dependencies. The shared cursor (gstate.next_group)
-// guarantees prefetched groups are never re-claimed by live workers.
+// scan, driven by OasisScanPrefetch when a predecessor pipeline drains and the executor fires the
+// prefetch hook on this source. The shared cursor (gstate.next_group) guarantees prefetched groups
+// are never re-claimed by live workers. Fires the waiter list once submitted to wake any worker that
+// parked in ColdStartYield.
 static void SubmitPrefetchWindow(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                                  const OasisScanBindData &bind) {
-	std::lock_guard<std::mutex> guard(gstate.prefetch_mutex);
-	if (!gstate.prefetch_worker || gstate.prefetch_groups == 0) {
+	std::vector<OasisScanGlobalState::WakeFn> waiters;
+	{
+		std::lock_guard<std::mutex> guard(gstate.prefetch_mutex);
+		if (gstate.prefetch_worker && gstate.prefetch_groups > 0) {
+			auto &worker = *gstate.prefetch_worker;
+			while (worker.inflight.size() < gstate.prefetch_groups) {
+				size_t group = ClaimNextMatchingGroup(context, gstate, worker, bind);
+				if (group >= gstate.total_groups) {
+					break;
+				}
+				worker.inflight.push_back(
+				    BeginGroup(context, ctx, gstate, worker, bind, group, /*defer_cpu_decode=*/true));
+			}
+		}
 		gstate.prefetch_submitted.store(true, std::memory_order_release);
+		// Take the waiter list under the lock; fire it outside so a woken worker's reschedule never
+		// runs while we hold prefetch_mutex.
+		waiters.swap(gstate.prefetch_waiters);
+	}
+	for (auto &wake : waiters) {
+		wake();
+	}
+}
+
+// Executor-driven prefetch hook (table_function.prefetch). Fired by Executor::PrefetchNextPipelines
+// on this scan's source the instant its last predecessor pipeline stops submitting. Sets
+// prefetch_expected so a worker that reaches this scan first yields instead of cold-starting, then
+// submits the prefetch window exactly once. Self-contained: everything it needs is on the gstate.
+static void OasisScanPrefetch(ClientContext &context, GlobalTableFunctionState &gstate_p) {
+	auto &gstate = gstate_p.Cast<OasisScanGlobalState>();
+	// Flag set first, before submitting, so a worker racing in between sees prefetch_expected and
+	// yields rather than claiming a cold window. (A worker that checks between the flag and the window
+	// being ready registers a waiter and is woken by SubmitPrefetchWindow below.)
+	gstate.prefetch_expected.store(true, std::memory_order_release);
+	if (gstate.prefetch_hook_fired.test_and_set()) {
+		return; // already submitted by an earlier firing
+	}
+	if (!gstate.ctx || !gstate.bind_data) {
 		return;
 	}
-	auto &worker = *gstate.prefetch_worker;
-	while (worker.inflight.size() < gstate.prefetch_groups) {
-		size_t group = ClaimNextMatchingGroup(context, gstate, worker, bind);
-		if (group >= gstate.total_groups) {
-			break;
-		}
-		worker.inflight.push_back(BeginGroup(context, ctx, gstate, worker, bind, group, /*defer_cpu_decode=*/true));
-	}
-	gstate.prefetch_submitted.store(true, std::memory_order_release);
+	SubmitPrefetchWindow(context, *gstate.ctx, gstate, *gstate.bind_data);
 }
 
 // Claims the next non-empty row group off the shared atomic cursor, returning its index (or
@@ -528,7 +542,7 @@ enum class LoadResult : uint8_t {
 // find the window empty and claim fresh groups. cpu_decode_deferred is left set -- the adopting
 // worker decodes the CPU columns lazily when each group reaches the head (LoadNextGroup).
 static void AdoptPrefetchWindow(OasisScanGlobalState &gstate, OasisScanLocalState &lstate) {
-	if (lstate.adopted_prefetch || !gstate.prefetch_node) {
+	if (lstate.adopted_prefetch || !gstate.prefetch_worker) {
 		return;
 	}
 	lstate.adopted_prefetch = true;
@@ -552,12 +566,12 @@ static void TopUpInflight(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		size_t group = ClaimNextMatchingGroup(context, gstate, lstate, bind);
 		if (group >= gstate.total_groups) {
 			lstate.groups_exhausted = true;
-			// Phase 3: the cursor is exhausted -- whichever worker observes this first has just claimed
-			// this scan's last group. Hand the scheduler a `last` marker for this scan's prefetch node
-			// (exactly once); the dispatcher then kicks off prefetch for every dependent that just
-			// became ready, overlapping this scan's drain tail with the successors' FPGA warmup.
-			if (gstate.prefetch_node && !gstate.last_splinter_fired.test_and_set()) {
-				ctx.scheduler().submit(oasis::QuerySplinter{}, gstate.prefetch_node, /*last=*/true);
+			// The cursor is exhausted -- whichever worker observes this first has just claimed this
+			// scan's last group. Tell the executor this pipeline has drained (exactly once); it owns
+			// the dependency graph and fires prefetch on the genuinely-next pipeline's source,
+			// overlapping this scan's drain tail with the successor's FPGA warmup.
+			if (gstate.source_op && !gstate.last_splinter_fired.test_and_set()) {
+				context.GetExecutor().PrefetchNextPipelines(*gstate.source_op);
 			}
 			break;
 		}
@@ -565,33 +579,38 @@ static void TopUpInflight(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	}
 }
 
-// Phase 5: cold-start yield. If this scan is reached before its prefetch window has been submitted
-// AND a predecessor is guaranteed to submit it later (outstanding_deps > 0), yield (BLOCKED) instead
-// of claiming a cold window ourselves, arming a wake that fires when the predecessor's last splinter
-// submits our window. This overlaps the predecessor's drain tail with our warmup rather than racing
-// it cold. Once we have kept a group in flight (warmed_up), we never take this path again -- normal
-// BLOCKED-on-head behavior only. Returns true if the worker yielded (caller returns BLOCKED).
+// Cold-start yield. If this scan is reached before its prefetch window has been submitted AND a
+// predecessor is going to submit it (prefetch_expected, set by the executor's prefetch hook), yield
+// (BLOCKED) instead of claiming a cold window ourselves, registering a wake that SubmitPrefetchWindow
+// fires once the window lands. This overlaps the predecessor's drain tail with our warmup rather than
+// racing it cold. A first scan never gets prefetch_expected -> never yields. Once we have kept a group
+// in flight (warmed_up), we never take this path again -- normal BLOCKED-on-head behavior only.
+// Returns true if the worker yielded (caller returns BLOCKED).
 static bool ColdStartYield(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, InterruptState interrupt_state) {
-	if (lstate.warmed_up || !gstate.prefetch_node) {
+	if (lstate.warmed_up || gstate.prefetch_groups == 0) {
 		return false;
 	}
-	auto *node = gstate.prefetch_node;
-	// Already warm (window submitted), or a root / un-gated scan that nobody else will warm: do not
-	// yield -- proceed to claim/adopt normally. Only yield when a predecessor is guaranteed to warm
-	// us, so the wake is guaranteed to arrive (no deadlock).
-	if (node->submitted() || node->outstanding_deps() == 0) {
+	// No predecessor will warm us (first scan / un-gated): claim cold, do not yield.
+	if (!gstate.prefetch_expected.load(std::memory_order_acquire)) {
 		return false;
 	}
+	// Already warm: proceed to adopt the submitted window.
+	if (gstate.prefetch_submitted.load(std::memory_order_acquire)) {
+		return false;
+	}
+	// A predecessor is warming us but the window has not landed yet -- park, registering a one-shot
+	// wake under the same lock that guards the submitted flag and the waiter list, so we never miss the
+	// transition (the window cannot be submitted between our check and the registration).
 	auto guard = std::make_shared<std::atomic_flag>();
-	bool armed = node->arm_wake([interrupt_state, guard]() {
+	std::lock_guard<std::mutex> lock(gstate.prefetch_mutex);
+	if (gstate.prefetch_submitted.load(std::memory_order_acquire)) {
+		return false; // landed between the check above and the lock: proceed (it is warm now).
+	}
+	gstate.prefetch_waiters.push_back([interrupt_state, guard]() {
 		if (!guard->test_and_set()) {
 			interrupt_state.Callback();
 		}
 	});
-	if (!armed) {
-		// The window was submitted between our checks above and arm_wake: proceed (it is warm now).
-		return false;
-	}
 	return true;
 }
 
@@ -835,76 +854,6 @@ virtual_column_map_t OasisScanGetVirtualColumns(ClientContext &, optional_ptr<Fu
 	return result;
 }
 
-// Looks up the prefetch node for `pipeline`'s source, or nullptr if the source is not a registered
-// read_oasis scan. Keyed by the source operator pointer, the identifier both InitGlobal (input.op)
-// and this hook (pipeline->GetSource()) observe identically.
-static oasis::PrefetchNode *NodeForPipeline(oasis::PrefetchRegistry &registry, Pipeline &pipeline) {
-	auto source = pipeline.GetSource();
-	if (!source) {
-		return nullptr;
-	}
-	return registry.find(source.get());
-}
-
-// Walks `pipeline`'s parents to find every nearest read_oasis dependent and registers each as a
-// dependent of `node`. A parent whose source is itself a read_oasis scan terminates the walk (it is
-// the dependent); a parent with a non-scan source is walked transitively through its own parents.
-static void WireDependents(oasis::PrefetchRegistry &registry, oasis::PrefetchNode &node, Pipeline &pipeline) {
-	for (auto &parent_weak : pipeline.GetParents()) {
-		auto parent = parent_weak.lock();
-		if (!parent) {
-			continue;
-		}
-		if (auto *parent_node = NodeForPipeline(registry, *parent)) {
-			node.add_dependent(parent_node);
-		} else {
-			// Intermediate non-scan pipeline: continue toward its own parents.
-			WireDependents(registry, node, *parent);
-		}
-	}
-}
-
-// Phase 2 schedule hook: wire the prefetch DAG over all pipelines, then submit any root scan (zero
-// outstanding dependencies) so its FPGA window warms immediately. Runs once per query after every
-// scan has registered its node.
-static void OasisSchedulePipelineHook(Executor &executor, const vector<shared_ptr<Pipeline>> &pipelines) {
-	if (!oasis::OasisContext::is_initialized()) {
-		return; // No Oasis context => no read_oasis scan in this query.
-	}
-	auto &ctx = oasis::OasisContext::ctx();
-	auto registry = ctx.scheduler().find_prefetch_registry(&executor);
-	if (!registry) {
-		return; // No read_oasis scan in this query (or prefetch disabled for all of them).
-	}
-
-	// Edge + dependency-count wiring: for each scan pipeline, register it as a dependent of every
-	// scan it (transitively) depends on. add_dependent bumps the dependent's outstanding count.
-	for (auto &pipeline : pipelines) {
-		auto *node = NodeForPipeline(*registry, *pipeline);
-		if (!node) {
-			continue;
-		}
-		WireDependents(*registry, *node, *pipeline);
-	}
-
-	// Root submission: any scan with no outstanding dependencies is runnable now -- warm it.
-	for (auto &pipeline : pipelines) {
-		auto *node = NodeForPipeline(*registry, *pipeline);
-		if (node && node->outstanding_deps() == 0) {
-			node->submit_once();
-		}
-	}
-}
-
-// Companion reset hook: drop this query's prefetch registry (at schedule start, to clear any stale
-// entry under a reused Executor address, and at query teardown).
-static void OasisExecutorResetHook(Executor &executor) {
-	if (!oasis::OasisContext::is_initialized()) {
-		return;
-	}
-	oasis::OasisContext::ctx().scheduler().drop_prefetch_registry(&executor);
-}
-
 void RegisterOasisScanFunction(ExtensionLoader &loader) {
 	TableFunction table_function("read_oasis",           // Function name
 	                             {LogicalType::VARCHAR}, // Function arguments: Parquet file path
@@ -921,11 +870,10 @@ void RegisterOasisScanFunction(ExtensionLoader &loader) {
 	table_function.statistics = OasisScanStatistics;
 	table_function.table_scan_progress = OasisScanProgress;
 	table_function.get_partition_data = OasisScanGetPartitionData;
+	// Executor-driven cross-pipeline prefetch: the executor fires this on the genuinely-next
+	// pipeline's source when its last predecessor drains (see Executor::PrefetchNextPipelines).
+	table_function.prefetch = OasisScanPrefetch;
 	loader.RegisterFunction(table_function);
-
-	// Install the schedule-time prefetch hooks into DuckDB core (process-global, idempotent).
-	Executor::SetSchedulePipelineHook(OasisSchedulePipelineHook);
-	Executor::SetExecutorResetHook(OasisExecutorResetHook);
 }
 
 } // namespace duckdb

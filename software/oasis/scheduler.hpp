@@ -1,6 +1,5 @@
 #pragma once
 
-#include "oasis/prefetch_registry.hpp"
 #include "oasis/query_splinter.hpp"
 #include "oasis/splinter_result.hpp"
 
@@ -40,14 +39,7 @@ class Scheduler {
     // Expands the splinter into its flows and pushes each onto an unbounded queue, returning
     // instantly with a future. The splinter completes (its single result channel closes) only once
     // every flow has drained.
-    //
-    // `prefetch_key` ties this splinter to a PrefetchNode (the submitting scan). When `last` is set,
-    // this is that scan's final splinter: as soon as the dispatcher pulls it off the queue it kicks
-    // off prefetch for every dependent scan that just became ready (notify_dependents_last_splinter).
-    // Driving this from the dispatcher starts the successors' FPGA warmup the instant the predecessor
-    // stops submitting, without burdening the submitting worker thread. Both default off, so callers
-    // that do not participate in prefetch submit exactly as before.
-    SplinterResultHandle submit(QuerySplinter splinter, PrefetchNode *prefetch_key = nullptr, bool last = false);
+    SplinterResultHandle submit(QuerySplinter splinter);
 
     [[nodiscard]] libstf::stream_t num_streams() const { return num_streams_; }
 
@@ -56,10 +48,6 @@ class Scheduler {
 
     void                 set_pipeline_depth(size_t depth);
     [[nodiscard]] size_t pipeline_depth() const { return queue_depth_.load(); }
-
-    std::shared_ptr<PrefetchRegistry> get_or_create_prefetch_registry(const void *executor_key);
-    std::shared_ptr<PrefetchRegistry> find_prefetch_registry(const void *executor_key);
-    void                              drop_prefetch_registry(const void *executor_key);
 
   private:
     struct SplinterCompletion {
@@ -110,9 +98,6 @@ class Scheduler {
     std::deque<Pending>     queue_;
     bool                    stop_ = false;
     std::thread             dispatcher_;
-
-    std::mutex                                                          prefetch_mutex_;
-    std::unordered_map<const void *, std::shared_ptr<PrefetchRegistry>> prefetch_registries_;
 
     // The dispatcher loop: Pops the queue head, picks the least-loaded active stream with a free
     // pipeline slot, and dispatches there. Parks on dispatch_cv_ when the queue is empty or every

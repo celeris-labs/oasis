@@ -11,11 +11,11 @@
 
 #include "duckdb/planner/table_filter_state.hpp"
 
-#include "oasis/prefetch_registry.hpp"
-
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <vector>
 
 namespace duckdb {
 
@@ -69,33 +69,53 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 
 	size_t groups_in_flight_per_worker = 1;
 
-	// --- Dependency-aware cross-pipeline prefetch (see prefetch_registry.hpp) ---
+	// --- Executor-driven cross-pipeline prefetch ---
+	//
+	// The executor owns the real pipeline dependency graph. When a predecessor pipeline submits its
+	// last splinter it calls Executor::PrefetchNextPipelines, which fires the table-function `prefetch`
+	// hook (OasisScanPrefetch) on the source of the genuinely-next pipeline. That hook submits this
+	// scan's prefetch window. The first scan of a query has no predecessor, so it is never warmed and
+	// cold-starts.
 
-	// The query's Executor pointer, used to key this scan's per-query PrefetchRegistry. Set in
-	// OasisScanInitGlobal.
-	const void *executor_key = nullptr;
+	// This scan's source operator, the key the executor matches in PrefetchNextPipelines. Set from
+	// input.op in OasisScanInitGlobal; nullptr (and prefetch disabled) for cardinality-only scans.
+	const PhysicalOperator *source_op = nullptr;
 
-	// This scan's node in the per-query registry. Owned by the registry (per-query lifetime); this is
-	// a non-owning handle. Set during the Phase 2 schedule-time wiring pass. nullptr until then (and
-	// always nullptr if the prefetch hook is not installed).
-	oasis::PrefetchNode *prefetch_node = nullptr;
+	// The scan's bind data, stashed so the prefetch hook (which only receives ClientContext + gstate)
+	// is self-contained. Set in OasisScanInitGlobal.
+	const OasisScanBindData *bind_data = nullptr;
 
 	// How many row groups to warm when this scan's prefetch fires (oasis_scan_prefetch_groups,
 	// capped at total_groups). 0 disables prefetch for this scan.
 	size_t prefetch_groups = 0;
+
+	// Set by the executor's prefetch hook the instant before it submits this scan's window: a true
+	// value means a predecessor is warming us, so a worker that arrives first should yield (BLOCKED)
+	// rather than cold-start. A first scan never gets the flag and so never yields.
+	std::atomic<bool> prefetch_expected {false};
 
 	// A global-state-owned worker context (own file handle + readers) used to build and submit the
 	// prefetch window from outside any pipeline's local-state lifetime. Its `inflight` deque holds the
 	// warm PendingGroups until live workers adopt them. Guarded by prefetch_mutex.
 	std::mutex prefetch_mutex;
 	unique_ptr<OasisScanLocalState> prefetch_worker;
-	// Set once the prefetch window has been submitted (PrefetchNode::submit ran). Read by live
-	// workers' cold-start check.
+	// Set once the prefetch window has been submitted (OasisScanPrefetch ran). Read by live workers'
+	// cold-start check.
 	std::atomic<bool> prefetch_submitted {false};
 
-	// Guards the one-time "this scan submitted its last splinter" event (Phase 3). The shared cursor
-	// makes last-splinter a single well-defined event (whichever worker claims the final group); this
-	// flag ensures exactly one worker fires the dependents' decrement.
+	// One-shot guard so the prefetch hook submits the window exactly once even if the executor fires
+	// it more than once.
+	std::atomic_flag prefetch_hook_fired = ATOMIC_FLAG_INIT;
+
+	// Waiter list fired by SubmitPrefetchWindow once the window is submitted: a worker that reached
+	// this scan before its window existed (and parked itself BLOCKED via ColdStartYield) registers a
+	// wake here so it is rescheduled promptly. Guarded by prefetch_mutex.
+	using WakeFn = std::function<void()>;
+	std::vector<WakeFn> prefetch_waiters;
+
+	// Guards the one-time "this scan submitted its last splinter" event. The shared cursor makes
+	// last-splinter a single well-defined event (whichever worker claims the final group); this flag
+	// ensures exactly one worker notifies the executor.
 	std::atomic_flag last_splinter_fired = ATOMIC_FLAG_INIT;
 
 	idx_t MaxThreads() const override {
