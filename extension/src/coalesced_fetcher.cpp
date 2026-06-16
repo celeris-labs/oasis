@@ -25,7 +25,7 @@ CoalescedFetcher::CoalescedFetcher(FileHandle &file_handle_p, std::shared_ptr<li
 
 CoalescedFetcher::RangeHandle CoalescedFetcher::Register(uint64_t offset, uint64_t size) {
 	if (fetched) {
-		throw InternalException("CoalescedFetcher::Register called after Fetch");
+		throw InternalException("CoalescedFetcher::Register called after PrepareReads");
 	}
 
 	RangeHandle handle = ranges.size();
@@ -59,9 +59,9 @@ CoalescedFetcher::RangeHandle CoalescedFetcher::Register(uint64_t offset, uint64
 	return handle;
 }
 
-void CoalescedFetcher::Fetch() {
+void CoalescedFetcher::PrepareReads() {
 	if (fetched) {
-		throw InternalException("CoalescedFetcher::Fetch called twice");
+		throw InternalException("CoalescedFetcher::PrepareReads called twice");
 	}
 
 	// Whole-row-group prefetch heuristic: When the registered (projected) bytes cover more than
@@ -82,14 +82,54 @@ void CoalescedFetcher::Fetch() {
 			                  (unsigned long long)m.size, status.message().c_str());
 		}
 		m.buffer = libstf::make_buffer(memory_pool, ptr, m.size, m.size);
-		file_handle.Read(m.buffer->ptr, m.size, m.offset);
 		total_fetched += m.size;
 	}
 }
 
+void CoalescedFetcher::ExecuteMergedRead(size_t idx) {
+	if (!fetched) {
+		throw InternalException("CoalescedFetcher::ExecuteMergedRead called before PrepareReads");
+	}
+	if (idx >= merged.size()) {
+		throw InternalException("CoalescedFetcher::ExecuteMergedRead invalid index %llu", (unsigned long long)idx);
+	}
+	auto &m = merged[idx];
+	file_handle.Read(m.buffer->ptr, m.size, m.offset);
+}
+
+namespace {
+
+class MergedReadTask : public AsyncTask {
+public:
+	MergedReadTask(CoalescedFetcher &fetcher, size_t idx) : fetcher(fetcher), idx(idx) {
+	}
+
+	void Execute() override {
+		fetcher.ExecuteMergedRead(idx);
+	}
+
+private:
+	CoalescedFetcher &fetcher;
+	size_t idx;
+};
+
+} // namespace
+
+vector<unique_ptr<AsyncTask>> CoalescedFetcher::BuildReadTasks() {
+	if (!fetched) {
+		throw InternalException("CoalescedFetcher::BuildReadTasks called before PrepareReads");
+	}
+	vector<unique_ptr<AsyncTask>> tasks;
+	tasks.reserve(merged.size());
+	for (size_t idx = 0; idx < merged.size(); idx++) {
+		tasks.push_back(make_uniq<MergedReadTask>(*this, idx));
+	}
+	return tasks;
+}
+
 CoalescedFetcher::RangeView CoalescedFetcher::Resolve(RangeHandle handle) const {
 	if (!fetched) {
-		throw InternalException("CoalescedFetcher::Resolve called before Fetch");
+		throw InternalException("CoalescedFetcher::Resolve called before PrepareReads");
 	}
 	if (handle >= ranges.size()) {
 		throw InternalException("CoalescedFetcher::Resolve invalid handle %llu", (unsigned long long)handle);

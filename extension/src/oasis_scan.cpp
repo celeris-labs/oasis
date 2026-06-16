@@ -32,6 +32,23 @@
 
 namespace duckdb {
 
+namespace {
+
+class OasisSplinterResultTask : public AsyncTask {
+public:
+	explicit OasisSplinterResultTask(oasis::SplinterResultHandle result) : result(std::move(result)) {
+	}
+
+	void Execute() override {
+		result.wait_ready();
+	}
+
+private:
+	oasis::SplinterResultHandle result;
+};
+
+} // namespace
+
 unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types, vector<string> &names) {
 	auto parquet_file = StringValue::Get(input.inputs[0]);
@@ -42,7 +59,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	auto bind_data = make_uniq<OasisScanBindData>();
 
 	for (auto &col : parquet_reader.columns) {
-		names.push_back(col.name);
+		names.push_back(col.name.GetIdentifierName());
 		return_types.push_back(col.type);
 	}
 
@@ -172,21 +189,19 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 	return chunks.empty() ? 0 : chunks[0].num_values;
 }
 
-// Submits the whole row group `group` to the shared scheduler as ONE splinter (one flow per
-// projected hardware column), returning the single result handle. Each flow's sink is tagged with
-// its projection index, so the consumer places the tagged batches into hw_buffers[projection_index].
-static oasis::SplinterResultHandle
-SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
-                       OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
+// Select the hardware-decoded column chunks, allocate their host input buffers, and emit one 
+// AsyncTask per coalesced read (host path). For RDMA, the hardware pulls bytes straight into the 
+// stream during decode, so there are no tasks. Leaves `pending` in the IO_PENDING phase.
+static void BeginGroupIO(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                         OasisScanLocalState &lstate, const OasisScanBindData &bind,
+                         OasisScanLocalState::PendingGroup &pending) {
+	const size_t group = pending.group;
 	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
 	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
 
-	// Phase 0: Collect the column chunks that will be decoded in hardware and fetch them.
-	std::vector<size_t> hw_slot; // projection indices of the hardware columns, in order
-	std::vector<const parcore::metadata::ColumnChunk *> hw_chunks;
-	hw_slot.reserve(gstate.projected_columns.size());
-	hw_chunks.reserve(gstate.projected_columns.size());
-
+	// Collect the column chunks that will be decoded in hardware.
+	pending.hw_slot.reserve(gstate.projected_columns.size());
+	pending.hw_chunks.reserve(gstate.projected_columns.size());
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
@@ -206,64 +221,85 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 			    (unsigned long long)decoded_size, (unsigned long long)buffer_capacity);
 		}
 
-		hw_slot.push_back(i);
-		hw_chunks.push_back(&cc);
+		pending.hw_slot.push_back(i);
+		pending.hw_chunks.push_back(&cc);
 	}
 
+	if (rdma) {
+		return; // No host reads on the RDMA path.
+	}
+
+	// Full byte span of the row group: [min chunk offset, max chunk end) over ALL chunks.
 	CoalescedFetcher::GroupSpan group_span {0, 0};
-	if (!rdma) {
-		// Full byte span of the row group: [min chunk offset, max chunk end) over ALL chunks.
-		uint64_t span_begin = std::numeric_limits<uint64_t>::max();
-		uint64_t span_end = 0;
-		for (const auto &cc : bind.metadata.groups[group].chunks) {
-			span_begin = std::min<uint64_t>(span_begin, cc.offset);
-			span_end = std::max<uint64_t>(span_end, cc.offset + cc.total_compressed_size);
-		}
-		if (span_end > span_begin) {
-			group_span = {span_begin, span_end - span_begin};
-		}
+	uint64_t span_begin = std::numeric_limits<uint64_t>::max();
+	uint64_t span_end = 0;
+	for (const auto &cc : bind.metadata.groups[group].chunks) {
+		span_begin = std::min<uint64_t>(span_begin, cc.offset);
+		span_end = std::max<uint64_t>(span_end, cc.offset + cc.total_compressed_size);
+	}
+	if (span_end > span_begin) {
+		group_span = {span_begin, span_end - span_begin};
 	}
 
-	std::vector<CoalescedFetcher::RangeHandle> host_handles;
-	CoalescedFetcher fetcher(*lstate.file_handle, ctx.memory_pool(), group_span);
-	if (!rdma) {
-		host_handles.reserve(hw_chunks.size());
-		for (const auto *cc : hw_chunks) {
-			host_handles.push_back(fetcher.Register(cc->offset, cc->total_compressed_size));
-		}
-
-		fetcher.Fetch();
-		DUCKDB_LOG_DEBUG(context, "Coalesced %llu column chunk(s) into %llu read(s) (%llu bytes) for row group %llu.",
-		                 (unsigned long long)fetcher.num_ranges(), (unsigned long long)fetcher.num_reads(),
-		                 (unsigned long long)fetcher.bytes_fetched(), (unsigned long long)group);
+	pending.fetcher = make_uniq<CoalescedFetcher>(*lstate.file_handle, ctx.memory_pool(), group_span);
+	pending.host_handles.reserve(pending.hw_chunks.size());
+	for (const auto *cc : pending.hw_chunks) {
+		pending.host_handles.push_back(pending.fetcher->Register(cc->offset, cc->total_compressed_size));
 	}
+	pending.fetcher->PrepareReads();
 
-	// Phase 1: Build one QuerySplinter for the whole row group -- one flow per hardware column. The 
-    // scheduler load-balances the flows across hardware streams and closes the handle once all 
-    // flows finish.
+	auto *fetcher = pending.fetcher.get();
+	pending.io_tasks = fetcher->BuildReadTasks();
+	DUCKDB_LOG_DEBUG(context, "Coalesced %llu column chunk(s) into %llu read(s) (%llu bytes) for row group %llu.",
+	                 (unsigned long long)fetcher->num_ranges(), (unsigned long long)fetcher->num_reads(),
+	                 (unsigned long long)fetcher->bytes_fetched(), (unsigned long long)group);
+}
+
+// Build and submit the whole row group as ONE QuerySplinter (one flow per hardware column), then 
+// initialize and fully decode the CPU/string columns. Each flow's sink is tagged with its 
+// projection index, so the consumer places the tagged batches into hw_buffers[projection_index].
+static void FinishGroupIO(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
+                          OasisScanLocalState &lstate, const OasisScanBindData &bind,
+                          OasisScanLocalState::PendingGroup &pending) {
+	const size_t group = pending.group;
+	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
+
+	// Build one QuerySplinter for the whole row group -- one flow per hardware column. The scheduler
+	// load-balances the flows across hardware streams and closes the handle once all flows finish.
 	oasis::QuerySplinter splinter;
-	splinter.streams.reserve(hw_slot.size());
-	for (size_t k = 0; k < hw_slot.size(); k++) {
-		const auto &cc = *hw_chunks[k];
+	splinter.streams.reserve(pending.hw_slot.size());
+	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
+		const auto &cc = *pending.hw_chunks[k];
 		auto type = parcore::metadata::to_libstf_type(cc.type);
 
 		oasis::OperatorFlow flow;
 		if (rdma) {
 			flow.push_back(MakeRDMASource(*rdma, cc));
 		} else {
-			flow.push_back(MakeHostSource(ctx, fetcher.Resolve(host_handles[k])));
+			flow.push_back(MakeHostSource(ctx, pending.fetcher->Resolve(pending.host_handles[k])));
 		}
 		flow.push_back(
 		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
-		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(hw_slot[k]));
+		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(pending.hw_slot[k]));
 		splinter.streams.push_back(std::move(flow));
 	}
 
-	// Phase 2: Submit the whole row group as one splinter.
-	auto result = ctx.scheduler().submit(std::move(splinter));
-    DUCKDB_LOG_DEBUG(context, "Submitted QuerySplinter (%llu flow(s)) for row group %llu.",
-		             (unsigned long long)hw_slot.size(), (unsigned long long)group);
-	return result;
+	pending.result = ctx.scheduler().submit(std::move(splinter));
+	DUCKDB_LOG_DEBUG(context, "Submitted QuerySplinter (%llu flow(s)) for row group %llu.",
+	                 (unsigned long long)pending.hw_slot.size(), (unsigned long long)group);
+
+	pending.hw_buffers.assign(gstate.projected_columns.size(), nullptr);
+	pending.hw_columns_remaining = pending.hw_slot.size();
+
+	// InitializeRead(...) does the page-header parsing / I/O positioning for the CPU/string columns,
+	// then DecodeCpuColumns drains them in full. Both run while the FPGA splinters are in flight.
+	if (gstate.has_cpu_columns) {
+		lstate.root_reader->InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns,
+		                                   *lstate.scan_state->thrift_file_proto);
+	}
+	DecodeCpuColumns(gstate, lstate, pending.num_rows, pending.cpu_slices);
+
+	pending.phase = OasisScanLocalState::PendingGroup::Phase::DECODING;
 }
 
 // Non-blocking: Drains the row group's result handle, placing each tagged column chunk into
@@ -290,23 +326,6 @@ static bool TryCollectRowGroup(ClientContext &context, OasisScanGlobalState &gst
 		pending.hw_columns_remaining--;
 	}
 	return true;
-}
-
-// Arms a one-shot readiness callback on the row group's single result handle. When the handle
-// becomes ready it calls InterruptState::Callback() to reschedule the blocked DuckDB task, which
-// then re-polls. Returns true if the callback was armed. If the channel is ALREADY ready,
-// set_ready_callback registers nothing and returns false: the caller must re-poll.
-static bool ArmReadinessCallbacks(OasisScanGlobalState &gstate, OasisScanLocalState::PendingGroup &pending,
-                                  InterruptState interrupt_state) {
-	(void)gstate;
-	pending.wake_guard->clear();
-	auto guard = pending.wake_guard;
-	auto cb = [interrupt_state, guard]() {
-		if (!guard->test_and_set()) {
-			interrupt_state.Callback();
-		}
-	};
-	return pending.result.set_ready_callback(std::move(cb));
 }
 
 // Fully decodes every CPU/string column of the current group into per-slice Vectors written to
@@ -353,38 +372,6 @@ static void DecodeCpuColumns(OasisScanGlobalState &gstate, OasisScanLocalState &
 	}
 }
 
-// Begins decoding one row group without blocking: submit a splinter per hardware column, then fully
-// decode the CPU/string columns (overlapping with the hardware round trip). The hardware results 
-// are left draining; the returned PendingGroup holds the result handles for the caller to poll. CPU
-// slices are decoded here (in row-group order, as the sequential CPU reader requires) and stashed 
-// on the PendingGroup.
-static unique_ptr<OasisScanLocalState::PendingGroup>
-BeginGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
-           OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
-	auto pending = make_uniq<OasisScanLocalState::PendingGroup>();
-	pending->group = group;
-	pending->num_rows = RowGroupNumRows(bind, group);
-	pending->result = SubmitRowGroupSplinter(context, ctx, gstate, lstate, bind, group);
-	pending->hw_buffers.assign(gstate.projected_columns.size(), nullptr);
-
-	// Count the hardware columns we expect to collect from the single channel.
-	pending->hw_columns_remaining = 0;
-	for (const auto &col : gstate.projected_columns) {
-		if (!col.is_cpu) {
-			pending->hw_columns_remaining++;
-		}
-	}
-
-	// InitializeRead(...) does the page-header parsing / I/O positioning for the CPU/string columns,
-	// then DecodeCpuColumns drains them in full. Both run while the FPGA splinters are in flight.
-	if (gstate.has_cpu_columns) {
-		lstate.root_reader->InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns,
-		                                   *lstate.scan_state->thrift_file_proto);
-	}
-	DecodeCpuColumns(gstate, lstate, pending->num_rows, pending->cpu_slices);
-	return pending;
-}
-
 // Claims the next non-empty row group off the shared atomic cursor, returning its index (or
 // total_groups once all groups are consumed).
 static size_t ClaimNextNonEmptyGroup(OasisScanGlobalState &gstate, const OasisScanBindData &bind) {
@@ -419,6 +406,8 @@ enum class LoadResult : uint8_t {
 	EXHAUSTED
 };
 
+// Keeps the pipeline full: Claims matching groups up to the per-worker budget and runs BeginGroupIO
+// on each (selecting chunks + allocating buffers, no IO). New groups start IO_PENDING.
 static void TopUpInflight(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                           OasisScanLocalState &lstate, const OasisScanBindData &bind) {
 	while (!lstate.groups_exhausted && lstate.inflight.size() < gstate.groups_in_flight_per_worker) {
@@ -427,30 +416,57 @@ static void TopUpInflight(ClientContext &context, oasis::OasisContext &ctx, Oasi
 			lstate.groups_exhausted = true;
 			break;
 		}
-		lstate.inflight.push_back(BeginGroup(context, ctx, gstate, lstate, bind, group));
+		auto pending = make_uniq<OasisScanLocalState::PendingGroup>();
+		pending->group = group;
+		pending->num_rows = RowGroupNumRows(bind, group);
+		BeginGroupIO(context, ctx, gstate, lstate, bind, *pending);
+		lstate.inflight.push_back(std::move(pending));
 	}
 }
 
 static LoadResult LoadNextGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
-                                OasisScanLocalState &lstate, const OasisScanBindData &bind, InterruptState interrupt_state) {
-	// Submit phase: Keep the pipeline full so later groups decode in hardware while we collect the head.
+                                OasisScanLocalState &lstate, const OasisScanBindData &bind,
+                                std::vector<unique_ptr<AsyncTask>> &out_tasks) {
+	using Phase = OasisScanLocalState::PendingGroup::Phase;
+
+	// Keep the pipeline full so later groups overlap IO/decode with collecting the head.
 	TopUpInflight(context, ctx, gstate, lstate, bind);
+
+	// Promote to DECODING every group whose host reads have completed (its scheduled AsyncResult
+	// finished before this re-entry, see Decision 3) or that needs no host IO at all (RDMA, or no
+	// hardware columns). This submits their splinters so FPGA decode of all ready groups overlaps.
+	for (auto &pending : lstate.inflight) {
+		if (pending->phase == Phase::IO_PENDING && (pending->io_scheduled || pending->io_tasks.empty())) {
+			FinishGroupIO(context, ctx, gstate, lstate, bind, *pending);
+		}
+	}
 
 	if (lstate.inflight.empty()) {
 		return LoadResult::EXHAUSTED;
 	}
 	auto &head = *lstate.inflight.front();
 
-	// Poll phase: Collect the head group's hardware buffers without blocking. If any column is still
-    // outstanding, arm readiness callbacks and return BLOCKED so the worker thread is released.
-	//
-	// Arming and polling race against the completion thread, so we loop: The loop terminates
-    // because each iteration either collects at least one more column or successfully arms every
-    // remaining one.
-	while (!TryCollectRowGroup(context, gstate, bind, head)) {
-		if (ArmReadinessCallbacks(gstate, head, interrupt_state)) {
-			return LoadResult::BLOCKED;
+	// If the head still needs host reads, schedule the reads for every not-yet-started inflight 
+    // group as one AsyncResult and return that we are blocked.
+	if (head.phase == Phase::IO_PENDING) {
+		for (auto &pending : lstate.inflight) {
+			if (pending->phase == Phase::IO_PENDING && !pending->io_scheduled) {
+				for (auto &task : pending->io_tasks) {
+					out_tasks.push_back(std::move(task));
+				}
+				pending->io_tasks.clear();
+				pending->io_scheduled = true;
+			}
 		}
+		return LoadResult::BLOCKED;
+	}
+
+	// Head is DECODING: Collect its hardware buffers without blocking. If any column is still
+	// outstanding, block on the result handle via an async task (which frees the worker until the
+	// handle next becomes ready) and return BLOCKED.
+	if (!TryCollectRowGroup(context, gstate, bind, head)) {
+		out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
+		return LoadResult::BLOCKED;
 	}
 
 	lstate.current_buffers = std::move(head.hw_buffers);
@@ -499,10 +515,10 @@ struct SliceResult {
 // or claiming a new group as needed), zero-copy.
 static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                                 OasisScanLocalState &lstate, const OasisScanBindData &bind, DataChunk &output,
-                                InterruptState interrupt_state) {
+                                std::vector<unique_ptr<AsyncTask>> &out_tasks) {
 	// When the current group is fully emitted, decode/claim the next one.
 	if (lstate.current_group_num_rows == 0) {
-		auto load = LoadNextGroup(context, ctx, gstate, lstate, bind, std::move(interrupt_state));
+		auto load = LoadNextGroup(context, ctx, gstate, lstate, bind, out_tasks);
 		if (load != LoadResult::LOADED) {
 			return {0, load}; // BLOCKED or EXHAUSTED.
 		}
@@ -571,15 +587,16 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	return {emit, LoadResult::LOADED};
 }
 
-// Zero-copy multi-column scan. Each worker atomically claims a row group, submits its query 
+// Zero-copy multi-column scan. Each worker atomically claims a row group, submits its query
 // splinters to the Oasis scheduler, and slices the decoded buffers in lockstep into
 // STANDARD_VECTOR_SIZE-sized vectors. The one-buffer-per-column-chunk model holds because the OBM
-// buffers are sized to a whole DuckDB column chunk and BeginGroup rejects any chunk that would
+// buffers are sized to a whole DuckDB column chunk and BeginGroupIO rejects any chunk that would
 // overflow them.
 //
-// Rather than block a DuckDB worker thread while the FPGA decodes, we signal data_p.blocked 
-// whenever the hardware results are not ready, after arming a readiness callback that the 
-// Oasis scheduler's completion thread fires to reschedule this task.
+// Rather than block a DuckDB worker thread on IO or FPGA decode, we return BLOCKED via
+// data_p.async_result with AsyncTasks: input reads run on DuckDB's async pool, and FPGA-readiness
+// waits run there too (each bridging the result handle's readiness callback). The engine reschedules
+// this scan once the tasks complete.
 //
 // Otherwise we loop over slices until at least one row survives the pushed-down filters or we hit
 // EOF.
@@ -594,14 +611,15 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 		return;
 	}
 
-	InterruptState interrupt_state = data_p.interrupt_state ? *data_p.interrupt_state : InterruptState();
-
 	while (true) {
 		output.Reset();
-		auto slice = EmitOneSlice(context, ctx, gstate, lstate, bind, output, interrupt_state);
+		std::vector<unique_ptr<AsyncTask>> tasks;
+		auto slice = EmitOneSlice(context, ctx, gstate, lstate, bind, output, tasks);
 		if (slice.rows == 0) {
 			output.SetCardinality(0);
-			data_p.blocked = (slice.load == LoadResult::BLOCKED);
+			if (slice.load == LoadResult::BLOCKED) {
+				data_p.async_result = AsyncResult(std::move(tasks), TaskSchedulerType::ASYNC);
+			}
 			return;
 		}
 		if (ApplyFilters(gstate, lstate, output) > 0) {
@@ -630,7 +648,7 @@ unique_ptr<BaseStatistics> OasisScanStatistics(ClientContext &context, const Fun
 	}
 	ParquetOptions parquet_opts(context);
 	ParquetReader reader(context, OpenFileInfo {bind.filename}, parquet_opts);
-	return reader.GetStatistics(context, bind.metadata.column_names[column_index]);
+	return reader.GetStatistics(context, Identifier(bind.metadata.column_names[column_index]));
 }
 
 double OasisScanProgress(ClientContext &, const FunctionData *, const GlobalTableFunctionState *global_state) {

@@ -41,7 +41,7 @@ parcore::metadata::Metadata BuildParcoreMetadata(ParquetReader &parquet_reader) 
 	parcore::metadata::Metadata meta;
 
 	for (auto &col : parquet_reader.columns) {
-		meta.column_names.push_back(col.name);
+		meta.column_names.push_back(col.name.GetIdentifierName());
 	}
 
 	for (auto &rg : file_meta->row_groups) {

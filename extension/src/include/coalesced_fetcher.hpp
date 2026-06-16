@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/parallel/async_result.hpp"
 #include "libstf/buffer.hpp"
 #include "libstf/memory_pool.hpp"
 
@@ -11,14 +12,17 @@
 
 namespace duckdb {
 
-// Two-step coalesced host fetcher:
+// Coalesced host fetcher:
 //
-//   1. Register every (offset, size) range you intend to read. Ranges that overlap, are adjacent, 
+//   1. Register every (offset, size) range you intend to read. Ranges that overlap, are adjacent,
 //      or sit within ALLOW_GAP bytes of each other are merged into a single physical read.
-//   2. Fetch() issues one host read per merged range, into one libstf buffer per merged range.
+//   2. PrepareReads() finalizes the merged list and allocates one libstf buffer per merged range
+//      (no IO).
+//   3. ExecuteMergedRead(idx) issues the single host read for merged range `idx`. These reads are
+//      independent and may run concurrently (e.g. on DuckDB's async thread pool).
 //
-// Not thread-safe: each worker owns its own fetcher, mirroring the per-worker file_handle ownership 
-// in OasisScanLocalState.
+// Registration/preparation is single-threaded (each worker owns its own fetcher). Once 
+// PrepareReads() has run, distinct ExecuteMergedRead(idx) calls are safe to run concurrently.
 class CoalescedFetcher {
 public:
 	// Default gap (in bytes) within which two ranges are still merged. Matches the Parquet reader's 
@@ -43,13 +47,24 @@ public:
 	CoalescedFetcher(FileHandle &file_handle, std::shared_ptr<libstf::MemoryPool> memory_pool,
 	                 GroupSpan group_span, uint64_t allow_gap = DEFAULT_ALLOW_GAP);
 
-	// Register a range to be read. Returns a handle to resolve after Fetch(). May be merged with
-    // previously registered ranges. Must be called before Fetch().
+	// Register a range to be read. Returns a handle to resolve after the reads run. May be merged
+    // with previously registered ranges. Must be called before PrepareReads().
 	RangeHandle Register(uint64_t offset, uint64_t size);
 
-	// Issue the coalesced reads. Must be called exactly once, after all Register() calls and before 
-    // any Resolve().
-	void Fetch();
+	// Finalize the merged read list and allocate one libstf buffer per merged read. Does NO IO, so 
+    // it is safe to run on the compute worker. Must be called exactly once, after all Register() 
+    // calls and before any ExecuteMergedRead() or Resolve(). After this, num_reads() is the count 
+    // of merged reads to execute (indices [0, num_reads())).
+	void PrepareReads();
+
+	// Issue the single host read for merged read `idx`, into its pre-allocated buffer. Reads are
+    // independent (positional pread), so different indices may run concurrently on the async pool.
+    // Must be called after PrepareReads().
+	void ExecuteMergedRead(size_t idx);
+
+	// Build one independent AsyncTask per merged read, each of which runs ExecuteMergedRead() for 
+    // its index. The tasks borrow this fetcher, so it must outlive them.
+	vector<unique_ptr<AsyncTask>> BuildReadTasks();
 
 	struct RangeView {
 		std::shared_ptr<libstf::Buffer> buffer;

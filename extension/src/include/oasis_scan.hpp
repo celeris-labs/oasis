@@ -1,5 +1,6 @@
 #pragma once
 
+#include "coalesced_fetcher.hpp"
 #include "column_reader.hpp"
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
@@ -9,6 +10,7 @@
 #include "parcore/metadata/metadata.hpp"
 #include "parquet_reader.hpp"
 
+#include "duckdb/parallel/async_result.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 
 #include <atomic>
@@ -88,20 +90,36 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// Reused selection vector for row-level filtering, so we don't reallocate per scan call.
 	SelectionVector filter_sel;
 
-	// Async (BLOCKED) state for the row group this worker has submitted but not yet collected.
+	// Per-row-group state, tracked through a two-phase lifecycle so the head's input IO runs off 
+    // the compute worker (on DuckDB's async pool) ahead of FPGA decode:
+	//
+	//   IO_PENDING  -- host reads scheduled as AsyncTasks (or none, for RDMA) -->
+	//   DECODING    -- splinter submitted, hardware is decoding, CPU columns are decoded.
 	struct PendingGroup {
+		enum class Phase : uint8_t { IO_PENDING, DECODING };
+
 		size_t group = 0;
 		size_t num_rows = 0;
-		// The whole row group is one QuerySplinter with one result handle. Batches arrive tagged 
+		Phase phase = Phase::IO_PENDING;
+
+		bool io_scheduled = false;
+
+		std::unique_ptr<CoalescedFetcher> fetcher;
+		std::vector<unique_ptr<AsyncTask>> io_tasks;
+
+		// Hardware columns of this group:
+		// hw_slot[k] is the projection index, hw_chunks[k] the chunk, host_handles[k] the fetcher
+		// handle resolving hw_chunks[k]'s bytes (host path only).
+		std::vector<size_t> hw_slot;
+		std::vector<const parcore::metadata::ColumnChunk *> hw_chunks;
+		std::vector<CoalescedFetcher::RangeHandle> host_handles;
+
+		// The whole row group is one QuerySplinter with one result handle. Batches arrive tagged
         // with their projection index and are placed into hw_buffers by tag.
 		oasis::SplinterResultHandle result;
 		size_t hw_columns_remaining = 0;
 		std::vector<std::vector<unique_ptr<Vector>>> cpu_slices;
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
-
-		// One-shot wake guard for the current BLOCKED return: Only the first ready signal fires
-        // InterruptState::Callback(), so a single BLOCKED return yields exactly one Reschedule().
-		std::shared_ptr<std::atomic_flag> wake_guard = std::make_shared<std::atomic_flag>();
 	};
 
 	std::deque<unique_ptr<PendingGroup>> inflight;
