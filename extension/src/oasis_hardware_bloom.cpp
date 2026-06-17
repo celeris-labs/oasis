@@ -338,7 +338,7 @@ static void ExecuteHardwareBloomOnce(ClientContext &context, TableFunctionInput 
         }
 
         uint32_t first_last_beat = CheckedBeatIndex(build_beats, "build chunk");
-        uint32_t second_last_beat = CheckedBeatIndex(build_beats + probe_beats, "build+probe chunks");
+        uint32_t second_last_beat = CheckedBeatIndex(probe_beats, "probe chunks");
 
         OASIS_HW_BLOOM_LOG("TLAST injection plan: build_beats=%llu probe_beats=%llu first_last_beat=%llu second_last_beat=%llu",
                            (unsigned long long)build_beats,
