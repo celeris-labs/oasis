@@ -1,11 +1,13 @@
 #pragma once
 
 #include "oasis_scan.hpp"
+#include "oasis/splinter_result.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
-#include <vector>
+#include <optional>
 
 namespace libstf {
 class Buffer;
@@ -14,15 +16,22 @@ class Buffer;
 namespace duckdb {
 
 struct OasisHardwareBloomState {
+        ~OasisHardwareBloomState();
+
         std::atomic<bool> executed {false};
+        std::atomic<bool> tlast_injector_enabled {false};
 
         std::mutex launch_mutex;
         std::mutex consume_mutex;
 
-        std::vector<std::shared_ptr<libstf::Buffer>> buffers;
+        std::optional<oasis::SplinterResultHandle> result;
+        std::shared_ptr<libstf::Buffer> current_buffer;
 
-        size_t current_buffer_idx = 0;
         size_t current_buffer_offset = 0;
+        bool result_drained = false;
+
+        uint64_t output_buffers = 0;
+        uint64_t output_bytes = 0;
 };
 
 void InitializeOasisHardwareBloom(ClientContext &context, const OasisScanBindData &probe_bind);
