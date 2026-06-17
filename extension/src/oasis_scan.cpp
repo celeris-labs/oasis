@@ -125,12 +125,16 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	auto &fs = FileSystem::GetFileSystem(context.client);
 	lstate->file_handle = fs.OpenFile(gstate.filename, FileOpenFlags::FILE_FLAGS_READ);
 
-	// Build a per-worker ParquetReader: The root_reader supplies the per-column-chunk statistics 
-    // used for row-group skipping (RowGroupMatchesFilters). The CPU decode path additionally drives 
-    // this reader's child readers in OasisScanFunction.
+	// Build a per-worker ParquetReader: its per-column readers supply the per-column-chunk statistics
+    // used for row-group skipping (RowGroupMatchesFilters). The CPU decode path additionally drives
+    // these readers in OasisScanFunction. We project every file column (one FULL_READ ColumnIndex per
+    // column), so scan_state->GetColumnReader(col_id) is keyed directly by file column id.
 	ParquetOptions parquet_opts(context.client);
-	lstate->parquet_reader = make_uniq<ParquetReader>(context.client, OpenFileInfo {gstate.filename}, 
+	lstate->parquet_reader = make_uniq<ParquetReader>(context.client, OpenFileInfo {gstate.filename},
                                                       parquet_opts, bind_data.parquet_metadata);
+	for (idx_t c = 0; c < lstate->parquet_reader->columns.size(); c++) {
+		lstate->parquet_reader->column_indexes.emplace_back(c);
+	}
 	lstate->scan_state = make_uniq<ParquetReaderScanState>();
 
 	vector<idx_t> groups_to_read;
@@ -139,13 +143,12 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 		groups_to_read.push_back(g);
 	}
 	lstate->parquet_reader->InitializeScan(context.client, *lstate->scan_state, std::move(groups_to_read));
-	lstate->root_reader = std::move(lstate->scan_state->root_reader);
 
 	// Prepare the pushed-down filters for row-level filtering (one TableFilterState per filter,
 	// owned by this worker).
 	if (gstate.filters) {
-		for (auto &filter_entry : gstate.filters->filters) {
-			lstate->scan_filters.emplace_back(context.client, filter_entry.first, *filter_entry.second);
+		for (auto &entry : *gstate.filters) {
+			lstate->scan_filters.emplace_back(context.client, entry.GetIndex(), entry.Filter());
 		}
 	}
 
@@ -189,8 +192,11 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 	return chunks.empty() ? 0 : chunks[0].num_values;
 }
 
-// Select the hardware-decoded column chunks, allocate their host input buffers, and emit one 
-// AsyncTask per coalesced read (host path). For RDMA, the hardware pulls bytes straight into the 
+static void DecodeCPUColumns(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, size_t num_rows,
+                             std::vector<std::vector<unique_ptr<Vector>>> &out);
+
+// Select the hardware-decoded column chunks, allocate their host input buffers, and emit one
+// AsyncTask per coalesced read (host path). For RDMA, the hardware pulls bytes straight into the
 // stream during decode, so there are no tasks. Leaves `pending` in the IO_PENDING phase.
 static void BeginGroupIO(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                          OasisScanLocalState &lstate, const OasisScanBindData &bind,
@@ -292,12 +298,17 @@ static void FinishGroupIO(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	pending.hw_columns_remaining = pending.hw_slot.size();
 
 	// InitializeRead(...) does the page-header parsing / I/O positioning for the CPU/string columns,
-	// then DecodeCpuColumns drains them in full. Both run while the FPGA splinters are in flight.
+	// then DecodeCPUColumns drains them in full. Both run while the FPGA splinters are in flight.
 	if (gstate.has_cpu_columns) {
-		lstate.root_reader->InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns,
-		                                   *lstate.scan_state->thrift_file_proto);
+		const auto &row_group_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
+		for (const auto &col : gstate.projected_columns) {
+			if (col.is_cpu) {
+				lstate.scan_state->GetColumnReader(col.column_id)
+				    .InitializeRead(group, row_group_columns, *lstate.scan_state->thrift_file_proto);
+			}
+		}
 	}
-	DecodeCpuColumns(gstate, lstate, pending.num_rows, pending.cpu_slices);
+	DecodeCPUColumns(gstate, lstate, pending.num_rows, pending.cpu_slices);
 
 	pending.phase = OasisScanLocalState::PendingGroup::Phase::DECODING;
 }
@@ -330,7 +341,7 @@ static bool TryCollectRowGroup(ClientContext &context, OasisScanGlobalState &gst
 
 // Fully decodes every CPU/string column of the current group into per-slice Vectors written to
 // `out` (indexed [projection_index][slice]).
-static void DecodeCpuColumns(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, size_t num_rows,
+static void DecodeCPUColumns(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, size_t num_rows,
                              std::vector<std::vector<unique_ptr<Vector>>> &out) {
 	out.clear();
 	out.resize(gstate.projected_columns.size());
@@ -346,7 +357,7 @@ static void DecodeCpuColumns(OasisScanGlobalState &gstate, OasisScanLocalState &
 		if (!col.is_cpu) {
 			continue;
 		}
-		auto &child_reader = lstate.root_reader->Cast<StructColumnReader>().GetChildReader(col.column_id);
+		auto &child_reader = lstate.scan_state->GetColumnReader(col.column_id);
 
 		auto &slices = out[i];
 		for (size_t off = 0; off < num_rows; off += STANDARD_VECTOR_SIZE) {
@@ -358,15 +369,18 @@ static void DecodeCpuColumns(OasisScanGlobalState &gstate, OasisScanLocalState &
 			lstate.scan_state->repeat_buf.zero();
 
 			auto vec = make_uniq<Vector>(child_reader.Type());
-			auto rows_read = child_reader.Read(emit, define_ptr, repeat_ptr, *vec);
+			ColumnReaderInput input(emit, define_ptr, repeat_ptr);
+			auto rows_read = child_reader.Read(input, *vec);
 			if (rows_read != emit) {
 				throw InternalException("ParCore CPU column %llu read %llu values, expected %llu (decode desync)",
 				                        (unsigned long long)i, (unsigned long long)rows_read, (unsigned long long)emit);
 			}
 
-			// Since we retain every slice's vector until emit, flatten here so each slice owns its 
+			FlatVector::SetSize(*vec, count_t(emit));
+
+			// Since we retain every slice's vector until emit, flatten here so each slice owns its
             // own data and stops aliasing that shared scratch state.
-			vec->Flatten(emit);
+			vec->Flatten();
 			slices.push_back(std::move(vec));
 		}
 	}
@@ -494,7 +508,7 @@ static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalStat
 	if (lstate.empty_proj_remaining == 0) {
 		size_t group = ClaimNextNonEmptyGroup(gstate, bind);
 		if (group >= gstate.total_groups) {
-			output.SetCardinality(0);
+			output.SetChildCardinality(0);
 			return;
 		}
 		lstate.empty_proj_remaining = RowGroupNumRows(bind, group);
@@ -503,7 +517,7 @@ static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalStat
 
 	size_t const emit = std::min<size_t>(lstate.empty_proj_remaining, STANDARD_VECTOR_SIZE);
 	lstate.empty_proj_remaining -= emit;
-	output.SetCardinality(emit);
+	output.SetChildCardinality(emit);
 }
 
 struct SliceResult {
@@ -567,8 +581,9 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		//     consumer that holds onto the vector past our next scan call.
 		auto &vec = output.data[i];
 		vec.SetVectorType(VectorType::FLAT_VECTOR);
-		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_buf_offset * col.elem_size);
-		vec.SetAuxiliary(make_buffer<LibstfBufferVectorBuffer>(buf));
+		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_buf_offset * col.elem_size,
+		                    count_t(emit));
+		vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
 	}
 
 	// Advance the cursor. If we have emitted this group's last elements, release the buffers so the
@@ -583,7 +598,7 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		lstate.current_group_num_rows = 0;
 	}
 
-	output.SetCardinality(emit);
+	output.CheckCardinality(emit);
 	return {emit, LoadResult::LOADED};
 }
 
@@ -616,7 +631,7 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 		std::vector<unique_ptr<AsyncTask>> tasks;
 		auto slice = EmitOneSlice(context, ctx, gstate, lstate, bind, output, tasks);
 		if (slice.rows == 0) {
-			output.SetCardinality(0);
+			output.SetChildCardinality(0);
 			if (slice.load == LoadResult::BLOCKED) {
 				data_p.async_result = AsyncResult(std::move(tasks), TaskSchedulerType::ASYNC);
 			}

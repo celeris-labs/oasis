@@ -82,7 +82,6 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 	unique_ptr<ParquetReader> parquet_reader;
 	unique_ptr<ParquetReaderScanState> scan_state;
-	unique_ptr<ColumnReader> root_reader;
 
 	// Per-worker pushed-down filter states, built once at scan init from gstate.filters.
 	std::vector<OasisScanFilter> scan_filters;

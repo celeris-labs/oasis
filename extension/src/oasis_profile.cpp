@@ -130,7 +130,7 @@ void OasisProfileFunction(ClientContext &context, TableFunctionInput &data_p, Da
 	idx_t remaining = gstate.rows.size() - gstate.offset;
 	idx_t count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
 	if (count == 0) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
@@ -139,26 +139,26 @@ void OasisProfileFunction(ClientContext &context, TableFunctionInput &data_p, Da
 		const auto &p = row.profile;
 
 		idx_t col = 0;
-		output.SetValue(col++, i, Value::UBIGINT(row.decoder));
+		output.data[col++].SetValue(i, Value::UBIGINT(row.decoder));
 
-		output.SetValue(col++, i, Value::UBIGINT(p.in.handshakes_cycles));
-		output.SetValue(col++, i, Value::UBIGINT(p.in.starved_cycles));
-		output.SetValue(col++, i, Value::UBIGINT(p.in.stalled_cycles));
-		output.SetValue(col++, i, Value::UBIGINT(p.in.idle_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.in.handshakes_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.in.starved_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.in.stalled_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.in.idle_cycles));
 
-		output.SetValue(col++, i, Value::UBIGINT(p.out.handshakes_cycles));
-		output.SetValue(col++, i, Value::UBIGINT(p.out.starved_cycles));
-		output.SetValue(col++, i, Value::UBIGINT(p.out.stalled_cycles));
-		output.SetValue(col++, i, Value::UBIGINT(p.out.idle_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.out.handshakes_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.out.starved_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.out.stalled_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.out.idle_cycles));
 
-		output.SetValue(col++, i, Value::DOUBLE(row.in_throughput_gbps));
-		output.SetValue(col++, i, Value::DOUBLE(row.in_throughput_excl_idle_gbps));
-		output.SetValue(col++, i, Value::DOUBLE(row.out_throughput_gbps));
-		output.SetValue(col++, i, Value::DOUBLE(row.out_throughput_excl_idle_gbps));
+		output.data[col++].SetValue(i, Value::DOUBLE(row.in_throughput_gbps));
+		output.data[col++].SetValue(i, Value::DOUBLE(row.in_throughput_excl_idle_gbps));
+		output.data[col++].SetValue(i, Value::DOUBLE(row.out_throughput_gbps));
+		output.data[col++].SetValue(i, Value::DOUBLE(row.out_throughput_excl_idle_gbps));
 	}
 
 	gstate.offset += count;
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 } // namespace
