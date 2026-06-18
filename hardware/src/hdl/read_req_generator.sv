@@ -62,7 +62,7 @@ assign conf.ready = sq_rd.ready && fifo_in_ready;
 
 // The issued request is pushed into the FIFO and exposed on the output side as the outstanding
 // request. The consumer pops it (asserts req.ready) once the read has completed.
-FIFO #(FIFO_DEPTH, $bits(read_req_t)) inst_fifo (
+MehdiFIFO #(FIFO_DEPTH, $bits(read_req_t)) inst_fifo (
     .i_clk(clk),
     .i_rst_n(rst_n),
 
