@@ -31,7 +31,8 @@ endif()
 set(COMP_CORES 64)
 set(BUILD_OPT 1)
 
-set(FDEV_NAME u55c)
+# Target FPGA device (override with -DFDEV_NAME=v80 for the Alveo V80)
+set(FDEV_NAME u55c CACHE STRING "Target FPGA device (u55c, v80, ...)")
 
 # Enable 1 GiB huge pages in the TLB
 set(TLBL_BITS 30)

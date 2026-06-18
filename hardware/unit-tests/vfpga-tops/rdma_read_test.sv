@@ -6,6 +6,8 @@ import oasis::*;
 always_comb notify.tie_off_m();
 always_comb sq_wr.tie_off_m();
 always_comb cq_wr.tie_off_s();
+// RDMARead no longer consumes the read completion queue.
+always_comb cq_rd.tie_off_s();
 
 always_comb rq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
@@ -41,7 +43,7 @@ read_config_i  read_configs [1](.*);
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
     .NUM_CONFIGS(1),
-    .ADDR_SPACE_SIZES({NUM_RDMA_READ_CONFIG_REGS * 1})
+    .ADDR_SPACE_SIZES({NUM_READ_REQ_CONFIG_REGS * 1})
 ) inst_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -52,8 +54,8 @@ GlobalConfig #(
     .read_configs(read_configs)
 );
 
-rdma_read_config_i conf[1](.*);
-RDMAReadConfig #(
+ready_valid_i #(read_req_t) conf[1](.*);
+ReadReqConfig #(
     .NUM_STREAMS(1)
 ) inst_rdma_read_config (
     .clk(clk),
@@ -91,7 +93,6 @@ RDMARead inst_rdma_read (
     .rst_n(rst_n),
 
     .sq_rd(sq_rd),
-    .cq_rd(cq_rd),
 
     .conf(conf[0]),
 
