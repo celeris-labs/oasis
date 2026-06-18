@@ -1,8 +1,3 @@
-// Coyote transitively pulls <syslog.h>, which defines LOG_INFO / LOG_DEBUG as
-// preprocessor macros that collide with duckdb::LogLevel enum values. We include
-// DuckDB headers first so the enum is declared cleanly, then #undef the syslog
-// macros after the Coyote includes below so they don't corrupt LogLevel:: use
-// sites in this file.
 #include "rdma_file_system.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -21,10 +16,6 @@
 
 #include <coyote/cThread.hpp>
 #include <coyote/cDefs.hpp>
-
-// <syslog.h> (pulled in by Coyote above) defines this as a numeric macros, which
-// otherwise turns `LogLevel::LOG_DEBUG` into `LogLevel::7` below.
-#undef LOG_INFO
 
 #include <algorithm>
 #include <cstring>

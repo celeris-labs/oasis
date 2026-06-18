@@ -3,29 +3,6 @@
 #include "duckdb/main/database.hpp"
 #include "libstf/logging.hpp"
 
-// Coyote's <syslog.h> (pulled in transitively via oasis_context.hpp) defines LOG_DEBUG /
-// LOG_INFO / LOG_WARNING as numeric macros that collide with the duckdb::LogLevel enum
-// values used in logger.hpp, turning e.g. `LogLevel::LOG_WARNING` into `LogLevel::4`.
-// #undef them before including the logger so the LogLevel:: use sites below compile (see
-// the matching workaround at the top of oasis_scan.cpp).
-#ifdef LOG_TRACE
-#undef LOG_TRACE
-#endif
-#ifdef LOG_DEBUG
-#undef LOG_DEBUG
-#endif
-#ifdef LOG_INFO
-#undef LOG_INFO
-#endif
-#ifdef LOG_WARNING
-#undef LOG_WARNING
-#endif
-#ifdef LOG_ERROR
-#undef LOG_ERROR
-#endif
-#ifdef LOG_FATAL
-#undef LOG_FATAL
-#endif
 #include "duckdb/logging/logger.hpp"
 
 namespace duckdb {

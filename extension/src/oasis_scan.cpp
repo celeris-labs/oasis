@@ -25,21 +25,13 @@
 #include <utility>
 #include <vector>
 
-// oasis_scan.hpp transitively pulls in Coyote, which includes <syslog.h>. That
-// header defines LOG_INFO / LOG_DEBUG as numeric macros that collide with the
-// duckdb::LogLevel enum values, turning e.g. `LogLevel::LOG_DEBUG` into
-// `LogLevel::7`. #undef them so the LogLevel:: use sites below compile.
-#undef LOG_INFO
-#undef LOG_DEBUG
-
 namespace duckdb {
 
 namespace {
 
 class OasisSplinterResultTask : public AsyncTask {
 public:
-	explicit OasisSplinterResultTask(oasis::SplinterResultHandle result) : result(std::move(result)) {
-	}
+	explicit OasisSplinterResultTask(oasis::SplinterResultHandle result) : result(std::move(result)) {}
 
 	void Execute() override {
 		result.wait_ready();

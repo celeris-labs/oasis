@@ -51,8 +51,9 @@ class RDMASourceOperator final : public SourceOperator {
 };
 
 /**
- * DMA read host bytes into the stream via Coyote LOCAL_READ. Owns the input buffer for the 
- * splinter's lifetime so it stays mapped until the FPGA has consumed it.
+ * Triggers a local read of of the input host buffer into the stream. Owns the input buffer for the
+ * splinter's lifetime so it stays mapped until the hardware has consumed it. Throws if RDMA is 
+ * enabled, since only one of the data paths is synthesized into the hardware at a time
  */
 class LocalSourceOperator final : public SourceOperator {
   public:
