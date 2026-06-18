@@ -17,6 +17,8 @@
 
 namespace duckdb {
 
+// Translate DuckDB comparison operators to the operator IDs understood by the
+// Oasis/Celeris filter hardware.
 static oasis::FilterComparison filter_comparison_to_oasis(ExpressionType comparison) {
 	switch (comparison) {
 	case ExpressionType::COMPARE_EQUAL:
@@ -36,6 +38,7 @@ static oasis::FilterComparison filter_comparison_to_oasis(ExpressionType compari
 	}
 }
 
+// Encode a DuckDB constant as the 64-bit RHS payload used by the hardware.
 static uint64_t filter_rhs(const Value &constant) {
 	if (constant.IsNull()) {
 		throw InvalidInputException("Oasis hardware filtering does not support NULL constants");
@@ -43,6 +46,8 @@ static uint64_t filter_rhs(const Value &constant) {
 	return static_cast<uint64_t>(constant.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>());
 }
 
+// Build a hardware equality-list predicate, using the two normal RHS slots
+// first and then the additional RHS slots for longer IN lists.
 static OasisFilter make_list_filter(const vector<Value> &values) {
 	constexpr size_t MAX_LIST_VALUES =
 	    oasis::FilterConfig::NUM_RHS + oasis::FilterConfig::NUM_ADDITIONAL_RHS;
@@ -71,6 +76,8 @@ static OasisFilter make_list_filter(const vector<Value> &values) {
 
 using FilterTerm = pair<ExpressionType, Value>;
 
+// Collapse one or two comparison terms on the same column into one hardware
+// predicate: simple comparison, BETWEEN, or half-open range.
 static bool make_filter(const vector<FilterTerm> &terms, OasisFilter &result) {
 	if (terms.size() == 1) {
 		result = {filter_comparison_to_oasis(terms[0].first), {filter_rhs(terms[0].second)}};
@@ -100,6 +107,8 @@ static bool make_filter(const vector<FilterTerm> &terms, OasisFilter &result) {
 	return true;
 }
 
+// Convert DuckDB's regular TableFilter representation into one Oasis filter.
+// This covers the simple pushdown path used for per-column filters.
 static OasisFilter translate_filter(const TableFilter &filter) {
 	if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
 		auto &constant = filter.Cast<ConstantFilter>();
@@ -150,6 +159,7 @@ static OasisFilter translate_filter(const TableFilter &filter) {
 	    "Oasis hardware filtering supports comparisons, bounded ranges, and equality lists");
 }
 
+// Resolve a bound expression to the physical column id used by this LogicalGet.
 static bool bound_column_id(const Expression &expr, const LogicalGet &get, idx_t &column_id) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return false;
@@ -166,6 +176,7 @@ static bool bound_column_id(const Expression &expr, const LogicalGet &get, idx_t
 	return true;
 }
 
+// Parse a comparison expression and normalize it into "column OP constant".
 static bool bound_filter_term(const Expression &expr, const LogicalGet &get, idx_t &column_id,
                               FilterTerm &term) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COMPARISON) {
@@ -204,6 +215,7 @@ static bool bound_filter_term(const Expression &expr, const LogicalGet &get, idx
 	return true;
 }
 
+// Collect all AND-connected comparison terms in one branch of a complex filter.
 static bool collect_filter_terms(const Expression &expr, const LogicalGet &get,
                                  map<idx_t, vector<FilterTerm>> &terms) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
@@ -245,6 +257,8 @@ static bool collect_filter_terms(const Expression &expr, const LogicalGet &get,
 	return true;
 }
 
+// Translate one OR branch into one hardware layer. Predicates inside the branch
+// are ANDed together by the hardware.
 static bool translate_branch(const Expression &expr, const LogicalGet &get, OasisFilterLayer &layer) {
 	map<idx_t, vector<FilterTerm>> terms;
 	if (!collect_filter_terms(expr, get, terms)) {
@@ -260,6 +274,7 @@ static bool translate_branch(const Expression &expr, const LogicalGet &get, Oasi
 	return !layer.empty();
 }
 
+// Find the position of a physical column in the list assigned to hardware.
 static size_t column_position(const vector<size_t> &columns, idx_t column_id) {
 	auto column = std::find(columns.begin(), columns.end(), column_id);
 	if (column == columns.end()) {
@@ -268,10 +283,12 @@ static size_t column_position(const vector<size_t> &columns, idx_t column_id) {
 	return column - columns.begin();
 }
 
+// Format a hardware RHS value for EXPLAIN output.
 static string filter_value(uint64_t value) {
 	return to_string(static_cast<int64_t>(value));
 }
 
+// Pretty-print one Oasis filter predicate for DuckDB's EXPLAIN plan.
 static string filter_to_string(const string &column, const OasisFilter &filter) {
 	const auto lhs = filter_value(filter.rhs[0]);
 	const auto rhs = filter_value(filter.rhs[1]);
@@ -310,6 +327,8 @@ static string filter_to_string(const string &column, const OasisFilter &filter) 
 	throw InternalException("Unknown Oasis filter comparison");
 }
 
+// Complex pushdown entry point. Recognizes OR-of-AND expressions and maps each
+// OR branch to one hardware layer, then removes the software filter.
 void OasisPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionData *bind_data_p,
                                 vector<unique_ptr<Expression>> &filters) {
 	if (filters.size() != 1 || filters[0]->GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION ||
@@ -336,6 +355,7 @@ void OasisPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionData *
 	filters.clear();
 }
 
+// Produce the extra metadata shown by EXPLAIN for read_oasis().
 InsertionOrderPreservingMap<string> OasisScanToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
@@ -362,6 +382,8 @@ InsertionOrderPreservingMap<string> OasisScanToString(TableFunctionToStringInput
 	return result;
 }
 
+// Normalize DuckDB's two pushdown paths into the common Oasis layer format used
+// by scan initialization and hardware configuration.
 vector<OasisFilterLayer> NormalizeOasisFilters(const TableFunctionInitInput &input,
                                                const OasisScanBindData &bind_data) {
 	const bool has_table_filters = input.filters && !input.filters->filters.empty();
@@ -386,6 +408,8 @@ vector<OasisFilterLayer> NormalizeOasisFilters(const TableFunctionInitInput &inp
 	return {std::move(layer)};
 }
 
+// Assign physical columns to hardware streams. Additional-RHS filters must use
+// stream 0, so this may rotate the stream mapping to satisfy that requirement.
 vector<libstf::stream_t> AssignOasisFilterStreams(const vector<size_t> &columns,
                                                   const vector<OasisFilterLayer> &layers) {
 	optional_idx additional_rhs_column;
@@ -412,15 +436,24 @@ vector<libstf::stream_t> AssignOasisFilterStreams(const vector<size_t> &columns,
 	return streams;
 }
 
+// Convert Oasis filter layers into the concrete configuration words consumed by
+// the software/hardware FilterConfig interface.
 void ConfigureOasisFilters(oasis::FilterConfig &config, const vector<size_t> &columns,
                            const vector<libstf::stream_t> &streams,
-                           const vector<OasisFilterLayer> &layers) {
+                           const vector<OasisFilterLayer> &layers, oasis::FilterMode mode) {
 	vector<oasis::FilterConfig::Stream> stream_config;
 	vector<oasis::FilterConfig::Predicate> predicates;
 	vector<oasis::FilterConfig::AdditionalRhs> additional_rhs;
 
 	for (const auto stream : streams) {
-		stream_config.push_back({stream, libstf::type_t::INT64_T, true});
+		const bool enabled =
+		    mode == oasis::FilterMode::FULL_MATERIALIZATION ||
+		    std::any_of(layers.begin(), layers.end(), [&](const OasisFilterLayer &layer) {
+			    return std::any_of(layer.begin(), layer.end(), [&](const auto &entry) {
+				    return streams[column_position(columns, entry.first)] == stream;
+			    });
+		    });
+		stream_config.push_back({stream, libstf::type_t::INT64_T, enabled});
 	}
 	for (size_t layer = 0; layer < layers.size(); layer++) {
 		for (const auto &entry : layers[layer]) {
@@ -435,7 +468,7 @@ void ConfigureOasisFilters(oasis::FilterConfig &config, const vector<size_t> &co
 			}
 		}
 	}
-	config.configure(stream_config, predicates, additional_rhs);
+	config.configure(stream_config, predicates, additional_rhs, mode);
 }
 
 } // namespace duckdb

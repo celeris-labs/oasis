@@ -8,6 +8,9 @@ namespace duckdb {
 class LogicalGet;
 struct OasisScanBindData;
 
+// Experimental strategy switch. Changing this only requires rebuilding the extension.
+constexpr oasis::FilterMode OASIS_FILTER_MODE = oasis::FilterMode::BITMASK;
+
 struct OasisFilter {
 	oasis::FilterComparison comparison = oasis::FilterComparison::ALWAYS_TRUE;
 	std::array<uint64_t, oasis::FilterConfig::NUM_RHS> rhs = {};
@@ -30,6 +33,6 @@ vector<libstf::stream_t> AssignOasisFilterStreams(const vector<size_t> &columns,
 
 void ConfigureOasisFilters(oasis::FilterConfig &config, const vector<size_t> &columns,
                            const vector<libstf::stream_t> &streams,
-                           const vector<OasisFilterLayer> &layers);
+                           const vector<OasisFilterLayer> &layers, oasis::FilterMode mode);
 
 } // namespace duckdb

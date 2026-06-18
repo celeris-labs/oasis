@@ -250,25 +250,73 @@ FilterOperator inst_filter (
     .filter_conf(filter_conf)
 );
 
+logic filter_config_valid;
+logic bitmask_mode;
+
+assign filter_config_valid =
+    (filter_conf[0][0].control_config_valid === 1'b1);
+assign bitmask_mode =
+    filter_conf[0][0].control_config_data.mode == BITMASK;
+
 for (genvar I = 0; I < NUM_STREAMS; I++) begin
+    logic routing_valid;
+    logic stream_uses_filter;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n || !filter_enabled) begin
+            routing_valid <= 1'b0;
+            stream_uses_filter <= 1'b0;
+        end else if (!routing_valid && filter_config_valid) begin
+            routing_valid <= 1'b1;
+            stream_uses_filter <=
+                !bitmask_mode ||
+                filter_conf[I][0].control_config_data.stream_enabled == ENABLED;
+        end
+    end
+
     assign filter_inputs[I].tdata  = decoded_outputs[I].tdata;
     assign filter_inputs[I].tkeep  = decoded_outputs[I].tkeep;
     assign filter_inputs[I].tlast  = decoded_outputs[I].tlast;
-    assign filter_inputs[I].tvalid = filter_enabled && decoded_outputs[I].tvalid;
+    assign filter_inputs[I].tvalid =
+        filter_enabled &&
+        routing_valid &&
+        stream_uses_filter &&
+        decoded_outputs[I].tvalid;
 
     assign decoded_outputs[I].tready =
-        filter_enabled ? filter_inputs[I].tready : pipeline_outputs[I].tready;
+        !filter_enabled
+            ? pipeline_outputs[I].tready
+            : !routing_valid
+                ? 1'b0
+                : stream_uses_filter
+                    ? filter_inputs[I].tready
+                    : pipeline_outputs[I].tready;
     assign filtered_outputs[I].tready =
-        filter_enabled ? pipeline_outputs[I].tready : 1'b0;
+        filter_enabled &&
+        routing_valid &&
+        stream_uses_filter
+            ? pipeline_outputs[I].tready
+            : 1'b0;
 
     assign pipeline_outputs[I].tdata =
-        filter_enabled ? filtered_outputs[I].tdata : decoded_outputs[I].tdata;
+        filter_enabled && stream_uses_filter
+            ? filtered_outputs[I].tdata
+            : decoded_outputs[I].tdata;
     assign pipeline_outputs[I].tkeep =
-        filter_enabled ? filtered_outputs[I].tkeep : decoded_outputs[I].tkeep;
+        filter_enabled && stream_uses_filter
+            ? filtered_outputs[I].tkeep
+            : decoded_outputs[I].tkeep;
     assign pipeline_outputs[I].tlast =
-        filter_enabled ? filtered_outputs[I].tlast : decoded_outputs[I].tlast;
+        filter_enabled && stream_uses_filter
+            ? filtered_outputs[I].tlast
+            : decoded_outputs[I].tlast;
     assign pipeline_outputs[I].tvalid =
-        filter_enabled ? filtered_outputs[I].tvalid : decoded_outputs[I].tvalid;
+        !filter_enabled
+            ? decoded_outputs[I].tvalid
+            : routing_valid &&
+              (stream_uses_filter
+                   ? filtered_outputs[I].tvalid
+                   : decoded_outputs[I].tvalid);
 end
 
 // -- Output writer --------------------------------------------------------------------------------

@@ -22,16 +22,25 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::shared_ptr<arrow::io::ReadableFile> file;
 	std::vector<std::shared_ptr<parcore::ColumnChunkDecoder>> decoders;
 	std::vector<std::unique_ptr<parcore::FileReader>> readers;
+	std::shared_ptr<oasis::PipelineConfig> pipeline_config;
+	std::shared_ptr<oasis::FilterConfig> filter_config;
 
 	vector<size_t> hardware_column_ids;
 	vector<libstf::stream_t> stream_ids;
 	vector<size_t> output_hardware_indices;
+	vector<size_t> output_column_ids;
+	vector<size_t> filter_column_ids;
+	vector<OasisFilterLayer> filter_layers;
+	bool bitmask_mode = false;
 
 	size_t next_group = 0;
 	size_t total_groups = 0;
 	std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> current_buffers;
+	std::vector<std::shared_ptr<libstf::Buffer>> bitmask_buffers;
 	size_t current_buf_idx = 0;
 	size_t current_buf_offset = 0;
+	size_t bitmask_row_offset = 0;
+	size_t bitmask_total_rows = 0;
 };
 
 struct OasisScanLocalState : public LocalTableFunctionState {};

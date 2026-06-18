@@ -8,8 +8,6 @@
 #include "parquet_types.h"
 #include "thrift_tools.hpp"
 
-#include <numeric>
-
 namespace duckdb {
 
 static parcore::metadata::Type parquet_type_to_parcore(duckdb_parquet::Type::type t) {
@@ -145,33 +143,53 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	return std::move(bind_data);
 }
 
-static void plan_hardware_columns(const TableFunctionInitInput &input, const OasisScanBindData &bind_data,
-                                  const vector<OasisFilterLayer> &layers, OasisScanGlobalState &gstate) {
+static void validate_int64_column(const OasisScanBindData &bind_data, size_t col_id) {
+	if (col_id >= bind_data.metadata.groups[0].chunks.size()) {
+		throw InternalException("Oasis hardware column index is out of range");
+	}
+	if (bind_data.metadata.groups[0].chunks[col_id].type != parcore::metadata::Type::INT64_T) {
+		throw InvalidInputException("Oasis hardware filtering currently supports only INT64 columns");
+	}
+}
+
+static void plan_output_columns(const TableFunctionInitInput &input, OasisScanGlobalState &gstate) {
 	if (std::find(input.column_ids.begin(), input.column_ids.end(), COLUMN_IDENTIFIER_ROW_ID) !=
 	    input.column_ids.end()) {
 		throw InvalidInputException("Oasis hardware filtering does not support row ID projection");
 	}
 
-	gstate.hardware_column_ids.assign(input.column_ids.begin(), input.column_ids.end());
-	const auto scan_column_count = gstate.hardware_column_ids.size();
+	vector<size_t> scan_columns(input.column_ids.begin(), input.column_ids.end());
 	if (input.projection_ids.empty()) {
-		gstate.output_hardware_indices.resize(scan_column_count);
-		std::iota(gstate.output_hardware_indices.begin(), gstate.output_hardware_indices.end(), 0);
+		gstate.output_column_ids = scan_columns;
 	} else {
-		gstate.output_hardware_indices = input.projection_ids;
-	}
-	for (const auto scan_index : gstate.output_hardware_indices) {
-		if (scan_index >= scan_column_count) {
-			throw InternalException("Oasis projection index is out of range");
+		for (const auto scan_index : input.projection_ids) {
+			if (scan_index >= scan_columns.size()) {
+				throw InternalException("Oasis projection index is out of range");
+			}
+			gstate.output_column_ids.push_back(scan_columns[scan_index]);
 		}
 	}
+}
 
+static vector<size_t> collect_filter_columns(const vector<OasisFilterLayer> &layers) {
+	vector<size_t> columns;
 	for (const auto &layer : layers) {
 		for (const auto &predicate : layer) {
-			if (std::find(gstate.hardware_column_ids.begin(), gstate.hardware_column_ids.end(),
-			              predicate.first) == gstate.hardware_column_ids.end()) {
-				gstate.hardware_column_ids.push_back(predicate.first);
+			if (std::find(columns.begin(), columns.end(), predicate.first) == columns.end()) {
+				columns.push_back(predicate.first);
 			}
+		}
+	}
+	return columns;
+}
+
+static void plan_materialized_scan(const OasisScanBindData &bind_data, OasisScanGlobalState &gstate) {
+	gstate.hardware_column_ids = gstate.output_column_ids;
+
+	for (const auto filter_column : gstate.filter_column_ids) {
+		if (std::find(gstate.hardware_column_ids.begin(), gstate.hardware_column_ids.end(), filter_column) ==
+		    gstate.hardware_column_ids.end()) {
+			gstate.hardware_column_ids.push_back(filter_column);
 		}
 	}
 
@@ -181,13 +199,32 @@ static void plan_hardware_columns(const TableFunctionInitInput &input, const Oas
 		    "Oasis hardware filtering supports at most four unique projected and filter columns");
 	}
 	for (const auto col_id : gstate.hardware_column_ids) {
-		if (col_id >= bind_data.metadata.groups[0].chunks.size()) {
-			throw InternalException("Oasis hardware column index is out of range");
-		}
-		if (bind_data.metadata.groups[0].chunks[col_id].type != parcore::metadata::Type::INT64_T) {
-			throw InvalidInputException("Oasis hardware filtering currently supports only INT64 columns");
-		}
+		validate_int64_column(bind_data, col_id);
 	}
+	for (const auto output_column : gstate.output_column_ids) {
+		auto position =
+		    std::find(gstate.hardware_column_ids.begin(), gstate.hardware_column_ids.end(), output_column);
+		gstate.output_hardware_indices.push_back(position - gstate.hardware_column_ids.begin());
+	}
+}
+
+static void plan_bitmask_scan(const OasisScanBindData &bind_data, OasisScanGlobalState &gstate) {
+	if (gstate.filter_column_ids.empty()) {
+		throw InternalException("Oasis bitmask mode requires at least one filter column");
+	}
+	if (gstate.filter_column_ids.size() > oasis::FilterConfig::MAX_STREAMS) {
+		throw InvalidInputException("Oasis bitmask filtering supports at most four distinct filter columns");
+	}
+	if (gstate.output_column_ids.empty()) {
+		throw InvalidInputException("Oasis bitmask mode requires at least one projected column");
+	}
+	for (const auto col_id : gstate.filter_column_ids) {
+		validate_int64_column(bind_data, col_id);
+	}
+	for (const auto col_id : gstate.output_column_ids) {
+		validate_int64_column(bind_data, col_id);
+	}
+	gstate.bitmask_mode = true;
 }
 
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -209,28 +246,42 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 
 	gstate->total_groups = bind_data.metadata.groups.size();
 
-	auto layers = NormalizeOasisFilters(input, bind_data);
-	plan_hardware_columns(input, bind_data, layers, *gstate);
-	const bool filter_enabled = !layers.empty();
-	ctx.config<oasis::PipelineConfig>()->set_filter_enabled(filter_enabled);
+	gstate->filter_layers = NormalizeOasisFilters(input, bind_data);
+	gstate->filter_column_ids = collect_filter_columns(gstate->filter_layers);
+	plan_output_columns(input, *gstate);
+	const bool filter_enabled = !gstate->filter_layers.empty();
+	gstate->pipeline_config = ctx.config<oasis::PipelineConfig>();
+	gstate->filter_config = ctx.config<oasis::FilterConfig>();
+	gstate->pipeline_config->set_filter_enabled(false);
 
-	gstate->stream_ids = AssignOasisFilterStreams(gstate->hardware_column_ids, layers);
-
-	if (filter_enabled) {
-		auto filter_config = ctx.config<oasis::FilterConfig>();
-		ConfigureOasisFilters(*filter_config, gstate->hardware_column_ids, gstate->stream_ids, layers);
+	size_t decoder_count;
+	if (filter_enabled && OASIS_FILTER_MODE == oasis::FilterMode::BITMASK) {
+		plan_bitmask_scan(bind_data, *gstate);
+		gstate->stream_ids = AssignOasisFilterStreams(gstate->filter_column_ids, gstate->filter_layers);
+		decoder_count = oasis::FilterConfig::MAX_STREAMS;
+	} else {
+		plan_materialized_scan(bind_data, *gstate);
+		gstate->stream_ids =
+		    AssignOasisFilterStreams(gstate->hardware_column_ids, gstate->filter_layers);
+		if (filter_enabled) {
+			ConfigureOasisFilters(*gstate->filter_config, gstate->hardware_column_ids,
+			                      gstate->stream_ids, gstate->filter_layers, OASIS_FILTER_MODE);
+		}
+		gstate->pipeline_config->set_filter_enabled(filter_enabled);
+		decoder_count = gstate->hardware_column_ids.size();
 	}
 
-	for (size_t column_index = 0; column_index < gstate->hardware_column_ids.size(); column_index++) {
+	for (size_t stream = 0; stream < decoder_count; stream++) {
 		auto decoder = std::make_shared<parcore::ColumnChunkDecoder>(
 		    ctx.cthread(), ctx.tlb_manager(), ctx.output_buffer_manager(),
-		    column_chunk_config, page_config, gstate->stream_ids[column_index]);
+		    column_chunk_config, page_config, stream);
 		gstate->decoders.push_back(decoder);
 		gstate->readers.push_back(std::make_unique<parcore::FileReader>(
 		    decoder, ctx.memory_pool(), bind_data.metadata, gstate->file));
 	}
 
-	gstate->current_buffers.assign(gstate->hardware_column_ids.size(), {});
+	gstate->current_buffers.assign(
+	    gstate->bitmask_mode ? gstate->output_column_ids.size() : gstate->hardware_column_ids.size(), {});
 
 	return std::move(gstate);
 }
@@ -240,12 +291,46 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &, Table
 	return make_uniq<OasisScanLocalState>();
 }
 
-static void load_next_row_group(OasisScanGlobalState &gstate) {
+static size_t buffer_bytes(const std::vector<std::shared_ptr<libstf::Buffer>> &buffers) {
+	size_t total = 0;
+	for (const auto &buffer : buffers) {
+		total += buffer->size;
+	}
+	return total;
+}
+
+static uint8_t buffer_byte_at(const std::vector<std::shared_ptr<libstf::Buffer>> &buffers, size_t offset) {
+	for (const auto &buffer : buffers) {
+		if (offset < buffer->size) {
+			return reinterpret_cast<const uint8_t *>(buffer->ptr)[offset];
+		}
+		offset -= buffer->size;
+	}
+	throw InternalException("Oasis bitmask offset is outside the returned FPGA buffers");
+}
+
+static int64_t buffer_int64_at(const std::vector<std::shared_ptr<libstf::Buffer>> &buffers, size_t index) {
+	size_t byte_offset = index * sizeof(int64_t);
+	for (const auto &buffer : buffers) {
+		if (byte_offset < buffer->size) {
+			if (byte_offset + sizeof(int64_t) > buffer->size) {
+				throw InternalException("Oasis INT64 value crosses an FPGA output buffer boundary");
+			}
+			return reinterpret_cast<const int64_t *>(buffer->ptr)[byte_offset / sizeof(int64_t)];
+		}
+		byte_offset -= buffer->size;
+	}
+	throw InternalException("Oasis row offset is outside the returned FPGA buffers");
+}
+
+static void load_next_materialized_row_group(OasisScanGlobalState &gstate) {
 	for (size_t i = 0; i < gstate.hardware_column_ids.size(); i++) {
-		gstate.readers[i]->enqueue_column_chunk(gstate.next_group, gstate.hardware_column_ids[i]);
+		gstate.readers[gstate.stream_ids[i]]->enqueue_column_chunk(
+		    gstate.next_group, gstate.hardware_column_ids[i]);
 	}
 	for (size_t i = 0; i < gstate.hardware_column_ids.size(); i++) {
-		gstate.current_buffers[i] = gstate.readers[i]->next_column_chunk(); // blocks on FPGA
+		gstate.current_buffers[i] =
+		    gstate.readers[gstate.stream_ids[i]]->next_column_chunk(); // blocks on FPGA
 	}
 
 	const auto expected_buffer_count = gstate.current_buffers[0].size();
@@ -261,6 +346,55 @@ static void load_next_row_group(OasisScanGlobalState &gstate) {
 
 	gstate.current_buf_idx = 0;
 	gstate.current_buf_offset = 0;
+	gstate.next_group++;
+}
+
+static void load_next_bitmask_row_group(OasisScanGlobalState &gstate) {
+	gstate.pipeline_config->set_filter_enabled(false);
+	ConfigureOasisFilters(*gstate.filter_config, gstate.filter_column_ids, gstate.stream_ids,
+	                      gstate.filter_layers, oasis::FilterMode::BITMASK);
+	gstate.pipeline_config->set_filter_enabled(true);
+
+	for (size_t i = 0; i < gstate.filter_column_ids.size(); i++) {
+		gstate.readers[gstate.stream_ids[i]]->enqueue_column_chunk(gstate.next_group,
+		                                                          gstate.filter_column_ids[i]);
+	}
+	for (size_t i = 0; i < gstate.filter_column_ids.size(); i++) {
+		auto mask = gstate.readers[gstate.stream_ids[i]]->next_column_chunk();
+		if (i == 0) {
+			gstate.bitmask_buffers = std::move(mask);
+		}
+	}
+
+	gstate.pipeline_config->set_filter_enabled(false);
+	for (size_t batch_start = 0; batch_start < gstate.output_column_ids.size();
+	     batch_start += oasis::FilterConfig::MAX_STREAMS) {
+		const auto batch_size =
+		    std::min<size_t>(oasis::FilterConfig::MAX_STREAMS,
+		                     gstate.output_column_ids.size() - batch_start);
+		for (size_t stream = 0; stream < batch_size; stream++) {
+			gstate.readers[stream]->enqueue_column_chunk(
+			    gstate.next_group, gstate.output_column_ids[batch_start + stream]);
+		}
+		for (size_t stream = 0; stream < batch_size; stream++) {
+			gstate.current_buffers[batch_start + stream] =
+			    gstate.readers[stream]->next_column_chunk();
+		}
+	}
+
+	gstate.bitmask_total_rows = buffer_bytes(gstate.current_buffers[0]) / sizeof(int64_t);
+	for (const auto &buffers : gstate.current_buffers) {
+		const auto output_bytes = buffer_bytes(buffers);
+		if (output_bytes % sizeof(int64_t) != 0 ||
+		    output_bytes / sizeof(int64_t) != gstate.bitmask_total_rows) {
+			throw InternalException("Oasis bitmask projected columns are not row-aligned");
+		}
+	}
+	if (buffer_bytes(gstate.bitmask_buffers) < (gstate.bitmask_total_rows + 7) / 8) {
+		throw InternalException("Oasis hardware returned an incomplete selection bitmask");
+	}
+
+	gstate.bitmask_row_offset = 0;
 	gstate.next_group++;
 }
 
@@ -300,15 +434,57 @@ static void emit_output_slice(OasisScanGlobalState &gstate, DataChunk &output) {
 	output.SetCardinality(emit);
 }
 
+static idx_t emit_bitmask_slice(OasisScanGlobalState &gstate, DataChunk &output) {
+	vector<int64_t *> output_data;
+	for (idx_t output_index = 0; output_index < output.ColumnCount(); output_index++) {
+		auto &vector = output.data[output_index];
+		vector.SetVectorType(VectorType::FLAT_VECTOR);
+		output_data.push_back(FlatVector::GetData<int64_t>(vector));
+	}
+
+	idx_t emit = 0;
+	while (gstate.bitmask_row_offset < gstate.bitmask_total_rows && emit < STANDARD_VECTOR_SIZE) {
+		const auto row = gstate.bitmask_row_offset++;
+		const auto mask_byte = buffer_byte_at(gstate.bitmask_buffers, row / 8);
+		if ((mask_byte & (uint8_t {1} << (row % 8))) == 0) {
+			continue;
+		}
+
+		for (idx_t output_index = 0; output_index < output.ColumnCount(); output_index++) {
+			output_data[output_index][emit] =
+			    buffer_int64_at(gstate.current_buffers[output_index], row);
+		}
+		emit++;
+	}
+
+	output.SetCardinality(emit);
+	return emit;
+}
+
 void OasisScanFunction(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
 	auto &gstate = data_p.global_state->Cast<OasisScanGlobalState>();
+
+	if (gstate.bitmask_mode) {
+		while (true) {
+			if (gstate.bitmask_row_offset >= gstate.bitmask_total_rows) {
+				if (gstate.next_group >= gstate.total_groups) {
+					output.SetCardinality(0);
+					return;
+				}
+				load_next_bitmask_row_group(gstate);
+			}
+			if (emit_bitmask_slice(gstate, output) > 0) {
+				return;
+			}
+		}
+	}
 
 	while (gstate.current_buf_idx >= gstate.current_buffers[0].size()) {
 		if (gstate.next_group >= gstate.total_groups) {
 			output.SetCardinality(0);
 			return;
 		}
-		load_next_row_group(gstate);
+		load_next_materialized_row_group(gstate);
 	}
 
 	emit_output_slice(gstate, output);
