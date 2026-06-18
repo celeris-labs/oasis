@@ -49,20 +49,36 @@ class Scheduler {
     void                 set_pipeline_depth(size_t depth);
     [[nodiscard]] size_t pipeline_depth() const { return queue_depth_.load(); }
 
+    // Invoked from the interrupt switch for a (non-bypass) stream interrupt. Pops the front pending
+    // completion for that stream, pushes the corresponding onto the splinter's result channel, and
+    // runs the flow/splinter completion accounting. Runs on the interrupt thread, so it stays
+    // allocation-free and never blocks.
+    void handle_completion(libstf::stream_t stream, uint32_t bytes_written, bool last);
+
   private:
     struct SplinterCompletion {
         std::shared_ptr<SplinterResultChannel> channel;
         std::atomic<size_t>                    outstanding_sinks;
     };
 
-    // One in-flight flow on a stream. It owns the flow's operators and OutputHandle(s) (one per
-    // sink) until reaped, plus a shared pointer to the splinter's completion record.
+    // One in-flight flow on a stream. It owns the flow's operators (including each sink's output
+    // buffer) until reaped, plus a shared pointer to the splinter's completion record.
     struct InFlight {
-        OperatorFlow                                       flow;
-        std::vector<std::shared_ptr<libstf::OutputHandle>> handles;
-        std::shared_ptr<SplinterCompletion>                completion;
-        std::atomic<size_t>                                flow_outstanding{0};
-        bool                                               done = false;
+        OperatorFlow                        flow;
+        std::shared_ptr<SplinterCompletion> completion;
+        std::atomic<size_t>                 flow_outstanding{0};
+        bool                                done = false;
+    };
+
+    // One enqueued sink output buffer awaiting its hardware interrupt, recorded in the stream's 
+    // FIFO in enqueue order. Holds everything handle_completion needs without re-locking the 
+    // in-flight list: the buffer to surface, the tag, the splinter completion, and a stable 
+    // iterator to the owning in-flight slot for the per-flow accounting.
+    struct PendingCompletion {
+        std::shared_ptr<libstf::Buffer>     buffer;
+        size_t                              tag;
+        std::shared_ptr<SplinterCompletion> completion;
+        std::list<InFlight>::iterator       slot;
     };
 
     // A queued flow waiting for the dispatcher to place it on a stream. Carries the shared
@@ -81,9 +97,10 @@ class Scheduler {
     // tolerates being read slightly stale in pick_stream. `in_flight`/`done` are guarded by the
     // stream mutex.
     struct StreamState {
-        std::mutex          mutex;
-        std::list<InFlight> in_flight;
-        std::atomic<size_t> enqueued{0};
+        std::mutex                    mutex;
+        std::list<InFlight>           in_flight;
+        std::deque<PendingCompletion> completions; // enqueued buffers awaiting interrupts, in order
+        std::atomic<size_t>           enqueued{0};
     };
 
     OasisContext                 &ctx_;
@@ -108,13 +125,13 @@ class Scheduler {
     // full. Must be called holding dispatch_mutex_.
     std::optional<libstf::stream_t> pick_stream() const;
 
-    // Applies a flow on `stream` and registers a completion callback per sink, parking it in the
-    // stream's in-flight list. Called only by the dispatcher, with a slot already reserved
-    // (enqueued atomically bumped).
+    // Applies a flow on `stream`: Records a pending completion per sink and enqueues its output
+    // buffer to the FPGA, parking the flow in the stream's in-flight list. Called only by the
+    // dispatcher, with a slot already reserved (enqueued atomically bumped).
     void dispatch_to(libstf::stream_t stream, Pending &pending);
 
-    // Splices in-flight slots whose callback has run into `finished` (without destroying them, so
-    // the caller can destroy them outside the locks -- ~OutputHandle join()s the callback thread).
+    // Splices `done` in-flight slots into `finished` (without destroying them, so the caller can
+    // destroy them outside the locks -- keeping flow/buffer teardown off the scheduler locks).
     // Must be called holding ss.mutex.
     void reap(StreamState &ss, std::list<InFlight> &finished);
 };

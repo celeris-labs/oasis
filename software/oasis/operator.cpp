@@ -12,7 +12,7 @@
 namespace oasis {
 
 void RDMASourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
-    ctx.config<RDMAReadConfig>()->enqueue_read(stream, offset_, size_);
+    ctx.config<ReadReqConfig>()->enqueue_read(stream, offset_, size_);
 }
 
 void RDMASourceOperator::print(std::ostream &os) const {
@@ -59,13 +59,11 @@ void DecodeColumnChunkOperator::print(std::ostream &os) const {
 }
 
 void LocalSinkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
-    libstf::stream_mask_t mask;
-    mask.set(stream);
-    handle_ = ctx.output_buffer_manager()->acquire_output_handle(mask);
+    ctx.enqueue_output_buffer(stream, *buffer_);
 }
 
 void LocalSinkOperator::print(std::ostream &os) const {
-    os << "HostBufferSink(tag=" << tag_ << ")";
+    os << "HostBufferSink(tag=" << tag_ << ", size=" << buffer_->size << ")";
 }
 
 } // namespace oasis

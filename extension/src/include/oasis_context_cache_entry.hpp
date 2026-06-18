@@ -20,24 +20,14 @@ struct OasisContextCacheEntry : public ObjectCacheEntry {
 		return optional_idx();
 	}
 
-	// Auto-enqueued (managed-stream) OBM buffer capacity. The scan relies on a column chunk's
-	// decoded output fitting in a single buffer for now. The worst case is one DuckDB row group of
-	// the widest fixed-width type:
-	// DEFAULT_ROW_GROUP_SIZE (122,880 rows) x 8 bytes (INT64/DOUBLE) = 960 KiB
-	// 1 MiB fits that, so it covers Parquet files written with DuckDB's default row_group_size.
-	static constexpr size_t OBM_BUFFER_CAPACITY = 1ULL * 1024 * 1024;
-
 	explicit OasisContextCacheEntry(DatabaseInstance &db) : log_sink(db) {
 		libstf::set_log_sink(&log_sink);
 #ifdef EN_SIMULATION
-		// Simulation uses a small buffer to keep sim runtime/memory tractable. Sim test fixtures
-		// must use row groups small enough that a decoded column chunk fits in this single buffer.
 		auto pool = std::make_shared<libstf::SimpleMemoryPool>();
-		oasis::OasisContext::init(std::move(pool), libstf::BYTES_PER_FPGA_TRANSFER);
 #else
 		auto pool = std::make_shared<libstf::HugePageMemoryPool>();
-		oasis::OasisContext::init(std::move(pool), OBM_BUFFER_CAPACITY);
 #endif
+		oasis::OasisContext::init(std::move(pool));
 	}
 
 	oasis::OasisContext &ctx() {

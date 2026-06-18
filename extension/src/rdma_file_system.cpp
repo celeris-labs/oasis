@@ -15,9 +15,9 @@
 #include "oasis/oasis_context.hpp"
 #include "oasis_context_cache_entry.hpp"
 
+#include "oasis/bypass_receiver.hpp"
+
 #include <libstf/buffer.hpp>
-#include <libstf/output_buffer_manager.hpp>
-#include <libstf/output_handle.hpp>
 
 #include <coyote/cThread.hpp>
 #include <coyote/cDefs.hpp>
@@ -35,11 +35,6 @@
 namespace duckdb {
 
 namespace {
-
-// Minimal stub region size for initRDMA — the file-system path no longer uses
-// a host-side staging buffer (HW writes straight into caller buffers), but
-// Coyote still requires a region to set up the QP.
-constexpr uint32_t RDMA_INIT_STUB_SIZE = 4096;
 
 template <typename T>
 T ReadLE(const uint8_t *src) {
@@ -92,14 +87,7 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	}
 	auto params = RDMAParams::ReadFrom(opener);
 
-	auto coyote_thread = ctx.cthread();
-	void *staging_buffer = nullptr;
-	if (!ctx.memory_pool()->allocate(RDMA_INIT_STUB_SIZE, &staging_buffer).ok()) {
-		throw IOException("Failed to allocate RDMA staging buffer of %u bytes", RDMA_INIT_STUB_SIZE);
-	}
-	if (!coyote_thread->initRDMA(RDMA_INIT_STUB_SIZE, params.port, params.server.c_str(), staging_buffer)) {
-		throw IOException("Coyote initRDMA failed for server %s:%u", params.server, params.port);
-	}
+	ctx.initRDMA(params.server, params.port);
 
 	LoadDirectory(opener);
 	initialized = true;
@@ -114,7 +102,7 @@ void RDMAFileSystem::EnqueueRead(uint64_t remote_offset, size_t size) {
 	}
 
 	auto &ctx = oasis::OasisContext::ctx();
-	auto rdma_cfg = ctx.config<oasis::RDMAReadConfig>();
+	auto rdma_cfg = ctx.config<oasis::ReadReqConfig>();
 	rdma_cfg->enqueue_read(ctx.rdmaBypassStream(), static_cast<uintptr_t>(remote_offset), size);
 }
 
@@ -125,35 +113,27 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 
 	// EnsureInitialized has already created the OasisContext singleton.
 	auto &ctx = oasis::OasisContext::ctx();
-	auto obm = ctx.output_buffer_manager();
-	auto bypass_stream = ctx.rdmaBypassStream();
 
-	// Serialize buffer-enqueue + CSR fire so the buffer at the front of the
-	// OBM's per-stream FIFO always matches the read just triggered. The OBM
-	// is internally thread-safe and `get_next_stream_output` is sequenced
-	// correctly against interrupts, so we drop the lock before blocking.
-	std::shared_ptr<libstf::OutputHandle> handle;
+	// Serialize buffer-enqueue + CSR fire so the buffers at the front of the bypass receiver's FIFO
+	// always match the read just triggered. The receiver is internally thread-safe and the handle's
+	// next() is sequenced correctly against interrupts, so we drop the lock before blocking.
+	std::shared_ptr<oasis::BypassStreamReceiver::Handle> handle;
 	{
 		std::lock_guard<std::mutex> lock(mtx);
 
 		// Trigger the remote read first because it has long latency.
 		EnqueueRead(remote_offset, size);
 
-		// The bypass stream is configured as unmanaged on the OBM. Pass the exact
-		// expected size so the OBM allocates a single right-sized buffer with
-		// no speculative pre-allocation.
-		handle = obm->acquire_output_handle(bypass_stream, size);
+		// Pass the exact expected size so the receiver allocates a single right-sized buffer (or a
+		// few chunks for very large reads) with no speculative pre-allocation.
+		handle = ctx.bypass_receiver().acquire(size);
 	}
 
 	// Drain all buffers for this transfer. For sizes that fit in a single FPGA buffer this is
-	// one iteration; for larger sizes the OBM chunks the transfer across multiple buffers, each
+	// one iteration; for larger sizes the receiver chunks the transfer across multiple buffers, each
 	// surfaced via its own interrupt.
 	size_t copied = 0;
-	while (handle->stream_has_more_output(bypass_stream)) {
-		auto buf = handle->get_next_stream_output(bypass_stream);
-		if (!buf) {
-			break;
-		}
+	while (auto buf = handle->next()) {
 		if (copied + buf->size > size) {
 			throw IOException("RDMA read overran requested size: requested %llu, already got %llu, "
 			                  "next chunk %llu",

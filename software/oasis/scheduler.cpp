@@ -55,17 +55,17 @@ Scheduler::~Scheduler() {
     dispatch_cv_.notify_one();
     dispatcher_.join();
 
-    // The dispatcher is gone, but flows it already placed may still be in flight with callbacks
-    // pending. Wait until every slot's callback has run, then reap. Erasing only after `done`
-    // guarantees ~OutputHandle (which joins the callback thread) never runs while that callback is
-    // still executing. The callback signals dispatch_cv_, so wait on that.
+    // The dispatcher is gone, but flows it already placed may still be in flight, awaiting their
+    // hardware interrupts. Wait until every slot is `done` (its last sink's interrupt has run on the
+    // interrupt thread, via handle_completion), then reap. handle_completion signals dispatch_cv_, so
+    // wait on that.
     //
     // Lock order: this predicate takes stream->mutex while holding dispatch_mutex_, so the contract
-    // is dispatch_mutex_ -> stream.mutex. Nothing may take them in the opposite order. The completion
-    // callback respects this because it never holds the two together: it mutates `enqueued`
-    // lock-free (atomic) and takes dispatch_mutex_ only on its own, after releasing ss.mutex, purely
-    // to pair with the wait on dispatch_cv_. As in dispatch_loop, the reaped slots are destroyed
-    // (join()ing their callback threads) only after the locks are dropped.
+    // is dispatch_mutex_ -> stream.mutex. Nothing may take them in the opposite order. handle_completion
+    // respects this because it never holds the two together: it mutates `enqueued` lock-free (atomic)
+    // and takes dispatch_mutex_ only on its own, after releasing ss.mutex, purely to pair with the wait
+    // on dispatch_cv_. As in dispatch_loop, the reaped slots are destroyed only after the locks are
+    // dropped, so flow destruction never runs under a scheduler lock.
     for (auto &stream : streams_) {
         std::list<InFlight> finished;
         {
@@ -82,7 +82,7 @@ Scheduler::~Scheduler() {
             std::lock_guard<std::mutex> slock(stream->mutex);
             reap(*stream, finished);
         }
-        finished.clear(); // destroy / join with no scheduler lock held
+        finished.clear(); // destroy with no scheduler lock held
     }
 }
 
@@ -145,13 +145,12 @@ void Scheduler::dispatch_loop() {
     while (true) {
         libstf::Profiler::open_regions({profiler_prefix + "dispatch_loop"});
         // Reap finished slots so freed capacity is visible to pick_stream below. Cheap to sweep all
-        // active streams; the dispatcher is the sole reaper, so ~OutputHandle stays on this thread.
+        // active streams; the dispatcher is the sole reaper.
         //
         // We splice the done slots out under the locks but destroy them *after* releasing both
-        // dispatch_mutex_ and ss.mutex. ~OutputHandle join()s the slot's callback thread, and that
-        // thread may still be finishing -- needing ss.mutex (to set `done`) or just running. If we
-        // destroyed (joined) while holding the locks, a callback thread blocked on one of them could
-        // never finish, deadlocking the join. Destroying outside the locks removes that whole class.
+        // dispatch_mutex_ and ss.mutex. handle_completion sets `done` on the interrupt thread and may
+        // still be in its tail (between setting `done` and notifying); destroying flows outside the
+        // locks keeps slot teardown off the scheduler locks and away from that path.
         std::list<InFlight> finished;
         const libstf::stream_t active = std::max<libstf::stream_t>(active_streams_.load(), 1);
         for (libstf::stream_t s = 0; s < active; ++s) {
@@ -160,7 +159,7 @@ void Scheduler::dispatch_loop() {
         }
         {
             // Destroy the reaped slots with no scheduler lock held (see above). Do it before any
-            // re-lock so the dispatcher never holds dispatch_mutex_ across a join.
+            // re-lock so the dispatcher never holds dispatch_mutex_ across flow teardown.
             lock.unlock();
             finished.clear();
             lock.lock();
@@ -196,8 +195,8 @@ void Scheduler::dispatch_loop() {
 
 void Scheduler::reap(StreamState &ss, std::list<InFlight> &finished) {
     // Splice done slots into `finished` instead of erasing here: splice moves the list nodes without
-    // destroying the InFlight (and thus without ~OutputHandle / join()), so the caller can destroy
-    // them after dropping the locks. Must be called holding ss.mutex.
+    // destroying the InFlight (and thus without tearing down its flow/buffers), so the caller can
+    // destroy them after dropping the locks. Must be called holding ss.mutex.
     for (auto it = ss.in_flight.begin(); it != ss.in_flight.end();) {
         if (it->done) {
             auto next = std::next(it);
@@ -213,11 +212,12 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
     libstf::Profiler::open_regions({profiler_prefix + "dispatch_to"});
     StreamState &ss = *streams_[stream];
 
-    // Park the flow in the in-flight list; the iterator is stable for the callbacks to flag `done`
-    // and accumulate handles. The dispatcher already reserved the slot (atomically bumped `enqueued`).
+    // Park the flow in the in-flight list; the iterator is stable for handle_completion to flag
+    // `done`. The dispatcher already reserved the slot (atomically bumped `enqueued`).
     std::vector<LocalSinkOperator *> sinks;
     std::list<InFlight>::iterator    slot;
     {
+        libstf::Profiler::open_regions({profiler_prefix + "dispatch_to::setup"});
         std::lock_guard<std::mutex> lock(ss.mutex);
         slot             = ss.in_flight.emplace(ss.in_flight.end());
         slot->flow       = std::move(pending.flow);
@@ -228,57 +228,25 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
             }
         }
         slot->flow_outstanding.store(sinks.size(), std::memory_order_relaxed);
-        slot->handles.reserve(sinks.size());
+
+        // Record a pending completion per sink *before* any buffer is enqueued so the interrupt that
+        // fires once the hardware writes always finds its match. The FIFO order must equal the
+        // enqueue (CSR) order below; both run here, on the single dispatcher thread.
+        for (LocalSinkOperator *sink : sinks) {
+            ss.completions.push_back(
+                PendingCompletion{sink->buffer(), sink->tag(), slot->completion, slot});
+        }
+        libstf::Profiler::close_regions({profiler_prefix + "dispatch_to::setup"});
     }
     assert(!sinks.empty() && "flow has no sink");
-    SplinterCompletion *completion = slot->completion.get();
 
-    // Each sink must `apply()` first (acquire its OutputHandle) so its completion callback can be
-    // registered *before* the source triggers the transfer. add_callback is not retroactive: if
-    // mark_done fired first, the callback would be lost.
+    // Enqueue each sink's output buffer to the FPGA (CSR writes), in FIFO order, before the sources
+    // trigger the transfer so the hardware output writer already has a destination.
     for (LocalSinkOperator *sink : sinks) {
         sink->apply(stream, ctx_);
-        slot->handles.push_back(sink->handle());
-        libstf::OutputHandle *handle = sink->handle().get();
-        size_t                tag    = sink->tag();
-
-        // The callback fires on the handle's own thread (via the hardware interrupt path) once this
-        // sink's transfer is done. It drains the output into the splinter's channel (tagged), then:
-        //  - decrements the splinter-wide sink count, closing the channel on the last one (the
-        //    splinter's single completion);
-        //  - decrements this flow's own sink count, and when that hits zero flags the slot reapable,
-        //    frees the pipeline slot, and wakes the dispatcher to reap (and destroy the handles) on
-        //    its own thread.
-        // Both counters are atomic, so this never nests dispatch_mutex_ with ss.mutex. acq_rel makes
-        // the channel pushes happen-before the observed close/done.
-        handle->add_callback([this, &ss, stream, slot, completion, handle, tag](libstf::stream_t) {
-            while (handle->stream_has_more_output(stream)) {
-                completion->channel->push_batch(tag, handle->get_next_stream_output(stream));
-            }
-            // Whole-splinter close: exactly once, by whichever sink (across all flows) finishes last.
-            if (completion->outstanding_sinks.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                completion->channel->close();
-            }
-
-            // Per-flow done: when this flow's last sink drains, flag the slot reapable and free the
-            // pipeline slot. The dispatcher reaps `done` slots but destroys them (and join()s this
-            // thread) only *after* dropping its locks, so this thread can always finish even if the
-            // reap races us here.
-            if (slot->flow_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                {
-                    std::lock_guard<std::mutex> slock(ss.mutex);
-                    slot->done = true;
-                }
-                ss.enqueued.fetch_sub(1, std::memory_order_relaxed);
-
-                {
-                    std::lock_guard<std::mutex> dlock(dispatch_mutex_);
-                }
-                dispatch_cv_.notify_one();
-            }
-        });
     }
 
+    // Apply the remaining operators (sources, decode config), which start the transfer.
     for (auto &op : slot->flow) {
         if (dynamic_cast<LocalSinkOperator *>(op.get()) == nullptr) {
             op->apply(stream, ctx_);
@@ -290,6 +258,44 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
                     static_cast<unsigned>(stream));
     }
     libstf::Profiler::close_regions({profiler_prefix + "dispatch_to"});
+}
+
+void Scheduler::handle_completion(libstf::stream_t stream, uint32_t bytes_written, bool /*last*/) {
+    StreamState &ss = *streams_[stream];
+
+    PendingCompletion pc;
+    {
+        std::lock_guard<std::mutex> lock(ss.mutex);
+        assert(!ss.completions.empty() && "interrupt on stream with no pending completion");
+        pc = std::move(ss.completions.front());
+        ss.completions.pop_front();
+    }
+
+    // Surface the decoded buffer to the splinter's consumer, tagged so it lands in the right column.
+    pc.buffer->size = bytes_written;
+    pc.completion->channel->push_batch(pc.tag, pc.buffer);
+
+    // Whole-splinter close: Exactly once, by whichever sink (across all flows) finishes last. 
+    // acq_rel makes the channel push happen-before the observed close/done.
+    if (pc.completion->outstanding_sinks.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        pc.completion->channel->close();
+    }
+
+    // Per-flow done: When this flow's last sink completes, flag the slot reapable, free the
+    // pipeline slot, and wake the dispatcher to reap (and destroy the flow) on its own thread. The
+    // counters are atomic, so this never nests dispatch_mutex_ with ss.mutex.
+    if (pc.slot->flow_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        {
+            std::lock_guard<std::mutex> slock(ss.mutex);
+            pc.slot->done = true;
+        }
+        ss.enqueued.fetch_sub(1, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> dlock(dispatch_mutex_);
+        }
+        dispatch_cv_.notify_one();
+    }
 }
 
 } // namespace oasis

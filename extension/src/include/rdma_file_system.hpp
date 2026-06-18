@@ -68,8 +68,8 @@ private:
 
 	// Guards first-time initialization and the `directory` map.
 	std::mutex init_mtx;
-	// Serializes the (enqueue buffer, fire CSR) pair inside RDMAReadRange so
-	// the OBM's per-stream FIFO stays aligned with the order of HW reads.
+	// Serializes the (enqueue buffer, fire CSR) pair inside RDMAReadRange so the bypass receiver's
+	// FIFO stays aligned with the order of HW reads.
 	std::mutex mtx;
 	bool initialized = false;
 

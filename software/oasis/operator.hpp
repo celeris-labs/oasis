@@ -2,7 +2,6 @@
 
 #include <libstf/buffer.hpp>
 #include <libstf/common.hpp>
-#include <libstf/output_handle.hpp>
 #include <parcore/metadata/metadata.hpp>
 
 #include <memory>
@@ -37,7 +36,7 @@ class SourceOperator : public Operator {};
 
 /**
  * Triggers a remote RDMA read. The hardware pulls bytes straight into the stream, so no host
- * buffer. Offsets are relative to the remote RDMA region base (see RDMAReadConfig::enqueue_read).
+ * buffer. Offsets are relative to the remote RDMA region base (see ReadReqConfig::enqueue_read).
  */
 class RDMASourceOperator final : public SourceOperator {
   public:
@@ -87,24 +86,26 @@ class DecodeColumnChunkOperator final : public Operator {
 };
 
 /**
- * Sink that writes the stream's output to host buffers. apply() acquires the OutputHandle from the
- * OutputBufferManager; the scheduler reads the decoded buffers off handle() once the hardware has written.
+ * Sink that writes the stream's output to a host buffer pre-allocated by the caller at the exact 
+ * decoded size. apply() enqueues that buffer directly to the FPGA's output writer for `stream`.
  */
 class LocalSinkOperator final : public Operator {
   public:
-    // `tag` identifies this QuerySplinter's output to the consumer. The scheduler forwards it 
-    // verbatim with each batch it pushes onto the result channel.
-    explicit LocalSinkOperator(size_t tag = 0) : tag_(tag) {}
+    // `buffer` is the right-sized output buffer the hardware will write into (its capacity must be 
+    // a multiple of BYTES_PER_FPGA_TRANSFER). `tag` identifies this flow's output to the
+    // consumer since a QuerySplinter's flows can return in any order.
+    explicit LocalSinkOperator(std::shared_ptr<libstf::Buffer> buffer, size_t tag = 0)
+        : tag_(tag), buffer_(std::move(buffer)) {}
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
 
-    [[nodiscard]] const std::shared_ptr<libstf::OutputHandle> &handle() const { return handle_; }
-    [[nodiscard]] size_t                                       tag() const { return tag_; }
+    [[nodiscard]] const std::shared_ptr<libstf::Buffer> &buffer() const { return buffer_; }
+    [[nodiscard]] size_t                                 tag()    const { return tag_; }
 
   private:
-    size_t                                tag_;
-    std::shared_ptr<libstf::OutputHandle> handle_;
+    size_t                          tag_;
+    std::shared_ptr<libstf::Buffer> buffer_;
 };
 
 } // namespace oasis

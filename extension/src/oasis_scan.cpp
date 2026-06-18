@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <utility>
 #include <vector>
 
 // oasis_scan.hpp transitively pulls in Coyote, which includes <syslog.h>. That
@@ -202,7 +204,6 @@ static void BeginGroupIO(ClientContext &context, oasis::OasisContext &ctx, Oasis
                          OasisScanLocalState &lstate, const OasisScanBindData &bind,
                          OasisScanLocalState::PendingGroup &pending) {
 	const size_t group = pending.group;
-	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
 	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
 
 	// Collect the column chunks that will be decoded in hardware.
@@ -216,15 +217,16 @@ static void BeginGroupIO(ClientContext &context, oasis::OasisContext &ctx, Oasis
 
 		const auto &cc = bind.metadata.groups[group].chunks[col.column_id];
 
-		// Enforce the one-buffer-per-chunk invariant: the decoded output must fit in a single OBM
-		// buffer. num_values is the row count, col.elem_size the decoded element width.
+		// Enforce the one-buffer-per-chunk invariant: the decoded output must fit in a single FPGA
+		// output buffer. num_values is the row count, col.elem_size the decoded element width.
 		const size_t decoded_size = cc.num_values * col.elem_size;
-		if (decoded_size > buffer_capacity) {
+		if (decoded_size > libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE) {
 			throw NotImplementedException(
-			    "Column '%s' row group %llu decodes to %llu bytes, exceeding the %llu byte output "
-			    "buffer capacity.",
+			    "Column '%s' row group %llu decodes to %llu bytes, exceeding the %llu byte maximum "
+			    "output buffer size.",
 			    bind.metadata.column_names[col.column_id].c_str(), (unsigned long long)group,
-			    (unsigned long long)decoded_size, (unsigned long long)buffer_capacity);
+			    (unsigned long long)decoded_size,
+			    (unsigned long long)libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE);
 		}
 
 		pending.hw_slot.push_back(i);
@@ -286,7 +288,9 @@ static void FinishGroupIO(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		}
 		flow.push_back(
 		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
-		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(pending.hw_slot[k]));
+		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(type));
+		flow.push_back(
+		    std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
 		splinter.streams.push_back(std::move(flow));
 	}
 
