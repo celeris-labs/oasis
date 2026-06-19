@@ -31,7 +31,8 @@ namespace {
 
 class OasisSplinterResultTask : public AsyncTask {
 public:
-	explicit OasisSplinterResultTask(oasis::SplinterResultHandle result) : result(std::move(result)) {}
+	explicit OasisSplinterResultTask(oasis::SplinterResultHandle result) : result(std::move(result)) {
+	}
 
 	void Execute() override {
 		result.wait_ready();
@@ -120,12 +121,12 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	lstate->file_handle = fs.OpenFile(gstate.filename, FileOpenFlags::FILE_FLAGS_READ);
 
 	// Build a per-worker ParquetReader: its per-column readers supply the per-column-chunk statistics
-    // used for row-group skipping (RowGroupMatchesFilters). The CPU decode path additionally drives
-    // these readers in OasisScanFunction. We project every file column (one FULL_READ ColumnIndex per
-    // column), so scan_state->GetColumnReader(col_id) is keyed directly by file column id.
+	// used for row-group skipping (RowGroupMatchesFilters). The CPU decode path additionally drives
+	// these readers in OasisScanFunction. We project every file column (one FULL_READ ColumnIndex per
+	// column), so scan_state->GetColumnReader(col_id) is keyed directly by file column id.
 	ParquetOptions parquet_opts(context.client);
-	lstate->parquet_reader = make_uniq<ParquetReader>(context.client, OpenFileInfo {gstate.filename},
-                                                      parquet_opts, bind_data.parquet_metadata);
+	lstate->parquet_reader = make_uniq<ParquetReader>(context.client, OpenFileInfo {gstate.filename}, parquet_opts,
+	                                                  bind_data.parquet_metadata);
 	for (idx_t c = 0; c < lstate->parquet_reader->columns.size(); c++) {
 		lstate->parquet_reader->column_indexes.emplace_back(c);
 	}
@@ -154,12 +155,12 @@ static std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdm
 	return std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + cc.offset, cc.total_compressed_size);
 }
 
-static std::unique_ptr<oasis::SourceOperator>
-MakeHostSource(oasis::OasisContext &ctx, const CoalescedFetcher::RangeView &view) {
+static std::unique_ptr<oasis::SourceOperator> MakeHostSource(oasis::OasisContext &ctx,
+                                                             const CoalescedFetcher::RangeView &view) {
 	if ((reinterpret_cast<uintptr_t>(view.data()) % 64) == 0) {
-		// Zero-copy for aligned ranges: A libstf::Buffer that describes just this chunk's slice, 
-        // owning a shared_ptr to the whole coalesced allocation so the backing bytes stay alive for 
-        // the splinter's lifetime.
+		// Zero-copy for aligned ranges: A libstf::Buffer that describes just this chunk's slice,
+		// owning a shared_ptr to the whole coalesced allocation so the backing bytes stay alive for
+		// the splinter's lifetime.
 		auto *slice_ptr = static_cast<uint8_t *>(view.buffer->ptr) + view.offset;
 		size_t capacity = view.buffer->capacity - view.offset;
 		// Custom deleter keeps the parent coalesced buffer alive and frees only the wrapper struct.
@@ -217,8 +218,7 @@ static void BeginGroupIO(ClientContext &context, oasis::OasisContext &ctx, Oasis
 			    "Column '%s' row group %llu decodes to %llu bytes, exceeding the %llu byte maximum "
 			    "output buffer size.",
 			    bind.metadata.column_names[col.column_id].c_str(), (unsigned long long)group,
-			    (unsigned long long)decoded_size,
-			    (unsigned long long)libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE);
+			    (unsigned long long)decoded_size, (unsigned long long)libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE);
 		}
 
 		pending.hw_slot.push_back(i);
@@ -255,8 +255,8 @@ static void BeginGroupIO(ClientContext &context, oasis::OasisContext &ctx, Oasis
 	                 (unsigned long long)fetcher->bytes_fetched(), (unsigned long long)group);
 }
 
-// Build and submit the whole row group as ONE QuerySplinter (one flow per hardware column), then 
-// initialize and fully decode the CPU/string columns. Each flow's sink is tagged with its 
+// Build and submit the whole row group as ONE QuerySplinter (one flow per hardware column), then
+// initialize and fully decode the CPU/string columns. Each flow's sink is tagged with its
 // projection index, so the consumer places the tagged batches into hw_buffers[projection_index].
 static void FinishGroupIO(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                           OasisScanLocalState &lstate, const OasisScanBindData &bind,
@@ -278,11 +278,9 @@ static void FinishGroupIO(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		} else {
 			flow.push_back(MakeHostSource(ctx, pending.fetcher->Resolve(pending.host_handles[k])));
 		}
-		flow.push_back(
-		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
+		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
 		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(type));
-		flow.push_back(
-		    std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
+		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
 		splinter.streams.push_back(std::move(flow));
 	}
 
@@ -312,7 +310,7 @@ static void FinishGroupIO(ClientContext &context, oasis::OasisContext &ctx, Oasi
 // Non-blocking: Drains the row group's result handle, placing each tagged column chunk into
 // pending.hw_buffers[tag]. Returns true if collecting the row group was successful.
 static bool TryCollectRowGroup(ClientContext &context, OasisScanGlobalState &gstate, const OasisScanBindData &bind,
-                                   OasisScanLocalState::PendingGroup &pending) {
+                               OasisScanLocalState::PendingGroup &pending) {
 	while (pending.hw_columns_remaining > 0) {
 		auto poll = pending.result.try_get_next_batch();
 		if (!poll.ready) {
@@ -375,7 +373,7 @@ static void DecodeCPUColumns(OasisScanGlobalState &gstate, OasisScanLocalState &
 			FlatVector::SetSize(*vec, count_t(emit));
 
 			// Since we retain every slice's vector until emit, flatten here so each slice owns its
-            // own data and stops aliasing that shared scratch state.
+			// own data and stops aliasing that shared scratch state.
 			vec->Flatten();
 			slices.push_back(std::move(vec));
 		}
@@ -397,8 +395,8 @@ static size_t ClaimNextNonEmptyGroup(OasisScanGlobalState &gstate, const OasisSc
 }
 
 // Claims the next non-empty row group that also survives filter pruning.
-static size_t ClaimNextMatchingGroup(ClientContext &context, OasisScanGlobalState &gstate,
-                                     OasisScanLocalState &lstate, const OasisScanBindData &bind) {
+static size_t ClaimNextMatchingGroup(ClientContext &context, OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
+                                     const OasisScanBindData &bind) {
 	while (true) {
 		size_t group = ClaimNextNonEmptyGroup(gstate, bind);
 		if (group >= gstate.total_groups) {
@@ -410,11 +408,7 @@ static size_t ClaimNextMatchingGroup(ClientContext &context, OasisScanGlobalStat
 	}
 }
 
-enum class LoadResult : uint8_t {
-	LOADED,
-	BLOCKED,
-	EXHAUSTED
-};
+enum class LoadResult : uint8_t { LOADED, BLOCKED, EXHAUSTED };
 
 // Keeps the pipeline full: Claims matching groups up to the per-worker budget and runs BeginGroupIO
 // on each (selecting chunks + allocating buffers, no IO). New groups start IO_PENDING.
@@ -456,8 +450,8 @@ static LoadResult LoadNextGroup(ClientContext &context, oasis::OasisContext &ctx
 	}
 	auto &head = *lstate.inflight.front();
 
-	// If the head still needs host reads, schedule the reads for every not-yet-started inflight 
-    // group as one AsyncResult and return that we are blocked.
+	// If the head still needs host reads, schedule the reads for every not-yet-started inflight
+	// group as one AsyncResult and return that we are blocked.
 	if (head.phase == Phase::IO_PENDING) {
 		for (auto &pending : lstate.inflight) {
 			if (pending->phase == Phase::IO_PENDING && !pending->io_scheduled) {
@@ -551,7 +545,8 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		if (buf->size / col.elem_size != total_elements) {
 			throw InternalException(
 			    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
-			    (unsigned long long)i, (unsigned long long)(buf->size / col.elem_size), (unsigned long long)total_elements);
+			    (unsigned long long)i, (unsigned long long)(buf->size / col.elem_size),
+			    (unsigned long long)total_elements);
 		}
 
 		// The actual zero-copy handoff. Two things happen here:
@@ -678,7 +673,7 @@ OperatorPartitionData OasisScanGetPartitionData(ClientContext &, TableFunctionGe
 }
 
 // Advertises the zero-width COLUMN_IDENTIFIER_EMPTY virtual column. For queries that consume no
-// column values (e.g., COUNT(*), EXISTS), DuckDB's optimizer projects this sentinel instead of 
+// column values (e.g., COUNT(*), EXISTS), DuckDB's optimizer projects this sentinel instead of
 // anchoring the scan on a real column (LogicalGet::GetAnyColumn).
 virtual_column_map_t OasisScanGetVirtualColumns(ClientContext &, optional_ptr<FunctionData>) {
 	virtual_column_map_t result;
