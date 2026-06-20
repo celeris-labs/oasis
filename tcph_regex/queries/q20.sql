@@ -17,7 +17,7 @@ WHERE
                 FROM
                     part
                 WHERE
-                    p_name LIKE 'forest%')
+                    regex_fpga(p_name, 'forest.*'))
                 AND ps_availqty > (
                     SELECT
                         0.5 * sum(l_quantity)

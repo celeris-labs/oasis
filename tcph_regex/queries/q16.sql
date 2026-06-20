@@ -9,7 +9,7 @@ FROM
 WHERE
     p_partkey = ps_partkey
     AND p_brand <> 'Brand#45'
-    AND p_type NOT LIKE 'MEDIUM POLISHED%'
+    AND NOT regex_fpga(p_type, 'MEDIUM POLISHED.*')
     AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)
     AND ps_suppkey NOT IN (
         SELECT
@@ -17,7 +17,7 @@ WHERE
         FROM
             supplier
         WHERE
-            s_comment LIKE '%Customer%Complaints%')
+            regex_fpga(s_comment, '.*Customer.*Complaints.*'))
 GROUP BY
     p_brand,
     p_type,

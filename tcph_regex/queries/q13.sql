@@ -8,7 +8,7 @@ FROM (
     FROM
         customer
     LEFT OUTER JOIN orders ON c_custkey = o_custkey
-    AND o_comment NOT LIKE '%special%requests%'
+    AND NOT regex_fpga(o_comment, '.*special.*requests.*')
 GROUP BY
     c_custkey) AS c_orders (c_custkey,
         c_count)

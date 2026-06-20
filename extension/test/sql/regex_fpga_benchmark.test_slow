@@ -1,0 +1,96 @@
+# name: test/sql/regex_fpga_benchmark.test_slow
+# description: regex_fpga benchmark workloads (constant vs non-constant patterns)
+# group: [sql]
+
+# Ground truth is SIMILAR TO (full match). Query verification is disabled here
+# because FPGA simulation is too slow on larger batches.
+
+require oasis
+
+statement ok
+CREATE TABLE strings AS
+SELECT
+	CASE (i % 20)
+		WHEN 0  THEN 'ab'
+		WHEN 1  THEN 'abb'
+		WHEN 2  THEN 'abbb'
+		WHEN 3  THEN 'a'
+		WHEN 4  THEN 'xab'
+		ELSE lpad(((i * 9582398353) % 1000)::VARCHAR, 4, '0')
+	END AS s,
+	CASE (i % 4)
+		WHEN 0 THEN 'ab*'
+		WHEN 1 THEN 'a.*'
+		WHEN 2 THEN '[0-9]+'
+		ELSE 'x'
+	END AS pattern
+FROM range(0, 100) t(i);
+
+# constant pattern: full-table aggregation matches SIMILAR TO
+query I
+SELECT sum(regex_fpga(s, 'ab*')::INT) = sum((s SIMILAR TO 'ab*')::INT)
+FROM strings;
+----
+1
+
+# non-constant pattern: four unique patterns grouped at runtime
+query I
+SELECT sum(regex_fpga(s, pattern)::INT) = sum((s SIMILAR TO pattern)::INT)
+FROM strings;
+----
+1
+
+# constant pattern: filter matches SIMILAR TO
+query I
+SELECT count(*) FILTER (WHERE regex_fpga(s, 'ab*'))
+	= count(*) FILTER (WHERE s SIMILAR TO 'ab*')
+FROM strings;
+----
+1
+
+# non-constant pattern: filter matches SIMILAR TO
+query I
+SELECT count(*) FILTER (WHERE regex_fpga(s, pattern))
+	= count(*) FILTER (WHERE s SIMILAR TO pattern)
+FROM strings;
+----
+1
+
+# non-constant pattern column with a single runtime value
+query I
+SELECT sum(regex_fpga(s, pattern)::INT) = sum((s SIMILAR TO pattern)::INT)
+FROM (SELECT s, 'ab*' AS pattern FROM strings);
+----
+1
+
+# constant and single-pattern-column paths must agree
+query I
+SELECT
+	sum(regex_fpga(s, 'ab*')::INT)
+	= sum(regex_fpga(s, p)::INT)
+FROM strings
+CROSS JOIN (SELECT 'ab*' AS p) t;
+----
+1
+
+# many unique patterns: stresses per-pattern grouping
+statement ok
+CREATE TABLE strings_many_patterns AS
+SELECT
+	s,
+	CASE (i % 4)
+		WHEN 0 THEN 'a*'
+		WHEN 1 THEN 'b*'
+		WHEN 2 THEN '[0-9]+'
+		ELSE 'x'
+	END AS pattern
+FROM (
+	SELECT s, row_number() OVER () - 1 AS i
+	FROM strings
+) t;
+
+query I
+SELECT sum(regex_fpga(s, pattern)::INT) = sum((s SIMILAR TO pattern)::INT)
+FROM strings_many_patterns;
+----
+1

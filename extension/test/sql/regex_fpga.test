@@ -1,0 +1,87 @@
+# name: test/sql/regex_fpga.test
+# description: regex_fpga correctness tests (constant and non-constant patterns)
+# group: [sql]
+
+# Ground truth is SIMILAR TO: 
+
+# Before the extension is loaded, regex_fpga is unavailable
+statement error
+SELECT regex_fpga('ab', 'ab*');
+----
+Scalar Function with name regex_fpga does not exist!
+
+require oasis
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE strings AS
+SELECT * FROM (
+	VALUES
+		('ab'),
+		('abb'),
+		('abbb'),
+		('a'),
+		('xab'),
+		('xyz'),
+		('0012'),
+		('abx'),
+		(NULL)
+) t(s);
+
+# constant pattern: regex_fpga must agree with SIMILAR TO on every row
+query I
+SELECT count(*)::BIGINT
+FROM strings
+WHERE regex_fpga(s, 'ab*') IS DISTINCT FROM (s SIMILAR TO 'ab*');
+----
+0
+
+# constant pattern: filter result matches SIMILAR TO
+query I nosort constant_filter
+SELECT count(*)::BIGINT FROM strings WHERE regex_fpga(s, 'ab*');
+----
+
+query I nosort constant_filter
+SELECT count(*)::BIGINT FROM strings WHERE s SIMILAR TO 'ab*';
+----
+
+# non-constant pattern: pattern from a column
+statement ok
+CREATE TABLE strings_patterns AS
+SELECT * FROM (
+	VALUES
+		('ab', 'ab*'),
+		('abb', 'ab*'),
+		('xyz', 'ab*'),
+		('0012', '[0-9]+'),
+		('ab', 'a.*'),
+		('x', 'x')
+) t(s, pattern);
+
+query I
+SELECT count(*)::BIGINT
+FROM strings_patterns
+WHERE regex_fpga(s, pattern) IS DISTINCT FROM (s SIMILAR TO pattern);
+----
+0
+
+# NULL inputs: regex_fpga and SIMILAR TO both yield NULL
+query I
+SELECT
+	regex_fpga(NULL, 'ab*') IS NULL
+	AND (NULL SIMILAR TO 'ab*') IS NULL
+	AND regex_fpga('ab', NULL) IS NULL
+	AND ('ab' SIMILAR TO NULL) IS NULL
+	AND regex_fpga(NULL, NULL) IS NULL
+	AND (NULL SIMILAR TO NULL) IS NULL;
+----
+1
+
+# constant and non-constant paths agree when the column holds one pattern
+query I
+SELECT bool_and(regex_fpga(s, 'ab*') IS NOT DISTINCT FROM regex_fpga(s, pattern))
+FROM (SELECT s, 'ab*' AS pattern FROM strings);
+----
+1

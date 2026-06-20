@@ -1,8 +1,6 @@
 #include "regex.hpp"
 #include "nfa.hpp"
 
-#include "oasis_context_cache_entry.hpp"
-
 #include "celeris/configuration.hpp"
 #include "celeris/operators/regex/fregex.h"
 #include "duckdb/common/exception.hpp"
@@ -25,7 +23,6 @@ static constexpr idx_t REGEX_HW_MAX_STATES = 8;
 static constexpr idx_t REGEX_HW_MAX_CHARS = 16;
 static constexpr size_t REGEX_CONFIG_BYTES = 64;
 static constexpr size_t REGEX_BEAT_BYTES = 64;
-static constexpr idx_t REGEX_RESULTS_PER_BEAT = 512;
 
 static_assert(sizeof(string_t) == 16, "duckdb string_t must match the FPGA wire format");
 
@@ -42,12 +39,16 @@ struct RegexFpgaBindData : public FunctionData {
 		}
 	}
 
+	RegexFpgaBindData(bool constant_pattern_p, string pattern_p, vector<uint8_t> regex_blob_p)
+	    : constant_pattern(constant_pattern_p), pattern(std::move(pattern_p)), regex_blob(std::move(regex_blob_p)) {
+	}
+
 	bool constant_pattern;
 	string pattern;
 	vector<uint8_t> regex_blob;
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<RegexFpgaBindData>(constant_pattern, pattern);
+		return make_uniq<RegexFpgaBindData>(constant_pattern, pattern, regex_blob);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
@@ -56,21 +57,13 @@ struct RegexFpgaBindData : public FunctionData {
 	}
 };
 
-static void EnsureOasisContext(ClientContext &context) {
-
-#ifndef EN_SIMULATION
-	ObjectCache::GetObjectCache(context).GetOrCreate<OasisContextCacheEntry>(OasisContextCacheEntry::ObjectType());
-#else
-	(void)context;
-#endif
-}
 
 
+// rem_engines_async packs up to 512 one-bit match flags per 64-byte output
+// word. Bit i (LSB-first within each byte) corresponds to input string i.
 static bool ReadMatchBit(const uint8_t *output_bytes, size_t output_size, idx_t string_index) {
-	const idx_t beat = string_index / REGEX_RESULTS_PER_BEAT;
-	const idx_t local_bit = string_index % REGEX_RESULTS_PER_BEAT;
-	const size_t byte_offset = beat * REGEX_BEAT_BYTES + local_bit / 8;
-	const size_t bit_in_byte = local_bit % 8;
+	const size_t byte_offset = string_index / 8;
+	const size_t bit_in_byte = string_index % 8;
 	if (byte_offset >= output_size) {
 		return false;
 	}
@@ -85,28 +78,20 @@ static vector<bool> RunFpgaRegexBatch(const vector<string_t>& inputs, const vect
 	if (count == 0) {
 		return {};
 	}
-	#ifdef EN_SIMULATION
-        std::cout << "simulation enabled" << std::endl;
-        std::unique_ptr<libstf::MemoryPool> pool= std::make_unique<libstf::SimpleMemoryPool>();
-        oasis::OasisContext::init(std::move(pool), libstf::BYTES_PER_FPGA_TRANSFER);
-    #else
-        std::unique_ptr<libstf::MemoryPool> pool = std::make_unique<libstf::HugePageMemoryPool>();
-        oasis::OasisContext::init(std::move(pool), 1<<21); // 2 MiB
-    #endif
 	oasis::OasisContext &ctx = oasis::OasisContext::ctx();
 	std::shared_ptr<celeris::RegexConfig> config = ctx.config<celeris::RegexConfig>();
-
-	config->write_bat_count(static_cast<uint32_t>(count));
-	config->write_regex_blob(regex_blob);
 
 	libstf::stream_mask_t active_outputs(0);
 	active_outputs.set(0);
 	std::shared_ptr<libstf::OutputHandle> output_handle = ctx.output_buffer_manager()->acquire_output_handle(active_outputs);
 
+	config->write_bat_count(static_cast<uint32_t>(count));
+	config->write_regex_blob(regex_blob);
+
 	uint64_t tight_nonlin_size = 0;
 	for (idx_t i = 0; i < count; i++) {
 		if (!inputs[i].IsInlined()) {
-			tight_nonlin_size += inputs[i].GetSize();
+			tight_nonlin_size += inputs[i].GetSize() + 1;
 		}
 	}
 
@@ -136,8 +121,11 @@ static vector<bool> RunFpgaRegexBatch(const vector<string_t>& inputs, const vect
 		std::memcpy(descriptor, &input, sizeof(string_t));
 		if (!input.IsInlined()) {
 			descriptor->SetPointer(reinterpret_cast<char *>(data_off));
-			std::memcpy(static_cast<char *>(raw_buffer->ptr) + data_off, input.GetData(), input.GetSize());
-			data_off += input.GetSize();
+			char *dest = static_cast<char *>(raw_buffer->ptr) + data_off;
+			const idx_t length = input.GetSize();
+			std::memcpy(dest, input.GetData(), length);
+			dest[length] = '\0';
+			data_off += length + 1;
 		}
 	}
 
@@ -146,10 +134,21 @@ static vector<bool> RunFpgaRegexBatch(const vector<string_t>& inputs, const vect
 		libstf::enqueue_stream_input(ctx.cthread(), ctx.tlb_manager(), raw_buffer->ptr, data_buffer_size, 1, true);
 	}
 
-	std::shared_ptr<libstf::Buffer> output_buffer = output_handle->get_next_stream_output(0);
+	// Drain every acquired handle, first non-empty beat carries the match bitmap.
+	std::shared_ptr<libstf::Buffer> output_buffer;
+	while (output_handle->any_stream_has_more_output()) {
+		std::shared_ptr<libstf::Buffer> buf = output_handle->get_next_stream_output(0);
+		if (buf && output_buffer == nullptr) {
+			output_buffer = buf;
+		}
+	}
+
+	if (output_buffer == nullptr) {
+		return vector<bool>(count, false);
+	}
+
 	const uint8_t *output_bytes = reinterpret_cast<const uint8_t *>(output_buffer->ptr);
 	const size_t output_size = output_buffer->size;
-
 	vector<bool> results(count, false);
 	for (idx_t i = 0; i < count; i++) {
 		results[i] = ReadMatchBit(output_bytes, output_size, i);
@@ -167,7 +166,6 @@ static void WriteFpgaResults(Vector &result, idx_t count, const vector<idx_t> &r
 
 static void ExecuteFpgaBatch(ClientContext &context, Vector &strings, Vector &result, idx_t count,
                              const vector<uint8_t> &regex_blob) {
-	EnsureOasisContext(context);
 
 	UnifiedVectorFormat str_format;
 	strings.ToUnifiedFormat(count, str_format);
@@ -202,7 +200,6 @@ static void ExecuteFpgaBatch(ClientContext &context, Vector &strings, Vector &re
 
 static void ExecuteFpgaBatchGrouped(ClientContext &context, Vector &strings, Vector &patterns, Vector &result,
                                     idx_t count) {
-	EnsureOasisContext(context);
 
 	UnifiedVectorFormat str_format;
 	UnifiedVectorFormat pat_format;
@@ -247,7 +244,6 @@ static void ExecuteFpgaBatchGrouped(ClientContext &context, Vector &strings, Vec
 unique_ptr<FunctionData> RegexFpgaBind(ClientContext &context, ScalarFunction &bound_function,
                                        vector<unique_ptr<Expression>> &arguments) {
 	D_ASSERT(arguments.size() == 2);
-	EnsureOasisContext(context);
 	if (arguments[1]->IsFoldable()) {
 		Value pattern_val = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
 		if (!pattern_val.IsNull()) {

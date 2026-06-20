@@ -25,6 +25,8 @@ CREATE TABLE part
     p_size        INTEGER not null,
     p_container   CHAR(10) not null,
     p_retailprice DOUBLE PRECISION not null,
+    -- Stock-keeping unit / catalog code, e.g. 'MFG-001234-EU'
+    p_sku         VARCHAR(20) not null,
     p_comment     VARCHAR(23) not null
 );
 
@@ -35,6 +37,8 @@ CREATE TABLE supplier
     s_address     VARCHAR(40) not null,
     s_nationkey   INTEGER not null,
     s_phone       CHAR(15) not null,
+    -- Procurement contact address, e.g. 'sales@acme-parts.com'
+    s_email       VARCHAR(64) not null,
     s_acctbal     DOUBLE PRECISION not null,
     s_comment     VARCHAR(101) not null
 );
@@ -55,6 +59,8 @@ CREATE TABLE customer
     c_address     VARCHAR(40) not null,
     c_nationkey   INTEGER not null,
     c_phone       CHAR(15) not null,
+    -- Customer contact address, e.g. 'j.smith@gmail.com'
+    c_email       VARCHAR(64) not null,
     c_acctbal     DOUBLE PRECISION   not null,
     c_mktsegment  CHAR(10) not null,
     c_comment     VARCHAR(117) not null
@@ -91,4 +97,18 @@ CREATE TABLE lineitem
     l_shipinstruct CHAR(25) not null,
     l_shipmode     CHAR(10) not null,
     l_comment      VARCHAR(44) not null
+);
+
+-- Seasonal marketing promotions attached to parts. Each campaign carries a
+-- structured promo code, e.g. 'SUMMER-2026-WEB-AB12', that is well suited to
+-- pattern matching with regex_fpga.
+CREATE TABLE promotion
+(
+    pr_promokey   BIGINT not null,
+    pr_partkey    BIGINT not null,
+    pr_code       VARCHAR(25) not null,
+    pr_channel    CHAR(10) not null,
+    pr_startdate  DATE not null,
+    pr_enddate    DATE not null,
+    pr_comment    VARCHAR(152) not null
 );

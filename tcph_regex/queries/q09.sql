@@ -21,7 +21,7 @@ FROM (
         AND p_partkey = l_partkey
         AND o_orderkey = l_orderkey
         AND s_nationkey = n_nationkey
-        AND p_name LIKE '%green%') AS profit
+        AND regex_fpga(p_name, '.*green.*')) AS profit
 GROUP BY
     nation,
     o_year

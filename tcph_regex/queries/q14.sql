@@ -1,6 +1,6 @@
 SELECT
     100.00 * sum(
-        CASE WHEN p_type LIKE 'PROMO%' THEN
+        CASE WHEN regex_fpga(p_type, 'PROMO.*') THEN
             l_extendedprice * (1 - l_discount)
         ELSE
             0
