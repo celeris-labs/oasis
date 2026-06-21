@@ -106,6 +106,18 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 		}
 	}
 
+	// Register a cold-start yield budget for hardware scans -- roughly one yield per prospective
+	// worker, so during cold start workers step aside to let others prime the pipeline breadth-first.
+	// The cardinality-only path never touches the hardware, so it registers nothing. DuckDB clamps
+	// this scan's parallelism to min(MaxThreads(), scheduler threads), and MaxThreads() is
+	// total_groups; INITIALIZE_ON_SCHEDULE runs this eagerly at schedule time so we know that count
+	// before any worker executes. Budget is consumed only by yields that actually happen, so any
+	// unused remainder is harmless -- no reconciliation needed.
+	if (!gstate->emit_cardinality_only) {
+		size_t const yield_budget = std::max<size_t>(1, std::min<size_t>(gstate->total_groups, num_threads));
+		ctx.add_yield_budget(yield_budget);
+	}
+
 	return std::move(gstate);
 }
 
@@ -423,11 +435,23 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	if (lstate.inflight.empty()) {
 		return LoadResult::EXHAUSTED;
 	}
+
 	auto &head = *lstate.inflight.front();
 
-	// Collect the head group's hardware buffers without blocking. If any column is still
-    // outstanding, hand the result handle to an async task and return BLOCKED so the worker is
-    // freed. DuckDB reschedules this scan once the handle becomes ready.
+	// Cold start: while the cross-scan yield budget has units left, consume one and yield by blocking
+	// on a group we have in flight. This frees the worker so other workers get the CPU to issue their
+	// own submissions, filling the hardware pipeline breadth-first before we start draining. The total
+	// number of yields is capped at the registered budget, so this is self-limiting and the scan
+	// always makes forward progress once the budget is spent. The group we block on may already be
+	// finished, in which case the async task returns immediately and the worker is rescheduled.
+	if (ctx.try_consume_yield()) {
+		out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
+		return LoadResult::BLOCKED;
+	}
+
+	// Collect the head group's hardware buffers without blocking. If any column is still outstanding,
+	// hand the result handle to an async task and return BLOCKED so the worker is freed. DuckDB
+	// reschedules this scan once the handle becomes ready.
 	if (!TryCollectGroup(context, gstate, bind, head)) {
 		out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
 		return LoadResult::BLOCKED;
@@ -649,6 +673,8 @@ void RegisterOasisScanFunction(ExtensionLoader &loader) {
 	);
 	table_function.projection_pushdown = true;
 	table_function.filter_pushdown = true;
+	// Initialize the global state eagerly at schedule time to register our cold workers.
+	table_function.global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
 	table_function.get_virtual_columns = OasisScanGetVirtualColumns;
 	table_function.cardinality = OasisScanCardinality;
 	table_function.statistics = OasisScanStatistics;
