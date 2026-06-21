@@ -94,6 +94,28 @@ logic handler_idle;
 assign handler_idle = (state_q == ST_IDLE);
 assign conf.ready = (conf_state_q == CONF_IDLE);
 
+// -- Debug: live FSM state exposed on a host-readable read CSR ---------------
+// Packs the top-level handler FSM, each sub-FSM's state_debug, and the
+// done/error flags so the host can tell exactly where a fetch stalls.
+logic [3:0] init_state_dbg;
+logic [3:0] send_state_dbg;
+logic [3:0] read_state_dbg;
+
+assign conf.status = {
+    9'd0,                              // [31:23] reserved
+    (conf_state_q == CONF_BUSY),       // [22] handler busy with a queued request
+    read_error,                        // [21]
+    read_done,                         // [20]
+    send_error,                        // [19]
+    send_done,                         // [18]
+    init_error,                        // [17]
+    init_done,                         // [16]
+    read_state_dbg,                    // [15:12] tcp_read FSM
+    send_state_dbg,                    // [11:8]  tcp_send_http FSM
+    init_state_dbg,                    // [7:4]   tcp_init FSM
+    state_q                            // [3:0]   HTTPRead FSM (IDLE/INIT/SEND/READ/CLOSE)
+};
+
 always_comb begin
     conf_state_d = conf_state_q;
     runTx_d        = 1'b0;
@@ -135,7 +157,7 @@ tcp_init inst_tcp_init (
     .done(init_done),
     .error(init_error),
     .session_id(init_session_id),
-    .state_debug()
+    .state_debug(init_state_dbg)
 );
 
 tcp_send_http inst_tcp_send_http (
@@ -170,7 +192,7 @@ tcp_send_http inst_tcp_send_http (
     .done(send_done),
     .error(send_error),
     .debug_http_len(debug_http_len),
-    .state_debug()
+    .state_debug(send_state_dbg)
 );
 
 tcp_read inst_tcp_read (
@@ -196,7 +218,7 @@ tcp_read inst_tcp_read (
     .debug_rx_write_ptr(debug_rx_write_ptr),
     .debug_rx_buffer_w0(debug_rx_buffer_w0),
     .debug_rx_buffer_w1(debug_rx_buffer_w1),
-    .state_debug()
+    .state_debug(read_state_dbg)
 );
 
 always_comb begin

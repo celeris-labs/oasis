@@ -18,14 +18,17 @@ interface http_read_config_i (
     data32_t      size;
     logic         valid;
     logic         ready;
+    // Debug-only: live FSM state packed by HTTPRead (modport s drives it), read back
+    // by HTTPReadConfig (modport m) and exposed on a host-readable read CSR.
+    data32_t      status;
 
     modport m (
         output cfg, size, valid,
-        input ready
+        input ready, status
     );
 
     modport s (
-        output ready,
+        output ready, status,
         input cfg, size, valid
     );
 

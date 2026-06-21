@@ -40,13 +40,13 @@ constexpr const uint32_t HTTP_RANGE_END   = 12;
 constexpr const uint32_t HTTP_SIZE        = 13;
 constexpr const uint32_t HTTP_START       = 14;
 constexpr const uint32_t HTTP_CLIENT_STATE = 1;
+// Read CSR 2 carries the packed HTTP/TCP FSM debug status (see HTTPRead.conf.status).
+constexpr const uint32_t HTTP_DEBUG_STATUS = 2;
 
 void PackPathWords(const std::string &path, uint32_t &file_len, uint32_t words[8]) {
     const size_t n = std::min(path.size(), size_t {32});
     file_len = static_cast<uint32_t>(n);
-    for (auto &word : words) {
-        word = 0;
-    }
+    std::memset(words, 0, 8 * sizeof(uint32_t));
     for (size_t i = 0; i < n; i++) {
         words[i / 4] |= static_cast<uint32_t>(static_cast<uint8_t>(path[i])) << (8 * (i % 4));
     }
@@ -78,8 +78,17 @@ void HTTPReadConfig::read(libstf::stream_t stream, uint32_t server_ip, uint16_t 
     write_register(libstf::ConfigRegister(reg_base + HTTP_START, 1));
 }
 
-uint8_t HTTPReadConfig::client_state() const {
+uint8_t HTTPReadConfig::client_state() {
     return static_cast<uint8_t>(read_register(HTTP_CLIENT_STATE).value() & 0xF);
+}
+
+uint32_t HTTPReadConfig::debug_status() {
+    return static_cast<uint32_t>(read_register(HTTP_DEBUG_STATUS).value());
+}
+
+uint64_t HTTPReadConfig::read_stream_register(libstf::stream_t stream, uint32_t reg) {
+    assert(reg < HTTP_READ_CONFIG_REGS);
+    return cthread->getCSR(addr_offset + stream * HTTP_READ_CONFIG_REGS + reg);
 }
 
 } // namespace oasis

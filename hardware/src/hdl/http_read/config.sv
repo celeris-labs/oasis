@@ -27,12 +27,15 @@ localparam NUM_WRITE_REGS = NUM_HTTP_READ_CONFIG_REGS;
 
 `RESET_RESYNC
 
-logic [AXIL_DATA_BITS - 1:0] values[2];
+// values[2] is a debug status word: the live HTTP/TCP FSM state of the bypass
+// stream's HTTPRead instance. The bypass stream is always the last one.
+logic [AXIL_DATA_BITS - 1:0] values[3];
 assign values[0] = HTTP_READ_CONFIG_ID;
 assign values[1] = NUM_STREAMS;
+assign values[2] = {{(AXIL_DATA_BITS-32){1'b0}}, out[NUM_STREAMS-1].status};
 
 ConfigReadRegisterFile #(
-    .NUM_REGS(2)
+    .NUM_REGS(3)
 ) inst_read_regs (
     .clk(clk),
     .rst_n(reset_synced),
