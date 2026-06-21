@@ -14,6 +14,7 @@
 #include "parcore/configuration.hpp"
 #include "parcore_metadata_util.hpp"
 #include "parquet_reader.hpp"
+#include "thrift_tools.hpp"
 #include "rdma_file_system.hpp"
 #include "reader/struct_column_reader.hpp"
 #include "filter_pushdown.hpp"
@@ -298,18 +299,26 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 }
 
 // Positions the shared CPU readers at the start of `group`'s CPU/string columns (page-header
-// parsing / I/O positioning).
+// parsing / I/O positioning) and bulk-prefetches their column-chunk bytes.
+//
+// Without this prefetch the thrift transport falls back to a raw synchronous file read for every
+// page header and page body (thrift_tools.hpp read()), i.e. hundreds of tiny pread()s per string
+// column per group on the worker thread. This was completely tanking performance.
 static void InitGroupCPUColumns(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, size_t group) {
 	if (!gstate.has_cpu_columns) {
 		return;
 	}
 	const auto &row_group_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
+	auto &trans = reinterpret_cast<ThriftFileTransport &>(*lstate.scan_state->thrift_file_proto->getTransport());
 	for (const auto &col : gstate.projected_columns) {
 		if (col.is_cpu) {
-			lstate.scan_state->GetColumnReader(col.column_id)
-			    .InitializeRead(group, row_group_columns, *lstate.scan_state->thrift_file_proto);
+			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);
+			reader.InitializeRead(group, row_group_columns, *lstate.scan_state->thrift_file_proto);
+			reader.RegisterPrefetch(trans, /*allow_merge=*/true);
 		}
 	}
+	trans.FinalizeRegistration();
+	trans.PrefetchRegistered();
 }
 
 // Non-blocking: Drains the row group's result handle, placing each tagged column chunk into
@@ -369,11 +378,9 @@ static void DecodeCPUColumnsSlice(OasisScanGlobalState &gstate, OasisScanLocalSt
 			                        (unsigned long long)i, (unsigned long long)rows_read, (unsigned long long)emit);
 		}
 
-		FlatVector::SetSize(vec, count_t(emit));
-
-		// Flatten so the output owns its own data and stops aliasing the shared scratch state,
-        // which the column's Read will overwrite.
-		vec.Flatten();
+		if (vec.GetVectorType() == VectorType::FLAT_VECTOR) {
+			FlatVector::SetSize(vec, count_t(emit));
+		}
 	}
 }
 
