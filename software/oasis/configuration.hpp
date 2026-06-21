@@ -11,6 +11,9 @@ constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A515;
 constexpr const uint64_t RDMA_READ_CONFIG_REGS = 2;
 constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
 
+constexpr const uint64_t HTTP_READ_CONFIG_REGS = 15;
+constexpr const uint64_t HTTP_READ_CONFIG_ID   = 0x0000000000485454;
+
 /**
  * Configues a hardware RDMARead module to properly process the next page
  */
@@ -37,6 +40,23 @@ class RDMAReadConfig : public libstf::Config {
 
   private:
     libstf::stream_t num_streams_;
+};
+
+/**
+ * Configures the hardware HTTP client (HttpConfig + handler) to issue one
+ * ranged GET request. The FPGA derives Host:/Range: ASCII from the binary
+ * server_ip, server_port, and range fields.
+ */
+class HTTPReadConfig : public libstf::Config {
+  public:
+    HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset, uint32_t num_regs);
+
+    void read(libstf::stream_t stream, uint32_t server_ip, uint16_t server_port, const std::string &path,
+              uint64_t range_begin, uint64_t range_end);
+
+    uint8_t client_state() const;
+
+    static constexpr uint64_t ID = HTTP_READ_CONFIG_ID;
 };
 
 } // namespace oasis

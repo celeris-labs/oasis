@@ -36,12 +36,10 @@ public:
     }
 
     bool isRDMAEnabled();
+    bool isHTTPEnabled();
 
-    /**
-     * Id of the RDMA bypass stream -- the last MemConfig stream, sitting past the decoders. Only 
-     * valid when isRDMAEnabled() is true.
-     */
     libstf::stream_t rdmaBypassStream();
+    libstf::stream_t httpBypassStream();
 
     int device_id() const { return device_id_; }
     int vfpga_id() const { return vfpga_id_; }

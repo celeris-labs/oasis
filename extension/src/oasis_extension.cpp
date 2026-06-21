@@ -6,6 +6,7 @@
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_settings.hpp"
 #include "oasis_log_sink.hpp"
+#include "http_file_system.hpp"
 #include "rdma_file_system.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -56,6 +57,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          Value::UBIGINT(static_cast<uint64_t>(coyote::DEF_PORT)));
 
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<RDMAFileSystem>());
+
+	// HTTP ranged-GET file system (FPGA bypass stream; requires -DENABLE_HTTP=ON bitstream)
+	config.AddExtensionOption(
+	    "http_server",
+	    "HTTP file server IP address for httpfpga:// reads (set via `SET http_server = '<ip-address>';`)",
+	    LogicalType::VARCHAR, Value("127.0.0.1"));
+	config.AddExtensionOption("http_port", "HTTP file server TCP port for httpfpga:// reads", LogicalType::UBIGINT,
+	                          Value::UBIGINT(static_cast<uint64_t>(coyote::DEF_PORT)));
+
+	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<HTTPFileSystem>(instance));
 
 	// Get the OasisContext to establish the connection to the FPGA.
 	Connection conn(instance);

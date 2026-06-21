@@ -37,10 +37,8 @@ static void handle_fpga_interrupt(int value) {
 }
 
 static libstf::stream_mask_t computeManagedStreams(libstf::GlobalConfig &global_config) {
-    // Decoder streams are managed (the OBM pre-allocates / tops up buffers for them). When RDMA is
-    // wired in, there is one extra MemConfig stream past the decoders -- the bypass stream used by
-    // RDMAFileSystem -- and that one is unmanaged because its transfer size is known per request.
-    // Note: The instance is not ready at this point so we cannot call isRDMAEnabled(...)
+    // Decoder streams are managed. When HTTP (or RDMA) is wired in, the extra MemConfig stream
+    // past the decoders is the bypass stream and is unmanaged (transfer size known per request).
     auto mem_config = global_config.get_config<libstf::MemConfig>();
     auto cc_config = global_config.get_config<parcore::ColumnChunkDecoderConfig>();
     libstf::stream_mask_t managed = ~libstf::stream_mask_t(0);
@@ -136,6 +134,14 @@ bool OasisContext::isRDMAEnabled() {
 
 libstf::stream_t OasisContext::rdmaBypassStream() {
     return config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
+}
+
+libstf::stream_t OasisContext::httpBypassStream() {
+    return config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
+}
+
+bool OasisContext::isHTTPEnabled() {
+    return global_config_.has_config(HTTP_READ_CONFIG_ID);
 }
 
 } // namespace oasis

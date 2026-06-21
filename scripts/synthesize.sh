@@ -4,8 +4,10 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 
 cmake_args=()
 decoders=1
+enable_http=0
 while [ $# -gt 0 ]; do
     case "$1" in
+        --http) enable_http=1 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
         --decoders) decoders="$2"; shift ;;
         --decoders=*) decoders="${1#*=}" ;;
@@ -13,6 +15,10 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$enable_http" -eq 1 ]; then
+    cmake_args+=(-DENABLE_HTTP=ON -DENABLE_RDMA=OFF)
+fi
 cmake_args+=(-DN_DECODERS="$decoders")
 
 pushd hardware
