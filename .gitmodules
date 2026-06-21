@@ -6,7 +6,7 @@
 	url = git@github.com:celeris-labs/celeris.git
 [submodule "extension/duckdb"]
 	path = extension/duckdb
-	url = https://github.com/duckdb/duckdb
+	url = https://github.com/JonasDann/duckdb.git
 [submodule "extension/extension-ci-tools"]
 	path = extension/extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools

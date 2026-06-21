@@ -5,23 +5,22 @@ project(oasis
   LANGUAGES CXX
 )
 
+# Default to a Release build (optimized) unless the user specifies otherwise.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+        "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" OFF)
 
 if(NOT TARGET Coyote)
-    if(EN_SIMULATION)
-        find_package(CoyoteSimulation QUIET)
-        if(NOT CoyoteSimulation_FOUND)
-            add_subdirectory(../parcore/coyote/sim/sw coyote)
-        endif()
-        add_compile_definitions(EN_SIMULATION)
-    else()
-        find_package(Coyote QUIET)
-        if(NOT Coyote_FOUND)
-            add_subdirectory(../parcore/coyote/sw coyote)
-        endif()
+    find_package(Coyote QUIET)
+    if(NOT Coyote_FOUND)
+        add_subdirectory(../parcore/libstf/coyote/sw coyote)
     endif()
 endif()
 
@@ -42,9 +41,11 @@ endif()
 add_library(oasis SHARED)
 
 target_sources(oasis PRIVATE
+    oasis/bypass_receiver.cpp
     oasis/configuration.cpp
     oasis/oasis_context.cpp
-    oasis/parcore/rdma_reader.cpp
+    oasis/operator.cpp
+    oasis/scheduler.cpp
 )
 target_include_directories(oasis
     PUBLIC
@@ -52,7 +53,8 @@ target_include_directories(oasis
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_link_libraries(oasis PRIVATE Coyote libstf parcore)
+find_package(Threads REQUIRED)
+target_link_libraries(oasis PRIVATE Coyote libstf parcore Threads::Threads)
 target_include_directories(oasis PRIVATE ${COYOTE_INCLUDE_DIRS} ${LIBSTF_INCLUDE_DIRS} ${PARCORE_INCLUDE_DIRS})
 
 include(GNUInstallDirs)

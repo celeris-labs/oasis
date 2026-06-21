@@ -1,4 +1,5 @@
 #include "regex.hpp"
+#include "celeris/celeris_context.hpp"
 #include "nfa.hpp"
 
 #include "celeris/configuration.hpp"
@@ -14,6 +15,7 @@
 
 #include <cstring>
 #include <mutex>
+#include <output_handle.hpp>
 #include <unordered_map>
 #include <vector>
 
@@ -78,12 +80,28 @@ static vector<bool> RunFpgaRegexBatch(const vector<string_t>& inputs, const vect
 	if (count == 0) {
 		return {};
 	}
-	oasis::OasisContext &ctx = oasis::OasisContext::ctx();
-	std::shared_ptr<celeris::RegexConfig> config = ctx.config<celeris::RegexConfig>();
+
+	try {
+		celeris::CelerisContext &ctx = celeris::CelerisContext::get_ctx();
+	} catch (const std::exception& e) {
+		#ifdef EN_SIMULATION
+        std::cout << "simulation enabled\n";
+        std::unique_ptr<libstf::MemoryPool> mem_pool =
+            std::make_unique<libstf::SimpleMemoryPool>();
+        celeris::CelerisContext::init(std::move(mem_pool), libstf::BYTES_PER_FPGA_TRANSFER);
+		#else
+        std::unique_ptr<libstf::MemoryPool> mem_pool =
+            std::make_unique<libstf::HugePageMemoryPool>();
+        celeris::CelerisContext::init(std::move(mem_pool), 1 << 21);
+		#endif
+	}
+	celeris::CelerisContext &ctx = celeris::CelerisContext::get_ctx();
+	//oasis::OasisContext &ctx = oasis::OasisContext::ctx();
+	std::shared_ptr<celeris::RegexConfig> config = ctx.get_config<celeris::RegexConfig>();
 
 	libstf::stream_mask_t active_outputs(0);
 	active_outputs.set(0);
-	std::shared_ptr<libstf::OutputHandle> output_handle = ctx.output_buffer_manager()->acquire_output_handle(active_outputs);
+	std::shared_ptr<libstf::OutputHandle> output_handle = ctx.get_output_buffer_manager().acquire_output_handle(active_outputs);
 
 	config->write_bat_count(static_cast<uint32_t>(count));
 	config->write_regex_blob(regex_blob);
@@ -100,14 +118,14 @@ static vector<bool> RunFpgaRegexBatch(const vector<string_t>& inputs, const vect
 	                                      : ((tight_nonlin_size + REGEX_BEAT_BYTES - 1) / REGEX_BEAT_BYTES) * REGEX_BEAT_BYTES;
 
 	libstf::Status status;
-	std::shared_ptr<libstf::Buffer> struct_buffer = libstf::make_buffer(ctx.memory_pool(), count * sizeof(string_t), status);
+	std::shared_ptr<libstf::Buffer> struct_buffer = libstf::make_buffer(ctx.get_memory_pool(), count * sizeof(string_t), status);
 	if (!status.ok()) {
 		throw InternalException("Failed to allocate FPGA regex descriptor buffer");
 	}
 
 	std::shared_ptr<libstf::Buffer> raw_buffer;
 	if (data_buffer_size > 0) {
-		raw_buffer = libstf::make_buffer(ctx.memory_pool(), data_buffer_size, status);
+		raw_buffer = libstf::make_buffer(ctx.get_memory_pool(), data_buffer_size, status);
 		if (!status.ok()) {
 			throw InternalException("Failed to allocate FPGA regex payload buffer");
 		}
@@ -129,9 +147,9 @@ static vector<bool> RunFpgaRegexBatch(const vector<string_t>& inputs, const vect
 		}
 	}
 
-	libstf::enqueue_stream_input(ctx.cthread(), ctx.tlb_manager(), struct_buffer->ptr, count * sizeof(string_t), 0, true);
+	libstf::enqueue_stream_input(ctx.get_cthread(), ctx.get_tlb_manager(), struct_buffer->ptr, count * sizeof(string_t), 0, true);
 	if (data_buffer_size > 0) {
-		libstf::enqueue_stream_input(ctx.cthread(), ctx.tlb_manager(), raw_buffer->ptr, data_buffer_size, 1, true);
+		libstf::enqueue_stream_input(ctx.get_cthread(), ctx.get_tlb_manager(), raw_buffer->ptr, data_buffer_size, 1, true);
 	}
 
 	// Drain every acquired handle, first non-empty beat carries the match bitmap.
@@ -158,7 +176,7 @@ static vector<bool> RunFpgaRegexBatch(const vector<string_t>& inputs, const vect
 
 static void WriteFpgaResults(Vector &result, idx_t count, const vector<idx_t> &result_rows, const vector<bool> &matches) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	bool *result_data = FlatVector::GetData<bool>(result);
+	bool *result_data = FlatVector::GetDataMutable<bool>(result);
 	for (idx_t i = 0; i < result_rows.size(); i++) {
 		result_data[result_rows[i]] = matches[i];
 	}
@@ -168,11 +186,11 @@ static void ExecuteFpgaBatch(ClientContext &context, Vector &strings, Vector &re
                              const vector<uint8_t> &regex_blob) {
 
 	UnifiedVectorFormat str_format;
-	strings.ToUnifiedFormat(count, str_format);
+	strings.ToUnifiedFormat(str_format);
 	const string_t *str_data = UnifiedVectorFormat::GetData<string_t>(str_format);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	ValidityMask &result_validity = FlatVector::Validity(result);
+	ValidityMask &result_validity = FlatVector::ValidityMutable(result);
 	result_validity.Initialize(count);
 
 	vector<string_t> inputs;
@@ -203,13 +221,13 @@ static void ExecuteFpgaBatchGrouped(ClientContext &context, Vector &strings, Vec
 
 	UnifiedVectorFormat str_format;
 	UnifiedVectorFormat pat_format;
-	strings.ToUnifiedFormat(count, str_format);
-	patterns.ToUnifiedFormat(count, pat_format);
+	strings.ToUnifiedFormat(str_format);
+	patterns.ToUnifiedFormat(pat_format);
 	const string_t *str_data = UnifiedVectorFormat::GetData<string_t>(str_format);
 	const string_t *pat_data = UnifiedVectorFormat::GetData<string_t>(pat_format);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	ValidityMask &result_validity = FlatVector::Validity(result);
+	ValidityMask &result_validity = FlatVector::ValidityMutable(result);
 	result_validity.Initialize(count);
 
 	std::unordered_map<string, vector<idx_t>> rows_by_pattern;
@@ -228,7 +246,7 @@ static void ExecuteFpgaBatchGrouped(ClientContext &context, Vector &strings, Vec
 		rows_by_pattern[pattern_key].push_back(row);
 	}
 
-	bool *result_data = FlatVector::GetData<bool>(result);
+	bool *result_data = FlatVector::GetDataMutable<bool>(result);
 	for (const auto &pattern_entry : rows_by_pattern) {
 		const string &pattern = pattern_entry.first;
 		const vector<idx_t> &rows = pattern_entry.second;
@@ -241,8 +259,9 @@ static void ExecuteFpgaBatchGrouped(ClientContext &context, Vector &strings, Vec
 	}
 }
 
-unique_ptr<FunctionData> RegexFpgaBind(ClientContext &context, ScalarFunction &bound_function,
-                                       vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> RegexFpgaBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &arguments = input.GetArguments();
 	D_ASSERT(arguments.size() == 2);
 	if (arguments[1]->IsFoldable()) {
 		Value pattern_val = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
@@ -258,7 +277,7 @@ void RegexFpgaFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 	Vector &strings = args.data[0];
 	Vector &patterns = args.data[1];
 	const BoundFunctionExpression &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	const RegexFpgaBindData &bind_data = func_expr.bind_info->Cast<RegexFpgaBindData>();
+	const RegexFpgaBindData &bind_data = func_expr.BindInfo()->Cast<RegexFpgaBindData>();
 
 	if (bind_data.constant_pattern) {
 		ExecuteFpgaBatch(context, strings, result, args.size(), bind_data.regex_blob);

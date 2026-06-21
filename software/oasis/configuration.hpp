@@ -8,32 +8,37 @@ namespace oasis {
 
 constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A515;
 
-constexpr const uint64_t RDMA_READ_CONFIG_REGS = 2;
-constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
+constexpr const uint64_t READ_REQ_CONFIG_REGS = 2;
+constexpr const uint64_t READ_REQ_CONFIG_ID   = 0x2f966a70f04c0e93;
 
 /**
- * Configues a hardware RDMARead module to properly process the next page
+ * Configues a hardware read request module to fetch data.
  */
-class RDMAReadConfig : public libstf::Config {
+class ReadReqConfig : public libstf::Config {
   public:
-    RDMAReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
+    ReadReqConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
                    uint32_t num_regs);
 
     /**
-     * Triggers a remote read using the RDMARead module.
-     *
-     * @param stream The Coyote stream on which to perform the read.
-     * @param vaddr  The address at which the read should be performed.
-     * @param size   The number of bytes to read.
+     * For RDMA reads, sets the base vaddr of the remote region that read addresses are relative to.
+     * It must be set before the first enqueue_read().
      */
-    void read(libstf::stream_t stream, uintptr_t vaddr, size_t size);
+    void set_base_vaddr(uintptr_t base_vaddr);
+
+    /**
+     * Triggers a read request using the `RDMARead` or `LocalRead` module.
+     *
+     * Reads are relative to the base virtual address set via set_base_vaddr().
+     */
+    void enqueue_read(libstf::stream_t stream, size_t vaddr, size_t size);
 
     const libstf::stream_t num_streams() const;
 
-    static constexpr uint64_t ID = RDMA_READ_CONFIG_ID;
+    static constexpr uint64_t ID = READ_REQ_CONFIG_ID;
 
   private:
     libstf::stream_t num_streams_;
+    uintptr_t        base_vaddr_ = 0;
 };
 
 } // namespace oasis

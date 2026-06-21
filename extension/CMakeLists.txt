@@ -29,8 +29,8 @@ include_directories(duckdb/third_party/thrift)
 # For simulation you also need:
 #   * celeris hardware build populated (see celeris/hardware)
 #   * xsim on PATH
-#   * export COYOTE_SIM_DIR=/home/vifranz/celeris/hardware/build
-option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" ON)
+#   * COYOTE_SIM_DIR=<abs path to parcore/build_hw> at runtime
+option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" OFF)
 if (EN_SIMULATION)
     find_package(CoyoteSimulation REQUIRED)
     add_compile_definitions(EN_SIMULATION)
@@ -40,7 +40,6 @@ endif ()
 
 find_package(libstf REQUIRED)
 
-find_package(Arrow REQUIRED)
 find_package(parcore REQUIRED)
 find_package(oasis REQUIRED)
 
@@ -85,7 +84,9 @@ set(FPGA_REGEX_SOURCES ${CELERIS_SOFTWARE_DIR}/celeris/configuration.cpp)
 # ---------------------------------------------------------------------------
 # Extension
 # ---------------------------------------------------------------------------
-set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/regex.cpp ${FPGA_REGEX_SOURCES})
+set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/oasis_profile.cpp
+                      src/rdma_file_system.cpp src/filter_pushdown.cpp src/parcore_metadata_util.cpp
+                      src/oasis_settings.cpp src/coalesced_fetcher.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
