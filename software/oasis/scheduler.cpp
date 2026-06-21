@@ -46,6 +46,19 @@ void Scheduler::set_pipeline_depth(size_t depth) {
     dispatch_cv_.notify_one(); // A deeper pipeline may open a slot the dispatcher can fill.
 }
 
+size_t Scheduler::queued_flows() const {
+    std::lock_guard<std::mutex> lock(dispatch_mutex_);
+    return queue_.size();
+}
+
+size_t Scheduler::in_flight_flows() const {
+    size_t total = 0;
+    for (const auto &ss : streams_) {
+        total += ss->enqueued.load(std::memory_order_relaxed);
+    }
+    return total;
+}
+
 Scheduler::~Scheduler() {
     // Stop the dispatcher first so no new flows are placed while we tear down.
     {

@@ -49,6 +49,12 @@ class Scheduler {
     void                 set_pipeline_depth(size_t depth);
     [[nodiscard]] size_t pipeline_depth() const { return queue_depth_.load(); }
 
+    // Flows waiting in the dispatcher queue (not yet enqueued to the hardware).
+    [[nodiscard]] size_t queued_flows() const;
+
+    // Flows currently enqueued across all streams (enqueued in hardware, awaiting completion).
+    [[nodiscard]] size_t in_flight_flows() const;
+
     // Invoked from the interrupt switch for a (non-bypass) stream interrupt. Pops the front pending
     // completion for that stream, pushes the corresponding onto the splinter's result channel, and
     // runs the flow/splinter completion accounting. Runs on the interrupt thread, so it stays
@@ -110,7 +116,7 @@ class Scheduler {
 
     std::vector<std::unique_ptr<StreamState>> streams_;
 
-    std::mutex              dispatch_mutex_;
+    mutable std::mutex      dispatch_mutex_;
     std::condition_variable dispatch_cv_;
     std::deque<Pending>     queue_;
     bool                    stop_ = false;

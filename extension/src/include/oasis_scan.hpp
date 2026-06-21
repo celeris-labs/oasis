@@ -18,12 +18,11 @@
 
 namespace duckdb {
 
-// Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across 
+// Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across
 // threads, so each worker owns its own (mirrors ParquetReader's per-scan-state scan_filters).
 struct OasisScanFilter {
 	OasisScanFilter(ClientContext &context, idx_t filter_idx, const TableFilter &filter)
-	    : filter_idx(filter_idx), filter(filter),
-	      filter_state(TableFilterState::Initialize(context, filter)) {
+	    : filter_idx(filter_idx), filter(filter), filter_state(TableFilterState::Initialize(context, filter)) {
 	}
 
 	idx_t filter_idx;
@@ -71,7 +70,7 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 };
 
 // Per-worker scan state. Owns this worker's file handle (DuckDB FileHandles are not safe to share
-// across threads) and, for the row group it is currently scanning, the decoded buffer per column it 
+// across threads) and, for the row group it is currently scanning, the decoded buffer per column it
 // is slicing into vectors.
 //
 // One buffer per column chunk: a row group is decoded in full in hardware, each column yielding
@@ -89,22 +88,11 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// Reused selection vector for row-level filtering, so we don't reallocate per scan call.
 	SelectionVector filter_sel;
 
-	// Per-row-group state, tracked through a two-phase lifecycle so the head's input IO runs off 
-    // the compute worker (on DuckDB's async pool) ahead of FPGA decode:
-	//
-	//   IO_PENDING  -- host reads scheduled as AsyncTasks (or none, for RDMA) -->
-	//   DECODING    -- splinter submitted, hardware is decoding, CPU columns are decoded.
 	struct PendingGroup {
-		enum class Phase : uint8_t { IO_PENDING, DECODING };
-
 		size_t group = 0;
 		size_t num_rows = 0;
-		Phase phase = Phase::IO_PENDING;
-
-		bool io_scheduled = false;
 
 		std::unique_ptr<CoalescedFetcher> fetcher;
-		std::vector<unique_ptr<AsyncTask>> io_tasks;
 
 		// Hardware columns of this group:
 		// hw_slot[k] is the projection index, hw_chunks[k] the chunk, host_handles[k] the fetcher
@@ -114,10 +102,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<CoalescedFetcher::RangeHandle> host_handles;
 
 		// The whole row group is one QuerySplinter with one result handle. Batches arrive tagged
-        // with their projection index and are placed into hw_buffers by tag.
+		// with their projection index and are placed into hw_buffers by tag.
 		oasis::SplinterResultHandle result;
 		size_t hw_columns_remaining = 0;
-		std::vector<std::vector<unique_ptr<Vector>>> cpu_slices;
+
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
 	};
 
@@ -127,16 +115,13 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 
-	// Fully-decoded CPU/string columns for the current row group, indexed [projection_index][slice].
-	std::vector<std::vector<unique_ptr<Vector>>> current_cpu_slices;
-
 	size_t current_buf_offset = 0;
 	size_t current_group_num_rows = 0;
 	idx_t current_group = 0;
 
 	// Empty-projection path only (COUNT(*) etc.): Rows left to emit from the row group we last
-    // claimed. We never decode anything in this path -- the count comes straight from the Parquet
-    // metadata.
+	// claimed. We never decode anything in this path -- the count comes straight from the Parquet
+	// metadata.
 	size_t empty_proj_remaining = 0;
 };
 

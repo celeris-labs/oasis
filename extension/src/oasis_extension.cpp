@@ -17,6 +17,9 @@
 
 namespace duckdb {
 
+// Default for oasis_scan_groups_in_flight (see the AddExtensionOption below).
+static constexpr uint64_t DEFAULT_GROUPS_IN_FLIGHT = 16;
+
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(instance);
@@ -39,7 +42,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "Row groups a single read_oasis scan keeps submitted but not yet collected, overlapping "
 	    "submission with collection. Split across the scan's worker threads (each worker keeps "
 	    "ceil(value / threads) groups in flight but at least 1).",
-	    LogicalType::UBIGINT, Value::UBIGINT(16));
+	    LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_GROUPS_IN_FLIGHT));
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);

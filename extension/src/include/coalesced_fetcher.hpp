@@ -1,7 +1,6 @@
 #pragma once
 
 #include "duckdb/common/file_system.hpp"
-#include "duckdb/parallel/async_result.hpp"
 #include "libstf/buffer.hpp"
 #include "libstf/memory_pool.hpp"
 
@@ -61,10 +60,6 @@ public:
     // independent (positional pread), so different indices may run concurrently on the async pool.
     // Must be called after PrepareReads().
 	void ExecuteMergedRead(size_t idx);
-
-	// Build one independent AsyncTask per merged read, each of which runs ExecuteMergedRead() for 
-    // its index. The tasks borrow this fetcher, so it must outlive them.
-	vector<unique_ptr<AsyncTask>> BuildReadTasks();
 
 	struct RangeView {
 		std::shared_ptr<libstf::Buffer> buffer;

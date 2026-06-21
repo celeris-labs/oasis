@@ -97,36 +97,6 @@ void CoalescedFetcher::ExecuteMergedRead(size_t idx) {
 	file_handle.Read(m.buffer->ptr, m.size, m.offset);
 }
 
-namespace {
-
-class MergedReadTask : public AsyncTask {
-public:
-	MergedReadTask(CoalescedFetcher &fetcher, size_t idx) : fetcher(fetcher), idx(idx) {
-	}
-
-	void Execute() override {
-		fetcher.ExecuteMergedRead(idx);
-	}
-
-private:
-	CoalescedFetcher &fetcher;
-	size_t idx;
-};
-
-} // namespace
-
-vector<unique_ptr<AsyncTask>> CoalescedFetcher::BuildReadTasks() {
-	if (!fetched) {
-		throw InternalException("CoalescedFetcher::BuildReadTasks called before PrepareReads");
-	}
-	vector<unique_ptr<AsyncTask>> tasks;
-	tasks.reserve(merged.size());
-	for (size_t idx = 0; idx < merged.size(); idx++) {
-		tasks.push_back(make_uniq<MergedReadTask>(*this, idx));
-	}
-	return tasks;
-}
-
 CoalescedFetcher::RangeView CoalescedFetcher::Resolve(RangeHandle handle) const {
 	if (!fetched) {
 		throw InternalException("CoalescedFetcher::Resolve called before PrepareReads");
