@@ -21,8 +21,8 @@
 
 namespace duckdb {
 
-static constexpr idx_t REGEX_HW_MAX_STATES = 8;
-static constexpr idx_t REGEX_HW_MAX_CHARS = 16;
+static constexpr idx_t REGEX_HW_MAX_STATES = 12;
+static constexpr idx_t REGEX_HW_MAX_CHARS = 12;
 static constexpr size_t REGEX_CONFIG_BYTES = 64;
 static constexpr size_t REGEX_BEAT_BYTES = 64;
 
