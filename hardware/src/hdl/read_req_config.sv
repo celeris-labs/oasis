@@ -42,10 +42,10 @@ ConfigReadRegisterFile #(
 
 // -- Write ----------------------------------------------------------------------------------------
 for (genvar I = 0; I < NUM_STREAMS; I++) begin
-    ready_valid_i #(vaddress_t) vaddr ();
+    ready_valid_i #(vaddress_t) vaddr(clk, reset_synced);
     ConfigWriteFIFO #(I * NUM_WRITE_REGS + 0, MAX_NUM_ENQUEUED_BUFFERS, vaddress_t) inst_vaddr (clk, reset_synced, write_config, vaddr);
 
-    ready_valid_i #(size_t) len ();
+    ready_valid_i #(size_t) len(clk, reset_synced);
     ConfigWriteFIFO #(I * NUM_WRITE_REGS + 1, MAX_NUM_ENQUEUED_BUFFERS, size_t) inst_len (clk, reset_synced, write_config, len);
 
     `READY_COMBINE(vaddr, len, out[I])
