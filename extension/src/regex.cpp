@@ -1,4 +1,5 @@
 #include "regex.hpp"
+#include "regex_fpga_batch.hpp"
 #include "celeris/celeris_context.hpp"
 #include "nfa.hpp"
 
@@ -13,9 +14,10 @@
 #include "libstf/util.hpp"
 #include "oasis/oasis_context.hpp"
 
+#include <caliper/cali.h>
+
+#include <caliper/cali_macros.h>
 #include <cstring>
-#include <mutex>
-#include <output_handle.hpp>
 #include <unordered_map>
 #include <vector>
 
@@ -23,13 +25,10 @@ namespace duckdb {
 
 static constexpr idx_t REGEX_HW_MAX_STATES = 12;
 static constexpr idx_t REGEX_HW_MAX_CHARS = 12;
-static constexpr size_t REGEX_CONFIG_BYTES = 64;
-static constexpr size_t REGEX_BEAT_BYTES = 64;
-
-static_assert(sizeof(string_t) == 16, "duckdb string_t must match the FPGA wire format");
 
 static vector<uint8_t> CompileRegexBlob(const string &pattern) {
-	NFA c(pattern,REGEX_HW_MAX_STATES,REGEX_HW_MAX_CHARS);
+	CALI_CXX_MARK_FUNCTION;
+	NFA c(pattern, REGEX_HW_MAX_STATES, REGEX_HW_MAX_CHARS);
 	return c.dump_binary();
 }
 
@@ -59,121 +58,6 @@ struct RegexFpgaBindData : public FunctionData {
 	}
 };
 
-
-
-// rem_engines_async packs up to 512 one-bit match flags per 64-byte output
-// word. Bit i (LSB-first within each byte) corresponds to input string i.
-static bool ReadMatchBit(const uint8_t *output_bytes, size_t output_size, idx_t string_index) {
-	const size_t byte_offset = string_index / 8;
-	const size_t bit_in_byte = string_index % 8;
-	if (byte_offset >= output_size) {
-		return false;
-	}
-	return (output_bytes[byte_offset] >> bit_in_byte) & 1;
-}
-
-static vector<bool> RunFpgaRegexBatch(const vector<string_t>& inputs, const vector<uint8_t>& regex_blob) {
-	static std::mutex fpga_mutex;
-	std::lock_guard<std::mutex> lock(fpga_mutex);
-
-	const idx_t count = inputs.size();
-	if (count == 0) {
-		return {};
-	}
-
-	try {
-		celeris::CelerisContext &ctx = celeris::CelerisContext::get_ctx();
-	} catch (const std::exception& e) {
-		#ifdef EN_SIMULATION
-        std::cout << "simulation enabled\n";
-        std::unique_ptr<libstf::MemoryPool> mem_pool =
-            std::make_unique<libstf::SimpleMemoryPool>();
-        celeris::CelerisContext::init(std::move(mem_pool), libstf::BYTES_PER_FPGA_TRANSFER);
-		#else
-        std::unique_ptr<libstf::MemoryPool> mem_pool =
-            std::make_unique<libstf::HugePageMemoryPool>();
-        celeris::CelerisContext::init(std::move(mem_pool), 1 << 21);
-		#endif
-	}
-	celeris::CelerisContext &ctx = celeris::CelerisContext::get_ctx();
-	//oasis::OasisContext &ctx = oasis::OasisContext::ctx();
-	std::shared_ptr<celeris::RegexConfig> config = ctx.get_config<celeris::RegexConfig>();
-
-	libstf::stream_mask_t active_outputs(0);
-	active_outputs.set(0);
-	std::shared_ptr<libstf::OutputHandle> output_handle = ctx.get_output_buffer_manager().acquire_output_handle(active_outputs);
-
-	config->write_bat_count(static_cast<uint32_t>(count));
-	config->write_regex_blob(regex_blob);
-
-	uint64_t tight_nonlin_size = 0;
-	for (idx_t i = 0; i < count; i++) {
-		if (!inputs[i].IsInlined()) {
-			tight_nonlin_size += inputs[i].GetSize() + 1;
-		}
-	}
-
-	const uint64_t data_buffer_size = tight_nonlin_size == 0
-	                                      ? 0
-	                                      : ((tight_nonlin_size + REGEX_BEAT_BYTES - 1) / REGEX_BEAT_BYTES) * REGEX_BEAT_BYTES;
-
-	libstf::Status status;
-	std::shared_ptr<libstf::Buffer> struct_buffer = libstf::make_buffer(ctx.get_memory_pool(), count * sizeof(string_t), status);
-	if (!status.ok()) {
-		throw InternalException("Failed to allocate FPGA regex descriptor buffer");
-	}
-
-	std::shared_ptr<libstf::Buffer> raw_buffer;
-	if (data_buffer_size > 0) {
-		raw_buffer = libstf::make_buffer(ctx.get_memory_pool(), data_buffer_size, status);
-		if (!status.ok()) {
-			throw InternalException("Failed to allocate FPGA regex payload buffer");
-		}
-		std::memset(raw_buffer->ptr, 0, data_buffer_size);
-	}
-
-	uint64_t data_off = 0;
-	for (idx_t i = 0; i < count; i++) {
-		const string_t &input = inputs[i];
-		string_t *descriptor = reinterpret_cast<string_t *>(static_cast<char *>(struct_buffer->ptr) + i * sizeof(string_t));
-		std::memcpy(descriptor, &input, sizeof(string_t));
-		if (!input.IsInlined()) {
-			descriptor->SetPointer(reinterpret_cast<char *>(data_off));
-			char *dest = static_cast<char *>(raw_buffer->ptr) + data_off;
-			const idx_t length = input.GetSize();
-			std::memcpy(dest, input.GetData(), length);
-			dest[length] = '\0';
-			data_off += length + 1;
-		}
-	}
-
-	libstf::enqueue_stream_input(ctx.get_cthread(), ctx.get_tlb_manager(), struct_buffer->ptr, count * sizeof(string_t), 0, true);
-	if (data_buffer_size > 0) {
-		libstf::enqueue_stream_input(ctx.get_cthread(), ctx.get_tlb_manager(), raw_buffer->ptr, data_buffer_size, 1, true);
-	}
-
-	// Drain every acquired handle, first non-empty beat carries the match bitmap.
-	std::shared_ptr<libstf::Buffer> output_buffer;
-	while (output_handle->any_stream_has_more_output()) {
-		std::shared_ptr<libstf::Buffer> buf = output_handle->get_next_stream_output(0);
-		if (buf && output_buffer == nullptr) {
-			output_buffer = buf;
-		}
-	}
-
-	if (output_buffer == nullptr) {
-		return vector<bool>(count, false);
-	}
-
-	const uint8_t *output_bytes = reinterpret_cast<const uint8_t *>(output_buffer->ptr);
-	const size_t output_size = output_buffer->size;
-	vector<bool> results(count, false);
-	for (idx_t i = 0; i < count; i++) {
-		results[i] = ReadMatchBit(output_bytes, output_size, i);
-	}
-	return results;
-}
-
 static void WriteFpgaResults(Vector &result, idx_t count, const vector<idx_t> &result_rows, const vector<bool> &matches) {
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	bool *result_data = FlatVector::GetDataMutable<bool>(result);
@@ -184,6 +68,7 @@ static void WriteFpgaResults(Vector &result, idx_t count, const vector<idx_t> &r
 
 static void ExecuteFpgaBatch(ClientContext &context, Vector &strings, Vector &result, idx_t count,
                              const vector<uint8_t> &regex_blob) {
+	CALI_MARK_BEGIN("ExecuteFpgaBatch");
 
 	UnifiedVectorFormat str_format;
 	strings.ToUnifiedFormat(str_format);
@@ -209,15 +94,20 @@ static void ExecuteFpgaBatch(ClientContext &context, Vector &strings, Vector &re
 	}
 
 	if (inputs.empty()) {
+		CALI_MARK_END("ExecuteFpgaBatch");
 		return;
 	}
 
-	vector<bool> matches = RunFpgaRegexBatch(inputs, regex_blob);
+	celeris::CelerisContext &ctx = GetCelerisContext();
+	vector<bool> matches = RunFpgaRegexBatch(ctx, inputs, regex_blob);
 	WriteFpgaResults(result, count, result_rows, matches);
+	CALI_MARK_END("ExecuteFpgaBatch");
 }
 
 static void ExecuteFpgaBatchGrouped(ClientContext &context, Vector &strings, Vector &patterns, Vector &result,
                                     idx_t count) {
+
+	CALI_MARK_BEGIN("ExecuteFpgaBatchGrouped_withoutExecution");
 
 	UnifiedVectorFormat str_format;
 	UnifiedVectorFormat pat_format;
@@ -246,13 +136,15 @@ static void ExecuteFpgaBatchGrouped(ClientContext &context, Vector &strings, Vec
 		rows_by_pattern[pattern_key].push_back(row);
 	}
 
+	CALI_MARK_END("ExecuteFpgaBatchGrouped_withoutExecution");
+	celeris::CelerisContext &ctx = GetCelerisContext();
 	bool *result_data = FlatVector::GetDataMutable<bool>(result);
 	for (const auto &pattern_entry : rows_by_pattern) {
 		const string &pattern = pattern_entry.first;
 		const vector<idx_t> &rows = pattern_entry.second;
 		const vector<string_t> &inputs = inputs_by_pattern[pattern];
-		vector<uint8_t> regex_blob = CompileRegexBlob(pattern);
-		vector<bool> matches = RunFpgaRegexBatch(inputs, regex_blob);
+		vector<uint8_t> pattern_blob = CompileRegexBlob(pattern);
+		vector<bool> matches = RunFpgaRegexBatch(ctx, inputs, pattern_blob);
 		for (idx_t i = 0; i < rows.size(); i++) {
 			result_data[rows[i]] = matches[i];
 		}

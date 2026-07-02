@@ -4,6 +4,7 @@
 #include "oasis_profile.hpp"
 #include "oasis_scan.hpp"
 #include "regex.hpp"
+#include "regex_table.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_settings.hpp"
 #include "oasis_log_sink.hpp"
@@ -65,6 +66,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                              {LogicalType::VARCHAR, LogicalType::VARCHAR}, // string, pattern
 	                              LogicalType::BOOLEAN, RegexFpgaFunction, RegexFpgaBind);
 	loader.RegisterFunction(regex_function);
+
+	// FPGA regex table scan: filter rows of a catalog table by regex on one column.
+	TableFunction table_function("regex_fpga_scan",
+	                             {LogicalType::VARCHAR}, // table_name
+	                             RegexFpgaScanFunction,
+	                             RegexFpgaScanBind,
+	                             RegexFpgaScanInitGlobal,
+	                             RegexFpgaScanInitLocal);
+	table_function.named_parameters["regex_column"] = LogicalType::VARCHAR;
+	table_function.named_parameters["pattern"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(table_function);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {

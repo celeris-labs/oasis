@@ -1,0 +1,42 @@
+# name: test/sql/regex_fpga_scan.test
+# description: regex_fpga_scan table function correctness
+# group: [sql]
+
+require oasis
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE regex_scan_strings AS
+SELECT * FROM (
+	VALUES
+		('ab'),
+		('abb'),
+		('abbb'),
+		('a'),
+		('xab'),
+		('xyz'),
+		('0012'),
+		('abx')
+) t(s);
+
+# regex_fpga_scan must return the same rows as SIMILAR TO for a constant pattern
+query I nosort scan_filter
+SELECT count(*)::BIGINT
+FROM regex_fpga_scan('regex_scan_strings', regex_column := 's', pattern := 'ab*');
+----
+
+query I nosort scan_filter
+SELECT count(*)::BIGINT FROM regex_scan_strings WHERE s SIMILAR TO 'ab*';
+----
+
+query I
+SELECT count(*)::BIGINT
+FROM regex_fpga_scan('regex_scan_strings', regex_column := 's', pattern := 'ab*') scan(s)
+FULL OUTER JOIN (
+	SELECT s FROM regex_scan_strings WHERE s SIMILAR TO 'ab*'
+) expected USING (s)
+WHERE scan.s IS NULL OR expected.s IS NULL;
+----
+0
