@@ -26,6 +26,98 @@ idx_t RegexFpgaScanGlobalState::MaxThreads() const {
 	return 1;
 }
 
+static LogicalType GetScanColumnType(const DuckTableEntry &table, const ColumnIndex &column_index) {
+	if (column_index.IsRowIdColumn()) {
+		return LogicalType::ROW_TYPE;
+	}
+	if (column_index.HasType()) {
+		return column_index.GetScanType();
+	}
+	return table.GetColumns().GetColumn(column_index.ToLogical()).Type();
+}
+
+static void BuildScanColumns(const RegexFpgaScanBindData &bind_data, const TableFunctionInitInput &input,
+                             vector<ColumnIndex> &scan_column_indexes, vector<StorageIndex> &scan_storage_ids,
+                             vector<LogicalType> &scan_types, idx_t &scanned_regex_column_idx) {
+	scan_column_indexes.clear();
+	scan_storage_ids.clear();
+	scan_types.clear();
+	scanned_regex_column_idx = DConstants::INVALID_INDEX;
+
+	if (input.column_indexes.empty()) {
+		for (idx_t col_idx = 0; col_idx < bind_data.column_types.size(); col_idx++) {
+			scan_column_indexes.emplace_back(col_idx);
+			scan_storage_ids.push_back(bind_data.column_ids[col_idx]);
+			scan_types.push_back(bind_data.column_types[col_idx]);
+		}
+		scanned_regex_column_idx = bind_data.regex_column_idx;
+		return;
+	}
+
+	scan_column_indexes = input.column_indexes;
+	for (idx_t col_idx = 0; col_idx < scan_column_indexes.size(); col_idx++) {
+		if (scan_column_indexes[col_idx].GetPrimaryIndex() == bind_data.regex_column_idx) {
+			scanned_regex_column_idx = col_idx;
+			break;
+		}
+	}
+	if (scanned_regex_column_idx == DConstants::INVALID_INDEX) {
+		scanned_regex_column_idx = scan_column_indexes.size();
+		scan_column_indexes.emplace_back(bind_data.regex_column_idx);
+	}
+
+	for (const auto &column_index : scan_column_indexes) {
+		scan_storage_ids.push_back(bind_data.table.GetStorageIndex(column_index));
+		scan_types.push_back(GetScanColumnType(bind_data.table, column_index));
+	}
+}
+
+static vector<idx_t> BuildOutputColumnMap(const TableFunctionInitInput &input,
+                                          const vector<ColumnIndex> &scan_column_indexes) {
+	vector<idx_t> output_map;
+	if (input.column_indexes.empty() || input.projection_ids.empty()) {
+		output_map.reserve(scan_column_indexes.size());
+		for (idx_t col_idx = 0; col_idx < scan_column_indexes.size(); col_idx++) {
+			output_map.push_back(col_idx);
+		}
+		return output_map;
+	}
+
+	output_map.reserve(input.projection_ids.size());
+	for (const auto proj_id : input.projection_ids) {
+		const auto &column_index = input.column_indexes[proj_id];
+		idx_t scan_idx = DConstants::INVALID_INDEX;
+		for (idx_t col_idx = 0; col_idx < scan_column_indexes.size(); col_idx++) {
+			if (scan_column_indexes[col_idx] == column_index) {
+				scan_idx = col_idx;
+				break;
+			}
+		}
+		if (scan_idx == DConstants::INVALID_INDEX) {
+			throw InternalException("Projected column not found in regex_fpga_scan scan columns");
+		}
+		output_map.push_back(scan_idx);
+	}
+	return output_map;
+}
+
+static bool UsesColumnProjection(const vector<idx_t> &output_column_map, idx_t scanned_column_count) {
+	if (output_column_map.size() != scanned_column_count) {
+		return true;
+	}
+	for (idx_t col_idx = 0; col_idx < output_column_map.size(); col_idx++) {
+		if (output_column_map[col_idx] != col_idx) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static DataChunk &CurrentRetainedChunk(RegexFpgaScanLocalState &lstate) {
+	D_ASSERT(lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX);
+	return *lstate.retained_chunks[lstate.current_retained_chunk_idx];
+}
+
 unique_ptr<FunctionData> RegexFpgaScanBind(ClientContext &context, TableFunctionBindInput &input,
                                            vector<LogicalType> &return_types, vector<string> &names) {
 	string table_name = StringValue::Get(input.inputs[0]);
@@ -70,12 +162,17 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	auto &bind_data = input.bind_data->Cast<RegexFpgaScanBindData>();
 	auto lstate = make_uniq<RegexFpgaScanLocalState>();
 
+	vector<ColumnIndex> scan_column_indexes;
+	vector<StorageIndex> scan_storage_ids;
+	BuildScanColumns(bind_data, input, scan_column_indexes, scan_storage_ids, lstate->scanned_types,
+	                 lstate->scanned_regex_column_idx);
+	lstate->output_column_map = BuildOutputColumnMap(input, scan_column_indexes);
+
 	auto &transaction = DuckTransaction::Get(context.client, bind_data.table.catalog);
-	bind_data.table.GetStorage().InitializeScan(context.client, transaction, lstate->scan_state, bind_data.column_ids,
+	bind_data.table.GetStorage().InitializeScan(context.client, transaction, lstate->scan_state, scan_storage_ids,
 	                                            nullptr);
 
-	lstate->scan_chunk.Initialize(context.client, bind_data.column_types);
-	lstate->output_cache.Initialize(context.client, bind_data.column_types, REGEX_FPGA_MAX_ACCUM_COUNT);
+	lstate->output_cache.Initialize(context.client, lstate->scanned_types, REGEX_FPGA_MAX_ACCUM_COUNT);
 	lstate->batch_row_refs.reserve(REGEX_FPGA_MAX_ACCUM_COUNT);
 
 	auto &ctx = global_state->Cast<RegexFpgaScanGlobalState>().ctx;
@@ -96,32 +193,29 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	return std::move(lstate);
 }
 
-//ensures scan_chunk has unconsumed rows
-//returns true if new rows arrived, false if table is exhausted
-
-
+// Ensures the current retained scan chunk has unconsumed rows.
+// Returns true if rows are available, false if the table is exhausted.
 static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindData &bind_data,
                                RegexFpgaScanLocalState &lstate) {
 	CALI_CXX_MARK_FUNCTION;
-	if (lstate.chunk_offset < lstate.scan_chunk.size()) {
+	if (lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX &&
+	    lstate.chunk_offset < CurrentRetainedChunk(lstate).size()) {
 		return true;
 	}
 
-	lstate.scan_chunk.Reset();
+	auto retained = make_uniq<DataChunk>();
+	retained->Initialize(context, lstate.scanned_types);
 	CALI_MARK_BEGIN("table_scan");
 	auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
-	bind_data.table.GetStorage().Scan(transaction, lstate.scan_chunk, lstate.scan_state);
+	bind_data.table.GetStorage().Scan(transaction, *retained, lstate.scan_state);
 	CALI_MARK_END("table_scan");
-	lstate.chunk_offset = 0;
-	if (lstate.scan_chunk.size() == 0) {
+	if (retained->size() == 0) {
 		return false;
 	}
 
-	auto retained = make_uniq<DataChunk>();
-	retained->Initialize(context, bind_data.column_types);
-	retained->Append(lstate.scan_chunk);
 	lstate.retained_chunks.push_back(std::move(retained));
 	lstate.current_retained_chunk_idx = lstate.retained_chunks.size() - 1;
+	lstate.chunk_offset = 0;
 	return true;
 }
 
@@ -210,19 +304,19 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 	CALI_CXX_MARK_FUNCTION;
 	while (lstate.output_cache.size() == 0 && !lstate.finished) {
 		if (!TryRefillScanChunk(context, bind_data, lstate)) {
-		    //table exhausted
 			FlushFpgaBatch(bind_data, global_state, lstate);
 			lstate.finished = true;
 			return;
 		}
 
-		auto &regex_vector = lstate.scan_chunk.data[bind_data.regex_column_idx];
+		auto &current_chunk = CurrentRetainedChunk(lstate);
+		auto &regex_vector = current_chunk.data[lstate.scanned_regex_column_idx];
 		UnifiedVectorFormat regex_format;
 		regex_vector.ToUnifiedFormat(regex_format);
 		const string_t *regex_data = UnifiedVectorFormat::GetData<string_t>(regex_format);
 
 		CALI_MARK_BEGIN("stage_rows_for_fpga_batch");
-		while (lstate.chunk_offset < lstate.scan_chunk.size() && lstate.output_cache.size() == 0) {
+		while (lstate.chunk_offset < current_chunk.size() && lstate.output_cache.size() == 0) {
 			const idx_t row_idx = lstate.chunk_offset++;
 			const idx_t regex_idx = regex_format.sel->get_index(row_idx);
 			if (!regex_format.validity.RowIsValid(regex_idx)) {
@@ -265,7 +359,14 @@ static void EmitFromOutputCache(RegexFpgaScanLocalState &lstate, DataChunk &outp
 	const idx_t remaining = lstate.output_cache.size() - lstate.output_cache_read_idx;
 	const idx_t emit_count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
 	const idx_t end = lstate.output_cache_read_idx + emit_count;
-	output.Slice(lstate.output_cache, lstate.output_cache_read_idx, end);
+	if (UsesColumnProjection(lstate.output_column_map, lstate.scanned_types.size())) {
+		DataChunk row_slice;
+		row_slice.InitializeEmpty(lstate.scanned_types);
+		row_slice.Slice(lstate.output_cache, lstate.output_cache_read_idx, end);
+		output.ReferenceColumns(row_slice, lstate.output_column_map);
+	} else {
+		output.Slice(lstate.output_cache, lstate.output_cache_read_idx, end);
+	}
 	lstate.output_cache_read_idx = end;
 	if (lstate.output_cache_read_idx >= lstate.output_cache.size()) {
 		lstate.output_cache.Reset();
@@ -301,6 +402,16 @@ void RegexFpgaScanFunction(ClientContext &context, TableFunctionInput &data_p, D
 	}
 
 	output.SetChildCardinality(0);
+}
+
+void RegisterRegexFpgaScanFunction(ExtensionLoader &loader) {
+	TableFunction table_function("regex_fpga_scan", {LogicalType::VARCHAR}, RegexFpgaScanFunction, RegexFpgaScanBind,
+	                             RegexFpgaScanInitGlobal, RegexFpgaScanInitLocal);
+	table_function.named_parameters["regex_column"] = LogicalType::VARCHAR;
+	table_function.named_parameters["pattern"] = LogicalType::VARCHAR;
+	table_function.projection_pushdown = true;
+	table_function.filter_prune = true;
+	loader.RegisterFunction(table_function);
 }
 
 } // namespace duckdb

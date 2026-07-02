@@ -44,8 +44,11 @@ struct StagedRowRef {
 
 struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	TableScanState scan_state;
-	DataChunk scan_chunk;
 	DataChunk output_cache;
+
+	vector<LogicalType> scanned_types;
+	idx_t scanned_regex_column_idx = DConstants::INVALID_INDEX;
+	vector<idx_t> output_column_map;
 
 	vector<unique_ptr<DataChunk>> retained_chunks;
 	vector<StagedRowRef> batch_row_refs;

@@ -67,16 +67,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                              LogicalType::BOOLEAN, RegexFpgaFunction, RegexFpgaBind);
 	loader.RegisterFunction(regex_function);
 
-	// FPGA regex table scan: filter rows of a catalog table by regex on one column.
-	TableFunction table_function("regex_fpga_scan",
-	                             {LogicalType::VARCHAR}, // table_name
-	                             RegexFpgaScanFunction,
-	                             RegexFpgaScanBind,
-	                             RegexFpgaScanInitGlobal,
-	                             RegexFpgaScanInitLocal);
-	table_function.named_parameters["regex_column"] = LogicalType::VARCHAR;
-	table_function.named_parameters["pattern"] = LogicalType::VARCHAR;
-	loader.RegisterFunction(table_function);
+	RegisterRegexFpgaScanFunction(loader);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {
