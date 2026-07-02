@@ -1,19 +1,13 @@
 -- Bavaria Postcode Customer Address Report
--- For customers in GERMANY, count those whose mailing address follows the
--- domestic street-number format with a post code in the 8xxx range
--- (Bavaria and parts of Baden-Württemberg), grouped by market segment,
--- to support regional fulfillment planning.
+-- Regex on German customers only (customer_de), matching the FPGA query row set.
 SELECT
     c_mktsegment,
     count(*) AS bavaria_postcode_customers,
     sum(c_acctbal) AS total_acctbal
 FROM
-    customer,
-    nation
+    customer_de
 WHERE
-    c_nationkey = n_nationkey
-    AND n_name = 'GERMANY'
-    AND c_address SIMILAR TO '\\d+ \\w+\\.? 8\\d\\d\\d \\w+'
+    c_address SIMILAR TO '\d+ \w+\.? 8\d\d\d \w+'
 GROUP BY
     c_mktsegment
 ORDER BY

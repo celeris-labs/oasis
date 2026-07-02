@@ -37,12 +37,20 @@ struct RegexFpgaScanGlobalState : public GlobalTableFunctionState {
 	}
 };
 
+struct StagedRowRef {
+	idx_t chunk_idx;
+	idx_t row_idx;
+};
+
 struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	TableScanState scan_state;
 	DataChunk scan_chunk;
-	DataChunk accum_rows;
 	DataChunk output_cache;
 
+	vector<unique_ptr<DataChunk>> retained_chunks;
+	vector<StagedRowRef> batch_row_refs;
+
+	idx_t current_retained_chunk_idx = DConstants::INVALID_INDEX;
 	idx_t chunk_offset = 0;
 	idx_t output_cache_read_idx = 0;
 

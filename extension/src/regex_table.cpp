@@ -75,8 +75,8 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	                                            nullptr);
 
 	lstate->scan_chunk.Initialize(context.client, bind_data.column_types);
-	lstate->accum_rows.Initialize(context.client, bind_data.column_types, REGEX_FPGA_MAX_ACCUM_COUNT);
 	lstate->output_cache.Initialize(context.client, bind_data.column_types, REGEX_FPGA_MAX_ACCUM_COUNT);
+	lstate->batch_row_refs.reserve(REGEX_FPGA_MAX_ACCUM_COUNT);
 
 	auto &ctx = global_state->Cast<RegexFpgaScanGlobalState>().ctx;
 	libstf::Status status;
@@ -113,17 +113,59 @@ static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindDa
 	bind_data.table.GetStorage().Scan(transaction, lstate.scan_chunk, lstate.scan_state);
 	CALI_MARK_END("table_scan");
 	lstate.chunk_offset = 0;
-	return lstate.scan_chunk.size() > 0;
+	if (lstate.scan_chunk.size() == 0) {
+		return false;
+	}
+
+	auto retained = make_uniq<DataChunk>();
+	retained->Initialize(context, bind_data.column_types);
+	retained->Append(lstate.scan_chunk);
+	lstate.retained_chunks.push_back(std::move(retained));
+	lstate.current_retained_chunk_idx = lstate.retained_chunks.size() - 1;
+	return true;
 }
 
-static void ResetFpgaAccumulation(RegexFpgaScanLocalState &lstate) {
+static void ResetFpgaAccumulation(RegexFpgaScanLocalState &lstate, bool keep_current_retained_chunk = false) {
 	lstate.accum_count = 0;
 	lstate.raw_used = 0;
-	lstate.accum_rows.SetChildCardinality(0);
+	lstate.batch_row_refs.clear();
+
+	if (keep_current_retained_chunk && lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX) {
+		unique_ptr<DataChunk> kept = std::move(lstate.retained_chunks[lstate.current_retained_chunk_idx]);
+		lstate.retained_chunks.clear();
+		lstate.retained_chunks.push_back(std::move(kept));
+		lstate.current_retained_chunk_idx = 0;
+	} else {
+		lstate.retained_chunks.clear();
+		lstate.current_retained_chunk_idx = DConstants::INVALID_INDEX;
+	}
+}
+
+static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const std::vector<bool> &matches) {
+	vector<vector<idx_t>> matches_by_chunk(lstate.retained_chunks.size());
+	for (idx_t i = 0; i < lstate.accum_count; i++) {
+		if (!matches[i]) {
+			continue;
+		}
+		const auto &row_ref = lstate.batch_row_refs[i];
+		matches_by_chunk[row_ref.chunk_idx].push_back(row_ref.row_idx);
+	}
+
+	for (idx_t chunk_idx = 0; chunk_idx < matches_by_chunk.size(); chunk_idx++) {
+		auto &row_indices = matches_by_chunk[chunk_idx];
+		if (row_indices.empty()) {
+			continue;
+		}
+		SelectionVector match_sel(row_indices.size());
+		for (idx_t i = 0; i < row_indices.size(); i++) {
+			match_sel.set_index(i, row_indices[i]);
+		}
+		lstate.output_cache.Append(*lstate.retained_chunks[chunk_idx], match_sel, row_indices.size());
+	}
 }
 
 static void FlushFpgaBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaScanGlobalState &global_state,
-                           RegexFpgaScanLocalState &lstate) {
+                           RegexFpgaScanLocalState &lstate, bool keep_current_retained_chunk = false) {
 	CALI_CXX_MARK_FUNCTION;
 	if (lstate.accum_count == 0) {
 		return;
@@ -136,22 +178,21 @@ static void FlushFpgaBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 	CALI_MARK_END("fpga_regex_batch");
 
 	CALI_MARK_BEGIN("collect_matches");
-	SelectionVector sel(lstate.accum_count);
 	idx_t match_count = 0;
 	for (idx_t i = 0; i < lstate.accum_count; i++) {
 		if (matches[i]) {
-			sel.set_index(match_count++, i);
+			match_count++;
 		}
 	}
 	CALI_MARK_END("collect_matches");
 
 	if (match_count > 0) {
 		CALI_MARK_BEGIN("append_output_cache");
-		lstate.output_cache.Append(lstate.accum_rows, sel, match_count);
+		AppendMatchedRows(lstate, matches);
 		CALI_MARK_END("append_output_cache");
 	}
 
-	ResetFpgaAccumulation(lstate);
+	ResetFpgaAccumulation(lstate, keep_current_retained_chunk);
 }
 
 static bool WouldExceedFpgaBatch(const RegexFpgaScanLocalState &lstate, uint64_t next_raw_cost) {
@@ -192,10 +233,10 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			const uint64_t raw_cost = RegexFpgaNonInlinedRawCost(regex_value);
 			if (WouldExceedFpgaBatch(lstate, raw_cost)) {
 				CALI_MARK_END("stage_rows_for_fpga_batch");
-				FlushFpgaBatch(bind_data, global_state, lstate);
+				const bool keep_current_chunk = lstate.chunk_offset > 0;
+				FlushFpgaBatch(bind_data, global_state, lstate, keep_current_chunk);
+				lstate.chunk_offset--;
 				if (lstate.output_cache.size() > 0) {
-					// Re-process this row on the next accumulation batch.
-					lstate.chunk_offset--;
 					return;
 				}
 				CALI_MARK_BEGIN("stage_rows_for_fpga_batch");
@@ -206,9 +247,7 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			                    static_cast<char *>(lstate.raw_buffer ? lstate.raw_buffer->ptr : nullptr),
 			                    lstate.raw_used, regex_value);
 
-			SelectionVector sel(1);
-			sel.set_index(0, row_idx);
-			lstate.accum_rows.Append(lstate.scan_chunk, sel, 1);
+			lstate.batch_row_refs.push_back({lstate.current_retained_chunk_idx, row_idx});
 
 			lstate.raw_used += raw_cost;
 			lstate.accum_count++;
