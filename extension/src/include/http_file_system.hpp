@@ -25,12 +25,14 @@ public:
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override;
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
+	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 
 	void Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Read(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	void Seek(FileHandle &handle, idx_t location) override;
 	idx_t SeekPosition(FileHandle &handle) override;
 	int64_t GetFileSize(FileHandle &handle) override;
+	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
 	bool CanSeek() override {
 		return true;
 	}
@@ -41,6 +43,7 @@ public:
 private:
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst);
+	uint64_t ProbeContentLength(const string &resource_path);
 
 	DatabaseInstance &instance;
 	std::mutex init_mtx;
