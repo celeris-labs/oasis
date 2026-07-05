@@ -53,6 +53,7 @@ static OasisScanBindData *TryGetOasisBind(LogicalGet &get) {
 	}
 }
 
+//ToDo: Use DuckDBs estimated score
 static idx_t EstimateSizeScore(const OasisScanBindData &bind) {
 	return bind.metadata.groups.size();
 }
