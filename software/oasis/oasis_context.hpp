@@ -5,7 +5,7 @@
 #include "libstf/configuration.hpp"
 #include "libstf/memory_pool.hpp"
 #include "libstf/tlb_manager.hpp"
-#include "oasis/bypass_receiver.hpp"
+#include "oasis/bypass_stream_manager.hpp"
 #include "oasis/scheduler.hpp"
 
 #include <atomic>
@@ -33,7 +33,7 @@ public:
     std::shared_ptr<libstf::TLBManager> tlb_manager();
 
     Scheduler &scheduler();
-    BypassStreamReceiver &bypass_receiver();
+    BypassStreamManager &bypass_manager();
 
     /**
      * Allocates an output buffer the hardware decoder can write into. `size` is the exact decoded
@@ -49,7 +49,7 @@ public:
     void enqueue_output_buffer(libstf::stream_t stream, libstf::Buffer &buffer);
 
     /**
-     * Routes a hardware interrupt: Bypass-stream interrupts go to the BypassStreamReceiver, 
+     * Routes a hardware interrupt: Bypass-stream interrupts go to the BypassStreamManager,
      * everything else goes straight to the scheduler.
      */
     void handle_interrupt(int value);
@@ -114,7 +114,7 @@ private:
     bool             rdma_enabled_;
     libstf::stream_t bypass_stream_;
 
-    std::unique_ptr<BypassStreamReceiver> bypass_receiver_;
+    std::unique_ptr<BypassStreamManager> bypass_manager_;
     std::unique_ptr<Scheduler> scheduler_;
 
     // Cross-scan budget of cold-start yields still to be performed.

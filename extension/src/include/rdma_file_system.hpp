@@ -60,7 +60,6 @@ public:
 	}
 
 private:
-	static void EnqueueRead(uint64_t remote_offset, size_t size);
 	void RDMAReadRange(uint64_t remote_offset, void *dst, size_t size);
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void LoadDirectory(optional_ptr<FileOpener> opener);
@@ -68,9 +67,6 @@ private:
 
 	// Guards first-time initialization and the `directory` map.
 	std::mutex init_mtx;
-	// Serializes the (enqueue buffer, fire CSR) pair inside RDMAReadRange so the bypass receiver's
-	// FIFO stays aligned with the order of HW reads.
-	std::mutex mtx;
 	bool initialized = false;
 
 	std::unordered_map<std::string, RDMADirEntry> directory;

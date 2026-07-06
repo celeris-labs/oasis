@@ -6,11 +6,12 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/config.hpp"
-#include "oasis/configuration.hpp"
-#include "oasis/oasis_context.hpp"
+
 #include "oasis_context_cache_entry.hpp"
 
-#include "oasis/bypass_receiver.hpp"
+#include "oasis/configuration.hpp"
+#include "oasis/oasis_context.hpp"
+#include "oasis/bypass_stream_manager.hpp"
 
 #include <libstf/buffer.hpp>
 
@@ -19,7 +20,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -84,19 +84,6 @@ void RDMAFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	initialized = true;
 }
 
-void RDMAFileSystem::EnqueueRead(uint64_t remote_offset, size_t size) {
-	if (size == 0) {
-		return;
-	}
-	if (size > std::numeric_limits<uint32_t>::max()) {
-		throw IOException("RDMA read size %llu exceeds 32-bit limit", (unsigned long long)size);
-	}
-
-	auto &ctx = oasis::OasisContext::ctx();
-	auto rdma_cfg = ctx.config<oasis::ReadReqConfig>();
-	rdma_cfg->enqueue_read(ctx.rdmaBypassStream(), static_cast<uintptr_t>(remote_offset), size);
-}
-
 void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t size) {
 	if (size == 0) {
 		return;
@@ -104,21 +91,7 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 
 	// EnsureInitialized has already created the OasisContext singleton.
 	auto &ctx = oasis::OasisContext::ctx();
-
-	// Serialize buffer-enqueue + CSR fire so the buffers at the front of the bypass receiver's FIFO
-	// always match the read just triggered. The receiver is internally thread-safe and the handle's
-	// next() is sequenced correctly against interrupts, so we drop the lock before blocking.
-	std::shared_ptr<oasis::BypassStreamReceiver::Handle> handle;
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-
-		// Trigger the remote read first because it has long latency.
-		EnqueueRead(remote_offset, size);
-
-		// Pass the exact expected size so the receiver allocates a single right-sized buffer (or a
-		// few chunks for very large reads) with no speculative pre-allocation.
-		handle = ctx.bypass_receiver().acquire(size);
-	}
+	auto handle = ctx.bypass_manager().submit(static_cast<uintptr_t>(remote_offset), size);
 
 	// Drain all buffers for this transfer. For sizes that fit in a single FPGA buffer this is
 	// one iteration; for larger sizes the receiver chunks the transfer across multiple buffers, each

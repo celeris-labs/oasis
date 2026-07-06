@@ -20,7 +20,6 @@
 #include "filter_pushdown.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -171,30 +170,16 @@ static std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdm
 	return std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + cc.offset, cc.total_compressed_size);
 }
 
-static std::unique_ptr<oasis::SourceOperator> MakeHostSource(oasis::OasisContext &ctx,
-                                                             const CoalescedFetcher::RangeView &view) {
-	if ((reinterpret_cast<uintptr_t>(view.data()) % 64) == 0) {
-		// Zero-copy for aligned ranges: A libstf::Buffer that describes just this chunk's slice,
-		// owning a shared_ptr to the whole coalesced allocation so the backing bytes stay alive for
-		// the splinter's lifetime.
-		auto *slice_ptr = static_cast<uint8_t *>(view.buffer->ptr) + view.offset;
-		size_t capacity = view.buffer->capacity - view.offset;
-		// Custom deleter keeps the parent coalesced buffer alive and frees only the wrapper struct.
-		auto parent = view.buffer;
-		std::shared_ptr<libstf::Buffer> slice(new libstf::Buffer {slice_ptr, view.size, capacity},
-		                                      [parent](libstf::Buffer *b) { delete b; });
-		return std::make_unique<oasis::LocalSourceOperator>(std::move(slice));
-	}
-
-	// TODO: REMOVE unaligned slice: Copy it out into its own aligned buffer.
-	void *ptr;
-	auto status = ctx.memory_pool()->allocate(view.size, &ptr);
-	if (!status.ok()) {
-		throw IOException("Could not allocate input buffer: " + status.message());
-	}
-	std::memcpy(ptr, view.data(), view.size);
-	auto buffer = libstf::make_buffer(ctx.memory_pool(), ptr, view.size, view.size);
-	return std::make_unique<oasis::LocalSourceOperator>(std::move(buffer));
+static std::unique_ptr<oasis::SourceOperator> MakeHostSource(const CoalescedFetcher::RangeView &view) {
+	// Zero-copy: a libstf::Buffer that describes just this chunk's slice, owning a shared_ptr to the
+	// whole coalesced allocation so the backing bytes stay alive for the splinter's lifetime.
+	auto *slice_ptr = static_cast<uint8_t *>(view.buffer->ptr) + view.offset;
+	size_t capacity = view.buffer->capacity - view.offset;
+	// Custom deleter keeps the parent coalesced buffer alive and frees only the wrapper struct.
+	auto parent = view.buffer;
+	std::shared_ptr<libstf::Buffer> slice(new libstf::Buffer {slice_ptr, view.size, capacity},
+	                                      [parent](libstf::Buffer *b) { delete b; });
+	return std::make_unique<oasis::LocalSourceOperator>(std::move(slice));
 }
 
 // Every column chunk in a row group shares its row count. Take it from the first chunk.
@@ -261,12 +246,13 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		pending.fetcher->PrepareReads();
 
 		// Coalesced, synchronous read of every merged range on this worker thread.
-        // Note: Tried to also make this asynchronous which lead to significantly worse performance.
+		// Note: Tried to also make this asynchronous which lead to significantly worse performance.
 		for (size_t idx = 0; idx < pending.fetcher->num_reads(); idx++) {
 			pending.fetcher->ExecuteMergedRead(idx);
 		}
 		DUCKDB_LOG_DEBUG(context, "Coalesced %llu column chunk(s) into %llu read(s) (%llu bytes) for row group %llu.",
-		                 (unsigned long long)pending.fetcher->num_ranges(), (unsigned long long)pending.fetcher->num_reads(),
+		                 (unsigned long long)pending.fetcher->num_ranges(),
+		                 (unsigned long long)pending.fetcher->num_reads(),
 		                 (unsigned long long)pending.fetcher->bytes_fetched(), (unsigned long long)group);
 	}
 
@@ -282,7 +268,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		if (rdma) {
 			flow.push_back(MakeRDMASource(*rdma, cc));
 		} else {
-			flow.push_back(MakeHostSource(ctx, pending.fetcher->Resolve(pending.host_handles[k])));
+			flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 		}
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
 		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(type));
@@ -290,12 +276,18 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		splinter.streams.push_back(std::move(flow));
 	}
 
+	pending.hw_buffers.assign(gstate.projected_columns.size(), nullptr);
+	pending.hw_columns_remaining = pending.hw_slot.size();
+
+	// A group with no hardware columns (e.g. a string-only projection) has nothing to decode in
+	// hardware. Skip submission entirely and leave `result` default-constructed.
+	if (pending.hw_slot.empty()) {
+		return;
+	}
+
 	pending.result = ctx.scheduler().submit(std::move(splinter));
 	DUCKDB_LOG_DEBUG(context, "Submitted QuerySplinter (%llu flow(s)) for row group %llu.",
 	                 (unsigned long long)pending.hw_slot.size(), (unsigned long long)group);
-
-	pending.hw_buffers.assign(gstate.projected_columns.size(), nullptr);
-	pending.hw_columns_remaining = pending.hw_slot.size();
 }
 
 // Positions the shared CPU readers at the start of `group`'s CPU/string columns (page-header
@@ -310,6 +302,7 @@ static void InitGroupCPUColumns(OasisScanGlobalState &gstate, OasisScanLocalStat
 	}
 	const auto &row_group_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*lstate.scan_state->thrift_file_proto->getTransport());
+	trans.ClearPrefetch();
 	for (const auto &col : gstate.projected_columns) {
 		if (col.is_cpu) {
 			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);
@@ -323,8 +316,7 @@ static void InitGroupCPUColumns(OasisScanGlobalState &gstate, OasisScanLocalStat
 
 // Non-blocking: Drains the row group's result handle, placing each tagged column chunk into
 // pending.hw_buffers[tag]. Returns true if collecting the row group was successful.
-static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate, 
-                            const OasisScanBindData &bind,
+static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate, const OasisScanBindData &bind,
                             OasisScanLocalState::PendingGroup &pending) {
 	while (pending.hw_columns_remaining > 0) {
 		auto poll = pending.result.try_get_next_batch();
@@ -445,23 +437,18 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	auto &head = *lstate.inflight.front();
 
-	// Cold start: while the cross-scan yield budget has units left, consume one and yield by blocking
-	// on a group we have in flight. This frees the worker so other workers get the CPU to issue their
-	// own submissions, filling the hardware pipeline breadth-first before we start draining. The total
-	// number of yields is capped at the registered budget, so this is self-limiting and the scan
-	// always makes forward progress once the budget is spent. The group we block on may already be
-	// finished, in which case the async task returns immediately and the worker is rescheduled.
-	if (ctx.try_consume_yield()) {
-		out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
-		return LoadResult::BLOCKED;
-	}
+	// A group with no hardware columns (string-only projection) submitted no splinter , so skip
+    // straight to loading the string columns.
+	if (!head.hw_slot.empty()) {
+		if (ctx.try_consume_yield()) {
+			out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
+			return LoadResult::BLOCKED;
+		}
 
-	// Collect the head group's hardware buffers without blocking. If any column is still outstanding,
-	// hand the result handle to an async task and return BLOCKED so the worker is freed. DuckDB
-	// reschedules this scan once the handle becomes ready.
-	if (!TryCollectGroup(context, gstate, bind, head)) {
-		out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
-		return LoadResult::BLOCKED;
+		if (!TryCollectGroup(context, gstate, bind, head)) {
+			out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
+			return LoadResult::BLOCKED;
+		}
 	}
 
 	lstate.current_buffers = std::move(head.hw_buffers);

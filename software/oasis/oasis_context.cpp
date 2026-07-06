@@ -63,6 +63,12 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // ID of the RDMA bypass stream -- the last MemConfig stream, sitting past the decoders.
     bypass_stream_ = cc_config->num_decoders();
 
+    // TODO: Give each stream a distinct ctid so concurrent reads run on separate RDMA queue pairs.
+    auto read_req_config = config<ReadReqConfig>();
+    for (libstf::stream_t stream = 0; stream < read_req_config->num_streams(); ++stream) {
+        read_req_config->set_pid(stream, 0);
+    }
+
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());
     if (huge_pool) {
@@ -72,15 +78,15 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // Clear any stale buffers left enqueued in hardware from a previous run.
     mem_config_->flush_buffers();
 
-    // Receivers must exist before the scheduler so any interrupt has somewhere to route.
-    bypass_receiver_ = std::make_unique<BypassStreamReceiver>(
-        *this, bypass_stream_, mem_config_->maximum_num_enqueued_buffers());
+    // The bypass manager must exist before the scheduler so any interrupt has somewhere to route.
+    bypass_manager_ = std::make_unique<BypassStreamManager>(*this, bypass_stream_,
+        ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS, mem_config_->maximum_num_enqueued_buffers());
     scheduler_       = std::make_unique<Scheduler>(*this);
 }
 
 OasisContext::~OasisContext() {
     scheduler_.reset();
-    bypass_receiver_.reset();
+    bypass_manager_.reset();
 }
 
 void OasisContext::init(std::shared_ptr<libstf::MemoryPool> memory_pool) {
@@ -120,8 +126,8 @@ Scheduler &OasisContext::scheduler() {
     return *scheduler_;
 }
 
-BypassStreamReceiver &OasisContext::bypass_receiver() {
-    return *bypass_receiver_;
+BypassStreamManager &OasisContext::bypass_manager() {
+    return *bypass_manager_;
 }
 
 void OasisContext::initRDMA(const std::string &server, uint16_t port) {
@@ -179,7 +185,7 @@ void OasisContext::handle_interrupt(int value) {
                        1) != 0;
 
     if (rdma_enabled_ && stream_id == bypass_stream_) {
-        bypass_receiver_->handle_completion(bytes_written, last);
+        bypass_manager_->handle_completion(bytes_written, last);
     } else {
         scheduler_->handle_completion(stream_id, bytes_written, last);
     }
