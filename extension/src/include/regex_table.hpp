@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "libstf/buffer.hpp"
@@ -33,6 +34,9 @@ struct RegexFpgaScanBindData : public TableFunctionData {
 struct RegexFpgaScanGlobalState : public GlobalTableFunctionState {
 	idx_t MaxThreads() const override;
 	celeris::CelerisContext &ctx;
+	ParallelTableScanState parallel_scan;
+	idx_t max_threads = 1;
+
 	explicit RegexFpgaScanGlobalState(celeris::CelerisContext &ctx) : ctx(ctx) {
 	}
 };
@@ -56,6 +60,7 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	idx_t current_retained_chunk_idx = DConstants::INVALID_INDEX;
 	idx_t chunk_offset = 0;
 	idx_t output_cache_read_idx = 0;
+	idx_t rows_in_current_row_group = 0;
 
 	idx_t accum_count = 0;
 	uint64_t raw_used = 0;

@@ -23,7 +23,7 @@ static constexpr idx_t REGEX_HW_MAX_STATES = 12;
 static constexpr idx_t REGEX_HW_MAX_CHARS = 12;
 
 idx_t RegexFpgaScanGlobalState::MaxThreads() const {
-	return 1;
+	return max_threads;
 }
 
 static LogicalType GetScanColumnType(const DuckTableEntry &table, const ColumnIndex &column_index) {
@@ -154,12 +154,18 @@ unique_ptr<FunctionData> RegexFpgaScanBind(ClientContext &context, TableFunction
 
 unique_ptr<GlobalTableFunctionState> RegexFpgaScanInitGlobal(ClientContext &context,
                                                              TableFunctionInitInput &input) {
-	return make_uniq<RegexFpgaScanGlobalState>(GetCelerisContext());
+	auto &bind_data = input.bind_data->Cast<RegexFpgaScanBindData>();
+	auto gstate = make_uniq<RegexFpgaScanGlobalState>(GetCelerisContext());
+	auto &storage = bind_data.table.GetStorage();
+	storage.InitializeParallelScan(context, gstate->parallel_scan, input.column_indexes);
+	gstate->max_threads = storage.MaxThreads(context);
+	return std::move(gstate);
 }
 
 unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state) {
 	auto &bind_data = input.bind_data->Cast<RegexFpgaScanBindData>();
+	auto &gstate = global_state->Cast<RegexFpgaScanGlobalState>();
 	auto lstate = make_uniq<RegexFpgaScanLocalState>();
 
 	vector<ColumnIndex> scan_column_indexes;
@@ -168,14 +174,14 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	                 lstate->scanned_regex_column_idx);
 	lstate->output_column_map = BuildOutputColumnMap(input, scan_column_indexes);
 
-	auto &transaction = DuckTransaction::Get(context.client, bind_data.table.catalog);
-	bind_data.table.GetStorage().InitializeScan(context.client, transaction, lstate->scan_state, scan_storage_ids,
-	                                            nullptr);
-
+	auto &storage = bind_data.table.GetStorage();
+	lstate->scan_state.Initialize(scan_storage_ids, context.client, nullptr);
 	lstate->output_cache.Initialize(context.client, lstate->scanned_types, REGEX_FPGA_MAX_ACCUM_COUNT);
 	lstate->batch_row_refs.reserve(REGEX_FPGA_MAX_ACCUM_COUNT);
 
-	auto &ctx = global_state->Cast<RegexFpgaScanGlobalState>().ctx;
+	lstate->rows_in_current_row_group = storage.NextParallelScan(context.client, gstate.parallel_scan, lstate->scan_state);
+
+	auto &ctx = gstate.ctx;
 	libstf::Status status;
 	const uint64_t raw_capacity = align_to_64_multiple(REGEX_FPGA_RAW_BATCH_LIMIT);
 	lstate->struct_buffer =
@@ -193,30 +199,35 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	return std::move(lstate);
 }
 
-// Ensures the current retained scan chunk has unconsumed rows.
-// Returns true if rows are available, false if the table is exhausted.
 static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindData &bind_data,
-                               RegexFpgaScanLocalState &lstate) {
+                               RegexFpgaScanGlobalState &global_state, RegexFpgaScanLocalState &lstate) {
 	CALI_CXX_MARK_FUNCTION;
 	if (lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX &&
 	    lstate.chunk_offset < CurrentRetainedChunk(lstate).size()) {
 		return true;
 	}
 
-	auto retained = make_uniq<DataChunk>();
-	retained->Initialize(context, lstate.scanned_types);
-	CALI_MARK_BEGIN("table_scan");
+	auto &storage = bind_data.table.GetStorage();
 	auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
-	bind_data.table.GetStorage().Scan(transaction, *retained, lstate.scan_state);
-	CALI_MARK_END("table_scan");
-	if (retained->size() == 0) {
-		return false;
-	}
+	while (true) {
+		auto retained = make_uniq<DataChunk>();
+		retained->Initialize(context, lstate.scanned_types);
+		CALI_MARK_BEGIN("table_scan");
+		storage.Scan(transaction, *retained, lstate.scan_state);
+		CALI_MARK_END("table_scan");
+		lstate.chunk_offset = 0;
+		if (retained->size() > 0) {
+			lstate.retained_chunks.push_back(std::move(retained));
+			lstate.current_retained_chunk_idx = lstate.retained_chunks.size() - 1;
+			return true;
+		}
 
-	lstate.retained_chunks.push_back(std::move(retained));
-	lstate.current_retained_chunk_idx = lstate.retained_chunks.size() - 1;
-	lstate.chunk_offset = 0;
-	return true;
+		lstate.rows_in_current_row_group =
+		    storage.NextParallelScan(context, global_state.parallel_scan, lstate.scan_state);
+		if (lstate.rows_in_current_row_group == 0) {
+			return false;
+		}
+	}
 }
 
 static void ResetFpgaAccumulation(RegexFpgaScanLocalState &lstate, bool keep_current_retained_chunk = false) {
@@ -303,7 +314,7 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
                            RegexFpgaScanLocalState &lstate, ClientContext &context) {
 	CALI_CXX_MARK_FUNCTION;
 	while (lstate.output_cache.size() == 0 && !lstate.finished) {
-		if (!TryRefillScanChunk(context, bind_data, lstate)) {
+		if (!TryRefillScanChunk(context, bind_data, global_state, lstate)) {
 			FlushFpgaBatch(bind_data, global_state, lstate);
 			lstate.finished = true;
 			return;
