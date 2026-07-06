@@ -40,3 +40,59 @@ FULL OUTER JOIN (
 WHERE scan.s IS NULL OR expected.s IS NULL;
 ----
 0
+
+statement ok
+CREATE TABLE regex_scan_multi AS
+SELECT * FROM (
+	VALUES
+		('ab', 1, 10.5),
+		('abb', 2, 20.0),
+		('abbb', 1, 30.5),
+		('a', 3, 40.0),
+		('xab', 2, 50.5),
+		('xyz', 3, 60.0),
+		('0012', 1, 70.5),
+		('abx', 2, 80.0)
+) t(s, grp, val);
+
+# Late materialization: projected payload columns with aggregation
+query II nosort multi_agg_count
+SELECT grp, count(*)::BIGINT
+FROM regex_fpga_scan('regex_scan_multi', regex_column := 's', pattern := 'ab*')
+GROUP BY grp
+ORDER BY grp;
+----
+1	2
+2	1
+3	1
+
+query III nosort multi_agg_sum
+SELECT grp, count(*)::BIGINT, round(sum(val), 1)
+FROM regex_fpga_scan('regex_scan_multi', regex_column := 's', pattern := 'ab*')
+GROUP BY grp
+ORDER BY grp;
+----
+1	2	41.0
+2	1	20.0
+3	1	40.0
+
+# Full-row join against SIMILAR TO for multi-column table
+query I
+SELECT count(*)::BIGINT
+FROM regex_fpga_scan('regex_scan_multi', regex_column := 's', pattern := 'ab*') scan(s, grp, val)
+FULL OUTER JOIN (
+	SELECT s, grp, val FROM regex_scan_multi WHERE s SIMILAR TO 'ab*'
+) expected USING (s, grp, val)
+WHERE scan.s IS NULL OR expected.s IS NULL;
+----
+0
+
+# Regex-only projection uses legacy path (single VARCHAR column table)
+query I nosort scan_filter
+SELECT count(*)::BIGINT
+FROM regex_fpga_scan('regex_scan_strings', regex_column := 's', pattern := 'ab*') scan(s);
+----
+
+query I nosort scan_filter
+SELECT count(*)::BIGINT FROM regex_scan_strings WHERE s SIMILAR TO 'ab*';
+----

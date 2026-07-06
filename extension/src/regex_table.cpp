@@ -101,18 +101,6 @@ static vector<idx_t> BuildOutputColumnMap(const TableFunctionInitInput &input,
 	return output_map;
 }
 
-static bool UsesColumnProjection(const vector<idx_t> &output_column_map, idx_t scanned_column_count) {
-	if (output_column_map.size() != scanned_column_count) {
-		return true;
-	}
-	for (idx_t col_idx = 0; col_idx < output_column_map.size(); col_idx++) {
-		if (output_column_map[col_idx] != col_idx) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static DataChunk &CurrentRetainedChunk(RegexFpgaScanLocalState &lstate) {
 	D_ASSERT(lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX);
 	return *lstate.retained_chunks[lstate.current_retained_chunk_idx];
@@ -174,10 +162,16 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	                 lstate->scanned_regex_column_idx);
 	lstate->output_column_map = BuildOutputColumnMap(input, scan_column_indexes);
 
+	lstate->output_types.reserve(lstate->output_column_map.size());
+	for (const auto scan_idx : lstate->output_column_map) {
+		lstate->output_types.push_back(lstate->scanned_types[scan_idx]);
+	}
+
 	auto &storage = bind_data.table.GetStorage();
 	lstate->scan_state.Initialize(scan_storage_ids, context.client, nullptr);
-	lstate->output_cache.Initialize(context.client, lstate->scanned_types, REGEX_FPGA_MAX_ACCUM_COUNT);
+	lstate->output_cache.Initialize(context.client, lstate->output_types, REGEX_FPGA_MAX_ACCUM_COUNT);
 	lstate->batch_row_refs.reserve(REGEX_FPGA_MAX_ACCUM_COUNT);
+	lstate->match_sel_scratch.Initialize(STANDARD_VECTOR_SIZE);
 
 	lstate->rows_in_current_row_group = storage.NextParallelScan(context.client, gstate.parallel_scan, lstate->scan_state);
 
@@ -247,7 +241,11 @@ static void ResetFpgaAccumulation(RegexFpgaScanLocalState &lstate, bool keep_cur
 }
 
 static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const std::vector<bool> &matches) {
-	vector<vector<idx_t>> matches_by_chunk(lstate.retained_chunks.size());
+	auto &matches_by_chunk = lstate.match_indices_scratch;
+	matches_by_chunk.resize(lstate.retained_chunks.size());
+	for (auto &row_indices : matches_by_chunk) {
+		row_indices.clear();
+	}
 	for (idx_t i = 0; i < lstate.accum_count; i++) {
 		if (!matches[i]) {
 			continue;
@@ -256,16 +254,20 @@ static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const std::vector
 		matches_by_chunk[row_ref.chunk_idx].push_back(row_ref.row_idx);
 	}
 
+	// Project each retained chunk down to the output columns (zero-copy view) before copying the matched
+	// rows into the cache, so match-only columns (e.g. the regex column) are never physically copied.
+	DataChunk projected;
+	projected.InitializeEmpty(lstate.output_types);
 	for (idx_t chunk_idx = 0; chunk_idx < matches_by_chunk.size(); chunk_idx++) {
 		auto &row_indices = matches_by_chunk[chunk_idx];
 		if (row_indices.empty()) {
 			continue;
 		}
-		SelectionVector match_sel(row_indices.size());
 		for (idx_t i = 0; i < row_indices.size(); i++) {
-			match_sel.set_index(i, row_indices[i]);
+			lstate.match_sel_scratch.set_index(i, row_indices[i]);
 		}
-		lstate.output_cache.Append(*lstate.retained_chunks[chunk_idx], match_sel, row_indices.size());
+		projected.ReferenceColumns(*lstate.retained_chunks[chunk_idx], lstate.output_column_map);
+		lstate.output_cache.Append(projected, lstate.match_sel_scratch, row_indices.size());
 	}
 }
 
@@ -282,20 +284,9 @@ static void FlushFpgaBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 	                                     bind_data.regex_blob);
 	CALI_MARK_END("fpga_regex_batch");
 
-	CALI_MARK_BEGIN("collect_matches");
-	idx_t match_count = 0;
-	for (idx_t i = 0; i < lstate.accum_count; i++) {
-		if (matches[i]) {
-			match_count++;
-		}
-	}
-	CALI_MARK_END("collect_matches");
-
-	if (match_count > 0) {
-		CALI_MARK_BEGIN("append_output_cache");
-		AppendMatchedRows(lstate, matches);
-		CALI_MARK_END("append_output_cache");
-	}
+	CALI_MARK_BEGIN("append_output_cache");
+	AppendMatchedRows(lstate, matches);
+	CALI_MARK_END("append_output_cache");
 
 	ResetFpgaAccumulation(lstate, keep_current_retained_chunk);
 }
@@ -370,14 +361,8 @@ static void EmitFromOutputCache(RegexFpgaScanLocalState &lstate, DataChunk &outp
 	const idx_t remaining = lstate.output_cache.size() - lstate.output_cache_read_idx;
 	const idx_t emit_count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
 	const idx_t end = lstate.output_cache_read_idx + emit_count;
-	if (UsesColumnProjection(lstate.output_column_map, lstate.scanned_types.size())) {
-		DataChunk row_slice;
-		row_slice.InitializeEmpty(lstate.scanned_types);
-		row_slice.Slice(lstate.output_cache, lstate.output_cache_read_idx, end);
-		output.ReferenceColumns(row_slice, lstate.output_column_map);
-	} else {
-		output.Slice(lstate.output_cache, lstate.output_cache_read_idx, end);
-	}
+	// output_cache is already materialized in output-projection layout, so emit it directly.
+	output.Slice(lstate.output_cache, lstate.output_cache_read_idx, end);
 	lstate.output_cache_read_idx = end;
 	if (lstate.output_cache_read_idx >= lstate.output_cache.size()) {
 		lstate.output_cache.Reset();

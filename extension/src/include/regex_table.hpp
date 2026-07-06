@@ -3,6 +3,7 @@
 #include "celeris/celeris_context.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -51,11 +52,16 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	DataChunk output_cache;
 
 	vector<LogicalType> scanned_types;
+	vector<LogicalType> output_types;
 	idx_t scanned_regex_column_idx = DConstants::INVALID_INDEX;
 	vector<idx_t> output_column_map;
 
 	vector<unique_ptr<DataChunk>> retained_chunks;
 	vector<StagedRowRef> batch_row_refs;
+
+	// Reusable scratch for compacting matched rows, sized once to avoid per-flush allocation.
+	vector<vector<idx_t>> match_indices_scratch;
+	SelectionVector match_sel_scratch;
 
 	idx_t current_retained_chunk_idx = DConstants::INVALID_INDEX;
 	idx_t chunk_offset = 0;
