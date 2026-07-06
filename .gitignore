@@ -1,5 +1,9 @@
 .claude
 build*
+extension/CMakeFiles/**
+extension/CMakeCache.txt 
+CMakeFiles/**
+CMakeCache.txt
 
 # Generated unit test files
 hardware/unit-tests/diff/**

@@ -10,8 +10,7 @@
 #include <mutex>
 #include <output_handle.hpp>
 
-#include <caliper/cali.h>
-#include <caliper/cali_macros.h>
+#include "oasis_profiling.hpp"
 
 namespace duckdb {
 

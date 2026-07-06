@@ -13,9 +13,7 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "libstf/buffer.hpp"
 #include "nfa.hpp"
-
-#include <caliper/cali.h>
-#include <caliper/cali_macros.h>
+#include "oasis_profiling.hpp"
 
 namespace duckdb {
 
@@ -75,9 +73,20 @@ static void BuildScanColumns(const RegexFpgaScanBindData &bind_data, const Table
 static vector<idx_t> BuildOutputColumnMap(const TableFunctionInitInput &input,
                                           const vector<ColumnIndex> &scan_column_indexes) {
 	vector<idx_t> output_map;
-	if (input.column_indexes.empty() || input.projection_ids.empty()) {
+	if (input.column_indexes.empty()) {
+		// No projection pushdown: BuildScanColumns scanned every table column, so emit them all.
 		output_map.reserve(scan_column_indexes.size());
 		for (idx_t col_idx = 0; col_idx < scan_column_indexes.size(); col_idx++) {
+			output_map.push_back(col_idx);
+		}
+		return output_map;
+	}
+	if (input.projection_ids.empty()) {
+		// Projection pushdown without reordering: emit exactly the requested columns. This excludes
+		// the regex column that BuildScanColumns may have appended purely for matching, which would
+		// otherwise leave output_cache one column wider than the output chunk (e.g. count(*)).
+		output_map.reserve(input.column_indexes.size());
+		for (idx_t col_idx = 0; col_idx < input.column_indexes.size(); col_idx++) {
 			output_map.push_back(col_idx);
 		}
 		return output_map;
@@ -168,7 +177,8 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	}
 
 	auto &storage = bind_data.table.GetStorage();
-	lstate->scan_state.Initialize(scan_storage_ids, context.client, nullptr);
+	// Push scan filters (e.g. c_nationkey = 7) into the storage scan so the FPGA only sees surviving rows.
+	lstate->scan_state.Initialize(scan_storage_ids, context.client, input.filters.get());
 	lstate->output_cache.Initialize(context.client, lstate->output_types, REGEX_FPGA_MAX_ACCUM_COUNT);
 	lstate->batch_row_refs.reserve(REGEX_FPGA_MAX_ACCUM_COUNT);
 	lstate->match_sel_scratch.Initialize(STANDARD_VECTOR_SIZE);
@@ -406,6 +416,7 @@ void RegisterRegexFpgaScanFunction(ExtensionLoader &loader) {
 	table_function.named_parameters["regex_column"] = LogicalType::VARCHAR;
 	table_function.named_parameters["pattern"] = LogicalType::VARCHAR;
 	table_function.projection_pushdown = true;
+	table_function.filter_pushdown = true;
 	table_function.filter_prune = true;
 	loader.RegisterFunction(table_function);
 }

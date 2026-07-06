@@ -1,13 +1,15 @@
 -- Bavaria Postcode Customer Address Report
--- Regex on German customers only (customer_de), matching the FPGA query row set.
+-- Regex over the full customer table, restricted to German customers (c_nationkey = 7), matching
+-- the FPGA query row set.
 SELECT
     c_mktsegment,
     count(*) AS bavaria_postcode_customers,
     sum(c_acctbal) AS total_acctbal
 FROM
-    customer_de
+    customer
 WHERE
-    c_address SIMILAR TO '\d+ \w+\.? 8\d\d\d \w+'
+    c_nationkey = 7
+    AND c_address SIMILAR TO '\d+ \w+\.? 8\d\d\d \w+'
 GROUP BY
     c_mktsegment
 ORDER BY

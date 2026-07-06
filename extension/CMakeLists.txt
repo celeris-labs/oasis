@@ -91,6 +91,14 @@ target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE PRIVATE ${CELERIS_S
 add_dependencies(${EXTENSION_NAME} oasis_fregex_ext)
 add_dependencies(${LOADABLE_EXTENSION_NAME} oasis_fregex_ext)
 
+# Caliper region profiling is not thread-safe under DuckDB's parallel pipeline; keep it off by
+# default and enable it only for single-threaded profiling builds.
+option(OASIS_ENABLE_PROFILING "Enable Caliper region profiling (single-threaded use only)" OFF)
+if (OASIS_ENABLE_PROFILING)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE OASIS_ENABLE_PROFILING)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE OASIS_ENABLE_PROFILING)
+endif ()
+
 set_target_properties(${EXTENSION_NAME} PROPERTIES BUILD_RPATH "${FREGEX_BUILD_DIR}")
 set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES BUILD_RPATH "${FREGEX_BUILD_DIR}")
 

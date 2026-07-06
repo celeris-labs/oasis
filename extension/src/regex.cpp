@@ -13,10 +13,8 @@
 #include "libstf/buffer.hpp"
 #include "libstf/util.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis_profiling.hpp"
 
-#include <caliper/cali.h>
-
-#include <caliper/cali_macros.h>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
