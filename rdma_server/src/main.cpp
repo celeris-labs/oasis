@@ -31,7 +31,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <ifaddrs.h>
 #include <iomanip>
 #include <iostream>
 #include <netinet/in.h>
@@ -100,31 +99,6 @@ template <typename T> void write_header_value(uint8_t *&ptr, T value) {
 }
 
 /**
- * Returns a newline-separated list of non-loopback IPv4 addresses with their interface names.
- */
-std::string local_ipv4_addresses() {
-    std::string     result;
-    struct ifaddrs *ifa_list;
-    if (getifaddrs(&ifa_list) != 0)
-        return result;
-    for (auto *ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
-            continue;
-        auto *sin = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
-        if (sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK))
-            continue;
-        char buf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
-        result += "\n  ";
-        result += ifa->ifa_name;
-        result += ": ";
-        result += buf;
-    }
-    freeifaddrs(ifa_list);
-    return result;
-}
-
-/**
  * Expands a mix of .parquet files and directories into a flat, sorted list of .parquet paths.
  */
 std::vector<std::string> resolve_inputs(const std::vector<std::string> &args) {
@@ -150,13 +124,14 @@ std::vector<std::string> resolve_inputs(const std::vector<std::string> &args) {
  * Holds every libibverbs object that makes up the server's RDMA endpoint.
  */
 struct RDMAEndpoint {
-    struct ibv_context *context    = nullptr;
-    struct ibv_pd      *pd         = nullptr;
-    struct ibv_cq      *cq         = nullptr;
-    struct ibv_qp      *qp         = nullptr;
-    struct ibv_mr      *mr         = nullptr;
-    uint8_t            *mem        = nullptr;
-    size_t              mem_size   = 0;
+    struct ibv_context     *context  = nullptr;
+    struct ibv_pd          *pd       = nullptr;
+    struct ibv_cq          *cq       = nullptr;
+    struct ibv_qp          *qp       = nullptr;
+    struct ibv_mr          *mr       = nullptr;
+    uint8_t                *mem      = nullptr;
+    size_t                  mem_size = 0;
+    struct ibv_device_attr  dev_attr = {}; // NIC limits, queried once; used to clamp QP caps.
 
     ~RDMAEndpoint() {
         if (qp)
@@ -175,10 +150,33 @@ struct RDMAEndpoint {
 };
 
 /**
- * Opens the NIC, allocates and registers a region_size buffer for remote reads, and
- * creates an RC queue pair left in the INIT state. Returns false on any failure.
+ * Moves the queue pair to the INIT state, ready to accept a fresh RTR/RTS transition.
+ * Used both at first setup and when re-arming the QP for a reconnecting client.
  */
-bool setup_endpoint(RDMAEndpoint &ep, uint64_t region_size, int dev_idx, int ib_port) {
+bool move_qp_to_init(struct ibv_qp *qp, int ib_port) {
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state        = IBV_QPS_INIT;
+    attr.port_num        = static_cast<uint8_t>(ib_port);
+    attr.pkey_index      = 0;
+    attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+    // ibv_modify_qp returns the error code directly and does not reliably set errno, so report the
+    // return value -- strerror(errno) here would print a stale value from an unrelated syscall.
+    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    if (ret) {
+        std::cerr << "Could not move QP to INIT: " << strerror(ret) << "\n";
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Opens the NIC, caches its device limits, and allocates and registers a region_size buffer for
+ * remote reads. Leaves ep.qp null: a fresh QP is created per client by arm_qp(), which avoids the
+ * fragile reset-and-reuse path that behaves inconsistently across mlx5 and bnxt_re. Returns false
+ * on any failure.
+ */
+bool setup_endpoint(RDMAEndpoint &ep, uint64_t region_size, int dev_idx) {
     int                num_devices = 0;
     struct ibv_device **dev_list   = ibv_get_device_list(&num_devices);
     if (!dev_list || num_devices == 0) {
@@ -228,34 +226,44 @@ bool setup_endpoint(RDMAEndpoint &ep, uint64_t region_size, int dev_idx, int ib_
         return false;
     }
 
+    // Cache the NIC's limits so arm_qp() can clamp QP capabilities to what the device supports.
+    if (ibv_query_device(ep.context, &ep.dev_attr) != 0) {
+        std::cerr << "Could not query device attributes: " << strerror(errno) << "\n";
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Creates a fresh RC queue pair on the endpoint and leaves it in the INIT state, ready for an
+ * RTR/RTS transition. Called once per client so each connection starts from a clean QP -- more
+ * portable across NICs than resetting and reusing one QP. ep.qp must be null on entry (any prior
+ * QP destroyed first). Caps are clamped to the cached device limits.
+ *
+ * This QP is a passive RDMA-read responder -- the FPGA is the requester and we never post send/recv
+ * work requests -- so it needs only token WQE depth. Broadcom (bnxt_re) has a tighter per-QP WQE
+ * budget than Mellanox (mlx5): the 2048/16 caps that worked on mlx5 fail here (EINVAL on
+ * max_sge > 13, then ENOSPC as WR x SGE overruns the budget).
+ */
+bool arm_qp(RDMAEndpoint &ep, int ib_port) {
     struct ibv_qp_init_attr qp_init_attr;
     memset(&qp_init_attr, 0, sizeof(qp_init_attr));
     qp_init_attr.send_cq          = ep.cq;
     qp_init_attr.recv_cq          = ep.cq;
     qp_init_attr.qp_type          = IBV_QPT_RC;
-    qp_init_attr.cap.max_send_wr  = 2048;
-    qp_init_attr.cap.max_recv_wr  = 2048;
-    qp_init_attr.cap.max_send_sge = 16;
-    qp_init_attr.cap.max_recv_sge = 16;
+    qp_init_attr.cap.max_send_wr  = std::min(16, ep.dev_attr.max_qp_wr);
+    qp_init_attr.cap.max_recv_wr  = std::min(16, ep.dev_attr.max_qp_wr);
+    qp_init_attr.cap.max_send_sge = std::min(1, ep.dev_attr.max_sge);
+    qp_init_attr.cap.max_recv_sge = std::min(1, ep.dev_attr.max_sge);
 
     ep.qp = ibv_create_qp(ep.pd, &qp_init_attr);
     if (!ep.qp) {
-        std::cerr << "Could not create queue pair\n";
+        std::cerr << "Could not create queue pair: " << strerror(errno) << "\n";
         return false;
     }
 
-    struct ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state        = IBV_QPS_INIT;
-    attr.port_num        = static_cast<uint8_t>(ib_port);
-    attr.pkey_index      = 0;
-    attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
-    if (ibv_modify_qp(ep.qp, &attr,
-                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
-        std::cerr << "Could not move QP to INIT: " << strerror(errno) << "\n";
-        return false;
-    }
-    return true;
+    return move_qp_to_init(ep.qp, ib_port);
 }
 
 /**
@@ -322,10 +330,11 @@ bool connect_qp(RDMAEndpoint &ep, const ibvQ &remote, uint32_t psn, int ib_port,
     attr.ah_attr.grh.hop_limit     = 4;
     attr.ah_attr.grh.traffic_class = 0;
 
-    if (ibv_modify_qp(ep.qp, &attr,
-                      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-                          IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
-        std::cerr << "Could not move QP to RTR: " << strerror(errno) << "\n";
+    int ret = ibv_modify_qp(ep.qp, &attr,
+                            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                                IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+    if (ret) {
+        std::cerr << "Could not move QP to RTR: " << strerror(ret) << "\n";
         return false;
     }
 
@@ -337,25 +346,22 @@ bool connect_qp(RDMAEndpoint &ep, const ibvQ &remote, uint32_t psn, int ib_port,
     attr.rnr_retry     = 1;
     attr.max_rd_atomic = 16;
     attr.path_mig_state = IBV_MIG_REARM;
-    if (ibv_modify_qp(ep.qp, &attr,
-                      IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
-                          IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_PATH_MIG_STATE)) {
-        std::cerr << "Could not move QP to RTS: " << strerror(errno) << "\n";
+    ret = ibv_modify_qp(ep.qp, &attr,
+                        IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                            IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_PATH_MIG_STATE);
+    if (ret) {
+        std::cerr << "Could not move QP to RTS: " << strerror(ret) << "\n";
         return false;
     }
     return true;
 }
 
 /**
- * Accepts a single TCP connection on port and performs the Coyote-compatible QP
- * exchange: read the client's ibvQ, then send ours. Returns the accepted socket fd
- * (kept open for the lifetime of the server) or -1 on failure.
- *
- * The client's PSN is adopted as the shared PSN, so local.psn
- * is filled from the client's QP after the read and before the reply is sent. On
- * success remote_out holds the client's queue metadata.
+ * Creates, binds, and listens on a TCP socket for QP-exchange connections. Kept open for
+ * the server's lifetime so successive clients can reconnect. Returns the listening socket
+ * fd or -1 on failure.
  */
-int exchange_qp(uint16_t port, ibvQ &local, ibvQ &remote_out) {
+int create_listen_socket(uint16_t port) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
         std::cerr << "Could not create socket\n";
@@ -379,11 +385,23 @@ int exchange_qp(uint16_t port, ibvQ &local, ibvQ &remote_out) {
         close(sockfd);
         return -1;
     }
+    return sockfd;
+}
 
-    int connfd = accept(sockfd, nullptr, nullptr);
-    close(sockfd); // one client only; done listening
+/**
+ * Accepts one client on listenfd and performs the Coyote-compatible QP exchange: read the
+ * client's ibvQ, then send ours. Returns the accepted socket fd (kept open until the
+ * client tears the connection down) or -1 on failure.
+ *
+ * The client's PSN is adopted as the shared PSN, so local.psn is filled from the client's
+ * QP after the read and before the reply is sent. On success remote_out holds the client's
+ * queue metadata.
+ */
+int accept_and_exchange(int listenfd, ibvQ &local, ibvQ &remote_out) {
+    int connfd = accept(listenfd, nullptr, nullptr);
     if (connfd < 0) {
-        std::cerr << "Failed to accept connection\n";
+        if (errno != EINTR) // EINTR is the shutdown signal interrupting accept()
+            std::cerr << "Failed to accept connection\n";
         return -1;
     }
 
@@ -400,6 +418,22 @@ int exchange_qp(uint16_t port, ibvQ &local, ibvQ &remote_out) {
         return -1;
     }
     return connfd;
+}
+
+/**
+ * Blocks until the client tears down the TCP connection (read returns 0) or the server is
+ * asked to stop. RDMA reads are served by the NIC with no CPU involvement, so the socket
+ * carries no post-exchange traffic; any bytes that do arrive are ignored.
+ */
+void wait_for_disconnect(int connfd) {
+    char buf[64];
+    while (!g_stop.load()) {
+        ssize_t n = read(connfd, buf, sizeof(buf));
+        if (n == 0)                  // client closed the connection
+            return;
+        if (n < 0 && errno != EINTR) // real error (EINTR just means a signal woke us)
+            return;
+    }
 }
 
 } // namespace
@@ -508,7 +542,7 @@ int main(int argc, char *argv[]) {
 
     // Bring up the Mellanox NIC and register the region for remote reads.
     RDMAEndpoint ep;
-    if (!setup_endpoint(ep, region_size, dev_idx, ib_port)) {
+    if (!setup_endpoint(ep, region_size, dev_idx)) {
         return EXIT_FAILURE;
     }
 
@@ -550,44 +584,68 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    std::cout << "Waiting for connection from client on port " << port << ":" << local_ipv4_addresses() << std::endl;
-
-    // Exchange QP metadata with the client. The client sends its QP first; we reply
-    // with ours, advertising the region's rkey and address for remote reads.
+    // The QP metadata we advertise. rkey, vaddr and size are stable across clients; qpn is refreshed
+    // per connection (each client gets a fresh QP, see arm_qp) and psn is adopted from the client
+    // during the exchange. Both are filled in inside the serve loop below.
     ibvQ local;
     local.ip_addr = local_ip;
-    local.qpn     = ep.qp->qp_num;
     local.rkey    = ep.mr->rkey;
     local.vaddr   = ep.mem;
     local.size    = region_size;
     // Coyote encodes the GID as the RoCE IP repeated four times (see ibvQ::gidToUint).
     snprintf(local.gid, sizeof(local.gid), "%08x%08x%08x%08x", local_ip, local_ip, local_ip, local_ip);
 
-    ibvQ remote;
-    memset(&remote, 0, sizeof(remote));
-    int connfd = exchange_qp(port, local, remote);
-    if (connfd < 0) {
+    int listenfd = create_listen_socket(port);
+    if (listenfd < 0) {
         return EXIT_FAILURE;
     }
 
-    remote.print("Remote");
-    local.print("Local");
+    // Install the handlers via sigaction without SA_RESTART so that a signal interrupts a
+    // blocking accept()/read() with EINTR instead of silently restarting it; that lets the
+    // loop below observe g_stop and shut down. std::signal would set SA_RESTART on Linux.
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
-    // Connect our QP to the client's and move it to RTS so the NIC can answer reads.
-    if (!connect_qp(ep, remote, local.psn, ib_port, gid_idx)) {
-        close(connfd);
-        return EXIT_FAILURE;
-    }
-
-    std::cout << "Now serving... Press Ctrl+C to exit." << std::endl;
-
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
+    // Serve one client at a time. Each iteration creates a fresh QP (destroyed at the end of the
+    // iteration) so the next client starts from a clean QP -- more portable than resetting and
+    // reusing one QP, which behaves inconsistently across mlx5 and bnxt_re.
     while (!g_stop.load()) {
-        pause();
+        std::cout << "Waiting for connection from client on port " << port << "... Press Ctrl+C to exit." << std::endl;
+
+        // Fresh QP for this client; advertise its (new) QP number in the exchange.
+        if (!arm_qp(ep, ib_port)) {
+            break;
+        }
+        local.qpn = ep.qp->qp_num;
+
+        ibvQ remote;
+        memset(&remote, 0, sizeof(remote));
+        int connfd = accept_and_exchange(listenfd, local, remote);
+        if (connfd >= 0) {
+            remote.print("Remote");
+            local.print("Local");
+
+            // Connect our QP to the client's and move it to RTS so the NIC can answer reads.
+            if (!connect_qp(ep, remote, local.psn, ib_port, gid_idx)) {
+                close(connfd);
+            } else {
+                std::cout << "Now serving... Press Ctrl+C to exit." << std::endl;
+                wait_for_disconnect(connfd);
+                close(connfd);
+                std::cout << "Client disconnected." << std::endl;
+            }
+        }
+
+        // Tear the QP down; the next iteration builds a clean one. connfd < 0 is just a transient
+        // accept/exchange failure -- fall through, drop this QP, and wait for the next client.
+        ibv_destroy_qp(ep.qp);
+        ep.qp = nullptr;
     }
 
     std::cout << "Shutting down!" << std::endl;
-    close(connfd);
+    close(listenfd);
     return EXIT_SUCCESS;
 }
