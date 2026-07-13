@@ -39,7 +39,6 @@ endif()
 add_library(oasis SHARED)
 
 target_sources(oasis PRIVATE
-    oasis/bypass_stream_manager.cpp
     oasis/configuration.cpp
     oasis/oasis_context.cpp
     oasis/operator.cpp

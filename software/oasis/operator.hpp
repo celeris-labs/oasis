@@ -4,8 +4,12 @@
 #include <libstf/common.hpp>
 #include <parcore/metadata/metadata.hpp>
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <ostream>
+#include <stdexcept>
+#include <vector>
 
 namespace oasis {
 
@@ -40,7 +44,11 @@ class SourceOperator : public Operator {};
  */
 class RDMASourceOperator final : public SourceOperator {
   public:
-    RDMASourceOperator(uint64_t offset, size_t size) : offset_(offset), size_(size) {}
+    RDMASourceOperator(uint64_t offset, size_t size) : offset_(offset), size_(size) {
+        if (size > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("RDMA read size exceeds 32-bit limit");
+        }
+    }
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
@@ -87,26 +95,37 @@ class DecodeColumnChunkOperator final : public Operator {
 };
 
 /**
- * Sink that writes the stream's output to a host buffer pre-allocated by the caller at the exact 
- * decoded size. apply() enqueues that buffer directly to the FPGA's output writer for `stream`.
+ * Sink that writes the stream's output to host buffers pre-allocated by the caller at the exact
+ * transfer size. A flow ends in exactly one sink; a transfer larger than a single output-writer
+ * buffer spans multiple buffers, which the hardware fills in enqueue order. apply() enqueues every
+ * buffer to the FPGA's output writer for `stream`, in order.
  */
 class LocalSinkOperator final : public Operator {
   public:
-    // `buffer` is the right-sized output buffer the hardware will write into (its capacity must be 
-    // a multiple of BYTES_PER_FPGA_TRANSFER). `tag` identifies this flow's output to the
-    // consumer since a QuerySplinter's flows can return in any order.
+    // `buffers` are the right-sized output buffers the hardware will write into, in write order
+    // (each capacity must be a multiple of BYTES_PER_FPGA_TRANSFER). `tag` identifies this flow's
+    // output to the consumer since a QuerySplinter's flows can return in any order.
+    explicit LocalSinkOperator(std::vector<std::shared_ptr<libstf::Buffer>> buffers, size_t tag = 0)
+        : tag_(tag), buffers_(std::move(buffers)) {
+        if (buffers_.empty()) {
+            throw std::runtime_error("LocalSinkOperator requires at least one buffer");
+        }
+    }
+
     explicit LocalSinkOperator(std::shared_ptr<libstf::Buffer> buffer, size_t tag = 0)
-        : tag_(tag), buffer_(std::move(buffer)) {}
+        : LocalSinkOperator(std::vector<std::shared_ptr<libstf::Buffer>>{std::move(buffer)}, tag) {}
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
 
-    [[nodiscard]] const std::shared_ptr<libstf::Buffer> &buffer() const { return buffer_; }
-    [[nodiscard]] size_t                                 tag()    const { return tag_; }
+    [[nodiscard]] const std::vector<std::shared_ptr<libstf::Buffer>> &buffers() const {
+        return buffers_;
+    }
+    [[nodiscard]] size_t tag() const { return tag_; }
 
   private:
-    size_t                          tag_;
-    std::shared_ptr<libstf::Buffer> buffer_;
+    size_t                                       tag_;
+    std::vector<std::shared_ptr<libstf::Buffer>> buffers_;
 };
 
 } // namespace oasis

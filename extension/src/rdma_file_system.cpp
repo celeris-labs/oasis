@@ -11,9 +11,12 @@
 
 #include "oasis/configuration.hpp"
 #include "oasis/oasis_context.hpp"
-#include "oasis/bypass_stream_manager.hpp"
+#include "oasis/operator.hpp"
+#include "oasis/query_splinter.hpp"
+#include "oasis/scheduler.hpp"
 
 #include <libstf/buffer.hpp>
+#include <libstf/common.hpp>
 
 #include <coyote/cThread.hpp>
 #include <coyote/cDefs.hpp>
@@ -91,13 +94,26 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 
 	// EnsureInitialized has already created the OasisContext singleton.
 	auto &ctx = oasis::OasisContext::ctx();
-	auto handle = ctx.bypass_manager().submit(static_cast<uintptr_t>(remote_offset), size);
 
-	// Drain all buffers for this transfer. For sizes that fit in a single FPGA buffer this is
-	// one iteration; for larger sizes the receiver chunks the transfer across multiple buffers, each
-	// surfaced via its own interrupt.
+	// One raw flow on the bypass stream: an RDMA source writing directly into one sink buffer per
+	// FPGA output-buffer-sized chunk. The scheduler capability-matches it onto the bypass stream.
+	oasis::OperatorFlow flow;
+	flow.push_back(std::make_unique<oasis::RDMASourceOperator>(remote_offset, size));
+	size_t remaining = size;
+	while (remaining > 0) {
+		size_t chunk = std::min<size_t>(remaining, libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE);
+		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(chunk)));
+		remaining -= chunk;
+	}
+	oasis::QuerySplinter splinter;
+	splinter.streams.push_back(std::move(flow));
+	auto handle = ctx.scheduler().submit(std::move(splinter));
+
+	// Drain the flow's batches. The bypass stream completes its sinks in enqueue order, so the
+	// batches arrive in file order and can be copied out sequentially.
 	size_t copied = 0;
-	while (auto buf = handle->next()) {
+	while (auto batch = handle.get_next_batch()) {
+		const auto &buf = batch->buffer;
 		if (copied + buf->size > size) {
 			throw IOException("RDMA read overran requested size: requested %llu, already got %llu, "
 			                  "next chunk %llu",
@@ -109,6 +125,55 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 	if (copied != size) {
 		throw IOException("RDMA read short transfer: requested %llu bytes, got %llu", (unsigned long long)size,
 		                  (unsigned long long)copied);
+	}
+}
+
+void RDMAFileSystem::ReadWithStaging(RDMAFileHandle &handle, void *dst, size_t size, uint64_t location) {
+	uint64_t pos = location;
+	const uint64_t end = location + size;
+	auto *out = static_cast<uint8_t *>(dst);
+
+	auto range = handle.staged_ranges.begin();
+	while (pos < end) {
+		// Skip staged ranges that end at or before the read position (ranges are sorted by offset).
+		while (range != handle.staged_ranges.end() && range->offset + range->size <= pos) {
+			++range;
+		}
+
+		if (range != handle.staged_ranges.end() && range->offset <= pos) {
+			// Covered: copy the overlap out of the staged buffers.
+			uint64_t range_pos = pos - range->offset;
+			const uint64_t n = std::min<uint64_t>(end, range->offset + range->size) - pos;
+			uint64_t copied = 0;
+			uint64_t buffer_begin = 0;
+			for (const auto &buf : range->buffers) {
+				const uint64_t buffer_end = buffer_begin + buf->size;
+				if (copied < n && range_pos + copied < buffer_end) {
+					const uint64_t offset_in_buffer = range_pos + copied - buffer_begin;
+					const uint64_t take = std::min<uint64_t>(n - copied, buf->size - offset_in_buffer);
+					std::memcpy(out + copied, static_cast<const uint8_t *>(buf->ptr) + offset_in_buffer, take);
+					copied += take;
+				}
+				buffer_begin = buffer_end;
+			}
+			if (copied != n) {
+				throw IOException("Staged RDMA range at offset %llu is missing bytes: wanted %llu, staged %llu",
+				                  (unsigned long long)range->offset, (unsigned long long)n,
+				                  (unsigned long long)copied);
+			}
+			pos += n;
+			out += n;
+			continue;
+		}
+
+		// Gap up to the next staged range (or the end of the read): fall back to an RDMA read. This
+		// happens e.g. when the thrift read-ahead merged two staged column chunks across a small
+		// unstaged column sitting between them.
+		const uint64_t gap_end =
+		    (range == handle.staged_ranges.end()) ? end : std::min<uint64_t>(end, range->offset);
+		RDMAReadRange(handle.remote_offset + pos, out, gap_end - pos);
+		out += gap_end - pos;
+		pos = gap_end;
 	}
 }
 
@@ -247,7 +312,7 @@ void RDMAFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 	if (location + static_cast<uint64_t>(nr_bytes) > h.size) {
 		throw IOException("Read past end of file %s", handle.path);
 	}
-	RDMAReadRange(h.remote_offset + location, buffer, static_cast<size_t>(nr_bytes));
+	ReadWithStaging(h, buffer, static_cast<size_t>(nr_bytes), location);
 }
 
 int64_t RDMAFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
@@ -260,7 +325,7 @@ int64_t RDMAFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes)
 	}
 	auto remaining = h.size - h.cursor;
 	auto to_read = std::min<uint64_t>(static_cast<uint64_t>(nr_bytes), remaining);
-	RDMAReadRange(h.remote_offset + h.cursor, buffer, static_cast<size_t>(to_read));
+	ReadWithStaging(h, buffer, static_cast<size_t>(to_read), h.cursor);
 	h.cursor += to_read;
 	return static_cast<int64_t>(to_read);
 }

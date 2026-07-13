@@ -5,7 +5,6 @@
 #include "libstf/configuration.hpp"
 #include "libstf/memory_pool.hpp"
 #include "libstf/tlb_manager.hpp"
-#include "oasis/bypass_stream_manager.hpp"
 #include "oasis/scheduler.hpp"
 
 #include <atomic>
@@ -33,7 +32,6 @@ public:
     std::shared_ptr<libstf::TLBManager> tlb_manager();
 
     Scheduler &scheduler();
-    BypassStreamManager &bypass_manager();
 
     /**
      * Allocates an output buffer the hardware decoder can write into. `size` is the exact decoded
@@ -49,8 +47,7 @@ public:
     void enqueue_output_buffer(libstf::stream_t stream, libstf::Buffer &buffer);
 
     /**
-     * Routes a hardware interrupt: Bypass-stream interrupts go to the BypassStreamManager,
-     * everything else goes straight to the scheduler.
+     * Routes a hardware interrupt to the scheduler.
      */
     void handle_interrupt(int value);
 
@@ -61,11 +58,9 @@ public:
 
     bool isRDMAEnabled() const { return rdma_enabled_; }
 
-    libstf::stream_t rdmaBypassStream() const { return bypass_stream_; }
-
     /**
-     * Establishes the RDMA queue pair with the remote server and configures the read-request module
-     * with the remote region's base vaddr (only known once the queue pair has been exchanged).
+     * Establishes the RDMA queue pair with the remote server and configures the remote region's 
+     * base vaddr (only known once the queue pair has been exchanged).
      */
     void initRDMA(const std::string &server, uint16_t port);
 
@@ -111,10 +106,8 @@ private:
     std::shared_ptr<libstf::TLBManager> tlb_manager_;
     std::shared_ptr<libstf::MemConfig> mem_config_;
 
-    bool             rdma_enabled_;
-    libstf::stream_t bypass_stream_;
+    bool rdma_enabled_;
 
-    std::unique_ptr<BypassStreamManager> bypass_manager_;
     std::unique_ptr<Scheduler> scheduler_;
 
     // Cross-scan budget of cold-start yields still to be performed.

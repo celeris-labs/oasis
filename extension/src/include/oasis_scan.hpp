@@ -64,6 +64,11 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 
 	size_t groups_in_flight_per_worker = 1;
 
+	// Scan-wide profiling totals, folded in from each worker's local counters when its scan
+	// finishes (OasisScanGetMetrics) and reported on the query profiling tree.
+	std::atomic<uint64_t> filter_time_ns {0};
+	std::atomic<uint64_t> string_decode_time_ns {0};
+
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
 	}
@@ -101,12 +106,17 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<const parcore::metadata::ColumnChunk *> hw_chunks;
 		std::vector<CoalescedFetcher::RangeHandle> host_handles;
 
-		// The whole row group is one QuerySplinter with one result handle. Batches arrive tagged
-		// with their projection index and are placed into hw_buffers by tag.
+		// CPU (string) columns of this group: Fetched over RDMA as raw bypass flows: cpu_slot[k]
+        // is the projection index, cpu_chunks[k] the chunk.
+		std::vector<size_t> cpu_slot;
+		std::vector<const parcore::metadata::ColumnChunk *> cpu_chunks;
+
 		oasis::SplinterResultHandle result;
-		size_t hw_columns_remaining = 0;
+		bool submitted = false;
+		size_t batches_remaining = 0;
 
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
+		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> cpu_buffers;
 	};
 
 	std::deque<unique_ptr<PendingGroup>> inflight;
@@ -123,6 +133,11 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// claimed. We never decode anything in this path -- the count comes straight from the Parquet
 	// metadata.
 	size_t empty_proj_remaining = 0;
+
+	// This worker's profiling counters (steady_clock nanoseconds), folded into the global totals
+	// when the worker's scan finishes.
+	uint64_t filter_time_ns = 0;
+	uint64_t string_decode_time_ns = 0;
 };
 
 void RegisterOasisScanFunction(ExtensionLoader &loader);

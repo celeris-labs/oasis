@@ -2,11 +2,14 @@
 
 #include "duckdb/common/file_system.hpp"
 
+#include <libstf/buffer.hpp>
+
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace coyote {
 class cThread;
@@ -27,6 +30,8 @@ struct RDMAParams {
 
 	static RDMAParams ReadFrom(optional_ptr<FileOpener> opener);
 };
+
+class RDMAFileHandle;
 
 class RDMAFileSystem : public FileSystem {
 public:
@@ -61,6 +66,9 @@ public:
 
 private:
 	void RDMAReadRange(uint64_t remote_offset, void *dst, size_t size);
+	// Serves [location, location+size) of the handle's file: staged ranges are copied from host
+	// memory, any uncovered gap falls back to an RDMA read.
+	void ReadWithStaging(RDMAFileHandle &handle, void *dst, size_t size, uint64_t location);
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void LoadDirectory(optional_ptr<FileOpener> opener);
 	void LogDirectory(optional_ptr<FileOpener> opener, uint64_t dir_size);
@@ -81,9 +89,25 @@ public:
 	void Close() override {
 	}
 
+	// A contiguous span of the file already fetched into host memory (e.g. a CPU column chunk
+	// fetched as part of a row group's QuerySplinter).
+	struct StagedRange {
+		uint64_t offset; // file-relative byte offset the range starts at
+		uint64_t size;
+		std::vector<std::shared_ptr<libstf::Buffer>> buffers;
+	};
+
+	// Replaces the staged ranges RDMAFileSystem::Read serves from before falling back to RDMA.
+	// `ranges` must be sorted by offset and non-overlapping. Not thread-safe: a FileHandle is owned
+	// by one worker, and that worker both stages ranges and reads.
+	void StageRanges(std::vector<StagedRange> ranges) {
+		staged_ranges = std::move(ranges);
+	}
+
 	uint64_t remote_offset;
 	uint64_t size;
 	uint64_t cursor;
+	std::vector<StagedRange> staged_ranges;
 };
 
 } // namespace duckdb

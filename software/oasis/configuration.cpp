@@ -7,7 +7,7 @@ namespace oasis {
 
 constexpr const uint32_t READ_REQ_VADDR_ADDR = 0;
 constexpr const uint32_t READ_REQ_SIZE_ADDR  = 1;
-constexpr const uint32_t READ_REQ_PID_ADDR   = 2;
+constexpr const uint32_t READ_REQ_CTID_ADDR  = 2;
 
 ReadReqConfig::ReadReqConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
                                uint32_t num_regs)
@@ -15,9 +15,9 @@ ReadReqConfig::ReadReqConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t 
 
 void ReadReqConfig::set_base_vaddr(uintptr_t base_vaddr) { base_vaddr_ = base_vaddr; }
 
-void ReadReqConfig::set_pid(libstf::stream_t stream, uint32_t pid) {
+void ReadReqConfig::set_ctid(libstf::stream_t stream, uint32_t ctid) {
     auto reg_offset = stream * READ_REQ_CONFIG_REGS;
-    write_register(libstf::ConfigRegister(reg_offset + READ_REQ_PID_ADDR, pid));
+    write_register(libstf::ConfigRegister(reg_offset + READ_REQ_CTID_ADDR, ctid));
 }
 
 void ReadReqConfig::enqueue_read(libstf::stream_t stream, size_t vaddr, size_t size) {

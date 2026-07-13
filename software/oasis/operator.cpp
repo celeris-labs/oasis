@@ -47,11 +47,18 @@ void DecodeColumnChunkOperator::print(std::ostream &os) const {
 }
 
 void LocalSinkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
-    ctx.enqueue_output_buffer(stream, *buffer_);
+    for (const auto &buffer : buffers_) {
+        ctx.enqueue_output_buffer(stream, *buffer);
+    }
 }
 
 void LocalSinkOperator::print(std::ostream &os) const {
-    os << "HostBufferSink(tag=" << tag_ << ", size=" << buffer_->size << ")";
+    size_t bytes = 0;
+    for (const auto &buffer : buffers_) {
+        bytes += buffer->size;
+    }
+    os << "HostBufferSink(tag=" << tag_ << ", buffers=" << buffers_.size() << ", size=" << bytes
+       << ")";
 }
 
 } // namespace oasis

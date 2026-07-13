@@ -6,9 +6,11 @@
 #include <libstf/profiling.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <sstream>
 #include <stdexcept>
 #include <unistd.h>
+#include <vector>
 
 namespace oasis {
 
@@ -45,8 +47,7 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     , global_config_(cthread())
     , tlb_manager_(std::make_shared<libstf::TLBManager>(cthread(), memory_pool_))
     , mem_config_(global_config_.get_config<libstf::MemConfig>())
-    , rdma_enabled_(false)
-    , bypass_stream_(0) {
+    , rdma_enabled_(false) {
 
     // Verify the bitstream loaded on the device is actually an Oasis system.
     if (global_config_.system_id() != OASIS_SYSTEM_ID) {
@@ -60,13 +61,10 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // The hardware exposes one MemConfig stream per column-chunk decoder plus an extra bypass
     // stream when RDMA is wired in. If the counts match, RDMA wasn't synthesized into this shell.
     rdma_enabled_ = mem_config_->num_streams() != cc_config->num_decoders();
-    // ID of the RDMA bypass stream -- the last MemConfig stream, sitting past the decoders.
-    bypass_stream_ = cc_config->num_decoders();
 
-    // TODO: Give each stream a distinct ctid so concurrent reads run on separate RDMA queue pairs.
     auto read_req_config = config<ReadReqConfig>();
     for (libstf::stream_t stream = 0; stream < read_req_config->num_streams(); ++stream) {
-        read_req_config->set_pid(stream, 0);
+        read_req_config->set_ctid(stream, cthread_->getCtid());
     }
 
     // Pre-map huge pages to FPGA TLB
@@ -78,15 +76,25 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // Clear any stale buffers left enqueued in hardware from a previous run.
     mem_config_->flush_buffers();
 
-    // The bypass manager must exist before the scheduler so any interrupt has somewhere to route.
-    bypass_manager_ = std::make_unique<BypassStreamManager>(*this, bypass_stream_,
-        ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS, mem_config_->maximum_num_enqueued_buffers());
-    scheduler_       = std::make_unique<Scheduler>(*this);
+    // Stream scheduler.
+    std::vector<StreamDescription> stream_descriptions;
+    stream_descriptions.reserve(mem_config_->num_streams());
+    for (libstf::stream_t stream = 0; stream < cc_config->num_decoders(); ++stream) {
+        stream_descriptions.push_back({StreamCapability::DECODE,
+                                       cc_config->maximum_num_enqueued_configs(),
+                                       mem_config_->maximum_num_enqueued_buffers()});
+    }
+    if (rdma_enabled_) {
+        stream_descriptions.push_back({StreamCapability::BYPASS,
+                                       ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
+                                       mem_config_->maximum_num_enqueued_buffers()});
+    }
+    assert(stream_descriptions.size() == mem_config_->num_streams());
+    scheduler_ = std::make_unique<Scheduler>(*this, std::move(stream_descriptions));
 }
 
 OasisContext::~OasisContext() {
     scheduler_.reset();
-    bypass_manager_.reset();
 }
 
 void OasisContext::init(std::shared_ptr<libstf::MemoryPool> memory_pool) {
@@ -124,10 +132,6 @@ std::shared_ptr<libstf::TLBManager> OasisContext::tlb_manager() {
 
 Scheduler &OasisContext::scheduler() {
     return *scheduler_;
-}
-
-BypassStreamManager &OasisContext::bypass_manager() {
-    return *bypass_manager_;
 }
 
 void OasisContext::initRDMA(const std::string &server, uint16_t port) {
@@ -184,11 +188,7 @@ void OasisContext::handle_interrupt(int value) {
                                   libstf::FPGA_INTERRUPT_TRANSFER_SIZE_BITS)) &
                        1) != 0;
 
-    if (rdma_enabled_ && stream_id == bypass_stream_) {
-        bypass_manager_->handle_completion(bytes_written, last);
-    } else {
-        scheduler_->handle_completion(stream_id, bytes_written, last);
-    }
+    scheduler_->handle_completion(stream_id, bytes_written, last);
     libstf::Profiler::close_regions({"oasis::OasisContext::handle_interrupt"});
 }
 

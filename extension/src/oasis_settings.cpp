@@ -19,7 +19,7 @@ void SetSchedulerNumStreams(ClientContext &context, SetScope, Value &parameter) 
 	}
 	auto streams = parameter.GetValue<uint64_t>();
 	auto &scheduler = GetOrCreateOasisContext(context).scheduler();
-	auto available = static_cast<uint64_t>(scheduler.num_streams());
+	auto available = static_cast<uint64_t>(scheduler.num_decode_streams());
 	if (streams < 1 || streams > available) {
 		throw InvalidInputException("oasis_scheduler_num_streams must be between 1 and %llu (got %llu)",
 		                            (unsigned long long)available, (unsigned long long)streams);
