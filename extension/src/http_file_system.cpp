@@ -48,12 +48,24 @@ uint64_t GetUIntSetting(optional_ptr<FileOpener> opener, const string &key, uint
 	return fallback;
 }
 
-uint32_t ParseIPv4(const string &host) {
-	struct in_addr addr {};
-	if (inet_pton(AF_INET, host.c_str(), &addr) != 1) {
+// parseIpBE: 10.253.74.74 -> 0x0AFD4A4A.
+// Used as-is for openConnTcp and HTTP Host CSR (those CSRs do not byte-swap).
+//
+// doArpLookup goes through NET_ARP_REG which byte-reverses the written word
+// (shell_slave IP set path does not). Pass bswap32(parseIpBE) so wire who-has
+// matches 10.253.74.74. Earlier "backwards ARP" with bswap was from YMM multi-beat
+// MMIO, not from the bswap itself (ARP is now a single dword store in libcoyote).
+uint32_t ParseIpBE(const string &host) {
+	unsigned b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+	if (std::sscanf(host.c_str(), "%u.%u.%u.%u", &b0, &b1, &b2, &b3) != 4 || b0 > 255 ||
+	    b1 > 255 || b2 > 255 || b3 > 255) {
 		throw IOException("Invalid http_server address '%s'", host);
 	}
-	return ntohl(addr.s_addr);
+	return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+uint32_t IpForArpLookup(uint32_t ip_be) {
+	return __builtin_bswap32(ip_be);
 }
 
 string NormalizeHttpPath(const string &path) {
@@ -66,16 +78,16 @@ string NormalizeHttpPath(const string &path) {
 // Decodes the packed HTTP/TCP FSM debug status word (HTTPReadConfig read CSR 2)
 // into a human-readable one-liner. See HTTPReadConfig::debug_status() for layout.
 string DecodeHttpFpgaStatus(uint32_t status) {
-	static const char *top[] = {"IDLE", "TCP_INIT", "TCP_SEND", "TCP_READ", "CLOSE"};
+	static const char *top[] = {"IDLE", "TCP_SEND", "TCP_READ"};
 	const auto top_state = status & 0xF;
-	const char *top_name = top_state < 5 ? top[top_state] : "?";
+	const char *top_name = top_state < 3 ? top[top_state] : "?";
 	char buf[256];
 	std::snprintf(buf, sizeof(buf),
-	              "handler=%s(%u) init=%u send=%u read=%u | init_done=%u init_err=%u send_done=%u "
-	              "send_err=%u read_done=%u read_err=%u busy=%u",
-	              top_name, top_state, (status >> 4) & 0xF, (status >> 8) & 0xF, (status >> 12) & 0xF,
-	              (status >> 16) & 1, (status >> 17) & 1, (status >> 18) & 1, (status >> 19) & 1,
-	              (status >> 20) & 1, (status >> 21) & 1, (status >> 22) & 1);
+	              "handler=%s(%u) send=%u read=%u | send_done=%u send_err=%u read_done=%u "
+	              "read_err=%u busy=%u",
+	              top_name, top_state, (status >> 8) & 0xF, (status >> 12) & 0xF,
+	              (status >> 18) & 1, (status >> 19) & 1, (status >> 20) & 1, (status >> 21) & 1,
+	              (status >> 22) & 1);
 	return string(buf);
 }
 
@@ -129,6 +141,10 @@ uint64_t ParseContentLengthHeader(const string &headers) {
 HTTPFileSystem::HTTPFileSystem(DatabaseInstance &instance) : instance(instance) {
 }
 
+// The TCP session is opened/closed per ranged GET inside HTTPReadRange, so there
+// is no long-lived connection to tear down here.
+HTTPFileSystem::~HTTPFileSystem() = default;
+
 void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	std::lock_guard<std::mutex> lock(init_mtx);
 	if (initialized) {
@@ -147,9 +163,22 @@ void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 
 	server_host_ = GetStringSetting(opener, "http_server", "127.0.0.1");
 	server_port_ = static_cast<uint16_t>(GetUIntSetting(opener, "http_port", coyote::DEF_PORT));
-	server_ip_ = ParseIPv4(server_host_);
+	server_ip_ = ParseIpBE(server_host_);
 
 	(void)ctx.config<oasis::HTTPReadConfig>();
+
+	// Resolve the server's MAC once (like RDMAFileSystem::initRDMA sets up the QP
+	// once). The TCP connection itself is opened per request in HTTPReadRange,
+	// because in this Coyote shell only SW can open sockets and we want the
+	// session bound to each HTTP GET (Connection: close semantics).
+	if (HttpFpgaDebugEnabled()) {
+		std::fprintf(stderr,
+		             "[httpfpga] init http_server=%s parseIpBE=0x%08x arp=0x%08x port=%u\n",
+		             server_host_.c_str(), server_ip_, IpForArpLookup(server_ip_),
+		             static_cast<unsigned>(server_port_));
+	}
+	ctx.cthread()->doArpLookup(IpForArpLookup(server_ip_));
+
 	initialized = true;
 }
 
@@ -319,6 +348,7 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		throw IOException("HTTP read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 
+	// EnsureInitialized has already opened the TCP session (like RDMA's initRDMA).
 	auto &ctx = oasis::OasisContext::ctx();
 	auto obm = ctx.output_buffer_manager();
 	auto http_cfg = ctx.config<oasis::HTTPReadConfig>();
@@ -327,6 +357,45 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 
 	std::atomic<bool> poll_active {false};
 	std::thread poll_thread;
+	// Always join before leaving — a still-joinable std::thread dtor calls terminate().
+	struct PollThreadGuard {
+		std::atomic<bool> &active;
+		std::thread &thread;
+		~PollThreadGuard() {
+			active = false;
+			if (thread.joinable()) {
+				thread.join();
+			}
+		}
+	} poll_guard {poll_active, poll_thread};
+
+	// Open a fresh TCP session for this GET (SW-managed in this Coyote shell),
+	// then fire the CSR + acquire the OBM handle under the lock so the OBM's
+	// per-stream FIFO stays aligned with the order of HW reads (like RDMA).
+	auto cthread = ctx.cthread();
+	if (HttpFpgaDebugEnabled()) {
+		std::fprintf(stderr, "[httpfpga] openConnTcp ip=0x%08x (%u.%u.%u.%u) port=%u ...\n", server_ip_,
+		             (server_ip_ >> 24) & 0xff, (server_ip_ >> 16) & 0xff, (server_ip_ >> 8) & 0xff,
+		             server_ip_ & 0xff, static_cast<unsigned>(server_port_));
+	}
+	cthread->doArpLookup(IpForArpLookup(server_ip_));
+	std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+	uint16_t session_id = 0;
+	try {
+		session_id = cthread->openConnTcp(server_ip_, server_port_);
+	} catch (const std::exception &e) {
+		throw IOException("FPGA openConnTcp to %s:%u failed: %s "
+		                  "(no packets usually means TOE session create failed — run "
+		                  "parcore/libstf/coyote/util/open_conn_tcp_test/run.sh %s %u on this node)",
+		                  server_host_, static_cast<unsigned>(server_port_), e.what(),
+		                  server_host_.c_str(), static_cast<unsigned>(server_port_));
+	}
+	if (HttpFpgaDebugEnabled()) {
+		std::fprintf(stderr, "[httpfpga] openConnTcp ok session_id=%u\n",
+		             static_cast<unsigned>(session_id));
+	}
+
 	if (HttpFpgaDebugEnabled()) {
 		poll_active = true;
 		poll_thread = std::thread([http_cfg, bypass_stream, offset, size, &poll_active]() {
@@ -348,48 +417,51 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 	{
 		std::lock_guard<std::mutex> lock(mtx);
 
-		ctx.cthread()->doArpLookup(server_ip_);
-		http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end);
+		http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, session_id);
 		RecordHttpFpgaTrigger(bypass_stream, server_ip_, server_port_, path, offset, range_end,
 		                      static_cast<uint32_t>(size));
 		if (HttpFpgaDebugEnabled()) {
 			std::fprintf(stderr,
-			             "[httpfpga] triggered bypass_stream=%u server_ip=0x%08x port=%u file_len=%zu "
-			             "path=%s range=[%llu,%llu] size=%u (written to HW; write CSRs are not host-readable)\n",
-			             static_cast<unsigned>(bypass_stream), server_ip_, static_cast<unsigned>(server_port_),
-			             std::min(path.size(), size_t {32}), path.c_str(), (unsigned long long)offset,
-			             (unsigned long long)range_end, static_cast<unsigned>(size));
+			             "[httpfpga] triggered bypass_stream=%u session_id=%u server_ip=0x%08x port=%u "
+			             "path=%s range=[%llu,%llu] size=%u\n",
+			             static_cast<unsigned>(bypass_stream), static_cast<unsigned>(session_id),
+			             server_ip_, static_cast<unsigned>(server_port_), path.c_str(),
+			             (unsigned long long)offset, (unsigned long long)range_end,
+			             static_cast<unsigned>(size));
 		}
 		handle = obm->acquire_output_handle(bypass_stream, size);
 	}
 
 	size_t copied = 0;
-	while (handle->stream_has_more_output(bypass_stream)) {
-		auto buf = handle->get_next_stream_output(bypass_stream);
-		if (!buf) {
-			break;
-		}
-		if (copied + buf->size > size) {
-			poll_active = false;
-			if (poll_thread.joinable()) {
-				poll_thread.join();
+	try {
+		while (handle->stream_has_more_output(bypass_stream)) {
+			auto buf = handle->get_next_stream_output(bypass_stream);
+			if (!buf) {
+				break;
 			}
-			throw IOException("HTTP read overran requested size: requested %llu, already got %llu, next chunk %llu",
-			                  (unsigned long long)size, (unsigned long long)copied, (unsigned long long)buf->size);
+			if (copied + buf->size > size) {
+				throw IOException(
+				    "HTTP read overran requested size: requested %llu, already got %llu, next chunk %llu",
+				    (unsigned long long)size, (unsigned long long)copied, (unsigned long long)buf->size);
+			}
+			std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
+			copied += buf->size;
 		}
-		std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
-		copied += buf->size;
+
+		if (copied != size) {
+			throw IOException("HTTP read short transfer: requested %llu bytes, got %llu",
+			                  (unsigned long long)size, (unsigned long long)copied);
+		}
+	} catch (...) {
+		try {
+			cthread->closeConnTcp(session_id);
+		} catch (...) {
+		}
+		throw;
 	}
 
-	poll_active = false;
-	if (poll_thread.joinable()) {
-		poll_thread.join();
-	}
-
-	if (copied != size) {
-		throw IOException("HTTP read short transfer: requested %llu bytes, got %llu", (unsigned long long)size,
-		                  (unsigned long long)copied);
-	}
+	// Server uses Connection: close, so tear the session down after each GET.
+	cthread->closeConnTcp(session_id);
 }
 
 } // namespace duckdb

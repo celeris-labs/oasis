@@ -58,6 +58,7 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin : gen_streams
     data64_t reg_range_begin;
     data64_t reg_range_end;
     data64_t reg_size;
+    data64_t reg_session_id;
 
     localparam int BASE = I * NUM_WRITE_REGS;
 
@@ -75,9 +76,10 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin : gen_streams
     ConfigWriteRegister #(BASE + 11, data64_t) inst_range_begin (clk, write_config, reg_range_begin);
     ConfigWriteRegister #(BASE + 12, data64_t) inst_range_end   (clk, write_config, reg_range_end);
     ConfigWriteRegister #(BASE + 13, data64_t) inst_size        (clk, write_config, reg_size);
+    ConfigWriteRegister #(BASE + 14, data64_t) inst_session_id  (clk, write_config, reg_session_id);
 
     ready_valid_i #(data64_t) start_raw();
-    ConfigWriteReadyRegister #(BASE + 14, data64_t) inst_start (
+    ConfigWriteReadyRegister #(BASE + 15, data64_t) inst_start (
         .clk         (clk),
         .rst_n       (reset_synced),
         .write_config(write_config),
@@ -99,6 +101,7 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin : gen_streams
         cfg_live.file_w7     = reg_file_w7[31:0];
         cfg_live.range_begin = reg_range_begin;
         cfg_live.range_end   = reg_range_end;
+        cfg_live.session_id  = reg_session_id[15:0];
     end
 
     assign out[I].cfg        = cfg_live;

@@ -14,6 +14,7 @@ class FileOpener;
 class HTTPFileSystem : public FileSystem {
 public:
 	explicit HTTPFileSystem(DatabaseInstance &db);
+	~HTTPFileSystem() override;
 
 	static constexpr const char *URL_PREFIX = "httpfpga://";
 

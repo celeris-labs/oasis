@@ -51,7 +51,7 @@ set(TLBL_BITS 30)
 validation_checks_hw()
 
 load_apps (
-    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src ../celeris/hardware/src"
+    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src"
 )
 
 create_hw()

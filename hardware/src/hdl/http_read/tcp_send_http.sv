@@ -32,6 +32,9 @@ module tcp_send_http (
     output logic                                      done,
     output logic                                      error,
     output logic [15:0]                               debug_http_len,
+    output logic [AXI_DATA_BITS-1:0]                  debug_req_lo,
+    output logic [AXI_DATA_BITS-1:0]                  debug_req_hi,
+    output logic                                      debug_req_ready,
     output logic [3:0]                                state_debug
 );
 
@@ -201,6 +204,9 @@ module tcp_send_http (
     assign done = (state_q == ST_DONE);
     assign error = error_q;
     assign debug_http_len = http_len_q;
+    assign debug_req_lo = http_data_q[AXI_DATA_BITS-1:0];
+    assign debug_req_hi = http_data_q[2*AXI_DATA_BITS-1:AXI_DATA_BITS];
+    assign debug_req_ready = req_ready_w;
     assign state_debug = (state_q == ST_DONE) ? 4'd6 : state_q;
 
 endmodule

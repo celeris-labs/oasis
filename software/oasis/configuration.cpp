@@ -38,7 +38,8 @@ constexpr const uint32_t HTTP_FILE_W0     = 3;
 constexpr const uint32_t HTTP_RANGE_BEGIN = 11;
 constexpr const uint32_t HTTP_RANGE_END   = 12;
 constexpr const uint32_t HTTP_SIZE        = 13;
-constexpr const uint32_t HTTP_START       = 14;
+constexpr const uint32_t HTTP_SESSION_ID  = 14;
+constexpr const uint32_t HTTP_START       = 15;
 constexpr const uint32_t HTTP_CLIENT_STATE = 1;
 // Read CSR 2 carries the packed HTTP/TCP FSM debug status (see HTTPRead.conf.status).
 constexpr const uint32_t HTTP_DEBUG_STATUS = 2;
@@ -59,7 +60,8 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
     : Config(cthread, addr_offset, num_regs) {}
 
 void HTTPReadConfig::read(libstf::stream_t stream, uint32_t server_ip, uint16_t server_port,
-                          const std::string &path, uint64_t range_begin, uint64_t range_end) {
+                          const std::string &path, uint64_t range_begin, uint64_t range_end,
+                          uint16_t session_id) {
     uint32_t file_len = 0;
     uint32_t file_words[8] {};
     PackPathWords(path, file_len, file_words);
@@ -75,6 +77,7 @@ void HTTPReadConfig::read(libstf::stream_t stream, uint32_t server_ip, uint16_t 
     write_register(libstf::ConfigRegister(reg_base + HTTP_RANGE_END, range_end));
     write_register(libstf::ConfigRegister(reg_base + HTTP_SIZE,
                                             static_cast<uint64_t>(range_end - range_begin + 1)));
+    write_register(libstf::ConfigRegister(reg_base + HTTP_SESSION_ID, session_id));
     write_register(libstf::ConfigRegister(reg_base + HTTP_START, 1));
 }
 

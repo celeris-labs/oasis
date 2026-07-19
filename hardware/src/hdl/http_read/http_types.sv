@@ -5,7 +5,8 @@
 // range_begin/range_end.
 package http_types;
 
-parameter int NUM_HTTP_READ_CONFIG_REGS = 15;
+// 0..12 path/range fields, 13 size, 14 session_id (from SW openConnTcp), 15 start
+parameter int NUM_HTTP_READ_CONFIG_REGS = 16;
 parameter longint unsigned HTTP_READ_CONFIG_ID = 64'h0000000000485454;
 
 typedef struct packed {
@@ -22,6 +23,8 @@ typedef struct packed {
     logic [31:0] file_w7;
     logic [63:0] range_begin;
     logic [63:0] range_end;
+    // Coyote open/listen/close are SW-managed; HW only uses this session ID.
+    logic [15:0] session_id;
 } http_config_t;
 
 endpackage

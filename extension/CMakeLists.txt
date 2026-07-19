@@ -20,6 +20,9 @@ include_directories(duckdb/third_party/thrift)
 # Dependencies
 # ---------------------------------------------------------------------------
 
+# Prefer packages installed into the oasis tree (../.local) over a stale $HOME/opt.
+list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.local")
+
 # Both parcore/coyote/sw and parcore/coyote/sim/sw declare a target named
 # "Coyote" — the former opens a real FPGA char device, the latter spawns
 # Vivado xsim in the background and pipes to it. Swap the subdirectory to

@@ -7,6 +7,7 @@
 #include "oasis_settings.hpp"
 #include "oasis_log_sink.hpp"
 #include "http_file_system.hpp"
+#include "oasis_http_debug.hpp"
 #include "rdma_file_system.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -65,8 +66,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    LogicalType::VARCHAR, Value("127.0.0.1"));
 	config.AddExtensionOption("http_port", "HTTP file server TCP port for httpfpga:// reads", LogicalType::UBIGINT,
 	                          Value::UBIGINT(static_cast<uint64_t>(coyote::DEF_PORT)));
+	config.AddExtensionOption("httpfpga_debug",
+	                          "Print HTTP FPGA FSM status to stderr during httpfpga:// reads", LogicalType::BOOLEAN,
+	                          Value::BOOLEAN(false), SetHttpFpgaDebug);
 
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<HTTPFileSystem>(instance));
+	RegisterOasisHttpStateFunction(loader);
 
 	// Get the OasisContext to establish the connection to the FPGA.
 	Connection conn(instance);
