@@ -4,13 +4,14 @@ import oasis::*;
 import parcore::*;
 import http_types::*;
 import lynxTypes::*;
+import libstf::*;
 
 // -- Tie-off unused interfaces and signals --------------------------------------------------------
 `ifdef EN_TCP
 always_comb sq_rd.tie_off_m();
 always_comb cq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
-// TCP open/listen/close are SW-managed via cnfg_slave (openConnTcp).
+// handler.sv opens/closes TCP itself (legacy Coyote-http style).
 `elsif EN_RDMA
 always_comb rq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
@@ -37,6 +38,8 @@ localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
 localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
 
 `ifdef EN_TCP
+// HttpConfig: 27 param regs + START; read side has 3 status regs.
+localparam HTTP_CONFIG_ADDR_SPACE = 28;
 localparam NUM_CONFIGS   = 3;
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `elsif EN_RDMA
@@ -58,9 +61,7 @@ assign rst_n = aresetn;
 write_config_i                       write_configs[NUM_CONFIGS](.*);
 read_config_i                        read_configs [NUM_CONFIGS](.*);
 mem_config_i                         mem_conf[NUM_STREAMS](.*);
-`ifdef EN_TCP
-http_read_config_i                   http_conf[NUM_STREAMS](.*);
-`elsif EN_RDMA
+`ifdef EN_RDMA
 rdma_read_config_i                   rdma_conf[NUM_STREAMS](.*);
 `endif
 decoder_profile_i                    profile[NUM_DECODERS](.*);
@@ -73,7 +74,7 @@ GlobalConfig #(
         MEM_CONFIG_NUM_REGS,
         COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS)
 `ifdef EN_TCP
-        , NUM_HTTP_READ_CONFIG_REGS * NUM_STREAMS
+        , HTTP_CONFIG_ADDR_SPACE
 `elsif EN_RDMA
         , NUM_RDMA_READ_CONFIG_REGS * NUM_STREAMS
 `endif
@@ -114,17 +115,41 @@ ColumnChunkDecoderConfig #(
 );
 
 `ifdef EN_TCP
-HTTPReadConfig #(
-    .NUM_STREAMS(NUM_STREAMS)
-) inst_http_read_config (
-    .clk(clk),
-    .rst_n(rst_n),
+// HttpConfig latches params; START write emits one http_config_t beat → runTx pulse.
+http_config_t                  http_cfg_live;
+ready_valid_i #(http_config_t) http_start();
+logic [3:0]                    http_client_state;
+logic [31:0]                   http_total_word;
+http_config_t                  http_cfg_q;
+logic                          http_run_tx;
 
+HttpConfig #(
+    .NUM_PARAM_REGS(27),
+    .START_ADDR    (27)
+) inst_http_config (
+    .clk         (clk),
+    .rst_n       (rst_n),
     .write_config(write_configs[2]),
-    .read_config(read_configs[2]),
-
-    .out(http_conf)
+    .read_config (read_configs[2]),
+    .cfg         (http_cfg_live),
+    .start_cfg   (http_start),
+    .client_state(http_client_state),
+    .total_word  (http_total_word)
 );
+
+assign http_start.ready = 1'b1;
+
+always_ff @(posedge clk) begin
+    if (!rst_n) begin
+        http_cfg_q  <= '0;
+        http_run_tx <= 1'b0;
+    end else if (http_start.valid && http_start.ready) begin
+        http_cfg_q  <= http_start.data;
+        http_run_tx <= 1'b1;
+    end else begin
+        http_run_tx <= 1'b0;
+    end
+end
 `elsif EN_RDMA
 RDMAReadConfig #(
     .NUM_STREAMS(NUM_STREAMS)
@@ -231,52 +256,154 @@ endgenerate
 localparam BYPASS_ID = NUM_STREAMS - 1;
 
 `ifdef EN_TCP
-ndata_i #(data8_t, DATABEAT_SIZE) http_bypass_ndata();
+// Open/listen/close are Coyote user ports again (restored in user_logic_tmplt).
+// Listen unused for the HTTP client; open/close driven by handler.
+always_comb tcp_listen_req.tie_off_m();
+always_comb tcp_listen_rsp.tie_off_s();
 
-HTTPRead inst_http_read_bypass (
-    .clk(clk),
-    .rst_n(rst_n),
+logic [3:0]   dbg_rx_ptr;
+logic [AXI_DATA_BITS-1:0] dbg_rx_buf_0, dbg_rx_buf_1, dbg_tx_acc;
+logic [6:0]   dbg_tx_acc_cnt;
+logic         dbg_tx_acc_last;
+logic [15:0]  dbg_http_len;
+logic [3:0]   dbg_builder_state;
+logic [AXI_DATA_BITS-1:0] dbg_req_lo, dbg_req_hi;
+logic [7:0]   dbg_req_cnt;
 
-    .conf(http_conf[BYPASS_ID]),
+handler inst_handler (
+    .ap_clk  (clk),
+    .ap_rst_n(rst_n),
 
-    .s_axis_notifications_TVALID  (tcp_notify.valid),
-    .s_axis_notifications_TREADY  (tcp_notify.ready),
-    .s_axis_notifications_TDATA   (tcp_notify.data),
-    .m_axis_read_package_TVALID   (tcp_rd_pkg.valid),
-    .m_axis_read_package_TREADY   (tcp_rd_pkg.ready),
-    .m_axis_read_package_TDATA    (tcp_rd_pkg.data),
-    .s_axis_rx_metadata_TVALID    (tcp_rx_meta.valid),
-    .s_axis_rx_metadata_TREADY    (tcp_rx_meta.ready),
-    .s_axis_rx_metadata_TDATA     (tcp_rx_meta.data),
-    .s_axis_rx_data_TVALID        (axis_tcp_recv.tvalid),
-    .s_axis_rx_data_TREADY        (axis_tcp_recv.tready),
-    .s_axis_rx_data_TDATA         (axis_tcp_recv.tdata),
-    .s_axis_rx_data_TKEEP         (axis_tcp_recv.tkeep),
-    .s_axis_rx_data_TLAST         (axis_tcp_recv.tlast),
+    .m_axis_open_connection_TVALID (tcp_open_req.valid),
+    .m_axis_open_connection_TREADY (tcp_open_req.ready),
+    .m_axis_open_connection_TDATA  (tcp_open_req.data),
+    .s_axis_open_status_TVALID     (tcp_open_rsp.valid),
+    .s_axis_open_status_TREADY     (tcp_open_rsp.ready),
+    .s_axis_open_status_TDATA      (tcp_open_rsp.data),
+    .m_axis_close_connection_TVALID(tcp_close_req.valid),
+    .m_axis_close_connection_TREADY(tcp_close_req.ready),
+    .m_axis_close_connection_TDATA (tcp_close_req.data),
 
-    .m_axis_tx_meta_TVALID        (tcp_tx_meta.valid),
-    .m_axis_tx_meta_TREADY        (tcp_tx_meta.ready),
-    .m_axis_tx_meta_TDATA         (tcp_tx_meta.data),
-    .m_axis_tx_data_TVALID        (axis_tcp_send.tvalid),
-    .m_axis_tx_data_TREADY        (axis_tcp_send.tready),
-    .m_axis_tx_data_TDATA         (axis_tcp_send.tdata),
-    .m_axis_tx_data_TKEEP         (axis_tcp_send.tkeep),
-    .m_axis_tx_data_TLAST         (axis_tcp_send.tlast),
-    .s_axis_tx_status_TVALID      (tcp_tx_stat.valid),
-    .s_axis_tx_status_TREADY      (tcp_tx_stat.ready),
-    .s_axis_tx_status_TDATA       (tcp_tx_stat.data),
+    .s_axis_notifications_TVALID   (tcp_notify.valid),
+    .s_axis_notifications_TREADY   (tcp_notify.ready),
+    .s_axis_notifications_TDATA    (tcp_notify.data),
+    .m_axis_read_package_TVALID    (tcp_rd_pkg.valid),
+    .m_axis_read_package_TREADY    (tcp_rd_pkg.ready),
+    .m_axis_read_package_TDATA     (tcp_rd_pkg.data),
+    .s_axis_rx_metadata_TVALID     (tcp_rx_meta.valid),
+    .s_axis_rx_metadata_TREADY     (tcp_rx_meta.ready),
+    .s_axis_rx_metadata_TDATA      (tcp_rx_meta.data[TCP_RX_META_BITS-1:0]),
+    .s_axis_rx_data_TVALID         (axis_tcp_recv.tvalid),
+    .s_axis_rx_data_TREADY         (axis_tcp_recv.tready),
+    .s_axis_rx_data_TDATA          (axis_tcp_recv.tdata),
+    .s_axis_rx_data_TKEEP          (axis_tcp_recv.tkeep),
+    .s_axis_rx_data_TLAST          (axis_tcp_recv.tlast),
+    .s_axis_rx_data_TSTRB          ('0),
 
-    .out(http_bypass_ndata)
+    .m_axis_tx_meta_TVALID         (tcp_tx_meta.valid),
+    .m_axis_tx_meta_TREADY         (tcp_tx_meta.ready),
+    .m_axis_tx_meta_TDATA          (tcp_tx_meta.data),
+    .m_axis_tx_data_TVALID         (axis_tcp_send.tvalid),
+    .m_axis_tx_data_TREADY         (axis_tcp_send.tready),
+    .m_axis_tx_data_TDATA          (axis_tcp_send.tdata),
+    .m_axis_tx_data_TKEEP          (axis_tcp_send.tkeep),
+    .m_axis_tx_data_TLAST          (axis_tcp_send.tlast),
+    .s_axis_tx_status_TVALID       (tcp_tx_stat.valid),
+    .s_axis_tx_status_TREADY       (tcp_tx_stat.ready),
+    .s_axis_tx_status_TDATA        (tcp_tx_stat.data),
+
+    .runTx                         (http_run_tx),
+    .numSessions                   (http_cfg_q.num_sessions),
+    .pkgWordCount                  (http_cfg_q.pkg_word_count),
+    .serverIpAddress               (http_cfg_q.server_ip),
+    .ipHexLen                      (http_cfg_q.ip_hex_len),
+    .ipHexWord0                    (http_cfg_q.ip_hex_w0),
+    .ipHexWord1                    (http_cfg_q.ip_hex_w1),
+    .ipHexWord2                    (http_cfg_q.ip_hex_w2),
+    .ipHexWord3                    (http_cfg_q.ip_hex_w3),
+    .portHexWord0                  (http_cfg_q.port_hex),
+    .serverPort                    (http_cfg_q.server_port),
+    .fileLen                       (http_cfg_q.file_len),
+    .fileWord0                     (http_cfg_q.file_w0),
+    .fileWord1                     (http_cfg_q.file_w1),
+    .fileWord2                     (http_cfg_q.file_w2),
+    .fileWord3                     (http_cfg_q.file_w3),
+    .fileWord4                     (http_cfg_q.file_w4),
+    .fileWord5                     (http_cfg_q.file_w5),
+    .fileWord6                     (http_cfg_q.file_w6),
+    .fileWord7                     (http_cfg_q.file_w7),
+    .rangeBeginLen                 (http_cfg_q.range_begin_len),
+    .rangeBeginW0                  (http_cfg_q.range_begin_w0),
+    .rangeBeginW1                  (http_cfg_q.range_begin_w1),
+    .rangeEndLen                   (http_cfg_q.range_end_len),
+    .rangeEndW0                    (http_cfg_q.range_end_w0),
+    .rangeEndW1                    (http_cfg_q.range_end_w1),
+    .userFrequency                 (http_cfg_q.user_frequency),
+    .timeInSeconds                 (http_cfg_q.time_in_seconds),
+    .totalWord                     (http_total_word),
+    .state_debug                   (http_client_state),
+
+    .debug_rx_write_ptr  (dbg_rx_ptr),
+    .debug_rx_buffer_w0  (dbg_rx_buf_0),
+    .debug_rx_buffer_w1  (dbg_rx_buf_1),
+    .debug_tx_acc        (dbg_tx_acc),
+    .debug_tx_acc_cnt    (dbg_tx_acc_cnt),
+    .debug_tx_acc_last   (dbg_tx_acc_last),
+    .debug_http_len      (dbg_http_len),
+    .debug_builder_state (dbg_builder_state),
+    .debug_req_lo        (dbg_req_lo),
+    .debug_req_hi        (dbg_req_hi),
+    .debug_req_cnt       (dbg_req_cnt)
 );
 
-// Stream the stripped/re-aligned HTTP body into the OBM bypass path (mirrors RDMA).
-NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_http_bypass (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .in(http_bypass_ndata),
-    .out(axi_out[BYPASS_ID])
+ila_perf_tcp inst_ila_perf_tcp (
+    .clk(aclk),
+    .probe0  (tcp_open_req.valid),
+    .probe1  (tcp_open_req.ready),
+    .probe2  (tcp_open_req.data),
+    .probe3  (tcp_open_rsp.valid),
+    .probe4  (tcp_open_rsp.ready),
+    .probe5  (tcp_open_rsp.data),
+    .probe6  (tcp_close_req.valid),
+    .probe7  (tcp_close_req.ready),
+    .probe8  (tcp_close_req.data),
+    .probe9  (tcp_rx_meta.valid),
+    .probe10 (tcp_rx_meta.ready),
+    .probe11 (tcp_rx_meta.data),
+    .probe12 (tcp_notify.valid),
+    .probe13 (tcp_notify.ready),
+    .probe14 (tcp_notify.data),
+    .probe15 (axis_tcp_recv.tvalid),
+    .probe16 (axis_tcp_recv.tready),
+    .probe17 (axis_tcp_recv.tdata),
+    .probe18 (axis_tcp_recv.tlast),
+    .probe19 (http_client_state),
+    .probe20 (dbg_rx_ptr),
+    .probe21 (dbg_rx_buf_0),
+    .probe22 (dbg_rx_buf_1),
+    .probe23 (tcp_tx_meta.valid),
+    .probe24 (tcp_tx_meta.ready),
+    .probe25 (tcp_tx_meta.data),
+    .probe26 (tcp_tx_stat.valid),
+    .probe27 (tcp_tx_stat.ready),
+    .probe28 (tcp_tx_stat.data),
+    .probe29 (axis_tcp_send.tvalid),
+    .probe30 (axis_tcp_send.tready),
+    .probe31 (axis_tcp_send.tdata),
+    .probe32 (axis_tcp_send.tkeep),
+    .probe33 (axis_tcp_send.tlast),
+    .probe34 (dbg_tx_acc),
+    .probe35 (dbg_tx_acc_cnt),
+    .probe36 (dbg_tx_acc_last),
+    .probe37 (dbg_http_len),
+    .probe38 (dbg_builder_state),
+    .probe39 (dbg_req_lo),
+    .probe40 (dbg_req_hi),
+    .probe41 (dbg_req_cnt)
 );
+
+// handler has no host/OBM body port yet — bypass stream unused.
+always_comb axi_out[BYPASS_ID].tie_off_m();
 `elsif EN_RDMA
 AXI4S axi_in (.aclk(clk), .aresetn(rst_n));
 ndata_i #(data8_t, DATABEAT_SIZE) bypass_ndata();

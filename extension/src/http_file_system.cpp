@@ -141,8 +141,6 @@ uint64_t ParseContentLengthHeader(const string &headers) {
 HTTPFileSystem::HTTPFileSystem(DatabaseInstance &instance) : instance(instance) {
 }
 
-// The TCP session is opened/closed per ranged GET inside HTTPReadRange, so there
-// is no long-lived connection to tear down here.
 HTTPFileSystem::~HTTPFileSystem() = default;
 
 void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
@@ -167,10 +165,7 @@ void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 
 	(void)ctx.config<oasis::HTTPReadConfig>();
 
-	// Resolve the server's MAC once (like RDMAFileSystem::initRDMA sets up the QP
-	// once). The TCP connection itself is opened per request in HTTPReadRange,
-	// because in this Coyote shell only SW can open sockets and we want the
-	// session bound to each HTTP GET (Connection: close semantics).
+	// Optional ARP warm-up; handler opens TCP itself on START.
 	if (HttpFpgaDebugEnabled()) {
 		std::fprintf(stderr,
 		             "[httpfpga] init http_server=%s parseIpBE=0x%08x arp=0x%08x port=%u\n",
@@ -348,120 +343,36 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		throw IOException("HTTP read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 
-	// EnsureInitialized has already opened the TCP session (like RDMA's initRDMA).
+	// Dirty path: fire HW HttpConfig START (handler opens TCP). No body → host yet.
 	auto &ctx = oasis::OasisContext::ctx();
-	auto obm = ctx.output_buffer_manager();
 	auto http_cfg = ctx.config<oasis::HTTPReadConfig>();
 	const auto bypass_stream = ctx.httpBypassStream();
 	const uint64_t range_end = offset + size - 1;
 
-	std::atomic<bool> poll_active {false};
-	std::thread poll_thread;
-	// Always join before leaving — a still-joinable std::thread dtor calls terminate().
-	struct PollThreadGuard {
-		std::atomic<bool> &active;
-		std::thread &thread;
-		~PollThreadGuard() {
-			active = false;
-			if (thread.joinable()) {
-				thread.join();
-			}
-		}
-	} poll_guard {poll_active, poll_thread};
-
-	// Open a fresh TCP session for this GET (SW-managed in this Coyote shell),
-	// then fire the CSR + acquire the OBM handle under the lock so the OBM's
-	// per-stream FIFO stays aligned with the order of HW reads (like RDMA).
-	auto cthread = ctx.cthread();
-	if (HttpFpgaDebugEnabled()) {
-		std::fprintf(stderr, "[httpfpga] openConnTcp ip=0x%08x (%u.%u.%u.%u) port=%u ...\n", server_ip_,
-		             (server_ip_ >> 24) & 0xff, (server_ip_ >> 16) & 0xff, (server_ip_ >> 8) & 0xff,
-		             server_ip_ & 0xff, static_cast<unsigned>(server_port_));
-	}
-	cthread->doArpLookup(IpForArpLookup(server_ip_));
-	std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-	uint16_t session_id = 0;
-	try {
-		session_id = cthread->openConnTcp(server_ip_, server_port_);
-	} catch (const std::exception &e) {
-		throw IOException("FPGA openConnTcp to %s:%u failed: %s "
-		                  "(no packets usually means TOE session create failed — run "
-		                  "parcore/libstf/coyote/util/open_conn_tcp_test/run.sh %s %u on this node)",
-		                  server_host_, static_cast<unsigned>(server_port_), e.what(),
-		                  server_host_.c_str(), static_cast<unsigned>(server_port_));
-	}
-	if (HttpFpgaDebugEnabled()) {
-		std::fprintf(stderr, "[httpfpga] openConnTcp ok session_id=%u\n",
-		             static_cast<unsigned>(session_id));
-	}
-
-	if (HttpFpgaDebugEnabled()) {
-		poll_active = true;
-		poll_thread = std::thread([http_cfg, bypass_stream, offset, size, &poll_active]() {
-			while (poll_active.load()) {
-				std::this_thread::sleep_for(std::chrono::seconds(1));
-				if (!poll_active.load()) {
-					break;
-				}
-				const auto status = http_cfg->debug_status();
-				std::fprintf(stderr,
-				             "[httpfpga] waiting bypass_stream=%u offset=%llu size=%llu status=0x%08x %s\n",
-				             static_cast<unsigned>(bypass_stream), (unsigned long long)offset,
-				             (unsigned long long)size, status, DecodeHttpFpgaStatus(status).c_str());
-			}
-		});
-	}
-
-	std::shared_ptr<libstf::OutputHandle> handle;
 	{
 		std::lock_guard<std::mutex> lock(mtx);
-
-		http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, session_id);
+		http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, /*session*/ 0);
 		RecordHttpFpgaTrigger(bypass_stream, server_ip_, server_port_, path, offset, range_end,
 		                      static_cast<uint32_t>(size));
-		if (HttpFpgaDebugEnabled()) {
-			std::fprintf(stderr,
-			             "[httpfpga] triggered bypass_stream=%u session_id=%u server_ip=0x%08x port=%u "
-			             "path=%s range=[%llu,%llu] size=%u\n",
-			             static_cast<unsigned>(bypass_stream), static_cast<unsigned>(session_id),
-			             server_ip_, static_cast<unsigned>(server_port_), path.c_str(),
-			             (unsigned long long)offset, (unsigned long long)range_end,
-			             static_cast<unsigned>(size));
-		}
-		handle = obm->acquire_output_handle(bypass_stream, size);
+		std::fprintf(stderr,
+		             "[httpfpga] DIRTY fire path=%s range=[%llu,%llu] size=%llu (no OBM body yet)\n",
+		             path.c_str(), (unsigned long long)offset, (unsigned long long)range_end,
+		             (unsigned long long)size);
 	}
 
-	size_t copied = 0;
-	try {
-		while (handle->stream_has_more_output(bypass_stream)) {
-			auto buf = handle->get_next_stream_output(bypass_stream);
-			if (!buf) {
-				break;
-			}
-			if (copied + buf->size > size) {
-				throw IOException(
-				    "HTTP read overran requested size: requested %llu, already got %llu, next chunk %llu",
-				    (unsigned long long)size, (unsigned long long)copied, (unsigned long long)buf->size);
-			}
-			std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
-			copied += buf->size;
-		}
-
-		if (copied != size) {
-			throw IOException("HTTP read short transfer: requested %llu bytes, got %llu",
-			                  (unsigned long long)size, (unsigned long long)copied);
-		}
-	} catch (...) {
-		try {
-			cthread->closeConnTcp(session_id);
-		} catch (...) {
-		}
-		throw;
+	for (int i = 0; i < 30 && http_cfg->client_state() == 0; ++i) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}
+	std::fprintf(stderr, "[httpfpga] client_state after START = %u\n",
+	             static_cast<unsigned>(http_cfg->client_state()));
+	for (int i = 0; i < 120 && http_cfg->client_state() != 0; ++i) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(250));
+	}
+	std::fprintf(stderr, "[httpfpga] client_state done = %u total_word=%u\n",
+	             static_cast<unsigned>(http_cfg->client_state()), http_cfg->debug_status());
 
-	// Server uses Connection: close, so tear the session down after each GET.
-	cthread->closeConnTcp(session_id);
+	// No FPGA→CPU body path yet: zero-fill so DuckDB does not hang on OBM.
+	std::memset(dst, 0, size);
 }
 
 } // namespace duckdb

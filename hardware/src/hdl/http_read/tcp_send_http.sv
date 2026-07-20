@@ -5,8 +5,12 @@ module tcp_send_http (
     input  logic                                      rst_n,
     input  logic                                      start,
     input  logic [15:0]                               session_id,
-    input  logic [31:0]                               serverIp,
-    input  logic [15:0]                               serverPort,
+    input  logic [7:0]                                ipHexLen,
+    input  logic [31:0]                               ipHexWord0,
+    input  logic [31:0]                               ipHexWord1,
+    input  logic [31:0]                               ipHexWord2,
+    input  logic [31:0]                               ipHexWord3,
+    input  logic [31:0]                               portHexWord0,
     input  logic [31:0]                               fileLen,
     input  logic [31:0]                               fileWord0,
     input  logic [31:0]                               fileWord1,
@@ -16,8 +20,12 @@ module tcp_send_http (
     input  logic [31:0]                               fileWord5,
     input  logic [31:0]                               fileWord6,
     input  logic [31:0]                               fileWord7,
-    input  logic [63:0]                               rangeBegin,
-    input  logic [63:0]                               rangeEnd,
+    input  logic [7:0]                                rangeBeginLen,
+    input  logic [31:0]                               rangeBeginW0,
+    input  logic [31:0]                               rangeBeginW1,
+    input  logic [7:0]                                rangeEndLen,
+    input  logic [31:0]                               rangeEndW0,
+    input  logic [31:0]                               rangeEndW1,
     output logic                                      m_axis_tx_meta_TVALID,
     input  logic                                      m_axis_tx_meta_TREADY,
     output logic [TCP_TX_META_BITS-1:0]               m_axis_tx_meta_TDATA,
@@ -32,18 +40,15 @@ module tcp_send_http (
     output logic                                      done,
     output logic                                      error,
     output logic [15:0]                               debug_http_len,
-    output logic [AXI_DATA_BITS-1:0]                  debug_req_lo,
-    output logic [AXI_DATA_BITS-1:0]                  debug_req_hi,
-    output logic                                      debug_req_ready,
     output logic [3:0]                                state_debug
 );
 
-    localparam logic [3:0] ST_IDLE      = 4'd0;
-    localparam logic [3:0] ST_BUILD_HDR = 4'd3;
-    localparam logic [3:0] ST_SEND_META = 4'd4;
-    localparam logic [3:0] ST_SEND_DATA = 4'd5;
-    localparam logic [3:0] ST_WAIT_STAT = 4'd6;
-    localparam logic [3:0] ST_DONE      = 4'd15;
+    localparam logic [3:0] ST_IDLE       = 4'd0;
+    localparam logic [3:0] ST_BUILD_HDR  = 4'd3;
+    localparam logic [3:0] ST_SEND_META  = 4'd4;
+    localparam logic [3:0] ST_SEND_DATA  = 4'd5;
+    localparam logic [3:0] ST_WAIT_STAT  = 4'd6;
+    localparam logic [3:0] ST_DONE       = 4'd15;
 
     logic [3:0] state_q, state_d;
     logic [15:0] http_len_q, http_len_d;
@@ -56,26 +61,31 @@ module tcp_send_http (
     logic req_ready_w;
 
     http_req_builder u_http_builder (
-        .ap_clk       (clk),
-        .ap_rst_n     (rst_n),
-        .start        (state_q == ST_BUILD_HDR),
-        .partial_en   (1'b1),
-        .serverIp     (serverIp),
-        .serverPort   (serverPort),
-        .fileLen      (fileLen[5:0]),
-        .fileWord0    (fileWord0),
-        .fileWord1    (fileWord1),
-        .fileWord2    (fileWord2),
-        .fileWord3    (fileWord3),
-        .fileWord4    (fileWord4),
-        .fileWord5    (fileWord5),
-        .fileWord6    (fileWord6),
-        .fileWord7    (fileWord7),
-        .rangeBegin   (rangeBegin),
-        .rangeEnd     (rangeEnd),
-        .header_data  (header_data_w),
-        .header_len   (header_len_w),
-        .req_ready    (req_ready_w)
+        .ap_clk        (clk),
+        .ap_rst_n      (rst_n),
+        .start         (state_q == ST_BUILD_HDR),
+        .partial_en    (1'b1),
+        .ipHexLen      (ipHexLen),
+        .ipHex         ({ipHexWord3, ipHexWord2, ipHexWord1, ipHexWord0}),
+        .portHex       (portHexWord0),
+        .fileLen       (fileLen[5:0]),
+        .fileWord0     (fileWord0),
+        .fileWord1     (fileWord1),
+        .fileWord2     (fileWord2),
+        .fileWord3     (fileWord3),
+        .fileWord4     (fileWord4),
+        .fileWord5     (fileWord5),
+        .fileWord6     (fileWord6),
+        .fileWord7     (fileWord7),
+        .rangeBeginLen (rangeBeginLen),
+        .rangeBeginW0  (rangeBeginW0),
+        .rangeBeginW1  (rangeBeginW1),
+        .rangeEndLen   (rangeEndLen),
+        .rangeEndW0    (rangeEndW0),
+        .rangeEndW1    (rangeEndW1),
+        .header_data   (header_data_w),
+        .header_len    (header_len_w),
+        .req_ready     (req_ready_w)
     );
 
     function automatic logic [63:0] make_keep(input logic [6:0] count);
@@ -204,9 +214,6 @@ module tcp_send_http (
     assign done = (state_q == ST_DONE);
     assign error = error_q;
     assign debug_http_len = http_len_q;
-    assign debug_req_lo = http_data_q[AXI_DATA_BITS-1:0];
-    assign debug_req_hi = http_data_q[2*AXI_DATA_BITS-1:AXI_DATA_BITS];
-    assign debug_req_ready = req_ready_w;
     assign state_debug = (state_q == ST_DONE) ? 4'd6 : state_q;
 
 endmodule
