@@ -77,6 +77,11 @@ module handler (
     input  logic [31:0]                               rangeEndW1,
     input  logic [31:0]                               userFrequency,
     input  logic [31:0]                               timeInSeconds,
+    output logic                       m_axis_body_tvalid,
+    input  logic                       m_axis_body_tready,
+    output logic [AXI_DATA_BITS-1:0]   m_axis_body_tdata,
+    output logic [AXI_DATA_BITS/8-1:0] m_axis_body_tkeep,
+    output logic                                      m_axis_body_tlast,
 
     output logic [3:0]                                debug_rx_write_ptr,
     output logic [AXI_DATA_BITS-1:0]                  debug_rx_buffer_w0,
@@ -100,7 +105,6 @@ module handler (
     localparam logic [3:0] ST_CLOSE    = 4'd4;
 
     logic [3:0] state_q, state_d;
-    logic runTx_first_q, runTx_first_d;
     logic [15:0] session_id_q, session_id_d;
 
     logic init_done;
@@ -197,6 +201,11 @@ module handler (
         .s_axis_rx_data_TDATA(s_axis_rx_data_TDATA),
         .s_axis_rx_data_TKEEP(s_axis_rx_data_TKEEP),
         .s_axis_rx_data_TLAST(s_axis_rx_data_TLAST),
+        .m_axis_body_tvalid(m_axis_body_tvalid),
+        .m_axis_body_tready(m_axis_body_tready),
+        .m_axis_body_tdata(m_axis_body_tdata),
+        .m_axis_body_tkeep(m_axis_body_tkeep),
+        .m_axis_body_tlast(m_axis_body_tlast),
         .done(read_done),
         .error(read_error),
         .debug_rx_write_ptr(debug_rx_write_ptr),
@@ -215,7 +224,6 @@ module handler (
 
     always_comb begin
         state_d = state_q;
-        runTx_first_d = runTx_first_q;
         session_id_d = session_id_q;
 
         m_axis_close_connection_TVALID = 1'b0;
@@ -223,7 +231,7 @@ module handler (
 
         case (state_q)
             ST_IDLE: begin
-                if (runTx && !runTx_first_q) begin
+                if (runTx) begin
                     state_d = ST_TCP_INIT;
                 end
             end
@@ -253,7 +261,6 @@ module handler (
             ST_CLOSE: begin
                 m_axis_close_connection_TVALID = 1'b1;
                 if (m_axis_close_connection_TVALID && m_axis_close_connection_TREADY) begin
-                    runTx_first_d = 1'b1;
                     state_d = ST_IDLE;
                 end
             end
@@ -265,11 +272,9 @@ module handler (
     always_ff @(posedge ap_clk) begin
         if (!ap_rst_n) begin
             state_q <= ST_IDLE;
-            runTx_first_q <= 1'b0;
             session_id_q <= 16'd0;
         end else begin
             state_q <= state_d;
-            runTx_first_q <= runTx_first_d;
             session_id_q <= session_id_d;
         end
     end

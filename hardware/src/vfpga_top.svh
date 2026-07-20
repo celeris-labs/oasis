@@ -343,6 +343,12 @@ handler inst_handler (
     .totalWord                     (http_total_word),
     .state_debug                   (http_client_state),
 
+    .m_axis_body_tvalid  (axi_out[BYPASS_ID].tvalid),
+    .m_axis_body_tready  (axi_out[BYPASS_ID].tready),
+    .m_axis_body_tdata   (axi_out[BYPASS_ID].tdata),
+    .m_axis_body_tkeep   (axi_out[BYPASS_ID].tkeep),
+    .m_axis_body_tlast   (axi_out[BYPASS_ID].tlast),
+
     .debug_rx_write_ptr  (dbg_rx_ptr),
     .debug_rx_buffer_w0  (dbg_rx_buf_0),
     .debug_rx_buffer_w1  (dbg_rx_buf_1),
@@ -402,8 +408,7 @@ ila_perf_tcp inst_ila_perf_tcp (
     .probe41 (dbg_req_cnt)
 );
 
-// handler has no host/OBM body port yet — bypass stream unused.
-always_comb axi_out[BYPASS_ID].tie_off_m();
+//always_comb axi_out[BYPASS_ID].tie_off_m();
 `elsif EN_RDMA
 AXI4S axi_in (.aclk(clk), .aresetn(rst_n));
 ndata_i #(data8_t, DATABEAT_SIZE) bypass_ndata();

@@ -22,6 +22,12 @@ module tcp_read (
     input  logic [AXI_DATA_BITS-1:0]                  s_axis_rx_data_TDATA,
     input  logic [AXI_DATA_BITS/8-1:0]                s_axis_rx_data_TKEEP,
     input  logic                                      s_axis_rx_data_TLAST,
+
+    output logic                       m_axis_body_tvalid,
+    input  logic                       m_axis_body_tready,
+    output logic [AXI_DATA_BITS-1:0]   m_axis_body_tdata,
+    output logic [AXI_DATA_BITS/8-1:0] m_axis_body_tkeep,
+    output logic                       m_axis_body_tlast,
     
     output logic                                      done,
     output logic                                      error,
@@ -62,11 +68,17 @@ module tcp_read (
         .s_axis_tkeep(s_axis_rx_data_TKEEP),
         .s_axis_tlast(s_axis_rx_data_TLAST),
         .s_axis_tready(s_axis_rx_data_TREADY),
+        .m_axis_tvalid(m_axis_body_tvalid),
+        .m_axis_tdata(m_axis_body_tdata),
+        .m_axis_tkeep(m_axis_body_tkeep),
+        .m_axis_tlast(m_axis_body_tlast),
+        .m_axis_tready(m_axis_body_tready),
         .out_w0(payload_w0),
         .out_w1(payload_w1),
         .out_w0_valid(payload_w0_valid),
         .out_w1_valid(payload_w1_valid),
-        .done(payload_done)
+        .done(payload_done),
+        .out_payload_idx()
     );
 
     always_comb begin
