@@ -1,8 +1,8 @@
 // Adapted from hardware/copy_from_working/src/main.cpp for the oasis HTTP bitstream.
 //
-// Legacy top had only GlobalConfig + HttpConfig (HttpConfig base = 3).
-// Oasis has MemConfig + ColumnChunkDecoder + HttpConfig — discover HttpConfig
-// by scanning for HTTP_CONFIG_ID (0x485454). HW opens TCP itself; no openConnTcp.
+// Discovers HttpConfig by ID 0x485454. HW opens TCP itself.
+// Also enqueues a MemConfig buffer on the bypass stream so OutputWriter can DMA
+// the stripped HTTP body to the host, then prints it.
 
 #include <iostream>
 #include <sstream>
@@ -13,20 +13,38 @@
 #include <array>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <iomanip>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <boost/program_options.hpp>
 #include <unistd.h>
 
 #include <coyote/cThread.hpp>
+#include <coyote/cOps.hpp>
 
 #define DEFAULT_VFPGA_ID 0
 #define MHZ (1024ULL * 1024ULL)
 
 constexpr uint64_t OASIS_SYSTEM_ID   = 0x0A515;
 constexpr uint64_t HTTP_CONFIG_ID    = 0x0000000000485454ULL; // "HTT"
+constexpr uint64_t MEM_CONFIG_ID     = 0x0ULL;
 constexpr uint32_t HTTP_NUM_WRITE    = 28; // 27 params + START
 
 constexpr uint32_t GLOBAL_SYSTEM_ID   = 0;
 constexpr uint32_t GLOBAL_NUM_CONFIGS = 1;
+
+// Must match libstf::common.hpp / OutputWriter interrupt encoding.
+constexpr uint32_t BYTES_PER_FPGA_TRANSFER           = 65536;
+constexpr uint32_t INTERRUPT_TRANSFER_SIZE_BITS      = 28;
+constexpr uint32_t BUFFER_SIZE_BITS =
+    INTERRUPT_TRANSFER_SIZE_BITS - 16; // floor_log2(65536) == 16
+constexpr uint32_t FPGA_INTERRUPT_STREAM_ID_BITS     = 3;
+constexpr uint32_t FPGA_INTERRUPT_TRANSFER_SIZE_BITS = 28;
 
 enum class HttpLocal : uint32_t {
     SERVER_IP       = 0,
@@ -57,11 +75,48 @@ enum class HttpLocal : uint32_t {
     RANGE_END_W0    = 25,
     RANGE_END_W1    = 26,
     START           = 27,
-    // reads (same local offsets)
     ID              = 0,
     CLIENT_STATE    = 1,
     TOTAL_WORD      = 2,
 };
+
+struct IrqState {
+    std::mutex              m;
+    std::condition_variable cv;
+    uint32_t                stream_id     = 0;
+    uint32_t                bytes_written = 0;
+    bool                    last          = false;
+    bool                    got           = false;
+};
+
+static IrqState g_irq;
+static std::atomic<uint32_t> g_irq_count{0};
+
+static void on_fpga_irq(int value) {
+    const uint32_t u = static_cast<uint32_t>(value);
+    const uint32_t stream_id =
+        u & ((1u << FPGA_INTERRUPT_STREAM_ID_BITS) - 1u);
+    const uint32_t bytes_written =
+        (u >> FPGA_INTERRUPT_STREAM_ID_BITS) &
+        ((1u << FPGA_INTERRUPT_TRANSFER_SIZE_BITS) - 1u);
+    const bool last =
+        ((u >> (FPGA_INTERRUPT_STREAM_ID_BITS + FPGA_INTERRUPT_TRANSFER_SIZE_BITS)) & 1u) != 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_irq.m);
+        g_irq.stream_id     = stream_id;
+        g_irq.bytes_written = bytes_written;
+        g_irq.last          = last;
+        g_irq.got           = true;
+    }
+    g_irq_count.fetch_add(1);
+    g_irq.cv.notify_all();
+
+    std::cout << "[IRQ] value=0x" << std::hex << u << std::dec
+              << " stream=" << stream_id
+              << " bytes=" << bytes_written
+              << " last=" << last << std::endl;
+}
 
 static void validate_ip_ascii(const std::string& ip_str) {
     if (ip_str.empty() || ip_str.size() > 15) {
@@ -146,10 +201,8 @@ static uint32_t pack_port_hex_word(uint16_t port) {
     return word;
 }
 
-// libstf GlobalConfig layout: CSR0=system_id, CSR1=num_configs,
-// CSR[2..1+N]=end bounds of each config. Config i starts at:
-//   i==0 ? (2+N) : CSR[1+i]
-static uint32_t find_http_config_base(coyote::cThread& t) {
+static uint32_t find_config_base(coyote::cThread& t, uint64_t want_id, const char* name,
+                                 uint32_t min_write_regs = 0) {
     const uint64_t system_id = t.getCSR(GLOBAL_SYSTEM_ID);
     const uint64_t num_configs = t.getCSR(GLOBAL_NUM_CONFIGS);
 
@@ -158,7 +211,7 @@ static uint32_t find_http_config_base(coyote::cThread& t) {
 
     if (system_id != OASIS_SYSTEM_ID) {
         std::cerr << "WARNING: expected oasis SYSTEM_ID 0x" << std::hex << OASIS_SYSTEM_ID
-                  << " (legacy copy_from_working used 0xC011C011)\n" << std::dec;
+                  << std::dec << std::endl;
     }
     if (num_configs == 0 || num_configs > 16) {
         throw std::runtime_error("num_configs looks invalid");
@@ -170,15 +223,74 @@ static uint32_t find_http_config_base(coyote::cThread& t) {
         const uint64_t id = t.getCSR(start);
         std::cout << "config[" << i << "] [" << start << "," << end
                   << ") id=0x" << std::hex << id << std::dec << std::endl;
-        if (id == HTTP_CONFIG_ID) {
-            if (end < start + HTTP_NUM_WRITE) {
-                throw std::runtime_error("HttpConfig address space too small");
+        if (id == want_id) {
+            if (min_write_regs && end < start + min_write_regs) {
+                throw std::runtime_error(std::string(name) + " address space too small");
             }
             return start;
         }
         start = end;
     }
-    throw std::runtime_error("HttpConfig ID 0x485454 not found — wrong bitstream?");
+    throw std::runtime_error(std::string(name) + " not found — wrong bitstream?");
+}
+
+static size_t round_up_transfer(size_t n) {
+    if (n == 0) n = 1;
+    return ((n + BYTES_PER_FPGA_TRANSFER - 1) / BYTES_PER_FPGA_TRANSFER) * BYTES_PER_FPGA_TRANSFER;
+}
+
+static void enqueue_mem_buffer(coyote::cThread& t, uint32_t mem_base, uint32_t stream,
+                               void* ptr, size_t capacity) {
+    if (capacity == 0 || (capacity % BYTES_PER_FPGA_TRANSFER) != 0) {
+        throw std::runtime_error("buffer capacity must be a multiple of 65536");
+    }
+    const uint64_t vaddr = reinterpret_cast<uint64_t>(ptr);
+    const uint64_t n_xfer = capacity / BYTES_PER_FPGA_TRANSFER;
+    const uint64_t word = (vaddr << BUFFER_SIZE_BITS) | n_xfer;
+    t.setCSR(word, mem_base + stream);
+    std::cout << "[MEM] enqueue stream=" << stream
+              << " vaddr=0x" << std::hex << vaddr << std::dec
+              << " capacity=" << capacity
+              << " n_xfer=" << n_xfer << std::endl;
+}
+
+static void print_body(const uint8_t* data, size_t nbytes, size_t print_max) {
+    const size_t n = std::min(nbytes, print_max);
+    std::cout << "\n======== vFPGA bypass body (" << nbytes << " bytes"
+              << (nbytes > print_max ? ", showing first " + std::to_string(print_max) : "")
+              << ") ========\n";
+
+    // Hex + ASCII rows of 16
+    for (size_t off = 0; off < n; off += 16) {
+        std::cout << std::hex << std::setw(8) << std::setfill('0') << off << "  ";
+        for (size_t i = 0; i < 16; ++i) {
+            if (off + i < n) {
+                std::cout << std::hex << std::setw(2) << std::setfill('0')
+                          << static_cast<unsigned>(data[off + i]) << ' ';
+            } else {
+                std::cout << "   ";
+            }
+            if (i == 7) std::cout << ' ';
+        }
+        std::cout << " |";
+        for (size_t i = 0; i < 16 && off + i < n; ++i) {
+            const unsigned char c = data[off + i];
+            std::cout << (std::isprint(c) ? static_cast<char>(c) : '.');
+        }
+        std::cout << "|\n";
+    }
+    std::cout << std::dec << std::setfill(' ');
+
+    // Best-effort text view
+    std::cout << "-------- as text (printable / '.') --------\n";
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = data[i];
+        if (c == '\n' || c == '\r' || c == '\t' || std::isprint(c))
+            std::cout << static_cast<char>(c);
+        else
+            std::cout << '.';
+    }
+    std::cout << "\n==========================================\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -194,8 +306,11 @@ int main(int argc, char* argv[]) {
     uint64_t range_begin = 0;
     uint64_t range_end   = 50000;
     bool skip_arp = false;
+    uint64_t out_bytes = 0;   // 0 => derive from range
+    uint64_t print_max = 4096;
+    uint64_t irq_timeout_s = 30;
 
-    po::options_description desc("oasis http_handler_test (from copy_from_working main)");
+    po::options_description desc("oasis http_handler_test (body → host via bypass/OutputWriter)");
     desc.add_options()
         ("help,h", "Show help")
         ("ip,i",       po::value<std::string>(&ip_str)->required(),                     "HTTP Host IP A.B.C.D (required)")
@@ -210,6 +325,12 @@ int main(int argc, char* argv[]) {
                         "Range header start byte (default 0)")
         ("end,e",      po::value<uint64_t>(&range_end)->default_value(50000),
                         "Range header end byte (default 50000)")
+        ("out-bytes",  po::value<uint64_t>(&out_bytes)->default_value(0),
+                        "Expected body bytes to DMA (0 = end-begin+1)")
+        ("print-max",  po::value<uint64_t>(&print_max)->default_value(4096),
+                        "Max bytes to print from body")
+        ("irq-timeout", po::value<uint64_t>(&irq_timeout_s)->default_value(30),
+                        "Seconds to wait for OutputWriter IRQ after START")
         ("skip-arp",   po::bool_switch(&skip_arp),
                         "Do not call doArpLookup before START (TOE can ARP on SYN)");
     po::variables_map vm;
@@ -226,6 +347,8 @@ int main(int argc, char* argv[]) {
     ensure_u32("time",  timeS);
     ensure_u32("begin", range_begin);
     ensure_u32("end",   range_end);
+    if (range_end < range_begin)
+        throw std::invalid_argument("--end must be >= --begin");
 
     validate_ip_ascii(ip_str);
     uint32_t server_ip_be = parseIpBE(server_ip_str.empty() ? ip_str : server_ip_str);
@@ -249,7 +372,8 @@ int main(int argc, char* argv[]) {
     if (range_end_len == 0 || range_end_len > 8)
         throw std::invalid_argument("--end must produce 1..8 ASCII digits");
 
-    coyote::cThread coyote_thread(DEFAULT_VFPGA_ID, getpid());
+    // ISR must be registered at construction.
+    coyote::cThread coyote_thread(DEFAULT_VFPGA_ID, getpid(), /*device*/ 0, on_fpga_irq);
 
     std::cout << "[CFG] sessions=" << sessions
               << " words=" << words
@@ -262,8 +386,34 @@ int main(int argc, char* argv[]) {
               << " range=" << range_begin << "-" << range_end
               << std::endl;
 
-    const uint32_t http_base = find_http_config_base(coyote_thread);
+    const uint32_t mem_base = find_config_base(coyote_thread, MEM_CONFIG_ID, "MemConfig");
+    const uint32_t http_base = find_config_base(coyote_thread, HTTP_CONFIG_ID, "HttpConfig",
+                                               HTTP_NUM_WRITE);
+    std::cout << "MemConfig  base CSR = " << mem_base << std::endl;
     std::cout << "HttpConfig base CSR = " << http_base << std::endl;
+
+    const uint64_t num_streams = coyote_thread.getCSR(mem_base + 1);
+    if (num_streams == 0 || num_streams > 16) {
+        throw std::runtime_error("MemConfig num_streams looks invalid");
+    }
+    const uint32_t bypass_stream = static_cast<uint32_t>(num_streams - 1);
+    std::cout << "num_streams=" << num_streams
+              << " bypass_stream=" << bypass_stream << std::endl;
+
+    // Flush any stale OutputWriter buffers, then enqueue our host buffer.
+    coyote_thread.setCSR(1, mem_base + static_cast<uint32_t>(num_streams));
+
+    const size_t expected_body =
+        out_bytes != 0 ? static_cast<size_t>(out_bytes)
+                       : static_cast<size_t>(range_end - range_begin + 1);
+    const size_t out_cap = round_up_transfer(expected_body);
+    uint8_t* out_buf = static_cast<uint8_t*>(
+        coyote_thread.getMem({coyote::CoyoteAllocType::HPF, out_cap}));
+    if (!out_buf) {
+        throw std::runtime_error("getMem failed for output buffer");
+    }
+    std::memset(out_buf, 0, out_cap);
+    enqueue_mem_buffer(coyote_thread, mem_base, bypass_stream, out_buf, out_cap);
 
     auto wr = [&](HttpLocal reg, uint64_t val) {
         coyote_thread.setCSR(val, http_base + static_cast<uint32_t>(reg));
@@ -272,7 +422,6 @@ int main(int argc, char* argv[]) {
         return coyote_thread.getCSR(http_base + static_cast<uint32_t>(reg));
     };
 
-    // Optional ARP warm-up (NET_ARP_REG byte-swaps the written word).
     if (!skip_arp) {
         const uint32_t arp_ip = __builtin_bswap32(server_ip_be);
         std::cout << "doArpLookup(0x" << std::hex << arp_ip << std::dec << ") ..." << std::endl;
@@ -320,12 +469,52 @@ int main(int argc, char* argv[]) {
         sleep(static_cast<unsigned int>(timeS));
     }
 
-    while (rd(HttpLocal::CLIENT_STATE) != 0) {
-        std::cout << "running, state=" << rd(HttpLocal::CLIENT_STATE)
-                  << " total_word=" << rd(HttpLocal::TOTAL_WORD) << std::endl;
-        sleep(1);
+    // Wait for OutputWriter IRQ (body DMA) and/or HTTP FSM back to IDLE.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(irq_timeout_s);
+    uint32_t body_bytes = 0;
+    bool got_irq = false;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        {
+            std::unique_lock<std::mutex> lk(g_irq.m);
+            if (g_irq.got) {
+                got_irq = true;
+                body_bytes = g_irq.bytes_written;
+                if (g_irq.stream_id != bypass_stream) {
+                    std::cerr << "WARNING: IRQ stream " << g_irq.stream_id
+                              << " != bypass " << bypass_stream << std::endl;
+                }
+                // Clear for potential multi-buffer; we only enqueue one.
+                g_irq.got = false;
+                if (g_irq.last) break;
+            }
+        }
+
+        const uint64_t st = rd(HttpLocal::CLIENT_STATE);
+        std::cout << "running, state=" << st
+                  << " total_word=" << rd(HttpLocal::TOTAL_WORD)
+                  << " irq_count=" << g_irq_count.load() << std::endl;
+        if (st == 0 && got_irq) break;
+        if (st == 0 && !got_irq) {
+            // FSM done but no body IRQ yet — keep waiting a bit for late DMA.
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    std::cout << "[DONE] total_word=" << rd(HttpLocal::TOTAL_WORD) << std::endl;
+    std::cout << "[DONE] total_word=" << rd(HttpLocal::TOTAL_WORD)
+              << " client_state=" << rd(HttpLocal::CLIENT_STATE)
+              << " irq_count=" << g_irq_count.load()
+              << " body_bytes=" << body_bytes << std::endl;
+
+    if (!got_irq) {
+        std::cerr << "WARNING: no OutputWriter IRQ — is body wired and bitstream rebuilt?\n";
+        // Still dump buffer in case DMA completed without IRQ delivery.
+        body_bytes = static_cast<uint32_t>(std::min(expected_body, out_cap));
+    }
+
+    print_body(out_buf, body_bytes, static_cast<size_t>(print_max));
     return EXIT_SUCCESS;
 }
