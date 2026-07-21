@@ -1,8 +1,10 @@
 // Standalone server that hosts a set of Parquet files in an RDMA-readable
 // memory region for the Oasis extension's rdma:// filesystem.
 //
-// It brings up a single RC queue pair, registers the region for remote reads,
-// and then sits idle and waits for requests.
+// It registers one memory region for remote reads and then accepts a queue pair
+// per client connection, all sharing that region. The Oasis FPGA opens one queue
+// pair per read-request stream (one cThread each), so the server holds several
+// concurrent QPs against the same region and serves reads on all of them.
 //
 // The out-of-band QP exchange is wire-compatible with Coyote's cThread::initRDMA:
 // the client connects, sends its ibvQ, and then reads back ours. The ibvQ struct
@@ -32,11 +34,17 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -47,8 +55,28 @@ constexpr int      DEFAULT_IB_PORT  = 1;
 constexpr int      DEFAULT_GID_IDX  = 3;     // RoCEv2 IPv4 sgid index
 constexpr int      DEFAULT_DEV_IDX  = 0;
 
+// Upper bound on live client QPs. The FPGA opens one per read-request stream (a handful); this is a
+// safety valve so a misbehaving/looping client cannot make the server accumulate QPs without bound.
+constexpr size_t MAX_CONCURRENT_QPS = 256;
+
+// A stalled QP exchange must not pin a worker (and thus the server's shutdown) forever, so the
+// accepted socket gets this receive timeout. The client sends its ibvQ immediately after connecting,
+// so a few seconds is comfortably more than a healthy exchange needs.
+constexpr int EXCHANGE_TIMEOUT_SECONDS = 5;
+
 std::atomic<bool> g_stop{false};
 void              handle_signal(int) { g_stop.store(true); }
+
+/**
+ * Sets a receive timeout on a socket so blocking reads on it cannot hang indefinitely. Best-effort:
+ * a failure just leaves the socket blocking, which the caller's own timeouts still bound.
+ */
+void set_recv_timeout(int fd, int seconds) {
+    struct timeval tv;
+    tv.tv_sec  = seconds;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
 
 /**
  * RDMA queue metadata exchanged out-of-band. Must match coyote::ibvQ byte-for-byte
@@ -121,21 +149,20 @@ std::vector<std::string> resolve_inputs(const std::vector<std::string> &args) {
 }
 
 /**
- * Holds every libibverbs object that makes up the server's RDMA endpoint.
+ * The shared RDMA endpoint: the NIC context, protection domain, completion queue, and the single
+ * memory region every client queue pair reads from. Created once and shared read-only across the
+ * per-connection worker threads (each worker owns its own queue pair, created by arm_qp).
  */
 struct RDMAEndpoint {
     struct ibv_context     *context  = nullptr;
     struct ibv_pd          *pd       = nullptr;
     struct ibv_cq          *cq       = nullptr;
-    struct ibv_qp          *qp       = nullptr;
     struct ibv_mr          *mr       = nullptr;
     uint8_t                *mem      = nullptr;
     size_t                  mem_size = 0;
     struct ibv_device_attr  dev_attr = {}; // NIC limits, queried once; used to clamp QP caps.
 
     ~RDMAEndpoint() {
-        if (qp)
-            ibv_destroy_qp(qp);
         if (cq)
             ibv_destroy_cq(cq);
         if (mr)
@@ -171,10 +198,9 @@ bool move_qp_to_init(struct ibv_qp *qp, int ib_port) {
 }
 
 /**
- * Opens the NIC, caches its device limits, and allocates and registers a region_size buffer for
- * remote reads. Leaves ep.qp null: a fresh QP is created per client by arm_qp(), which avoids the
- * fragile reset-and-reuse path that behaves inconsistently across mlx5 and bnxt_re. Returns false
- * on any failure.
+ * Opens the NIC, caches its device limits, allocates and registers a region_size buffer for remote
+ * reads, and creates the shared completion queue. Queue pairs are created per client by arm_qp();
+ * the endpoint holds no QP of its own. Returns false on any failure.
  */
 bool setup_endpoint(RDMAEndpoint &ep, uint64_t region_size, int dev_idx) {
     int                num_devices = 0;
@@ -236,17 +262,17 @@ bool setup_endpoint(RDMAEndpoint &ep, uint64_t region_size, int dev_idx) {
 }
 
 /**
- * Creates a fresh RC queue pair on the endpoint and leaves it in the INIT state, ready for an
- * RTR/RTS transition. Called once per client so each connection starts from a clean QP -- more
- * portable across NICs than resetting and reusing one QP. ep.qp must be null on entry (any prior
- * QP destroyed first). Caps are clamped to the cached device limits.
+ * Creates a fresh RC queue pair on the shared endpoint and leaves it in the INIT state, ready for an
+ * RTR/RTS transition. Called once per client connection so each stream gets its own QP; a QP is
+ * never reset and reused, which behaves inconsistently across mlx5 and bnxt_re. Returns the new QP,
+ * or nullptr on failure. Caps are clamped to the cached device limits.
  *
  * This QP is a passive RDMA-read responder -- the FPGA is the requester and we never post send/recv
  * work requests -- so it needs only token WQE depth. Broadcom (bnxt_re) has a tighter per-QP WQE
  * budget than Mellanox (mlx5): the 2048/16 caps that worked on mlx5 fail here (EINVAL on
  * max_sge > 13, then ENOSPC as WR x SGE overruns the budget).
  */
-bool arm_qp(RDMAEndpoint &ep, int ib_port) {
+struct ibv_qp *arm_qp(RDMAEndpoint &ep, int ib_port) {
     struct ibv_qp_init_attr qp_init_attr;
     memset(&qp_init_attr, 0, sizeof(qp_init_attr));
     qp_init_attr.send_cq          = ep.cq;
@@ -257,13 +283,17 @@ bool arm_qp(RDMAEndpoint &ep, int ib_port) {
     qp_init_attr.cap.max_send_sge = std::min(1, ep.dev_attr.max_sge);
     qp_init_attr.cap.max_recv_sge = std::min(1, ep.dev_attr.max_sge);
 
-    ep.qp = ibv_create_qp(ep.pd, &qp_init_attr);
-    if (!ep.qp) {
+    struct ibv_qp *qp = ibv_create_qp(ep.pd, &qp_init_attr);
+    if (!qp) {
         std::cerr << "Could not create queue pair: " << strerror(errno) << "\n";
-        return false;
+        return nullptr;
     }
 
-    return move_qp_to_init(ep.qp, ib_port);
+    if (!move_qp_to_init(qp, ib_port)) {
+        ibv_destroy_qp(qp);
+        return nullptr;
+    }
+    return qp;
 }
 
 /**
@@ -298,7 +328,7 @@ bool query_local_ipv4(struct ibv_context *context, int ib_port, int gid_idx, uin
  * Coyote FPGA advertises its RoCE IP rather than a real GID. The shared PSN convention
  * (both sides use the client's PSN) also follows the reference.
  */
-bool connect_qp(RDMAEndpoint &ep, const ibvQ &remote, uint32_t psn, int ib_port, int gid_idx) {
+bool connect_qp(struct ibv_qp *qp, const ibvQ &remote, uint32_t psn, int ib_port, int gid_idx) {
     // Build the remote GID as ::ffff:<ip> in network byte order.
     uint64_t remote_gid = 0x0000FFFF00000000ULL | static_cast<uint64_t>(remote.ip_addr);
     uint32_t high_part  = htonl(static_cast<uint32_t>(remote_gid >> 32));
@@ -330,7 +360,7 @@ bool connect_qp(RDMAEndpoint &ep, const ibvQ &remote, uint32_t psn, int ib_port,
     attr.ah_attr.grh.hop_limit     = 4;
     attr.ah_attr.grh.traffic_class = 0;
 
-    int ret = ibv_modify_qp(ep.qp, &attr,
+    int ret = ibv_modify_qp(qp, &attr,
                             IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
                                 IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
     if (ret) {
@@ -346,7 +376,7 @@ bool connect_qp(RDMAEndpoint &ep, const ibvQ &remote, uint32_t psn, int ib_port,
     attr.rnr_retry     = 1;
     attr.max_rd_atomic = 16;
     attr.path_mig_state = IBV_MIG_REARM;
-    ret = ibv_modify_qp(ep.qp, &attr,
+    ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
                             IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_PATH_MIG_STATE);
     if (ret) {
@@ -380,7 +410,7 @@ int create_listen_socket(uint16_t port) {
         close(sockfd);
         return -1;
     }
-    if (listen(sockfd, 1) < 0) {
+    if (listen(sockfd, SOMAXCONN) < 0) {
         std::cerr << "Could not listen on port " << port << "\n";
         close(sockfd);
         return -1;
@@ -389,50 +419,123 @@ int create_listen_socket(uint16_t port) {
 }
 
 /**
- * Accepts one client on listenfd and performs the Coyote-compatible QP exchange: read the
- * client's ibvQ, then send ours. Returns the accepted socket fd (kept open until the
- * client tears the connection down) or -1 on failure.
+ * Performs the Coyote-compatible QP exchange on an already-accepted connection: read the client's
+ * ibvQ, then send ours. Returns true on success with remote_out holding the client's queue metadata.
  *
- * The client's PSN is adopted as the shared PSN, so local.psn is filled from the client's
- * QP after the read and before the reply is sent. On success remote_out holds the client's
- * queue metadata.
+ * The client's PSN is adopted as the shared PSN, so local.psn is filled from the client's QP after
+ * the read and before the reply is sent.
  */
-int accept_and_exchange(int listenfd, ibvQ &local, ibvQ &remote_out) {
-    int connfd = accept(listenfd, nullptr, nullptr);
-    if (connfd < 0) {
-        if (errno != EINTR) // EINTR is the shutdown signal interrupting accept()
-            std::cerr << "Failed to accept connection\n";
-        return -1;
-    }
-
-    // Read the client's QP first, then reply with ours (Coyote's exchange order).
+bool exchange_qp(int connfd, ibvQ &local, ibvQ &remote_out) {
+    // Read the client's QP first, then reply with ours (Coyote's exchange order). A short read here
+    // is usually the receive timeout firing on a client that connected but never sent its ibvQ.
     if (read(connfd, &remote_out, sizeof(ibvQ)) != static_cast<ssize_t>(sizeof(ibvQ))) {
-        std::cerr << "Failed to read client QP\n";
-        close(connfd);
-        return -1;
+        std::cerr << "Failed to read client QP: " << strerror(errno) << "\n";
+        return false;
     }
     local.psn = remote_out.psn; // both sides share the client's PSN
     if (write(connfd, &local, sizeof(ibvQ)) != static_cast<ssize_t>(sizeof(ibvQ))) {
         std::cerr << "Failed to send server QP\n";
-        close(connfd);
-        return -1;
+        return false;
     }
-    return connfd;
+    return true;
 }
 
 /**
- * Blocks until the client tears down the TCP connection (read returns 0) or the server is
- * asked to stop. RDMA reads are served by the NIC with no CPU involvement, so the socket
- * carries no post-exchange traffic; any bytes that do arrive are ignored.
+ * Blocks until the client tears down the TCP connection (read returns 0) or the server is asked to
+ * stop. RDMA reads are served by the NIC with no CPU involvement, so the socket carries no
+ * post-exchange traffic; any bytes that do arrive are ignored. Runs on a worker thread, where the
+ * shutdown signal is delivered to the main thread rather than here -- so instead of relying on
+ * EINTR we poll with a timeout and re-check g_stop between waits.
  */
 void wait_for_disconnect(int connfd) {
+    struct pollfd pfd;
+    pfd.fd     = connfd;
+    pfd.events = POLLIN;
     char buf[64];
     while (!g_stop.load()) {
+        int r = poll(&pfd, 1, 200 /* ms */);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return; // real poll error
+        }
+        if (r == 0)
+            continue; // timeout -- re-check g_stop
         ssize_t n = read(connfd, buf, sizeof(buf));
         if (n == 0)                  // client closed the connection
             return;
         if (n < 0 && errno != EINTR) // real error (EINTR just means a signal woke us)
             return;
+    }
+}
+
+/**
+ * Services one client connection end-to-end on its own thread: creates a fresh QP on the shared
+ * endpoint, exchanges queue metadata, connects the QP to the client's, then holds it in RTS
+ * serving RDMA reads until the client disconnects (or the server stops). Tears the QP and socket
+ * down on the way out. `local` is a per-connection copy of the advertised metadata; only its qpn
+ * (from the new QP) and psn (from the exchange) are filled here.
+ *
+ * `done` is set to true just before the thread returns, on every exit path, so the main loop can
+ * reap the finished thread (and free its QP resources) without blocking.
+ */
+void handle_client(int connfd, RDMAEndpoint &ep, ibvQ local, int ib_port, int gid_idx,
+                   std::shared_ptr<std::atomic<bool>> done) {
+    // Signal completion on any return path so the main loop reaps this worker promptly.
+    struct DoneGuard {
+        std::shared_ptr<std::atomic<bool>> flag;
+        ~DoneGuard() { flag->store(true); }
+    } done_guard{done};
+
+    // Bound the QP exchange so a client that connects but never completes it cannot pin this thread
+    // (and thus block the server's shutdown join) forever.
+    set_recv_timeout(connfd, EXCHANGE_TIMEOUT_SECONDS);
+
+    struct ibv_qp *qp = arm_qp(ep, ib_port);
+    if (!qp) {
+        close(connfd);
+        return;
+    }
+    local.qpn = qp->qp_num;
+
+    ibvQ remote;
+    memset(&remote, 0, sizeof(remote));
+    if (exchange_qp(connfd, local, remote) && connect_qp(qp, remote, local.psn, ib_port, gid_idx)) {
+        remote.print("Remote");
+        local.print("Local");
+        std::cout << "Now serving a stream (QPN 0x" << std::hex << qp->qp_num << std::dec
+                  << ")..." << std::endl;
+        wait_for_disconnect(connfd);
+        std::cout << "Stream QPN 0x" << std::hex << qp->qp_num << std::dec << " disconnected."
+                  << std::endl;
+    }
+
+    close(connfd);
+    ibv_destroy_qp(qp);
+}
+
+/**
+ * A worker thread plus the flag it raises when it finishes. Kept together so the main loop can join
+ * and drop finished workers (freeing their QPs) without blocking on ones still serving a client.
+ */
+struct Worker {
+    std::thread                        thread;
+    std::shared_ptr<std::atomic<bool>> done;
+};
+
+/**
+ * Joins and removes every worker that has finished, leaving the still-serving ones in place. Called
+ * from the accept loop so completed QPs are reclaimed continuously rather than only at shutdown.
+ */
+void reap_finished_workers(std::vector<Worker> &workers) {
+    for (auto it = workers.begin(); it != workers.end();) {
+        if (it->done->load()) {
+            if (it->thread.joinable())
+                it->thread.join();
+            it = workers.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -584,16 +687,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // The QP metadata we advertise. rkey, vaddr and size are stable across clients; qpn is refreshed
-    // per connection (each client gets a fresh QP, see arm_qp) and psn is adopted from the client
-    // during the exchange. Both are filled in inside the serve loop below.
-    ibvQ local;
-    local.ip_addr = local_ip;
-    local.rkey    = ep.mr->rkey;
-    local.vaddr   = ep.mem;
-    local.size    = region_size;
+    // The QP metadata we advertise. rkey, vaddr and size are stable across every connection (all QPs
+    // read the same region); qpn is filled per connection from its fresh QP and psn is adopted from
+    // the client during the exchange. Each worker takes a copy and fills those two fields in.
+    ibvQ local_template;
+    local_template.ip_addr = local_ip;
+    local_template.rkey    = ep.mr->rkey;
+    local_template.vaddr   = ep.mem;
+    local_template.size    = region_size;
     // Coyote encodes the GID as the RoCE IP repeated four times (see ibvQ::gidToUint).
-    snprintf(local.gid, sizeof(local.gid), "%08x%08x%08x%08x", local_ip, local_ip, local_ip, local_ip);
+    snprintf(local_template.gid, sizeof(local_template.gid), "%08x%08x%08x%08x", local_ip, local_ip, local_ip,
+             local_ip);
 
     int listenfd = create_listen_socket(port);
     if (listenfd < 0) {
@@ -601,51 +705,70 @@ int main(int argc, char *argv[]) {
     }
 
     // Install the handlers via sigaction without SA_RESTART so that a signal interrupts a
-    // blocking accept()/read() with EINTR instead of silently restarting it; that lets the
-    // loop below observe g_stop and shut down. std::signal would set SA_RESTART on Linux.
+    // blocking accept() with EINTR instead of silently restarting it; that lets the loop below
+    // observe g_stop and shut down. std::signal would set SA_RESTART on Linux.
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // Serve one client at a time. Each iteration creates a fresh QP (destroyed at the end of the
-    // iteration) so the next client starts from a clean QP -- more portable than resetting and
-    // reusing one QP, which behaves inconsistently across mlx5 and bnxt_re.
+    // Accept connections and hand each off to a worker thread that owns its own QP. The Oasis FPGA
+    // opens one connection per read-request stream, so several QPs are served concurrently against
+    // the shared region. Each worker creates a fresh QP (destroyed when its client disconnects) --
+    // more portable than resetting and reusing one QP, which behaves inconsistently across mlx5 and
+    // bnxt_re.
+    std::cout << "Waiting for connections from client on port " << port << "... Press Ctrl+C to exit." << std::endl;
+    std::vector<Worker> workers;
     while (!g_stop.load()) {
-        std::cout << "Waiting for connection from client on port " << port << "... Press Ctrl+C to exit." << std::endl;
+        // Reclaim any workers whose clients have disconnected before taking on more.
+        reap_finished_workers(workers);
 
-        // Fresh QP for this client; advertise its (new) QP number in the exchange.
-        if (!arm_qp(ep, ib_port)) {
-            break;
+        // Wait for a connection with a timeout instead of blocking in accept(), so the loop keeps
+        // reaping finished workers and re-checks g_stop even while idle.
+        struct pollfd pfd;
+        pfd.fd     = listenfd;
+        pfd.events = POLLIN;
+        int r      = poll(&pfd, 1, 500 /* ms */);
+        if (r <= 0) {
+            if (r < 0 && errno != EINTR)
+                std::cerr << "poll on listen socket failed: " << strerror(errno) << "\n";
+            continue; // timeout, EINTR (shutdown signal), or error -- loop re-checks g_stop
         }
-        local.qpn = ep.qp->qp_num;
 
-        ibvQ remote;
-        memset(&remote, 0, sizeof(remote));
-        int connfd = accept_and_exchange(listenfd, local, remote);
-        if (connfd >= 0) {
-            remote.print("Remote");
-            local.print("Local");
+        int connfd = accept(listenfd, nullptr, nullptr);
+        if (connfd < 0) {
+            if (errno == EINTR) // shutdown signal interrupted accept()
+                break;
+            std::cerr << "Failed to accept connection\n";
+            continue;
+        }
 
-            // Connect our QP to the client's and move it to RTS so the NIC can answer reads.
-            if (!connect_qp(ep, remote, local.psn, ib_port, gid_idx)) {
+        // Safety valve: never let live QPs grow without bound. Reap once more in case a worker just
+        // finished, and if we are still at the cap reject this connection rather than pile on.
+        if (workers.size() >= MAX_CONCURRENT_QPS) {
+            reap_finished_workers(workers);
+            if (workers.size() >= MAX_CONCURRENT_QPS) {
+                std::cerr << "At QP capacity (" << MAX_CONCURRENT_QPS << "); rejecting connection\n";
                 close(connfd);
-            } else {
-                std::cout << "Now serving... Press Ctrl+C to exit." << std::endl;
-                wait_for_disconnect(connfd);
-                close(connfd);
-                std::cout << "Client disconnected." << std::endl;
+                continue;
             }
         }
 
-        // Tear the QP down; the next iteration builds a clean one. connfd < 0 is just a transient
-        // accept/exchange failure -- fall through, drop this QP, and wait for the next client.
-        ibv_destroy_qp(ep.qp);
-        ep.qp = nullptr;
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        workers.push_back({std::thread(handle_client, connfd, std::ref(ep), local_template, ib_port,
+                                       gid_idx, done),
+                           done});
     }
 
     std::cout << "Shutting down!" << std::endl;
     close(listenfd);
+    // Join every worker before ep is destroyed -- the workers use its pd/cq/mr. g_stop makes the
+    // serving workers fall out of wait_for_disconnect within its poll interval, and the exchange
+    // receive timeout bounds any worker still mid-handshake, so none of these joins can hang.
+    for (auto &worker : workers) {
+        if (worker.thread.joinable())
+            worker.thread.join();
+    }
     return EXIT_SUCCESS;
 }

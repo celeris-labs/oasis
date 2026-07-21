@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Boost REQUIRED COMPONENTS program_options)
+find_package(Threads REQUIRED)
 
 find_library(IBVERBS_LIBRARY NAMES ibverbs REQUIRED)
 find_path(IBVERBS_INCLUDE_DIR NAMES infiniband/verbs.h REQUIRED)
@@ -19,4 +20,4 @@ find_path(IBVERBS_INCLUDE_DIR NAMES infiniband/verbs.h REQUIRED)
 add_executable(oasis_rdma_server src/main.cpp)
 
 target_include_directories(oasis_rdma_server PRIVATE ${IBVERBS_INCLUDE_DIR})
-target_link_libraries(oasis_rdma_server PUBLIC ${IBVERBS_LIBRARY} Boost::program_options)
+target_link_libraries(oasis_rdma_server PUBLIC ${IBVERBS_LIBRARY} Boost::program_options Threads::Threads)
