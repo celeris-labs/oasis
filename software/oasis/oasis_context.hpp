@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace oasis {
 
@@ -59,8 +60,11 @@ public:
     bool isRDMAEnabled() const { return rdma_enabled_; }
 
     /**
-     * Establishes the RDMA queue pair with the remote server and configures the remote region's 
-     * base vaddr (only known once the queue pair has been exchanged).
+     * Establishes one RDMA queue pair (i.e. one cThread) per hardware read-request stream with the
+     * remote server, and configures each stream's ctid and remote-region base vaddr (only known
+     * once its queue pair has been exchanged). A queue pair per stream keeps each stream's
+     * in-flight reads within the per-QP outstanding-read budget the server NIC grants
+     * (max_dest_rd_atomic), which all streams would otherwise overrun through a single shared QP.
      */
     void initRDMA(const std::string &server, uint16_t port);
 
@@ -107,6 +111,7 @@ private:
     std::shared_ptr<libstf::MemConfig> mem_config_;
 
     bool rdma_enabled_;
+    std::vector<std::shared_ptr<coyote::cThread>> rdma_cthreads_;
 
     std::unique_ptr<Scheduler> scheduler_;
 

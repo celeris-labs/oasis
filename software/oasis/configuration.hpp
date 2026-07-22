@@ -4,6 +4,8 @@
 #include <coyote/cThread.hpp>
 #include <libstf/configuration.hpp>
 
+#include <vector>
+
 namespace oasis {
 
 constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A515;
@@ -21,10 +23,11 @@ class ReadReqConfig : public libstf::Config {
                    uint32_t num_regs);
 
     /**
-     * For RDMA reads, sets the base vaddr of the remote region that read addresses are relative to.
-     * It must be set before the first enqueue_read().
+     * For RDMA reads, sets the base vaddr of the remote region that `stream`'s read addresses are
+     * relative to. Each stream has its own queue pair, so the remote region base can differ per
+     * stream. It must be set before the first enqueue_read() on that stream.
      */
-    void set_base_vaddr(uintptr_t base_vaddr);
+    void set_base_vaddr(libstf::stream_t stream, uintptr_t base_vaddr);
 
     /**
      * Set the Coyote thread id the hardware issues `stream`'s reads for. Must be set before the
@@ -46,8 +49,8 @@ class ReadReqConfig : public libstf::Config {
     static constexpr uint64_t ID = READ_REQ_CONFIG_ID;
 
   private:
-    libstf::stream_t num_streams_;
-    uintptr_t        base_vaddr_ = 0;
+    libstf::stream_t       num_streams_;
+    std::vector<uintptr_t> base_vaddrs_;
 };
 
 } // namespace oasis

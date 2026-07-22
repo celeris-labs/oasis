@@ -135,25 +135,35 @@ Scheduler &OasisContext::scheduler() {
 }
 
 void OasisContext::initRDMA(const std::string &server, uint16_t port) {
-    // Minimal stub region for initRDMA -- the hardware writes straight into the caller's buffers, so
-    // no host-side staging buffer is used, but Coyote still requires a region to set up the QP.
+    // Minimal stub region per queue pair -- the hardware writes straight into the caller's buffers,
+    // so no host-side staging buffer is used, but Coyote still requires a region to set up a QP.
     constexpr uint32_t RDMA_INIT_STUB_SIZE = 4096;
 
-    void *staging_buffer = nullptr;
-    if (!memory_pool_->allocate(RDMA_INIT_STUB_SIZE, &staging_buffer).ok()) {
-        std::ostringstream msg;
-        msg << "Failed to allocate RDMA staging buffer of " << RDMA_INIT_STUB_SIZE << " bytes";
-        throw std::runtime_error(msg.str());
-    }
-    if (!cthread_->initRDMA(RDMA_INIT_STUB_SIZE, port, server.c_str(), staging_buffer)) {
-        std::ostringstream msg;
-        msg << "Coyote initRDMA failed for server " << server << ":" << port;
-        throw std::runtime_error(msg.str());
-    }
+    auto read_req_config = config<ReadReqConfig>();
 
-    // The remote region's base vaddr is only known once the queue pair has been exchanged.
-    config<ReadReqConfig>()->set_base_vaddr(
-        reinterpret_cast<uintptr_t>(cthread_->getQpair()->remote.vaddr));
+    rdma_cthreads_.reserve(read_req_config->num_streams());
+    for (libstf::stream_t stream = 0; stream < read_req_config->num_streams(); ++stream) {
+        auto cthread = std::make_shared<coyote::cThread>(vfpga_id_, getpid(), device_id_);
+
+        void *staging_buffer = nullptr;
+        if (!memory_pool_->allocate(RDMA_INIT_STUB_SIZE, &staging_buffer).ok()) {
+            std::ostringstream msg;
+            msg << "Failed to allocate RDMA staging buffer of " << RDMA_INIT_STUB_SIZE
+                << " bytes for stream " << static_cast<int>(stream);
+            throw std::runtime_error(msg.str());
+        }
+        if (!cthread->initRDMA(RDMA_INIT_STUB_SIZE, port, server.c_str(), staging_buffer)) {
+            std::ostringstream msg;
+            msg << "Coyote initRDMA failed for server " << server << ":" << port << " (stream "
+                << static_cast<int>(stream) << ")";
+            throw std::runtime_error(msg.str());
+        }
+
+        read_req_config->set_ctid(stream, cthread->getCtid());
+        read_req_config->set_base_vaddr(
+            stream, reinterpret_cast<uintptr_t>(cthread->getQpair()->remote.vaddr));
+        rdma_cthreads_.push_back(std::move(cthread));
+    }
 }
 
 std::shared_ptr<libstf::Buffer> OasisContext::allocate_output_buffer(size_t size) {
