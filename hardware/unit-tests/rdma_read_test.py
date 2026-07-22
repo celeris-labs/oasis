@@ -33,6 +33,9 @@ class RDMAReadTestCase(fpga_test_case.FPGATestCase):
         def pos_to_register(pos: int) -> bytearray:
             return bytearray(pos.to_bytes(8, 'little'))
 
+        # Stream 0's queue pair / Coyote thread id (register 5 = stream 0 base + ctid slot).
+        self.write_register(fpga_register.vFPGARegister(5, pos_to_register(0)))
+
         for (size, vaddr) in configs:
             self.write_register(fpga_register.vFPGARegister(3, pos_to_register(vaddr)))
             self.write_register(fpga_register.vFPGARegister(4, pos_to_register(size)))

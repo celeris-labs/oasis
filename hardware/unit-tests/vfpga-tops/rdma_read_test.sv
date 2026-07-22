@@ -55,6 +55,7 @@ GlobalConfig #(
 );
 
 ready_valid_i #(read_req_t) conf[1](.*);
+logic [lynxTypes::PID_BITS-1:0] read_ctid[1];
 ReadReqConfig #(
     .NUM_STREAMS(1)
 ) inst_rdma_read_config (
@@ -64,7 +65,8 @@ ReadReqConfig #(
     .write_config(write_configs[0]),
     .read_config(read_configs[0]),
 
-    .out(conf)
+    .out(conf),
+    .ctid(read_ctid)
 );
 
 /* -- INPUT ------------------------------------------------------------- */
@@ -92,9 +94,10 @@ RDMARead inst_rdma_read (
     .clk(clk),
     .rst_n(rst_n),
 
-    .sq_rd(sq_rd),
-
     .conf(conf[0]),
+    .ctid(read_ctid[0]),
+
+    .sq_rd(sq_rd),
 
     .in(axi_rreq_recv_0),
     .out(out)

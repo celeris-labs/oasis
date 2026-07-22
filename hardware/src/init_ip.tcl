@@ -12,7 +12,7 @@ if {$cfg(fpga_arch) eq "ultrascale_plus"} {
     exit 1
 }
 
-create_ip {*}$ila_create_args -module_name ila_rdma_read
+create_ip {*}$ila_create_args -module_name ila_read
 set_property -dict [list \
     CONFIG.C_NUM_OF_PROBES {18} \
     CONFIG.C_EN_STRG_QUAL {1} \
@@ -34,4 +34,4 @@ set_property -dict [list \
     CONFIG.C_PROBE15_WIDTH {1} \
     CONFIG.C_PROBE16_WIDTH {1} \
     CONFIG.C_PROBE17_WIDTH {1} \
-] [get_ips ila_rdma_read]
+] [get_ips ila_read]

@@ -47,6 +47,7 @@ write_config_i                       write_configs[NUM_CONFIGS](.*);
 read_config_i                        read_configs [NUM_CONFIGS](.*);
 mem_config_i                         mem_conf[NUM_STREAMS](.*);
 ready_valid_i #(read_req_t)          read_conf[NUM_STREAMS](.*);
+logic [PID_BITS-1:0]                 read_ctid[NUM_STREAMS];
 ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
 decoder_profile_i                    decoder_profiles[NUM_DECODERS]();
 
@@ -57,7 +58,8 @@ GlobalConfig #(
         MEM_CONFIG_NUM_REGS,
         COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS),
         NUM_READ_REQ_CONFIG_REGS * NUM_STREAMS
-    })
+    }),
+    .READ_CONFIG_SKID_DEPTH(2)
 ) inst_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -103,7 +105,8 @@ ReadReqConfig #(
     .write_config(write_configs[2]),
     .read_config(read_configs[2]),
 
-    .out(read_conf)
+    .out(read_conf),
+    .ctid(read_ctid)
 );
 
 // -- Arbiter the read send queue ------------------------------------------------------------------
@@ -122,7 +125,7 @@ MetaIntfArbiter #(
 
 // -- Data path ------------------------------------------------------------------------------------
 AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
-for (genvar I = 0; I < NUM_DECODERS; I++) begin
+for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
     ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in(.*);
     typed_ndata_i #(DATABEAT_SIZE)          typed_out(.*);
@@ -140,6 +143,8 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
         .rst_n(rst_n),
 
         .conf(read_conf[I]),
+        .ctid(read_ctid[I]),
+
         .sq_rd(sq_rd_strm[I]),
 
         .in(axi_in),
@@ -188,7 +193,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
         .in(out),
         .out(axi_out[I])
     );
-end
+end : gen_decoders
 
 // -- RDMA bypass stream (last stream slot, no decoder) --------------------------------------------
 `ifdef EN_RDMA
@@ -208,7 +213,9 @@ RDMARead #(
     .rst_n(rst_n),
 
     .conf(read_conf[BYPASS_ID]),
-    .sq_rd(sq_rd_strm[BYPASS_ID]),    
+    .ctid(read_ctid[BYPASS_ID]),
+
+    .sq_rd(sq_rd_strm[BYPASS_ID]),
 
     .in(axi_in),
     .out(bypass_ndata)

@@ -1,6 +1,7 @@
 `timescale 1ns / 1ps
 
 import libstf::*;
+import lynxTypes::PID_BITS;
 import oasis::NUM_READ_REQ_CONFIG_REGS;
 import oasis::READ_REQ_CONFIG_ID;
 import oasis::read_req_t;
@@ -17,10 +18,11 @@ module ReadReqConfig #(
     write_config_i.s write_config,
     read_config_i.s  read_config,
 
-    ready_valid_i.m out[NUM_STREAMS]  // #(read_req_t)
+    ready_valid_i.m             out[NUM_STREAMS], // #(read_req_t)
+    output logic [PID_BITS-1:0] ctid[NUM_STREAMS]
 );
 
-localparam MAX_NUM_ENQUEUED_BUFFERS = 64;
+localparam MAX_NUM_ENQUEUED_REQUESTS = 64;
 localparam NUM_WRITE_REGS = NUM_READ_REQ_CONFIG_REGS;
 
 `RESET_RESYNC // Reset pipelining
@@ -43,12 +45,14 @@ ConfigReadRegisterFile #(
 // -- Write ----------------------------------------------------------------------------------------
 for (genvar I = 0; I < NUM_STREAMS; I++) begin
     ready_valid_i #(vaddress_t) vaddr(clk, reset_synced);
-    ConfigWriteFIFO #(I * NUM_WRITE_REGS + 0, MAX_NUM_ENQUEUED_BUFFERS, vaddress_t) inst_vaddr (clk, reset_synced, write_config, vaddr);
+    ConfigWriteFIFO #(I * NUM_WRITE_REGS + 0, MAX_NUM_ENQUEUED_REQUESTS, vaddress_t) inst_vaddr_reg (clk, reset_synced, write_config, vaddr);
 
     ready_valid_i #(size_t) len(clk, reset_synced);
-    ConfigWriteFIFO #(I * NUM_WRITE_REGS + 1, MAX_NUM_ENQUEUED_BUFFERS, size_t) inst_len (clk, reset_synced, write_config, len);
+    ConfigWriteFIFO #(I * NUM_WRITE_REGS + 1, MAX_NUM_ENQUEUED_REQUESTS, size_t) inst_len_reg (clk, reset_synced, write_config, len);
 
     `READY_COMBINE(vaddr, len, out[I])
+
+    ConfigWriteRegister #(I * NUM_WRITE_REGS + 2, logic [PID_BITS-1:0]) inst_ctid_reg (clk, write_config, ctid[I]);
 end
 
 endmodule
