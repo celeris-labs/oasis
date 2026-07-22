@@ -4,6 +4,7 @@
 #include "column_reader.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -41,21 +42,6 @@ public:
 
 private:
 	oasis::SplinterResultHandle result;
-};
-
-// Adds the lifetime of the scope to `target_ns`.
-class ScopedTimer {
-public:
-	explicit ScopedTimer(uint64_t &target_ns) : target_ns(target_ns), start(std::chrono::steady_clock::now()) {
-	}
-	~ScopedTimer() {
-		auto elapsed = std::chrono::steady_clock::now() - start;
-		target_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
-	}
-
-private:
-	uint64_t &target_ns;
-	std::chrono::steady_clock::time_point start;
 };
 
 } // namespace
@@ -97,6 +83,9 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	gstate->filename = bind_data.filename;
 	gstate->total_groups = bind_data.metadata.groups.size();
 	gstate->filters = input.filters;
+	if (input.op && input.op->type == PhysicalOperatorType::TABLE_SCAN) {
+		gstate->physical_scan = &input.op->Cast<PhysicalTableScan>();
+	}
 
 	// Split the scan-wide groups-in-flight budget across the worker threads this scan will run on.
 	Value groups_in_flight_val;
@@ -119,6 +108,18 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			// CPU path: Variable-length type (BYTE_ARRAY/string) decoded by DuckDB's ColumnReader.
 			gstate->projected_columns.push_back({col_id, 0, true});
 			gstate->has_cpu_columns = true;
+		}
+	}
+
+	// filter_prune: When the plan consumes fewer columns than we scan (some are filter-only),
+	// remember which projected columns are emitted so the scan can skip decoding the rest and
+	// reference only the consumed columns into the output chunk.
+	gstate->can_prune = input.CanRemoveFilterColumns();
+	gstate->column_emitted.assign(gstate->projected_columns.size(), !gstate->can_prune);
+	if (gstate->can_prune) {
+		gstate->projection_ids.assign(input.projection_ids.begin(), input.projection_ids.end());
+		for (auto proj_id : gstate->projection_ids) {
+			gstate->column_emitted[proj_id] = true;
 		}
 	}
 
@@ -146,6 +147,23 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
 	auto lstate = make_uniq<OasisScanLocalState>();
 
+	// Merge in the dynamic join filters, which did not exist yet when the global state was
+	// created at schedule time. The build side has completed by now (pipeline dependency), so the
+	// set is final. call_once publishes gstate.filters to every worker before it builds its
+	// per-worker filter states below.
+	std::call_once(gstate.dynamic_filter_merge, [&]() {
+		if (!gstate.physical_scan) {
+			return;
+		}
+		auto &dynamic_filters = gstate.physical_scan->dynamic_filters;
+		if (dynamic_filters && dynamic_filters->HasFilters()) {
+			gstate.merged_filters = dynamic_filters->GetFinalTableFilters(*gstate.physical_scan, gstate.filters);
+			if (gstate.merged_filters) {
+				gstate.filters = gstate.merged_filters.get();
+			}
+		}
+	});
+
 	// Each worker owns its own file handle: DuckDB FileHandles are not safe to share across threads,
 	// and the local source path reads from it on this worker thread.
 	auto &fs = FileSystem::GetFileSystem(context.client);
@@ -170,12 +188,21 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	}
 	lstate->parquet_reader->InitializeScan(context.client, *lstate->scan_state, std::move(groups_to_read));
 
-	// Prepare the pushed-down filters for row-level filtering (one TableFilterState per filter,
-	// owned by this worker).
-	if (gstate.filters) {
-		for (auto &entry : *gstate.filters) {
-			lstate->scan_filters.emplace_back(context.client, entry.GetIndex(), entry.Filter());
+	// Full-width staging chunk for filter pruning: Slices are scanned and filtered here, and only
+	// the projection_ids columns are referenced into the (narrower) output chunk.
+	if (gstate.can_prune) {
+		vector<LogicalType> scan_types;
+		scan_types.reserve(gstate.projected_columns.size());
+		for (auto &col : gstate.projected_columns) {
+			scan_types.push_back(lstate->parquet_reader->columns[col.column_id].type);
 		}
+		lstate->all_columns.Initialize(context.client, scan_types);
+	}
+
+	// Prepare the pushed-down filters for row-level filtering (one TableFilterState per filter,
+	// owned by this worker), splitting top-level ANDs into per-conjunct filters (BuildScanFilters).
+	if (gstate.filters) {
+		BuildScanFilters(context.client, *gstate.filters, lstate->scan_filters);
 	}
 
 	return std::move(lstate);
@@ -342,12 +369,19 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 // Without this prefetch the thrift transport falls back to a raw synchronous file read for every
 // page header and page body (thrift_tools.hpp read()), i.e. hundreds of tiny pread()s per string
 // column per group on the worker thread. This was completely tanking performance.
-static void InitGroupCPUColumns(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, size_t group) {
+static void InitGroupCPUColumns(ClientContext &context, OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
+                                size_t group) {
 	if (!gstate.has_cpu_columns) {
 		return;
 	}
 	// Page-header parsing and prefetch staging are part of the string-column decode cost.
 	ScopedTimer timer(lstate.string_decode_time_ns);
+	// Recreate the readers (and thrift protocol) for every group: ColumnReader carries page state
+	// and deferred skips that are only valid within one row group, and the filtered decode path
+	// can leave a group mid-page with skips still pending (rejected or filter-only column tails).
+	// Discarding the readers with the group makes those leftovers harmless -- and the skipped tail
+	// pages are never touched at all. The file handle (and any RDMA-staged ranges) is kept.
+	lstate.parquet_reader->InitializeScan(context, *lstate.scan_state, {});
 	const auto &row_group_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*lstate.scan_state->thrift_file_proto->getTransport());
 	trans.ClearPrefetch();
@@ -394,43 +428,6 @@ static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate
 	return true;
 }
 
-// Decodes one slice of the current group's CPU/string columns directly into output.data[i].
-static void DecodeCPUColumnsSlice(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, DataChunk &output,
-                                  size_t emit) {
-	if (!gstate.has_cpu_columns) {
-		return;
-	}
-	ScopedTimer timer(lstate.string_decode_time_ns);
-
-	auto *define_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->define_buf.ptr);
-	auto *repeat_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->repeat_buf.ptr);
-
-	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
-		const auto &col = gstate.projected_columns[i];
-		if (!col.is_cpu) {
-			continue;
-		}
-		auto &child_reader = lstate.scan_state->GetColumnReader(col.column_id);
-
-		// The reader writes into define/repeat scratch as a side effect; zero per slice so a short
-		// final slice can't inherit a previous slice's levels.
-		lstate.scan_state->define_buf.zero();
-		lstate.scan_state->repeat_buf.zero();
-
-		auto &vec = output.data[i];
-		ColumnReaderInput input(emit, define_ptr, repeat_ptr);
-		auto rows_read = child_reader.Read(input, vec);
-		if (rows_read != emit) {
-			throw InternalException("ParCore CPU column %llu read %llu values, expected %llu (decode desync)",
-			                        (unsigned long long)i, (unsigned long long)rows_read, (unsigned long long)emit);
-		}
-
-		if (vec.GetVectorType() == VectorType::FLAT_VECTOR) {
-			FlatVector::SetSize(vec, count_t(emit));
-		}
-	}
-}
-
 // Claims the next non-empty row group off the shared atomic cursor, returning its index (or
 // total_groups once all groups are consumed).
 static size_t ClaimNextNonEmptyGroup(OasisScanGlobalState &gstate, const OasisScanBindData &bind) {
@@ -445,15 +442,16 @@ static size_t ClaimNextNonEmptyGroup(OasisScanGlobalState &gstate, const OasisSc
 	}
 }
 
-// Claims the next non-empty row group that also survives filter pruning.
+// Claims the next non-empty row group that also survives filter pruning, filling
+// `needs_row_filter` for the claimed group (see RowGroupMatchesFilters).
 static size_t ClaimNextMatchingGroup(ClientContext &context, OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
-                                     const OasisScanBindData &bind) {
+                                     const OasisScanBindData &bind, std::vector<bool> &needs_row_filter) {
 	while (true) {
 		size_t group = ClaimNextNonEmptyGroup(gstate, bind);
 		if (group >= gstate.total_groups) {
 			return gstate.total_groups;
 		}
-		if (RowGroupMatchesFilters(context, gstate, lstate, group)) {
+		if (RowGroupMatchesFilters(context, gstate, lstate, group, needs_row_filter)) {
 			return group;
 		}
 	}
@@ -467,7 +465,8 @@ enum class LoadResult : uint8_t { LOADED, BLOCKED, EXHAUSTED };
 static void TopUpPrefetch(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                           OasisScanLocalState &lstate, const OasisScanBindData &bind) {
 	while (!lstate.groups_exhausted && lstate.inflight.size() < gstate.groups_in_flight_per_worker) {
-		size_t group = ClaimNextMatchingGroup(context, gstate, lstate, bind);
+		std::vector<bool> needs_row_filter;
+		size_t group = ClaimNextMatchingGroup(context, gstate, lstate, bind, needs_row_filter);
 		if (group >= gstate.total_groups) {
 			lstate.groups_exhausted = true;
 			break;
@@ -475,6 +474,7 @@ static void TopUpPrefetch(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		auto pending = make_uniq<OasisScanLocalState::PendingGroup>();
 		pending->group = group;
 		pending->num_rows = RowGroupNumRows(bind, group);
+		pending->needs_row_filter = std::move(needs_row_filter);
 		PrefetchGroup(context, ctx, gstate, lstate, bind, *pending);
 		lstate.inflight.push_back(std::move(pending));
 	}
@@ -507,6 +507,7 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	}
 
 	lstate.current_buffers = std::move(head.hw_buffers);
+	lstate.current_needs_row_filter = std::move(head.needs_row_filter);
 	lstate.current_buf_offset = 0;
 	lstate.current_group_num_rows = head.num_rows;
 	lstate.current_group = head.group;
@@ -531,7 +532,7 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 		rdma->StageRanges(std::move(ranges));
 	}
 
-	InitGroupCPUColumns(gstate, lstate, head.group);
+	InitGroupCPUColumns(context, gstate, lstate, head.group);
 	lstate.inflight.pop_front();
 	return LoadResult::LOADED;
 }
@@ -544,8 +545,8 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 // This path only runs when the query has no filter. A filtered aggregate (e.g.
 // SELECT COUNT(*) ... WHERE x > 5) still references the filter column, so DuckDB projects it and
 // emit_cardinality_only stays false -- such queries go through OasisScanFunction's normal decode
-// path, where ApplyFilters drops the non-matching rows. So here gstate.filters is always null
-// and there is nothing to prune; we only skip empty row groups.
+// path, where DecodeAndFilterSlice drops the non-matching rows. So here gstate.filters is always
+// null and there is nothing to prune; we only skip empty row groups.
 static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
                                 const OasisScanBindData &bind, DataChunk &output) {
 	// Claim the next non-empty group off the shared cursor, or signal EOF once the groups run out.
@@ -565,12 +566,13 @@ static void EmitCardinalityOnly(OasisScanGlobalState &gstate, OasisScanLocalStat
 }
 
 struct SliceResult {
-	size_t rows = 0;
-	LoadResult load = LoadResult::LOADED; // BLOCKED or EXHAUSTED when rows == 0.
+	size_t rows = 0;                      // Rows surviving the pushed-down filters (0 with LOADED
+	                                      // means the slice was fully filtered -- try the next one).
+	LoadResult load = LoadResult::LOADED; // BLOCKED or EXHAUSTED when no slice could be loaded.
 };
 
 // Emits the next STANDARD_VECTOR_SIZE-sized slice of the current row group into `output` (decoding
-// or claiming a new group as needed), zero-copy.
+// or claiming a new group as needed), zero-copy, with the pushed-down filters applied.
 static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                                 OasisScanLocalState &lstate, const OasisScanBindData &bind, DataChunk &output,
                                 std::vector<unique_ptr<AsyncTask>> &out_tasks) {
@@ -586,12 +588,17 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	size_t const remaining_elements = total_elements - lstate.current_buf_offset;
 	size_t const emit = std::min<size_t>(remaining_elements, STANDARD_VECTOR_SIZE);
 
-	DecodeCPUColumnsSlice(gstate, lstate, output, emit);
+	// With filter pruning, the slice is scanned and filtered in the full-width staging chunk and
+	// only the consumed columns are referenced into the (narrower) output chunk at the end.
+	DataChunk &scan_chunk = gstate.can_prune ? lstate.all_columns : output;
+	if (gstate.can_prune) {
+		scan_chunk.Reset();
+	}
 
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
-			continue; // Already decoded into output.data[i] by DecodeCPUColumnsSlice.
+			continue; // Decoded by DecodeAndFilterSlice below.
 		}
 
 		auto &buf = lstate.current_buffers[i];
@@ -623,12 +630,16 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		//     output.Reset()).
 		//   - vector auxiliary (set here) keeps it alive for any downstream
 		//     consumer that holds onto the vector past our next scan call.
-		auto &vec = output.data[i];
+		auto &vec = scan_chunk.data[i];
 		vec.SetVectorType(VectorType::FLAT_VECTOR);
 		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_buf_offset * col.elem_size,
 		                    count_t(emit));
 		vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
 	}
+
+	// Decode the CPU columns and apply the pushed-down filters (late-materialized: Filter columns
+	// first, then the surviving rows of the remaining columns).
+	idx_t const rows_passed = DecodeAndFilterSlice(gstate, lstate, scan_chunk, emit);
 
 	// Advance the cursor. If we have emitted this group's last elements, release the buffers so the
 	// next call's `if` branch loads the next row group. Dropping our refs here lets each buffer free as
@@ -640,8 +651,10 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		lstate.current_group_num_rows = 0;
 	}
 
-	output.CheckCardinality(emit);
-	return {emit, LoadResult::LOADED};
+	if (rows_passed > 0 && gstate.can_prune) {
+		output.ReferenceColumns(lstate.all_columns, gstate.projection_ids);
+	}
+	return {rows_passed, LoadResult::LOADED};
 }
 
 // Zero-copy multi-column scan. Each worker atomically claims a row group, submits its query
@@ -672,20 +685,15 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 		output.Reset();
 		std::vector<unique_ptr<AsyncTask>> tasks;
 		auto slice = EmitOneSlice(context, ctx, gstate, lstate, bind, output, tasks);
-		if (slice.rows == 0) {
+		if (slice.load != LoadResult::LOADED) {
 			output.SetChildCardinality(0);
 			if (slice.load == LoadResult::BLOCKED) {
 				data_p.async_result = AsyncResult(std::move(tasks), TaskSchedulerType::ASYNC);
 			}
 			return;
 		}
-		idx_t rows_passed;
-		{
-			ScopedTimer filter_timer(lstate.filter_time_ns);
-			rows_passed = ApplyFilters(gstate, lstate, output);
-		}
-		if (rows_passed > 0) {
-			return;
+		if (slice.rows > 0) {
+			return; // Filters already applied by EmitOneSlice.
 		}
 	}
 }
@@ -754,6 +762,14 @@ OperatorPartitionData OasisScanGetPartitionData(ClientContext &, TableFunctionGe
 	return OperatorPartitionData(lstate.current_group);
 }
 
+// Accepts any single-column expression (e.g. NOT LIKE, single-column OR chains) as a pushed-down
+// ExpressionFilter -- the optimizer only offers these when this callback is set. DecodeAndFilterSlice
+// evaluates them generically post-decode, and RowGroupMatchesFilters/BuildScanFilters classify
+// them per group like any other filter, so no restriction is needed (mirrors the parquet scan).
+static bool OasisScanPushdownExpression(ClientContext &, const LogicalGet &, Expression &) {
+	return true;
+}
+
 // Advertises the zero-width COLUMN_IDENTIFIER_EMPTY virtual column. For queries that consume no
 // column values (e.g., COUNT(*), EXISTS), DuckDB's optimizer projects this sentinel instead of
 // anchoring the scan on a real column (LogicalGet::GetAnyColumn).
@@ -773,6 +789,8 @@ void RegisterOasisScanFunction(ExtensionLoader &loader) {
 	);
 	table_function.projection_pushdown = true;
 	table_function.filter_pushdown = true;
+	table_function.filter_prune = true;
+	table_function.pushdown_expression = OasisScanPushdownExpression;
 	// Initialize the global state eagerly at schedule time to register our cold workers.
 	table_function.global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
 	table_function.get_virtual_columns = OasisScanGetVirtualColumns;

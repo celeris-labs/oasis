@@ -14,9 +14,28 @@
 #include "duckdb/planner/table_filter_state.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <deque>
+#include <mutex>
 
 namespace duckdb {
+
+class PhysicalTableScan;
+
+// Adds the lifetime of the scope to `target_ns`.
+class ScopedTimer {
+public:
+	explicit ScopedTimer(uint64_t &target_ns) : target_ns(target_ns), start(std::chrono::steady_clock::now()) {
+	}
+	~ScopedTimer() {
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		target_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+	}
+
+private:
+	uint64_t &target_ns;
+	std::chrono::steady_clock::time_point start;
+};
 
 // Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across
 // threads, so each worker owns its own (mirrors ParquetReader's per-scan-state scan_filters).
@@ -25,7 +44,15 @@ struct OasisScanFilter {
 	    : filter_idx(filter_idx), filter(filter), filter_state(TableFilterState::Initialize(context, filter)) {
 	}
 
+	// Owning variant: Used for filters synthesized by splitting a pushed-down AND into its
+	// conjuncts, so each conjunct is classified and evaluated independently.
+	OasisScanFilter(ClientContext &context, idx_t filter_idx, unique_ptr<TableFilter> owned_filter_p)
+	    : filter_idx(filter_idx), owned_filter(std::move(owned_filter_p)), filter(*owned_filter),
+	      filter_state(TableFilterState::Initialize(context, *owned_filter)) {
+	}
+
 	idx_t filter_idx;
+	unique_ptr<TableFilter> owned_filter; // null when `filter` references a gstate-owned filter
 	const TableFilter &filter;
 	unique_ptr<TableFilterState> filter_state;
 };
@@ -53,10 +80,27 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	vector<ProjectedColumn> projected_columns;
 	bool has_cpu_columns = false;
 
+	// filter_prune support. When the plan consumes fewer columns than the scan reads (some are
+	// filter-only), can_prune is set, projection_ids holds the indices (into projected_columns)
+	// of the consumed columns in output order, and column_emitted marks which projected columns
+	// are consumed at all. Without pruning, column_emitted is all-true and output == scan layout.
+	vector<column_t> projection_ids;
+	bool can_prune = false;
+	std::vector<bool> column_emitted;
+
 	// True when the query consumes no column values (e.g. COUNT(*), EXISTS).
 	bool emit_cardinality_only = false;
 
 	optional_ptr<TableFilterSet> filters;
+
+	// Dynamic join filters (min/max pushed by hash joins into the probe-side scan). Our global
+	// state is created at schedule time (INITIALIZE_ON_SCHEDULE), before the build side has run,
+	// so PhysicalTableScan's own dynamic-filter merge sees an empty set and drops them. Instead we
+	// keep a pointer to the physical scan and merge its dynamic filters into `filters` once, when
+	// the first worker initializes -- the probe pipeline only executes after the build completed.
+	optional_ptr<const PhysicalTableScan> physical_scan;
+	std::once_flag dynamic_filter_merge;
+	unique_ptr<TableFilterSet> merged_filters;
 
 	// Row-group cursor: the next group to hand out. Claimed atomically by workers.
 	std::atomic<size_t> next_group {0};
@@ -93,9 +137,20 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// Reused selection vector for row-level filtering, so we don't reallocate per scan call.
 	SelectionVector filter_sel;
 
+	// When can_prune, slices are scanned and filtered in this full-width chunk and only the
+	// projection_ids columns are referenced into the output chunk.
+	DataChunk all_columns;
+
+	// Per-slice scratch: which CPU columns have consumed the current slice from their reader.
+	std::vector<bool> cpu_column_read;
+
 	struct PendingGroup {
 		size_t group = 0;
 		size_t num_rows = 0;
+
+		// Per-scan_filters entry: whether the filter still needs row-level evaluation on this
+		// group (false when the group's statistics prove it always-true).
+		std::vector<bool> needs_row_filter;
 
 		std::unique_ptr<CoalescedFetcher> fetcher;
 
@@ -124,6 +179,9 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	bool groups_exhausted = false;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
+
+	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
+	std::vector<bool> current_needs_row_filter;
 
 	size_t current_buf_offset = 0;
 	size_t current_group_num_rows = 0;
