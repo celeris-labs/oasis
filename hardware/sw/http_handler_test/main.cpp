@@ -456,6 +456,9 @@ int main(int argc, char* argv[]) {
     wr(HttpLocal::RANGE_END_LEN,   range_end_len);
     wr(HttpLocal::RANGE_END_W0,    range_end_words[0]);
     wr(HttpLocal::RANGE_END_W1,    range_end_words[1]);
+    std::cout << "file=" << file << " range=" << range_begin << "-" << range_end << std::endl;
+    //TODO: for now sleep as without we got a problem with the file path not beening updated, probly also all the other registers
+    sleep(1);
     wr(HttpLocal::START,           1);
 
     std::cout << "client_state after START = " << rd(HttpLocal::CLIENT_STATE) << std::endl;
