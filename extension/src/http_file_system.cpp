@@ -17,15 +17,13 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
-#include <atomic>
-#include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <netdb.h>
 #include <sys/socket.h>
-#include <thread>
 #include <unistd.h>
 
 namespace duckdb {
@@ -315,6 +313,11 @@ void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 	if (nr_bytes < 0) {
 		throw IOException("Negative read size on %s", handle.path);
 	}
+	// The OBM drain blocks until exactly the requested byte count arrives, so a read
+	// past EOF (which the server answers with a short body) would hang. Reject it.
+	if (h.known_file_size != 0 && location + static_cast<uint64_t>(nr_bytes) > h.known_file_size) {
+		throw IOException("Read past end of file %s", handle.path);
+	}
 	HTTPReadRange(h.path, location, static_cast<size_t>(nr_bytes), buffer);
 }
 
@@ -343,36 +346,67 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		throw IOException("HTTP read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 
-	// Dirty path: fire HW HttpConfig START (handler opens TCP). No body → host yet.
 	auto &ctx = oasis::OasisContext::ctx();
 	auto http_cfg = ctx.config<oasis::HTTPReadConfig>();
+	auto obm = ctx.output_buffer_manager();
 	const auto bypass_stream = ctx.httpBypassStream();
 	const uint64_t range_end = offset + size - 1;
 
-	{
-		std::lock_guard<std::mutex> lock(mtx);
-		http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, /*session*/ 0);
-		RecordHttpFpgaTrigger(bypass_stream, server_ip_, server_port_, path, offset, range_end,
-		                      static_cast<uint32_t>(size));
-		std::fprintf(stderr,
-		             "[httpfpga] DIRTY fire path=%s range=[%llu,%llu] size=%llu (no OBM body yet)\n",
-		             path.c_str(), (unsigned long long)offset, (unsigned long long)range_end,
+	// Unlike RDMA (which queues multiple outstanding reads on a QP), the HTTP side is a
+	// single-session FSM: one set of parameter CSRs, one START, one client_state. A second
+	// request fired while one is in flight would overwrite the CSRs and interleave bodies
+	// on the shared bypass stream. So hold the lock across the whole transfer — trigger,
+	// enqueue and drain — which serializes httpfpga:// reads against each other.
+	std::lock_guard<std::mutex> lock(mtx);
+
+	// Trigger the request first: the handler opens the TCP connection and issues
+	// the ranged GET, which is long latency.
+	http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, /*session*/ 0);
+	RecordHttpFpgaTrigger(bypass_stream, server_ip_, server_port_, path, offset, range_end,
+	                      static_cast<uint32_t>(size));
+
+	// The bypass stream is configured as unmanaged on the OBM. The HW strips the
+	// HTTP header, so exactly `size` body bytes land here — pass that so the OBM
+	// allocates right-sized buffers with no speculative pre-allocation.
+	auto handle = obm->acquire_output_handle(bypass_stream, size);
+
+	if (HttpFpgaDebugEnabled()) {
+		std::fprintf(stderr, "[httpfpga] fire path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
+		             (unsigned long long)offset, (unsigned long long)range_end,
 		             (unsigned long long)size);
 	}
 
-	for (int i = 0; i < 30 && http_cfg->client_state() == 0; ++i) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	// Drain all buffers for this transfer. A body that fits in a single FPGA buffer is
+	// one iteration; larger ranges are chunked across multiple buffers, each surfaced
+	// via its own interrupt. These calls block until the FPGA writes (or discards) the
+	// allocation.
+	size_t copied = 0;
+	while (handle->stream_has_more_output(bypass_stream)) {
+		auto buf = handle->get_next_stream_output(bypass_stream);
+		if (!buf) {
+			break;
+		}
+		if (copied + buf->size > size) {
+			throw IOException("HTTP read overran requested size: requested %llu, already got %llu, "
+			                  "next chunk %llu",
+			                  (unsigned long long)size, (unsigned long long)copied,
+			                  (unsigned long long)buf->size);
+		}
+		std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
+		copied += buf->size;
 	}
-	std::fprintf(stderr, "[httpfpga] client_state after START = %u\n",
-	             static_cast<unsigned>(http_cfg->client_state()));
-	for (int i = 0; i < 120 && http_cfg->client_state() != 0; ++i) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(250));
+	if (copied != size) {
+		throw IOException("HTTP read short transfer for '%s' range=[%llu,%llu]: requested %llu "
+		                  "bytes, got %llu (client_state=%u total_word=%u)",
+		                  path, (unsigned long long)offset, (unsigned long long)range_end,
+		                  (unsigned long long)size, (unsigned long long)copied,
+		                  static_cast<unsigned>(http_cfg->client_state()), http_cfg->debug_status());
 	}
-	std::fprintf(stderr, "[httpfpga] client_state done = %u total_word=%u\n",
-	             static_cast<unsigned>(http_cfg->client_state()), http_cfg->debug_status());
 
-	// No FPGA→CPU body path yet: zero-fill so DuckDB does not hang on OBM.
-	std::memset(dst, 0, size);
+	if (HttpFpgaDebugEnabled()) {
+		std::fprintf(stderr, "[httpfpga] done path=%s copied=%llu client_state=%u\n", path.c_str(),
+		             (unsigned long long)copied, static_cast<unsigned>(http_cfg->client_state()));
+	}
 }
 
 } // namespace duckdb
