@@ -2,8 +2,15 @@
 
 import lynxTypes::*;
 
-// Working header strip (SCAN + debug w0/w1), extended with a streaming AXIS body
-// output: header bytes cleared in tkeep/tdata, body left unaligned for DataNormalizer.
+// Header strip + 64B align.
+// Finds the end of the HTTP header (\r\n\r\n) and emits the body as a fully
+// packed, byte-0-aligned AXIS stream: every beat except the last is full
+// (tkeep all ones), the last carries a bottom-justified partial tkeep.
+//
+// Only the first payload beat is offset (payload starts at lane `payload_idx`);
+// every following network beat is already bottom-justified. So a single one-beat
+// accumulator with one variable byte-shift is enough -- no DataNormalizer /
+// DataCompactor needed downstream.
 module strip_http (
     input  logic                           clk,
     input  logic                           rst_n,
@@ -16,7 +23,7 @@ module strip_http (
     input  logic                           s_axis_tlast,
     output logic                           s_axis_tready,
 
-    // Stripped (not aligned) body stream
+    // Aligned, packed body stream
     output logic                           m_axis_tvalid,
     output logic [AXI_DATA_BITS-1:0]       m_axis_tdata,
     output logic [AXI_DATA_BITS/8-1:0]     m_axis_tkeep,
@@ -34,30 +41,34 @@ module strip_http (
     output logic [6:0]                     out_payload_idx
 );
 
+    localparam int DW           = AXI_DATA_BITS;     // 512
     localparam int BYTE_LANES   = AXI_DATA_BITS / 8; // 64
     localparam int SEARCH_BYTES = BYTE_LANES + 3;    // 67
 
     typedef enum logic [1:0] {
         SCAN   = 2'd0,
         STREAM = 2'd1,
-        DONE   = 2'd2
+        FLUSH  = 2'd2,
+        DONE   = 2'd3
     } state_t;
 
     state_t state_q, state_d;
 
-    logic [23:0]  prev_tail_q, prev_tail_d;
-    logic [511:0] w0_q, w0_d;
-    logic [511:0] w1_q, w1_d;
-    logic         w0_valid_q, w0_valid_d;
-    logic         w1_valid_q, w1_valid_d;
-    logic         done_q, done_d;
-    logic [6:0]   payload_idx_q, payload_idx_d;
+    logic [23:0]     prev_tail_q, prev_tail_d;
+    logic [DW-1:0]   acc_q, acc_d;          // pending bytes, bottom-justified
+    logic [6:0]      acc_cnt_q, acc_cnt_d;  // valid bytes in acc (0..63)
+    logic [DW-1:0]   w0_q, w0_d;
+    logic [DW-1:0]   w1_q, w1_d;
+    logic            w0_valid_q, w0_valid_d;
+    logic            w1_valid_q, w1_valid_d;
+    logic            done_q, done_d;
+    logic [6:0]      payload_idx_q, payload_idx_d;
 
-    function automatic logic [AXI_DATA_BITS-1:0] apply_tkeep(
-        input logic [AXI_DATA_BITS-1:0]   data_in,
-        input logic [AXI_DATA_BITS/8-1:0] keep_in
+    function automatic logic [DW-1:0] apply_tkeep(
+        input logic [DW-1:0]         data_in,
+        input logic [BYTE_LANES-1:0] keep_in
     );
-        logic [AXI_DATA_BITS-1:0] data_masked;
+        logic [DW-1:0] data_masked;
         begin
             data_masked = '0;
             for (int lane = 0; lane < BYTE_LANES; lane++) begin
@@ -69,8 +80,17 @@ module strip_http (
         end
     endfunction
 
+    // Bottom-justified tkeep for `n` valid bytes.
+    function automatic logic [BYTE_LANES-1:0] keep_from_count(input logic [6:0] n);
+        begin
+            if (n == 0)               keep_from_count = '0;
+            else if (n >= BYTE_LANES) keep_from_count = {BYTE_LANES{1'b1}};
+            else                      keep_from_count = {BYTE_LANES{1'b1}} >> (BYTE_LANES - n);
+        end
+    endfunction
+
     // ---------------------------------------------------------------
-    // Combinational search & mask (unchanged mapping from working RTL)
+    // Header search: locate \r\n\r\n across the 3-byte carry + this beat
     // ---------------------------------------------------------------
     logic [SEARCH_BYTES*8-1:0] search_win_w;
     assign search_win_w = {s_axis_tdata, prev_tail_q};
@@ -93,22 +113,42 @@ module strip_http (
     logic [6:0] current_beat_idx_w;
     assign current_beat_idx_w = header_offset_w + 7'd1;
 
-    logic [AXI_DATA_BITS-1:0]   mask_w;
-    logic [BYTE_LANES-1:0]      clean_tkeep_w;
-    logic [AXI_DATA_BITS-1:0]   clean_tdata_w;
-    logic                       first_has_payload_w;
+    // First body beat: mask off the header lanes, then shift the (top-justified)
+    // payload down to lane 0.
+    logic [BYTE_LANES-1:0] clean_tkeep_w;
+    logic [DW-1:0]         clean_tdata_w;
+    logic                  first_has_payload_w;
+    logic [DW-1:0]         chunk_b0_w;
+    logic [6:0]            cnt_b0_w;
 
     always_comb begin
-        mask_w = '0;
-        if (current_beat_idx_w < BYTE_LANES) begin
-            mask_w = {AXI_DATA_BITS{1'b1}} << (current_beat_idx_w * 8);
+        if (current_beat_idx_w < BYTE_LANES)
             clean_tkeep_w = s_axis_tkeep & ({BYTE_LANES{1'b1}} << current_beat_idx_w);
-        end else begin
+        else
             clean_tkeep_w = '0;
-        end
-        clean_tdata_w      = apply_tkeep(s_axis_tdata & mask_w, clean_tkeep_w);
+        clean_tdata_w       = apply_tkeep(s_axis_tdata, clean_tkeep_w);
         first_has_payload_w = (clean_tkeep_w != '0);
+        chunk_b0_w          = clean_tdata_w >> ({3'b0, current_beat_idx_w} * 8);
+        cnt_b0_w            = $countones(clean_tkeep_w);
     end
+
+    // Subsequent beats are already bottom-justified.
+    logic [DW-1:0] chunk_st_w;
+    logic [6:0]    cnt_st_w;
+    assign chunk_st_w = apply_tkeep(s_axis_tdata, s_axis_tkeep);
+    assign cnt_st_w   = $countones(s_axis_tkeep);
+
+    // Merge the selected chunk on top of the accumulator.
+    logic [DW-1:0]   chunk_w;
+    logic [6:0]      chunk_cnt_w;
+    logic [2*DW-1:0] combined_w;
+    logic [7:0]      total_w;
+
+    assign chunk_w     = (state_q == SCAN) ? chunk_b0_w : chunk_st_w;
+    assign chunk_cnt_w = (state_q == SCAN) ? cnt_b0_w   : cnt_st_w;
+    assign combined_w  = {{DW{1'b0}}, acc_q}
+                       | ({{DW{1'b0}}, chunk_w} << ({3'b0, acc_cnt_q} * 8));
+    assign total_w     = {1'b0, acc_cnt_q} + {1'b0, chunk_cnt_w};
 
     // ---------------------------------------------------------------
     // FSM
@@ -116,6 +156,8 @@ module strip_http (
     always_comb begin : fsm_logic
         state_d       = state_q;
         prev_tail_d   = prev_tail_q;
+        acc_d         = acc_q;
+        acc_cnt_d     = acc_cnt_q;
         w0_d          = w0_q;
         w1_d          = w1_q;
         w0_valid_d    = w0_valid_q;
@@ -132,6 +174,8 @@ module strip_http (
         if (clear) begin
             state_d       = SCAN;
             prev_tail_d   = '0;
+            acc_d         = '0;
+            acc_cnt_d     = '0;
             w0_d          = '0;
             w1_d          = '0;
             w0_valid_d    = 1'b0;
@@ -140,72 +184,100 @@ module strip_http (
             payload_idx_d = '0;
         end else if (enable && state_q != DONE) begin
             case (state_q)
+                // SCAN drops header bytes; it never emits (first beat holds
+                // <64 payload bytes), so it can always accept.
                 SCAN: begin
-                    if (header_match_w && first_has_payload_w) begin
-                        // Present first (masked) body beat; tlast independent of ready
-                        m_axis_tvalid = s_axis_tvalid;
-                        m_axis_tdata  = clean_tdata_w;
-                        m_axis_tkeep  = clean_tkeep_w;
-                        m_axis_tlast  = s_axis_tlast;
-                        s_axis_tready = m_axis_tready;
+                    s_axis_tready = 1'b1;
+                    if (s_axis_tvalid) begin
+                        prev_tail_d = s_axis_tdata[DW-1 -: 24];
 
-                        if (s_axis_tvalid && m_axis_tready) begin
-                            prev_tail_d   = s_axis_tdata[AXI_DATA_BITS-1 -: 24];
+                        if (header_match_w) begin
                             payload_idx_d = current_beat_idx_w;
-                            w0_d          = clean_tdata_w;
-                            w0_valid_d    = 1'b1;
 
-                            if (s_axis_tlast) begin
-                                done_d  = 1'b1;
-                                state_d = DONE;
+                            if (first_has_payload_w) begin
+                                acc_d      = combined_w[DW-1:0]; // acc was empty
+                                acc_cnt_d  = total_w[6:0];
+                                w0_d       = combined_w[DW-1:0];
+                                w0_valid_d = 1'b1;
+                                state_d    = s_axis_tlast ? FLUSH : STREAM;
                             end else begin
-                                state_d = STREAM;
-                            end
-                        end
-                    end else begin
-                        // Drop header-only beats, or match with body on next beat
-                        s_axis_tready = 1'b1;
-                        if (s_axis_tvalid) begin
-                            prev_tail_d = s_axis_tdata[AXI_DATA_BITS-1 -: 24];
-
-                            if (header_match_w) begin
-                                payload_idx_d = current_beat_idx_w;
-                                // No payload in this beat — debug w0 stays empty until STREAM
+                                // header ends on a beat boundary: body next beat
                                 if (s_axis_tlast) begin
                                     done_d  = 1'b1;
                                     state_d = DONE;
                                 end else begin
                                     state_d = STREAM;
                                 end
-                            end else if (s_axis_tlast) begin
-                                done_d  = 1'b1;
-                                state_d = DONE;
                             end
+                        end else if (s_axis_tlast) begin
+                            // no header found before end of stream
+                            done_d  = 1'b1;
+                            state_d = DONE;
                         end
                     end
                 end
 
                 STREAM: begin
-                    // Full passthrough of remaining body (still unaligned if mid-beat start)
-                    m_axis_tvalid = s_axis_tvalid;
-                    m_axis_tdata  = apply_tkeep(s_axis_tdata, s_axis_tkeep);
-                    m_axis_tkeep  = s_axis_tkeep;
-                    m_axis_tlast  = s_axis_tlast;
-                    s_axis_tready = m_axis_tready;
+                    if (s_axis_tvalid) begin
+                        if (total_w >= 8'd64) begin
+                            // A full output beat is ready.
+                            m_axis_tvalid = 1'b1;
+                            m_axis_tdata  = combined_w[DW-1:0];
+                            m_axis_tkeep  = {BYTE_LANES{1'b1}};
+                            m_axis_tlast  = s_axis_tlast && (total_w == 8'd64);
+                            s_axis_tready = m_axis_tready;
 
-                    if (s_axis_tvalid && m_axis_tready) begin
-                        if (!w0_valid_q) begin
-                            w0_d       = apply_tkeep(s_axis_tdata, s_axis_tkeep);
-                            w0_valid_d = 1'b1;
-                        end else if (!w1_valid_q) begin
-                            w1_d       = apply_tkeep(s_axis_tdata, s_axis_tkeep);
-                            w1_valid_d = 1'b1;
+                            if (m_axis_tready) begin
+                                acc_d     = combined_w[2*DW-1:DW]; // overflow bytes
+                                acc_cnt_d = total_w[6:0] - 7'd64;
+                                if (!w1_valid_q) begin
+                                    w1_d       = combined_w[DW-1:0];
+                                    w1_valid_d = 1'b1;
+                                end
+                                if (s_axis_tlast) begin
+                                    if (total_w == 8'd64) begin
+                                        done_d  = 1'b1;
+                                        state_d = DONE;
+                                    end else begin
+                                        state_d = FLUSH; // remainder still in acc
+                                    end
+                                end
+                            end
+                        end else if (s_axis_tlast) begin
+                            // Last beat, everything fits in one partial beat.
+                            if (total_w != 8'd0) begin
+                                m_axis_tvalid = 1'b1;
+                                m_axis_tdata  = combined_w[DW-1:0];
+                                m_axis_tkeep  = keep_from_count(total_w[6:0]);
+                                m_axis_tlast  = 1'b1;
+                                s_axis_tready = m_axis_tready;
+                                if (m_axis_tready) begin
+                                    done_d  = 1'b1;
+                                    state_d = DONE;
+                                end
+                            end else begin
+                                s_axis_tready = 1'b1;
+                                done_d        = 1'b1;
+                                state_d       = DONE;
+                            end
+                        end else begin
+                            // Accumulate only.
+                            s_axis_tready = 1'b1;
+                            acc_d         = combined_w[DW-1:0];
+                            acc_cnt_d     = total_w[6:0];
                         end
+                    end
+                end
 
-                        if (s_axis_tlast) begin
-                            done_d  = 1'b1;
-                            state_d = DONE;
-                        end
+                // Flush the bytes still held in the accumulator as the last beat.
+                FLUSH: begin
+                    m_axis_tvalid = 1'b1;
+                    m_axis_tdata  = acc_q;
+                    m_axis_tkeep  = keep_from_count(acc_cnt_q);
+                    m_axis_tlast  = 1'b1;
+                    if (m_axis_tready) begin
+                        done_d  = 1'b1;
+                        state_d = DONE;
                     end
                 end
 
@@ -218,6 +290,8 @@ module strip_http (
         if (!rst_n) begin
             state_q       <= SCAN;
             prev_tail_q   <= '0;
+            acc_q         <= '0;
+            acc_cnt_q     <= '0;
             w0_q          <= '0;
             w1_q          <= '0;
             w0_valid_q    <= 1'b0;
@@ -227,6 +301,8 @@ module strip_http (
         end else begin
             state_q       <= state_d;
             prev_tail_q   <= prev_tail_d;
+            acc_q         <= acc_d;
+            acc_cnt_q     <= acc_cnt_d;
             w0_q          <= w0_d;
             w1_q          <= w1_d;
             w0_valid_q    <= w0_valid_d;

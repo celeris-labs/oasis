@@ -270,8 +270,11 @@ logic [3:0]   dbg_builder_state;
 logic [AXI_DATA_BITS-1:0] dbg_req_lo, dbg_req_hi;
 logic [7:0]   dbg_req_cnt;
 
-// Stripped HTTP body (unaligned keep) → OutputWriter bypass.
-// No DataNormalizer for now (bisect driver/bring-up); add it back once PCIe is stable.
+// strip_http already emits a 64B-aligned, packed body stream, so no
+// DataNormalizer/DataCompactor is needed on the bypass path.
+AXI4S axi_http_body (.aclk(clk), .aresetn(rst_n));
+ndata_i #(data8_t, DATABEAT_SIZE) http_body_ndata();
+
 handler inst_handler (
     .ap_clk  (clk),
     .ap_rst_n(rst_n),
@@ -345,11 +348,11 @@ handler inst_handler (
     .totalWord                     (http_total_word),
     .state_debug                   (http_client_state),
 
-    .m_axis_body_tvalid  (axi_out[BYPASS_ID].tvalid),
-    .m_axis_body_tready  (axi_out[BYPASS_ID].tready),
-    .m_axis_body_tdata   (axi_out[BYPASS_ID].tdata),
-    .m_axis_body_tkeep   (axi_out[BYPASS_ID].tkeep),
-    .m_axis_body_tlast   (axi_out[BYPASS_ID].tlast),
+    .m_axis_body_tvalid  (axi_http_body.tvalid),
+    .m_axis_body_tready  (axi_http_body.tready),
+    .m_axis_body_tdata   (axi_http_body.tdata),
+    .m_axis_body_tkeep   (axi_http_body.tkeep),
+    .m_axis_body_tlast   (axi_http_body.tlast),
 
     .debug_rx_write_ptr  (dbg_rx_ptr),
     .debug_rx_buffer_w0  (dbg_rx_buf_0),
@@ -362,6 +365,22 @@ handler inst_handler (
     .debug_req_lo        (dbg_req_lo),
     .debug_req_hi        (dbg_req_hi),
     .debug_req_cnt       (dbg_req_cnt)
+);
+
+AXIToNData #(data8_t, DATABEAT_SIZE) inst_http_axi_to_ndata (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(axi_http_body),
+    .out(http_body_ndata)
+);
+
+NDataToAXI #(data8_t, DATABEAT_SIZE) inst_http_ndata_to_axi (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(http_body_ndata),
+    .out(axi_out[BYPASS_ID])
 );
 
 
