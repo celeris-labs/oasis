@@ -18,9 +18,13 @@ module http_req_builder (
     input  logic [7:0]    rangeBeginLen,
     input  logic [31:0]   rangeBeginW0,
     input  logic [31:0]   rangeBeginW1,
+    input  logic [31:0]   rangeBeginW2,
+    input  logic [31:0]   rangeBeginW3,
     input  logic [7:0]    rangeEndLen,
     input  logic [31:0]   rangeEndW0,
     input  logic [31:0]   rangeEndW1,
+    input  logic [31:0]   rangeEndW2,
+    input  logic [31:0]   rangeEndW3,
     output logic [1023:0] header_data,
     output logic [15:0]   header_len,
     output logic          req_ready
@@ -77,8 +81,8 @@ module http_req_builder (
 
     logic [7:0] buffer_q [127:0];
     logic [31:0] file_words [7:0];
-    logic [31:0] range_begin_words [1:0];
-    logic [31:0] range_end_words [1:0];
+    logic [31:0] range_begin_words [3:0];
+    logic [31:0] range_end_words [3:0];
 
     logic req_ready_q, req_ready_d;
     assign req_ready = req_ready_q;
@@ -93,8 +97,12 @@ module http_req_builder (
         file_words[6] = fileWord6; file_words[7] = fileWord7;
         range_begin_words[0] = rangeBeginW0;
         range_begin_words[1] = rangeBeginW1;
+        range_begin_words[2] = rangeBeginW2;
+        range_begin_words[3] = rangeBeginW3;
         range_end_words[0]   = rangeEndW0;
         range_end_words[1]   = rangeEndW1;
+        range_end_words[2]   = rangeEndW2;
+        range_end_words[3]   = rangeEndW3;
     end
 
     genvar i;

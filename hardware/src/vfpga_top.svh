@@ -38,8 +38,8 @@ localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
 localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
 
 `ifdef EN_TCP
-// HttpConfig: 27 param regs + START; read side has 3 status regs.
-localparam HTTP_CONFIG_ADDR_SPACE = 28;
+// HttpConfig: 31 param regs + START; read side has 3 status regs.
+localparam HTTP_CONFIG_ADDR_SPACE = 32;
 localparam NUM_CONFIGS   = 3;
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `elsif EN_RDMA
@@ -124,8 +124,8 @@ http_config_t                  http_cfg_q;
 logic                          http_run_tx;
 
 HttpConfig #(
-    .NUM_PARAM_REGS(27),
-    .START_ADDR    (27)
+    .NUM_PARAM_REGS(31),
+    .START_ADDR    (31)
 ) inst_http_config (
     .clk         (clk),
     .rst_n       (rst_n),
@@ -340,9 +340,13 @@ handler inst_handler (
     .rangeBeginLen                 (http_cfg_q.range_begin_len),
     .rangeBeginW0                  (http_cfg_q.range_begin_w0),
     .rangeBeginW1                  (http_cfg_q.range_begin_w1),
+    .rangeBeginW2                  (http_cfg_q.range_begin_w2),
+    .rangeBeginW3                  (http_cfg_q.range_begin_w3),
     .rangeEndLen                   (http_cfg_q.range_end_len),
     .rangeEndW0                    (http_cfg_q.range_end_w0),
     .rangeEndW1                    (http_cfg_q.range_end_w1),
+    .rangeEndW2                    (http_cfg_q.range_end_w2),
+    .rangeEndW3                    (http_cfg_q.range_end_w3),
     .userFrequency                 (http_cfg_q.user_frequency),
     .timeInSeconds                 (http_cfg_q.time_in_seconds),
     .totalWord                     (http_total_word),

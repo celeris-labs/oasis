@@ -28,12 +28,18 @@ typedef struct packed {
     logic [31:0] file_w5;
     logic [31:0] file_w6;
     logic [31:0] file_w7;
-    logic [7:0]  range_begin_len; // ASCII digit count for Range start (0..10)
+    // Range endpoints are absolute file offsets, so they need to span the whole
+    // file: 4 words = 16 ASCII digits (~8.9 PiB).
+    logic [7:0]  range_begin_len; // ASCII digit count for Range start (0..16)
     logic [31:0] range_begin_w0;
     logic [31:0] range_begin_w1;
-    logic [7:0]  range_end_len;   // ASCII digit count for Range end (0..10)
+    logic [31:0] range_begin_w2;
+    logic [31:0] range_begin_w3;
+    logic [7:0]  range_end_len;   // ASCII digit count for Range end (0..16)
     logic [31:0] range_end_w0;
     logic [31:0] range_end_w1;
+    logic [31:0] range_end_w2;
+    logic [31:0] range_end_w3;
     logic [15:0] num_sessions;
     logic [31:0] pkg_word_count;
     logic [31:0] user_frequency;

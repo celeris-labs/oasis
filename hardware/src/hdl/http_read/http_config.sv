@@ -45,10 +45,14 @@ import http_types::*;
 //   21 RANGE_BEGIN_LEN  ([7:0])
 //   22 RANGE_BEGIN_W0   ([31:0])
 //   23 RANGE_BEGIN_W1   ([31:0])
-//   24 RANGE_END_LEN    ([7:0])
-//   25 RANGE_END_W0     ([31:0])
-//   26 RANGE_END_W1     ([31:0])
-//   27 START            (ConfigWriteReadyRegister)  -- value ignored, write triggers
+//   24 RANGE_BEGIN_W2   ([31:0])
+//   25 RANGE_BEGIN_W3   ([31:0])
+//   26 RANGE_END_LEN    ([7:0])
+//   27 RANGE_END_W0     ([31:0])
+//   28 RANGE_END_W1     ([31:0])
+//   29 RANGE_END_W2     ([31:0])
+//   30 RANGE_END_W3     ([31:0])
+//   31 START            (ConfigWriteReadyRegister)  -- value ignored, write triggers
 //
 // Register map (read side):
 //   0  HTTP_CONFIG_ID
@@ -56,8 +60,8 @@ import http_types::*;
 //   2  TOTAL_WORD
 // =================================================================================================
 module HttpConfig #(
-    parameter integer NUM_PARAM_REGS = 27,
-    parameter integer START_ADDR     = 27
+    parameter integer NUM_PARAM_REGS = 31,
+    parameter integer START_ADDR     = 31
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -112,9 +116,13 @@ data64_t reg_time_in_seconds;
 data64_t reg_range_begin_len;
 data64_t reg_range_begin_w0;
 data64_t reg_range_begin_w1;
+data64_t reg_range_begin_w2;
+data64_t reg_range_begin_w3;
 data64_t reg_range_end_len;
 data64_t reg_range_end_w0;
 data64_t reg_range_end_w1;
+data64_t reg_range_end_w2;
+data64_t reg_range_end_w3;
 
 ConfigWriteRegister #(0,  data64_t) inst_reg_server_ip        (clk, write_config, reg_server_ip);
 ConfigWriteRegister #(1,  data64_t) inst_reg_server_port      (clk, write_config, reg_server_port);
@@ -140,9 +148,13 @@ ConfigWriteRegister #(20, data64_t) inst_reg_time_in_seconds  (clk, write_config
 ConfigWriteRegister #(21, data64_t) inst_reg_range_begin_len    (clk, write_config, reg_range_begin_len);
 ConfigWriteRegister #(22, data64_t) inst_reg_range_begin_w0     (clk, write_config, reg_range_begin_w0);
 ConfigWriteRegister #(23, data64_t) inst_reg_range_begin_w1     (clk, write_config, reg_range_begin_w1);
-ConfigWriteRegister #(24, data64_t) inst_reg_range_end_len      (clk, write_config, reg_range_end_len);
-ConfigWriteRegister #(25, data64_t) inst_reg_range_end_w0       (clk, write_config, reg_range_end_w0);
-ConfigWriteRegister #(26, data64_t) inst_reg_range_end_w1       (clk, write_config, reg_range_end_w1);
+ConfigWriteRegister #(24, data64_t) inst_reg_range_begin_w2     (clk, write_config, reg_range_begin_w2);
+ConfigWriteRegister #(25, data64_t) inst_reg_range_begin_w3     (clk, write_config, reg_range_begin_w3);
+ConfigWriteRegister #(26, data64_t) inst_reg_range_end_len      (clk, write_config, reg_range_end_len);
+ConfigWriteRegister #(27, data64_t) inst_reg_range_end_w0       (clk, write_config, reg_range_end_w0);
+ConfigWriteRegister #(28, data64_t) inst_reg_range_end_w1       (clk, write_config, reg_range_end_w1);
+ConfigWriteRegister #(29, data64_t) inst_reg_range_end_w2       (clk, write_config, reg_range_end_w2);
+ConfigWriteRegister #(30, data64_t) inst_reg_range_end_w3       (clk, write_config, reg_range_end_w3);
 
 // -------------------------------------------------------------------------------------------------
 // Live snapshot bus. handler.sv samples whichever fields it needs from `cfg`.
@@ -172,9 +184,13 @@ always_comb begin
     cfg.range_begin_len = reg_range_begin_len[7:0];
     cfg.range_begin_w0  = reg_range_begin_w0 [31:0];
     cfg.range_begin_w1  = reg_range_begin_w1 [31:0];
+    cfg.range_begin_w2  = reg_range_begin_w2 [31:0];
+    cfg.range_begin_w3  = reg_range_begin_w3 [31:0];
     cfg.range_end_len   = reg_range_end_len  [7:0];
     cfg.range_end_w0    = reg_range_end_w0   [31:0];
     cfg.range_end_w1    = reg_range_end_w1   [31:0];
+    cfg.range_end_w2    = reg_range_end_w2   [31:0];
+    cfg.range_end_w3    = reg_range_end_w3   [31:0];
 end
 
 // -------------------------------------------------------------------------------------------------
