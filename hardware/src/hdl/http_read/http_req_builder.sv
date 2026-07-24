@@ -34,7 +34,10 @@ module http_req_builder (
     localparam int LEN_PORT       = 4;  // 4 fixed ASCII chars for port
     localparam int LEN_RANGE_PRE  = 13; // "Range: bytes="
     localparam int LEN_CRLF       = 2;  // "\r\n"
-    localparam int LEN_POST       = 21; // "Connection: close\r\n\r\n"
+    // No Connection header: HTTP/1.1 defaults to persistent connections, so omitting
+    // it selects keep-alive *and* frees 19 bytes of the 128B request budget (the send
+    // path is structurally two 64B beats). POST is just the blank line ending the header.
+    localparam int LEN_POST       = 2;  // "\r\n"
 
     localparam logic [LEN_PRE *8-1:0] STR_PRE  = 32'h20544547; // "GET "
     localparam logic [LEN_HOST*8-1:0] STR_HOST = {
@@ -46,11 +49,7 @@ module http_req_builder (
         8'h3D, 8'h73, 8'h65, 8'h74, 8'h79, 8'h62, 8'h20, 8'h3A,
         8'h65, 8'h67, 8'h6E, 8'h61, 8'h52
     };
-    localparam logic [LEN_POST*8-1:0] STR_POST = {
-        8'h0A, 8'h0D, 8'h0A, 8'h0D, 8'h65, 8'h73, 8'h6F, 8'h6C,
-        8'h63, 8'h20, 8'h3A, 8'h6E, 8'h6F, 8'h69, 8'h74, 8'h63,
-        8'h65, 8'h6E, 8'h6E, 8'h6F, 8'h43
-    };
+    localparam logic [LEN_POST*8-1:0] STR_POST = {8'h0A, 8'h0D}; // "\r\n"
 
     typedef enum logic [3:0] {
         IDLE        = 4'd0,

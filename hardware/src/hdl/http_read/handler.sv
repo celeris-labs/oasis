@@ -107,6 +107,16 @@ module handler (
     logic [3:0] state_q, state_d;
     logic [15:0] session_id_q, session_id_d;
 
+    // Cached TCP session (keep-alive). Valid while the peer keeps the connection up
+    // and the request targets the same server, letting requests skip ST_TCP_INIT.
+    logic        session_valid_q, session_valid_d;
+    logic [31:0] sess_ip_q, sess_ip_d;
+    logic [31:0] sess_port_q, sess_port_d;
+    logic        session_reusable;
+
+    assign session_reusable = session_valid_q && (sess_ip_q == serverIpAddress) &&
+                              (sess_port_q == serverPort);
+
     logic init_done;
     logic init_error;
     logic [15:0] init_session_id;
@@ -118,6 +128,7 @@ module handler (
 
     logic read_done;
     logic read_error;
+    logic read_conn_closed;
     logic [3:0] read_state_debug;
 
     assign totalWord = 0;
@@ -208,6 +219,7 @@ module handler (
         .m_axis_body_tlast(m_axis_body_tlast),
         .done(read_done),
         .error(read_error),
+        .conn_closed(read_conn_closed),
         .debug_rx_write_ptr(debug_rx_write_ptr),
         .debug_rx_buffer_w0(debug_rx_buffer_w0),
         .debug_rx_buffer_w1(debug_rx_buffer_w1),
@@ -225,6 +237,9 @@ module handler (
     always_comb begin
         state_d = state_q;
         session_id_d = session_id_q;
+        session_valid_d = session_valid_q;
+        sess_ip_d = sess_ip_q;
+        sess_port_d = sess_port_q;
 
         m_axis_close_connection_TVALID = 1'b0;
         m_axis_close_connection_TDATA  = session_id_q[TCP_CLOSE_CONN_REQ_BITS-1:0];
@@ -232,7 +247,8 @@ module handler (
         case (state_q)
             ST_IDLE: begin
                 if (runTx) begin
-                    state_d = ST_TCP_INIT;
+                    // Reuse the open connection when it targets the same server.
+                    state_d = session_reusable ? ST_TCP_SEND : ST_TCP_INIT;
                 end
             end
 
@@ -241,6 +257,10 @@ module handler (
                     session_id_d = init_session_id;
                     if (init_error) begin
                         //ignore
+                    end else begin
+                        session_valid_d = 1'b1;
+                        sess_ip_d       = serverIpAddress;
+                        sess_port_d     = serverPort;
                     end
                     state_d = ST_TCP_SEND;
                 end
@@ -254,7 +274,15 @@ module handler (
 
             ST_TCP_READ: begin
                 if (read_done) begin
-                    state_d = ST_CLOSE;
+                    // Content-Length framing lets the response finish without the peer
+                    // closing, so hold the session open and skip the teardown. Only tear
+                    // down when the peer actually closed the stream.
+                    if (read_conn_closed) begin
+                        session_valid_d = 1'b0;
+                        state_d         = ST_CLOSE;
+                    end else begin
+                        state_d = ST_IDLE;
+                    end
                 end
             end
 
@@ -273,9 +301,15 @@ module handler (
         if (!ap_rst_n) begin
             state_q <= ST_IDLE;
             session_id_q <= 16'd0;
+            session_valid_q <= 1'b0;
+            sess_ip_q <= 32'd0;
+            sess_port_q <= 32'd0;
         end else begin
             state_q <= state_d;
             session_id_q <= session_id_d;
+            session_valid_q <= session_valid_d;
+            sess_ip_q <= sess_ip_d;
+            sess_port_q <= sess_port_d;
         end
     end
 
