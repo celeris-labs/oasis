@@ -31,9 +31,6 @@ module tcp_read (
     
     output logic                                      done,
     output logic                                      error,
-    // High when the peer closed the connection, so the cached session must be
-    // reopened before the next request.
-    output logic                                      conn_closed,
     output logic [3:0]                                debug_rx_write_ptr,
     output logic [AXI_DATA_BITS-1:0]                  debug_rx_buffer_w0,
     output logic [AXI_DATA_BITS-1:0]                  debug_rx_buffer_w1,
@@ -53,8 +50,7 @@ module tcp_read (
     logic [AXI_DATA_BITS-1:0] payload_w1;
     logic payload_w0_valid;
     logic payload_w1_valid;
-    logic payload_done;      // strip_http reached DONE: the TCP stream ended
-    logic payload_resp_done; // pulse: one response body fully emitted
+    logic payload_done;
     logic payload_ready;
 
     logic [AXI_DATA_BITS-1:0] payload_w0_q, payload_w0_d;
@@ -82,12 +78,8 @@ module tcp_read (
         .out_w0_valid(payload_w0_valid),
         .out_w1_valid(payload_w1_valid),
         .done(payload_done),
-        .resp_done(payload_resp_done),
-        .out_content_len(),
         .out_payload_idx()
     );
-
-    assign conn_closed = payload_done;
 
     always_comb begin
         state_d             = state_q;
@@ -139,10 +131,7 @@ module tcp_read (
                     s_axis_rx_metadata_TREADY = 1'b1;
                 end
 
-                // One response per start. With Content-Length framing this fires at
-                // the body boundary and the connection stays up; `payload_done` only
-                // adds the fallback where the peer closed instead.
-                if (payload_resp_done || payload_done) begin
+                if (payload_done) begin
                     // Latch stripped payload into debug registers on completion.
                     payload_w0_d = payload_w0;
                     payload_w1_d = payload_w1;

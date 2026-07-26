@@ -33,7 +33,7 @@
 constexpr uint64_t OASIS_SYSTEM_ID   = 0x0A515;
 constexpr uint64_t HTTP_CONFIG_ID    = 0x0000000000485454ULL; // "HTT"
 constexpr uint64_t MEM_CONFIG_ID     = 0x0ULL;
-constexpr uint32_t HTTP_NUM_WRITE    = 28; // 27 params + START
+constexpr uint32_t HTTP_NUM_WRITE    = 32; // 31 params + START (4-word range)
 
 constexpr uint32_t GLOBAL_SYSTEM_ID   = 0;
 constexpr uint32_t GLOBAL_NUM_CONFIGS = 1;
@@ -71,10 +71,14 @@ enum class HttpLocal : uint32_t {
     RANGE_BEGIN_LEN = 21,
     RANGE_BEGIN_W0  = 22,
     RANGE_BEGIN_W1  = 23,
-    RANGE_END_LEN   = 24,
-    RANGE_END_W0    = 25,
-    RANGE_END_W1    = 26,
-    START           = 27,
+    RANGE_BEGIN_W2  = 24,
+    RANGE_BEGIN_W3  = 25,
+    RANGE_END_LEN   = 26,
+    RANGE_END_W0    = 27,
+    RANGE_END_W1    = 28,
+    RANGE_END_W2    = 29,
+    RANGE_END_W3    = 30,
+    START           = 31,
     ID              = 0,
     CLIENT_STATE    = 1,
     TOTAL_WORD      = 2,
@@ -367,10 +371,10 @@ int main(int argc, char* argv[]) {
     uint32_t range_end_len = 0;
     pack_file_path(std::to_string(range_begin), range_begin_words, range_begin_len);
     pack_file_path(std::to_string(range_end),   range_end_words,   range_end_len);
-    if (range_begin_len == 0 || range_begin_len > 8)
-        throw std::invalid_argument("--begin must produce 1..8 ASCII digits");
-    if (range_end_len == 0 || range_end_len > 8)
-        throw std::invalid_argument("--end must produce 1..8 ASCII digits");
+    if (range_begin_len == 0 || range_begin_len > 16)
+        throw std::invalid_argument("--begin must produce 1..16 ASCII digits");
+    if (range_end_len == 0 || range_end_len > 16)
+        throw std::invalid_argument("--end must produce 1..16 ASCII digits");
 
     // ISR must be registered at construction.
     coyote::cThread coyote_thread(DEFAULT_VFPGA_ID, getpid(), /*device*/ 0, on_fpga_irq);
@@ -453,9 +457,13 @@ int main(int argc, char* argv[]) {
     wr(HttpLocal::RANGE_BEGIN_LEN, range_begin_len);
     wr(HttpLocal::RANGE_BEGIN_W0,  range_begin_words[0]);
     wr(HttpLocal::RANGE_BEGIN_W1,  range_begin_words[1]);
+    wr(HttpLocal::RANGE_BEGIN_W2,  range_begin_words[2]);
+    wr(HttpLocal::RANGE_BEGIN_W3,  range_begin_words[3]);
     wr(HttpLocal::RANGE_END_LEN,   range_end_len);
     wr(HttpLocal::RANGE_END_W0,    range_end_words[0]);
     wr(HttpLocal::RANGE_END_W1,    range_end_words[1]);
+    wr(HttpLocal::RANGE_END_W2,    range_end_words[2]);
+    wr(HttpLocal::RANGE_END_W3,    range_end_words[3]);
     std::cout << "file=" << file << " range=" << range_begin << "-" << range_end << std::endl;
     //TODO: for now sleep as without we got a problem with the file path not beening updated, probly also all the other registers
     sleep(1);

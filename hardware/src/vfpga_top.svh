@@ -270,10 +270,11 @@ logic [3:0]   dbg_builder_state;
 logic [AXI_DATA_BITS-1:0] dbg_req_lo, dbg_req_hi;
 logic [7:0]   dbg_req_cnt;
 
-// strip_http already emits a 64B-aligned, packed body stream, so no
-// DataNormalizer/DataCompactor is needed on the bypass path.
+// Stripped HTTP body (unaligned keep) → DataNormalizer → OutputWriter bypass.
+// ENABLE_COMPACTOR(0): barrel-shift + beat merge only (lighter than COMPACTOR=1).
 AXI4S axi_http_body (.aclk(clk), .aresetn(rst_n));
 ndata_i #(data8_t, DATABEAT_SIZE) http_body_ndata();
+ndata_i #(data8_t, DATABEAT_SIZE) http_body_norm();
 
 handler inst_handler (
     .ap_clk  (clk),
@@ -379,11 +380,23 @@ AXIToNData #(data8_t, DATABEAT_SIZE) inst_http_axi_to_ndata (
     .out(http_body_ndata)
 );
 
-NDataToAXI #(data8_t, DATABEAT_SIZE) inst_http_ndata_to_axi (
+DataNormalizer #(
+    .data_t(data8_t),
+    .NUM_ELEMENTS(DATABEAT_SIZE),
+    .ENABLE_COMPACTOR(0)
+) inst_http_body_normalizer (
     .clk(clk),
     .rst_n(rst_n),
 
     .in(http_body_ndata),
+    .out(http_body_norm)
+);
+
+NDataToAXI #(data8_t, DATABEAT_SIZE) inst_http_ndata_to_axi (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(http_body_norm),
     .out(axi_out[BYPASS_ID])
 );
 
