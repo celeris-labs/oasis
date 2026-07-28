@@ -15,6 +15,7 @@ namespace duckdb {
 namespace {
 
 std::atomic<bool> g_httpfpga_debug {false};
+std::atomic<bool> g_httpfpga_cpu_fallback {false};
 std::mutex g_last_trigger_mtx;
 HttpFpgaLastTrigger g_last_trigger;
 
@@ -61,6 +62,14 @@ bool HttpFpgaDebugEnabled() {
 
 void SetHttpFpgaDebug(ClientContext &, SetScope, Value &parameter) {
 	g_httpfpga_debug.store(!parameter.IsNull() && parameter.GetValue<bool>());
+}
+
+bool HttpFpgaCpuFallbackEnabled() {
+	return g_httpfpga_cpu_fallback.load();
+}
+
+void SetHttpFpgaCpuFallback(ClientContext &, SetScope, Value &parameter) {
+	g_httpfpga_cpu_fallback.store(!parameter.IsNull() && parameter.GetValue<bool>());
 }
 
 void RecordHttpFpgaTrigger(uint32_t bypass_stream, uint32_t server_ip, uint16_t server_port, const string &path,

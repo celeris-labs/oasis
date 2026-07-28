@@ -69,6 +69,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("httpfpga_debug",
 	                          "Print HTTP FPGA FSM status to stderr during httpfpga:// reads", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false), SetHttpFpgaDebug);
+	config.AddExtensionOption("httpfpga_cpu_fallback",
+	                          "Fetch httpfpga:// reads over an ordinary host socket instead of the FPGA "
+	                          "(correct but bypasses the FPGA data path)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetHttpFpgaCpuFallback);
 
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<HTTPFileSystem>(instance));
 	RegisterOasisHttpStateFunction(loader);

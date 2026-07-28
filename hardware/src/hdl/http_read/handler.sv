@@ -195,6 +195,7 @@ module handler (
         .clk(ap_clk),
         .rst_n(ap_rst_n),
         .start(state_q == ST_TCP_READ),
+        .session_id(session_id_q),
         .s_axis_notifications_TVALID(s_axis_notifications_TVALID),
         .s_axis_notifications_TREADY(s_axis_notifications_TREADY),
         .s_axis_notifications_TDATA(s_axis_notifications_TDATA),

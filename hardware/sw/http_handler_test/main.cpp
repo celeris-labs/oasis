@@ -310,6 +310,7 @@ int main(int argc, char* argv[]) {
     uint64_t range_begin = 0;
     uint64_t range_end   = 50000;
     bool skip_arp = false;
+    bool no_prime = false;
     uint64_t out_bytes = 0;   // 0 => derive from range
     uint64_t print_max = 4096;
     uint64_t irq_timeout_s = 30;
@@ -336,7 +337,11 @@ int main(int argc, char* argv[]) {
         ("irq-timeout", po::value<uint64_t>(&irq_timeout_s)->default_value(30),
                         "Seconds to wait for OutputWriter IRQ after START")
         ("skip-arp",   po::bool_switch(&skip_arp),
-                        "Do not call doArpLookup before START (TOE can ARP on SYN)");
+                        "Do not call doArpLookup before START (TOE can ARP on SYN)")
+        ("no-prime",   po::bool_switch(&no_prime),
+                        "Skip the throwaway priming request. Only correct once the HW "
+                        "tcp_read session filter lands; by default we prime once to flush "
+                        "the stale one-run-behind notification.");
     po::variables_map vm;
     try {
         po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -404,9 +409,6 @@ int main(int argc, char* argv[]) {
     std::cout << "num_streams=" << num_streams
               << " bypass_stream=" << bypass_stream << std::endl;
 
-    // Flush any stale OutputWriter buffers, then enqueue our host buffer.
-    coyote_thread.setCSR(1, mem_base + static_cast<uint32_t>(num_streams));
-
     const size_t expected_body =
         out_bytes != 0 ? static_cast<size_t>(out_bytes)
                        : static_cast<size_t>(range_end - range_begin + 1);
@@ -416,8 +418,7 @@ int main(int argc, char* argv[]) {
     if (!out_buf) {
         throw std::runtime_error("getMem failed for output buffer");
     }
-    std::memset(out_buf, 0, out_cap);
-    enqueue_mem_buffer(coyote_thread, mem_base, bypass_stream, out_buf, out_cap);
+    // The OW buffer is (re-)armed inside fire_and_wait immediately before each START.
 
     auto wr = [&](HttpLocal reg, uint64_t val) {
         coyote_thread.setCSR(val, http_base + static_cast<uint32_t>(reg));
@@ -465,66 +466,102 @@ int main(int argc, char* argv[]) {
     wr(HttpLocal::RANGE_END_W2,    range_end_words[2]);
     wr(HttpLocal::RANGE_END_W3,    range_end_words[3]);
     std::cout << "file=" << file << " range=" << range_begin << "-" << range_end << std::endl;
-    //TODO: for now sleep as without we got a problem with the file path not beening updated, probly also all the other registers
-    sleep(1);
-    wr(HttpLocal::START,           1);
+    // One request cycle: (re-)arm the OW buffer, pulse START, wait for the body DMA.
+    // The config registers written above are left untouched between fires, so every
+    // call issues the SAME GET — which is what makes the priming scheme below work.
+    // Returns the body bytes DMA'd for this fire.
+    auto fire_and_wait = [&](const char* label) -> uint32_t {
+        // Re-arm the OutputWriter: flush any stale enqueue, clear + enqueue our buffer.
+        coyote_thread.setCSR(1, mem_base + static_cast<uint32_t>(num_streams));
+        std::memset(out_buf, 0, out_cap);
+        enqueue_mem_buffer(coyote_thread, mem_base, bypass_stream, out_buf, out_cap);
 
-    std::cout << "client_state after START = " << rd(HttpLocal::CLIENT_STATE) << std::endl;
-
-    while (rd(HttpLocal::CLIENT_STATE) == 0) {
-        sleep(1);
-        std::cout << "waiting leave IDLE, state=" << rd(HttpLocal::CLIENT_STATE) << std::endl;
-    }
-
-    if (timeS > 0) {
-        sleep(static_cast<unsigned int>(timeS));
-    }
-
-    // Wait for OutputWriter IRQ (body DMA) and/or HTTP FSM back to IDLE.
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(irq_timeout_s);
-    uint32_t body_bytes = 0;
-    bool got_irq = false;
-
-    while (std::chrono::steady_clock::now() < deadline) {
+        // Reset the IRQ capture so we only observe THIS fire's completion.
         {
-            std::unique_lock<std::mutex> lk(g_irq.m);
-            if (g_irq.got) {
-                got_irq = true;
-                body_bytes = g_irq.bytes_written;
-                if (g_irq.stream_id != bypass_stream) {
-                    std::cerr << "WARNING: IRQ stream " << g_irq.stream_id
-                              << " != bypass " << bypass_stream << std::endl;
+            std::lock_guard<std::mutex> lk(g_irq.m);
+            g_irq.got  = false;
+            g_irq.last = false;
+        }
+
+        // Barrier before START: a CSR read is non-posted and cannot be reordered ahead of
+        // the prior parameter writes, so it drains the posted MMIO store buffer and orders
+        // START strictly after every config write (a plain sleep would not drain it).
+        (void)rd(HttpLocal::CLIENT_STATE);
+        wr(HttpLocal::START, 1);
+        std::cout << "[" << label << "] client_state after START = "
+                  << rd(HttpLocal::CLIENT_STATE) << std::endl;
+
+        while (rd(HttpLocal::CLIENT_STATE) == 0) {
+            sleep(1);
+            std::cout << "waiting leave IDLE, state=" << rd(HttpLocal::CLIENT_STATE) << std::endl;
+        }
+
+        if (timeS > 0) {
+            sleep(static_cast<unsigned int>(timeS));
+        }
+
+        // Wait for OutputWriter IRQ (body DMA) and/or HTTP FSM back to IDLE.
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(irq_timeout_s);
+        uint32_t body_bytes = 0;
+        bool got_irq = false;
+
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::unique_lock<std::mutex> lk(g_irq.m);
+                if (g_irq.got) {
+                    got_irq = true;
+                    body_bytes = g_irq.bytes_written;
+                    if (g_irq.stream_id != bypass_stream) {
+                        std::cerr << "WARNING: IRQ stream " << g_irq.stream_id
+                                  << " != bypass " << bypass_stream << std::endl;
+                    }
+                    g_irq.got = false;
+                    if (g_irq.last) break;
                 }
-                // Clear for potential multi-buffer; we only enqueue one.
-                g_irq.got = false;
-                if (g_irq.last) break;
             }
+
+            const uint64_t st = rd(HttpLocal::CLIENT_STATE);
+            std::cout << "running, state=" << st
+                      << " total_word=" << rd(HttpLocal::TOTAL_WORD)
+                      << " irq_count=" << g_irq_count.load() << std::endl;
+            if (st == 0 && got_irq) break;
+            if (st == 0 && !got_irq) {
+                // FSM done but no body IRQ yet — keep waiting a bit for late DMA.
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
-        const uint64_t st = rd(HttpLocal::CLIENT_STATE);
-        std::cout << "running, state=" << st
-                  << " total_word=" << rd(HttpLocal::TOTAL_WORD)
-                  << " irq_count=" << g_irq_count.load() << std::endl;
-        if (st == 0 && got_irq) break;
-        if (st == 0 && !got_irq) {
-            // FSM done but no body IRQ yet — keep waiting a bit for late DMA.
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            continue;
+        std::cout << "[DONE " << label << "] total_word=" << rd(HttpLocal::TOTAL_WORD)
+                  << " client_state=" << rd(HttpLocal::CLIENT_STATE)
+                  << " irq_count=" << g_irq_count.load()
+                  << " body_bytes=" << body_bytes << std::endl;
+
+        if (!got_irq) {
+            std::cerr << "WARNING: no OutputWriter IRQ for " << label
+                      << " — is body wired and bitstream rebuilt?\n";
+            body_bytes = static_cast<uint32_t>(std::min(expected_body, out_cap));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
+        return body_bytes;
+    };
 
-    std::cout << "[DONE] total_word=" << rd(HttpLocal::TOTAL_WORD)
-              << " client_state=" << rd(HttpLocal::CLIENT_STATE)
-              << " irq_count=" << g_irq_count.load()
-              << " body_bytes=" << body_bytes << std::endl;
-
-    if (!got_irq) {
-        std::cerr << "WARNING: no OutputWriter IRQ — is body wired and bitstream rebuilt?\n";
-        // Still dump buffer in case DMA completed without IRQ delivery.
-        body_bytes = static_cast<uint32_t>(std::min(expected_body, out_cap));
+    // The FPGA hands back a body one run behind: the shared TOE notification FIFO still
+    // holds the previous connection's notification, so run N's tcp_read pops THAT and DMAs
+    // run (N-1)'s body, while run N's own body waits in the FIFO for the next run. That is
+    // why a single request always returns the previous path's data and you had to run the
+    // program twice by hand. We reproduce that second run in-process: fire one throwaway
+    // "prime" request (its stale body is discarded), then read the real body on the second
+    // fire. Because the config registers are identical across both fires, the second fire
+    // pops exactly the notification the first fire's request generated -> current data.
+    // The proper fix is the tcp_read session filter in hardware; this is the SW workaround.
+    if (!no_prime) {
+        std::cout << "==> priming request (result discarded to flush the stale notification)"
+                  << std::endl;
+        (void)fire_and_wait("prime");
     }
+    const uint32_t body_bytes = fire_and_wait("read");
 
     print_body(out_buf, body_bytes, static_cast<size_t>(print_max));
     return EXIT_SUCCESS;

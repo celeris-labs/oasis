@@ -170,7 +170,14 @@ void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 		             server_host_.c_str(), server_ip_, IpForArpLookup(server_ip_),
 		             static_cast<unsigned>(server_port_));
 	}
+	// Resolve the server MAC into the TOE ARP table, then let it settle. The standalone
+	// bring-up tool (which works) does doArpLookup + sleep(1) before every START; here we
+	// resolve once at init since the entry persists for the session. Without this the handler
+	// reaches START and tries to open the connection before the server MAC is known, then
+	// stalls — START fires but no SYN ever leaves the FPGA (the "fire, then hang, no TCP"
+	// symptom). This call was previously commented out, which is exactly that hang.
 	ctx.cthread()->doArpLookup(IpForArpLookup(server_ip_));
+	sleep(1);
 
 	initialized = true;
 }
@@ -228,15 +235,7 @@ int64_t HTTPFileSystem::GetFileSize(FileHandle &handle) {
 	return static_cast<int64_t>(h.known_file_size);
 }
 
-uint64_t HTTPFileSystem::ProbeContentLength(const string &resource_path) {
-	if (!initialized) {
-		throw IOException("httpfpga:// filesystem is not initialized");
-	}
-
-	const auto http_path = NormalizeHttpPath(resource_path);
-	const auto request = "HEAD " + http_path + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
-	                     std::to_string(server_port_) + "\r\nConnection: close\r\n\r\n";
-
+bool HTTPFileSystem::HttpSocketRequest(const std::string &request, std::string &response) {
 	addrinfo hints {};
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
@@ -244,7 +243,7 @@ uint64_t HTTPFileSystem::ProbeContentLength(const string &resource_path) {
 	addrinfo *result = nullptr;
 	const auto port_str = std::to_string(server_port_);
 	if (getaddrinfo(server_host_.c_str(), port_str.c_str(), &hints, &result) != 0) {
-		throw IOException("Failed to resolve http_server '%s'", server_host_);
+		return false;
 	}
 
 	int sock = -1;
@@ -262,17 +261,18 @@ uint64_t HTTPFileSystem::ProbeContentLength(const string &resource_path) {
 	freeaddrinfo(result);
 
 	if (sock < 0) {
-		throw IOException("Failed to connect to HTTP server %s:%u", server_host_, server_port_);
+		return false;
 	}
 
-	string response;
+	response.clear();
 	response.reserve(4096);
-	char buffer[1024];
 	if (send(sock, request.data(), request.size(), 0) < 0) {
 		close(sock);
-		throw IOException("Failed to send HTTP HEAD for '%s'", resource_path);
+		return false;
 	}
 
+	// Connection: close -> the server sends the whole response then FINs, so recv until 0.
+	char buffer[4096];
 	while (true) {
 		const auto n = recv(sock, buffer, sizeof(buffer), 0);
 		if (n <= 0) {
@@ -281,6 +281,64 @@ uint64_t HTTPFileSystem::ProbeContentLength(const string &resource_path) {
 		response.append(buffer, static_cast<size_t>(n));
 	}
 	close(sock);
+	return true;
+}
+
+void HTTPFileSystem::HTTPReadRangeCpu(const string &path, uint64_t offset, size_t size, void *dst) {
+	const auto http_path = NormalizeHttpPath(path);
+	const uint64_t range_end = offset + size - 1;
+	const auto request = "GET " + http_path + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
+	                     std::to_string(server_port_) + "\r\nRange: bytes=" + std::to_string(offset) + "-" +
+	                     std::to_string(range_end) + "\r\nConnection: close\r\n\r\n";
+
+	string response;
+	if (!HttpSocketRequest(request, response)) {
+		throw IOException("CPU-fallback GET failed for '%s' (socket error to %s:%u)", path, server_host_,
+		                  server_port_);
+	}
+
+	const auto header_end = response.find("\r\n\r\n");
+	const auto status_line_end = response.find("\r\n");
+	if (header_end == string::npos || status_line_end == string::npos || response.rfind("HTTP/", 0) != 0) {
+		throw IOException("CPU-fallback: invalid HTTP response for '%s'", path);
+	}
+	const auto status_line = response.substr(0, status_line_end);
+	const bool partial = status_line.find(" 206 ") != string::npos;
+	if (!partial && status_line.find(" 200 ") == string::npos) {
+		throw IOException("CPU-fallback GET for '%s' failed: %s", path, status_line);
+	}
+
+	// 206 -> body is exactly the requested range. 200 -> the server ignored Range and sent the whole
+	// object, so index into it at `offset`.
+	const size_t body_off = header_end + 4 + (partial ? 0 : static_cast<size_t>(offset));
+	if (response.size() < body_off + size) {
+		throw IOException("CPU-fallback short body for '%s' range=[%llu,%llu]: have %llu, need %llu", path,
+		                  (unsigned long long)offset, (unsigned long long)range_end,
+		                  (unsigned long long)(response.size() - std::min(response.size(), body_off)),
+		                  (unsigned long long)size);
+	}
+	std::memcpy(dst, response.data() + body_off, size);
+
+	if (HttpFpgaDebugEnabled()) {
+		std::fprintf(stderr, "[httpfpga] CPU-fallback read path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
+		             (unsigned long long)offset, (unsigned long long)range_end, (unsigned long long)size);
+	}
+}
+
+uint64_t HTTPFileSystem::ProbeContentLength(const string &resource_path) {
+	if (!initialized) {
+		throw IOException("httpfpga:// filesystem is not initialized");
+	}
+
+	const auto http_path = NormalizeHttpPath(resource_path);
+	const auto request = "HEAD " + http_path + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
+	                     std::to_string(server_port_) + "\r\nConnection: close\r\n\r\n";
+
+	string response;
+	if (!HttpSocketRequest(request, response)) {
+		throw IOException("Failed to probe size of '%s' (socket error to %s:%u)", resource_path,
+		                  server_host_, server_port_);
+	}
 
 	const auto header_end = response.find("\r\n\r\n");
 	if (header_end == string::npos) {
@@ -346,40 +404,43 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		throw IOException("HTTP read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 
+	// CPU fallback: bypass the FPGA and fetch over a plain socket. Reliable, but does not exercise
+	// the FPGA data path — a scaffolding aid while the HW receive path is validated.
+	if (HttpFpgaCpuFallbackEnabled()) {
+		HTTPReadRangeCpu(path, offset, size, dst);
+		return;
+	}
+
 	auto &ctx = oasis::OasisContext::ctx();
 	auto http_cfg = ctx.config<oasis::HTTPReadConfig>();
 	auto obm = ctx.output_buffer_manager();
 	const auto bypass_stream = ctx.httpBypassStream();
 	const uint64_t range_end = offset + size - 1;
 
-	// Unlike RDMA (which queues multiple outstanding reads on a QP), the HTTP side is a
-	// single-session FSM: one set of parameter CSRs, one START, one client_state. A second
-	// request fired while one is in flight would overwrite the CSRs and interleave bodies
-	// on the shared bypass stream. So hold the lock across the whole transfer — trigger,
-	// enqueue and drain — which serializes httpfpga:// reads against each other.
+	// The HTTP side is a single-session FSM: one set of parameter CSRs, one START, one client_state.
+	// A second request fired while one is in flight would overwrite the CSRs and interleave bodies on
+	// the shared bypass stream. So hold the lock across the whole transfer — trigger, enqueue, drain —
+	// which serializes httpfpga:// reads. With the HW drain-to-close fix (tcp_read), a single request
+	// returns the whole body across however many TCP segments it spans.
 	std::lock_guard<std::mutex> lock(mtx);
 
-	// Trigger the request first: the handler opens the TCP connection and issues
-	// the ranged GET, which is long latency.
+	// Trigger the request first: the handler opens the TCP connection and issues the ranged GET.
 	http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, /*session*/ 0);
 	RecordHttpFpgaTrigger(bypass_stream, server_ip_, server_port_, path, offset, range_end,
 	                      static_cast<uint32_t>(size));
 
-	// The bypass stream is configured as unmanaged on the OBM. The HW strips the
-	// HTTP header, so exactly `size` body bytes land here — pass that so the OBM
-	// allocates right-sized buffers with no speculative pre-allocation.
+	// The bypass stream is unmanaged on the OBM. The HW strips the HTTP header, so exactly `size`
+	// body bytes land here — pass that so the OBM allocates a right-sized buffer.
 	auto handle = obm->acquire_output_handle(bypass_stream, size);
 
 	if (HttpFpgaDebugEnabled()) {
-		std::fprintf(stderr, "[httpfpga] fire path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
-		             (unsigned long long)offset, (unsigned long long)range_end,
-		             (unsigned long long)size);
+		std::fprintf(stderr, "[httpfpga] read path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
+		             (unsigned long long)offset, (unsigned long long)range_end, (unsigned long long)size);
 	}
 
-	// Drain all buffers for this transfer. A body that fits in a single FPGA buffer is
-	// one iteration; larger ranges are chunked across multiple buffers, each surfaced
-	// via its own interrupt. These calls block until the FPGA writes (or discards) the
-	// allocation.
+	// Drain all buffers for this transfer. A body that fits one FPGA buffer is one iteration; larger
+	// ranges are chunked across multiple buffers, each surfaced via its own interrupt. These calls
+	// block until the FPGA writes (or discards) the allocation.
 	size_t copied = 0;
 	while (handle->stream_has_more_output(bypass_stream)) {
 		auto buf = handle->get_next_stream_output(bypass_stream);
@@ -396,8 +457,8 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		copied += buf->size;
 	}
 	if (copied != size) {
-		throw IOException("HTTP read short transfer for '%s' range=[%llu,%llu]: requested %llu "
-		                  "bytes, got %llu (client_state=%u total_word=%u)",
+		throw IOException("HTTP read short transfer for '%s' range=[%llu,%llu]: requested %llu bytes, "
+		                  "got %llu (client_state=%u total_word=%u)",
 		                  path, (unsigned long long)offset, (unsigned long long)range_end,
 		                  (unsigned long long)size, (unsigned long long)copied,
 		                  static_cast<unsigned>(http_cfg->client_state()), http_cfg->debug_status());

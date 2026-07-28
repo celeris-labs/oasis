@@ -1,0 +1,1 @@
+-debug "typical" -timescale "1ns/1ps" -top "tcp_read_tb" -snapshot "tcp_read_tb_snap" 

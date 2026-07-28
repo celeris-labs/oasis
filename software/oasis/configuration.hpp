@@ -11,8 +11,9 @@ constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A515;
 constexpr const uint64_t RDMA_READ_CONFIG_REGS = 2;
 constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
 
-// Matches hardware HttpConfig (27 params + START). ID string "HTT".
-constexpr const uint64_t HTTP_READ_CONFIG_REGS = 28;
+// Matches hardware HttpConfig (31 params [0..30] + START at 31 = 32 regs). ID string "HTT".
+// Kept in sync with hardware/src/hdl/http_read/http_config.sv (NUM_PARAM_REGS=31, START_ADDR=31).
+constexpr const uint64_t HTTP_READ_CONFIG_REGS = 32;
 constexpr const uint64_t HTTP_READ_CONFIG_ID   = 0x0000000000485454;
 
 /**

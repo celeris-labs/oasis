@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 #include <libstf/profiling.hpp>
@@ -45,10 +46,17 @@ constexpr const uint32_t HTTP_PKG_WORD_COUNT  = 18;
 constexpr const uint32_t HTTP_USER_FREQUENCY  = 19;
 constexpr const uint32_t HTTP_TIME_IN_SECONDS = 20;
 constexpr const uint32_t HTTP_RANGE_BEGIN_LEN = 21;
-constexpr const uint32_t HTTP_RANGE_BEGIN_W0  = 22;
-constexpr const uint32_t HTTP_RANGE_END_LEN   = 24;
-constexpr const uint32_t HTTP_RANGE_END_W0    = 25;
-constexpr const uint32_t HTTP_START           = 27;
+constexpr const uint32_t HTTP_RANGE_BEGIN_W0  = 22; // 22..25
+constexpr const uint32_t HTTP_RANGE_END_LEN   = 26;
+constexpr const uint32_t HTTP_RANGE_END_W0    = 27; // 27..30
+constexpr const uint32_t HTTP_START           = 31;
+
+// ASCII words transferred per Range endpoint. Range values are absolute file
+// offsets, so they scale with file size, not with read size: 2 words (8 digits)
+// caps out at ~95 MiB, which any real Parquet file blows past immediately. 4
+// words = 16 digits ~ 8.9 PiB.
+constexpr const uint32_t HTTP_RANGE_WORDS = 4;
+constexpr const uint32_t HTTP_RANGE_MAX_DIGITS = HTTP_RANGE_WORDS * 4;
 
 constexpr const uint32_t HTTP_CLIENT_STATE = 1;
 constexpr const uint32_t HTTP_TOTAL_WORD   = 2;
@@ -120,12 +128,33 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
     write_register(libstf::ConfigRegister(HTTP_PKG_WORD_COUNT, 16));
     write_register(libstf::ConfigRegister(HTTP_USER_FREQUENCY, 256ULL * 1024ULL * 1024ULL));
     write_register(libstf::ConfigRegister(HTTP_TIME_IN_SECONDS, 0));
+    // The length CSRs must never claim more characters than were transferred, or
+    // the HW walks past the words it was given and builds a garbage Range: header.
+    if (range_begin_len > HTTP_RANGE_MAX_DIGITS || range_end_len > HTTP_RANGE_MAX_DIGITS) {
+        std::ostringstream msg;
+        msg << "HTTP range endpoint does not fit in " << HTTP_RANGE_MAX_DIGITS
+            << " ASCII digits: begin=" << range_begin << " end=" << range_end;
+        throw std::runtime_error(msg.str());
+    }
+
     write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_LEN, range_begin_len));
-    write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_W0, range_begin_words[0]));
-    write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_W0 + 1, range_begin_words[1]));
+    for (uint32_t i = 0; i < HTTP_RANGE_WORDS; i++) {
+        write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_W0 + i, range_begin_words[i]));
+    }
     write_register(libstf::ConfigRegister(HTTP_RANGE_END_LEN, range_end_len));
-    write_register(libstf::ConfigRegister(HTTP_RANGE_END_W0, range_end_words[0]));
-    write_register(libstf::ConfigRegister(HTTP_RANGE_END_W0 + 1, range_end_words[1]));
+    for (uint32_t i = 0; i < HTTP_RANGE_WORDS; i++) {
+        write_register(libstf::ConfigRegister(HTTP_RANGE_END_W0 + i, range_end_words[i]));
+    }
+
+    // Barrier before START. The parameter writes above are posted MMIO stores; the START
+    // write is just another posted store, so nothing guarantees the parameter registers have
+    // been latched by HttpConfig before the START beat samples the cfg snapshot. If START wins
+    // the race, the handler builds its GET from a *stale* cfg — the "file path is one run behind"
+    // symptom (the bring-up tool papered over this with sleep(1) before START). A CSR read is
+    // non-posted and cannot be reordered ahead of the prior writes to the same AXI-Lite device,
+    // so it drains them and orders START strictly after every parameter write.
+    (void)read_register(HTTP_CLIENT_STATE);
+
     write_register(libstf::ConfigRegister(HTTP_START, 1));
 }
 

@@ -44,7 +44,14 @@ public:
 private:
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst);
+	// CPU fallback: fetch the range over an ordinary host socket, bypassing the FPGA entirely.
+	// Enabled with `SET httpfpga_cpu_fallback = true;`. Reliable but does not exercise the FPGA
+	// data path — a scaffolding aid while the HW receive path is validated.
+	void HTTPReadRangeCpu(const string &path, uint64_t offset, size_t size, void *dst);
 	uint64_t ProbeContentLength(const string &resource_path);
+	// Connect to the configured server, send `request`, read the full response until the peer
+	// closes. Returns false on any socket error.
+	bool HttpSocketRequest(const std::string &request, std::string &response);
 
 	DatabaseInstance &instance;
 	std::mutex init_mtx;
