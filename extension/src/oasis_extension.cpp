@@ -75,7 +75,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetHttpFpgaCpuFallback);
 
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<HTTPFileSystem>(instance));
-	RegisterOasisHttpStateFunction(loader);
 
 	// Get the OasisContext to establish the connection to the FPGA.
 	Connection conn(instance);

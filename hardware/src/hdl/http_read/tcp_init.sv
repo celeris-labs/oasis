@@ -55,7 +55,13 @@ module tcp_init (
                 s_axis_open_status_TREADY = 1'b1;
                 if (s_axis_open_status_TVALID && s_axis_open_status_TREADY) begin
                     session_id_d = s_axis_open_status_TDATA[15:0];
-                    error_d = (s_axis_open_status_TDATA[23:16] != 8'd0);
+                    // tcp_open_rsp_t = {ip_port[71:56], ip_address[55:24], success[23:16], sid[15:0]}.
+                    // success == 1 means the connection was established (cThread::openConnTcp
+                    // throws when this bit is clear), so an error is success == 0. The polarity
+                    // used to be inverted.
+                    // NOTE: handler.sv still ignores this flag; on error the session id is garbage
+                    // and tcp_read waits forever for notifications. See TODO list.
+                    error_d = (s_axis_open_status_TDATA[23:16] == 8'd0);
                     state_d = ST_DONE;
                 end
             end

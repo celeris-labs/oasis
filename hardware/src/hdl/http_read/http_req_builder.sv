@@ -120,7 +120,13 @@ module http_req_builder (
         state_d     = state_q;
         idx_d       = idx_q;
         sub_idx_d   = sub_idx_q;
-        req_ready_d = req_ready_q;
+        // req_ready is a ONE-CYCLE PULSE, not a level. It used to hold (req_ready_d = req_ready_q),
+        // which left it asserted in IDLE indefinitely after a build. tcp_send_http raises `start`
+        // (= state_q == ST_BUILD_HDR) and samples req_ready in the SAME cycle, so on every request
+        // after the first it saw the stale level and latched header_data/header_len from the
+        // PREVIOUS build -- i.e. it sent the previous request's GET, forever one run behind. Only
+        // the first request after reset was correct (req_ready_q resets to 0).
+        req_ready_d = 1'b0;
 
         write_en    = 1'b0;
         write_byte  = 8'h00;
@@ -280,6 +286,9 @@ module http_req_builder (
 
                 if (sub_idx_q == (LEN_POST - 1)) begin
                     state_d     = IDLE;
+                    // Pulses for exactly one cycle, during which state_q == IDLE and idx_q /
+                    // buffer_q still hold the finished header -- so the consumer's combinational
+                    // sample of header_len / header_data in that cycle is the fresh request.
                     req_ready_d = 1'b1;
                 end
             end

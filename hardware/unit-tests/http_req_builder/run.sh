@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Standalone xsim (Vivado) for http_req_builder. No package dependencies, so the DUT compiles alone.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+HDL="$ROOT/../../src/hdl/http_read"
+OUT="$ROOT/xsim.dir"
+
+if ! command -v xvlog >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  source /tools/Xilinx/Vivado/2024.2/settings64.sh
+fi
+
+cd "$ROOT"
+rm -rf "$OUT" xsim.jou xsim.log xvlog.pb xelab.pb webtalk* .Xil 2>/dev/null || true
+
+xvlog -sv "$HDL/http_req_builder.sv" http_req_builder_tb.sv
+xelab -debug typical -timescale 1ns/1ps -top http_req_builder_tb -snapshot http_req_builder_tb_snap
+xsim http_req_builder_tb_snap -R

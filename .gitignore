@@ -4,6 +4,9 @@ build*
 # Generated unit test files
 hardware/unit-tests/diff/**
 hardware/unit-tests/sim_dump.vcd
+hardware/unit-tests/**/xsim.dir/
+hardware/unit-tests/**/*.wdb
+hardware/unit-tests/**/*.pb
 
 # Vivado generated files
 .Xil

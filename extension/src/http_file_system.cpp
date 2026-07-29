@@ -73,22 +73,6 @@ string NormalizeHttpPath(const string &path) {
 	return "/" + path;
 }
 
-// Decodes the packed HTTP/TCP FSM debug status word (HTTPReadConfig read CSR 2)
-// into a human-readable one-liner. See HTTPReadConfig::debug_status() for layout.
-string DecodeHttpFpgaStatus(uint32_t status) {
-	static const char *top[] = {"IDLE", "TCP_SEND", "TCP_READ"};
-	const auto top_state = status & 0xF;
-	const char *top_name = top_state < 3 ? top[top_state] : "?";
-	char buf[256];
-	std::snprintf(buf, sizeof(buf),
-	              "handler=%s(%u) send=%u read=%u | send_done=%u send_err=%u read_done=%u "
-	              "read_err=%u busy=%u",
-	              top_name, top_state, (status >> 8) & 0xF, (status >> 12) & 0xF,
-	              (status >> 18) & 1, (status >> 19) & 1, (status >> 20) & 1, (status >> 21) & 1,
-	              (status >> 22) & 1);
-	return string(buf);
-}
-
 // Case-insensitive prefix check for HTTP header lines.
 bool StartsWithIgnoreCase(const string &line, const char *prefix) {
 	const auto prefix_len = std::strlen(prefix);
@@ -424,14 +408,21 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 	// returns the whole body across however many TCP segments it spans.
 	std::lock_guard<std::mutex> lock(mtx);
 
-	// Trigger the request first: the handler opens the TCP connection and issues the ranged GET.
-	http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, /*session*/ 0);
-	RecordHttpFpgaTrigger(bypass_stream, server_ip_, server_port_, path, offset, range_end,
-	                      static_cast<uint32_t>(size));
-
+	// Enqueue the destination buffer BEFORE triggering the request. The trigger is a posted CSR
+	// write, so the FPGA can start writing body bytes as soon as the response arrives; if no buffer
+	// has been enqueued for the bypass stream at that point, the StreamWriter targets whatever
+	// allocation the hardware still holds from an earlier read. Acquire-then-trigger closes that
+	// window at the cost of nothing but a few microseconds of connection-setup overlap.
+	//
 	// The bypass stream is unmanaged on the OBM. The HW strips the HTTP header, so exactly `size`
-	// body bytes land here — pass that so the OBM allocates a right-sized buffer.
+	// body bytes land here — pass that so the OBM allocates a right-sized buffer. Note the OBM
+	// rounds capacity up to BYTES_PER_FPGA_TRANSFER (64 KiB), so the hardware is always permitted
+	// to write up to 64 KiB regardless of `size`; the drain loop below is the only thing that
+	// detects over-delivery.
 	auto handle = obm->acquire_output_handle(bypass_stream, size);
+
+	// Now trigger: the handler opens the TCP connection and issues the ranged GET.
+	http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, /*session*/ 0);
 
 	if (HttpFpgaDebugEnabled()) {
 		std::fprintf(stderr, "[httpfpga] read path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
@@ -458,10 +449,10 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 	}
 	if (copied != size) {
 		throw IOException("HTTP read short transfer for '%s' range=[%llu,%llu]: requested %llu bytes, "
-		                  "got %llu (client_state=%u total_word=%u)",
+		                  "got %llu (client_state=%u)",
 		                  path, (unsigned long long)offset, (unsigned long long)range_end,
 		                  (unsigned long long)size, (unsigned long long)copied,
-		                  static_cast<unsigned>(http_cfg->client_state()), http_cfg->debug_status());
+		                  static_cast<unsigned>(http_cfg->client_state()));
 	}
 
 	if (HttpFpgaDebugEnabled()) {

@@ -161,7 +161,11 @@ module tcp_send_http (
             ST_WAIT_STAT: begin
                 s_axis_tx_status_TREADY = 1'b1;
                 if (s_axis_tx_status_TVALID && s_axis_tx_status_TREADY) begin
-                    error_d = (s_axis_tx_status_TDATA[1:0] != 2'd0);
+                    // tcp_tx_stat_t is {error[63:62], remaining_space[61:32], len[31:16], sid[15:0]}.
+                    // This used to read [1:0], which is sid[1:0] -- not the error code.
+                    // NOTE: `error` is still not acted upon; on error != 0 the TOE has rejected the
+                    // send and pushing the data beats anyway desyncs the TX path. See TODO list.
+                    error_d = (s_axis_tx_status_TDATA[TCP_TX_STAT_BITS-1 -: TCP_ERROR_BITS] != '0);
                     state_d = ST_SEND_DATA;
                 end
             end
