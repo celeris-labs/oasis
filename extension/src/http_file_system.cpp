@@ -73,6 +73,24 @@ string NormalizeHttpPath(const string &path) {
 	return "/" + path;
 }
 
+// Decodes the packed FSM status word (HttpConfig read CSR 2). Layout is defined by `totalWord` in
+// hardware/src/hdl/http_read/handler.sv. Every sub-FSM gets its own field here, which the 4-bit
+// client_state cannot give you: state_debug multiplexes one value, so 2, 6, 9 and 10 each alias two
+// different states.
+string DecodeHttpFpgaStatus(uint32_t status) {
+	static const char *handler_states[] = {"IDLE", "TCP_INIT", "TCP_SEND", "TCP_READ", "CLOSE"};
+	const auto top = status & 0xF;
+	char buf[256];
+	std::snprintf(buf, sizeof(buf),
+	              "handler=%s(%u) init=%u send=%u read=%u | done i/s/r=%u/%u/%u "
+	              "err i/s/r=%u/%u/%u busy=%u sid=%u",
+	              top < 5 ? handler_states[top] : "?", top, (status >> 4) & 0xF,
+	              (status >> 8) & 0xF, (status >> 12) & 0xF, (status >> 16) & 1,
+	              (status >> 18) & 1, (status >> 20) & 1, (status >> 17) & 1, (status >> 19) & 1,
+	              (status >> 21) & 1, (status >> 22) & 1, (status >> 24) & 0xFF);
+	return string(buf);
+}
+
 // Case-insensitive prefix check for HTTP header lines.
 bool StartsWithIgnoreCase(const string &line, const char *prefix) {
 	const auto prefix_len = std::strlen(prefix);
@@ -427,6 +445,11 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 	if (HttpFpgaDebugEnabled()) {
 		std::fprintf(stderr, "[httpfpga] read path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
 		             (unsigned long long)offset, (unsigned long long)range_end, (unsigned long long)size);
+		// Read the parameters back out of the hardware. The write CSRs are write-only, so this echo
+		// is the only confirmation that the values reached the FPGA and were not, say, still in
+		// flight when START sampled them.
+		std::fprintf(stderr, "[httpfpga]   latched: %s\n",
+		             http_cfg->request_echo().describe().c_str());
 	}
 
 	// Drain all buffers for this transfer. A body that fits one FPGA buffer is one iteration; larger
@@ -440,19 +463,21 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		}
 		if (copied + buf->size > size) {
 			throw IOException("HTTP read overran requested size: requested %llu, already got %llu, "
-			                  "next chunk %llu",
+			                  "next chunk %llu [%s]",
 			                  (unsigned long long)size, (unsigned long long)copied,
-			                  (unsigned long long)buf->size);
+			                  (unsigned long long)buf->size,
+			                  DecodeHttpFpgaStatus(http_cfg->debug_status()));
 		}
 		std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
 		copied += buf->size;
 	}
 	if (copied != size) {
 		throw IOException("HTTP read short transfer for '%s' range=[%llu,%llu]: requested %llu bytes, "
-		                  "got %llu (client_state=%u)",
+		                  "got %llu [%s] [latched: %s]",
 		                  path, (unsigned long long)offset, (unsigned long long)range_end,
 		                  (unsigned long long)size, (unsigned long long)copied,
-		                  static_cast<unsigned>(http_cfg->client_state()));
+		                  DecodeHttpFpgaStatus(http_cfg->debug_status()),
+		                  http_cfg->request_echo().describe());
 	}
 
 	if (HttpFpgaDebugEnabled()) {

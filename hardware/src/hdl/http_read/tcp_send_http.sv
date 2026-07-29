@@ -44,7 +44,16 @@ module tcp_send_http (
     output logic                                      done,
     output logic                                      error,
     output logic [15:0]                               debug_http_len,
-    output logic [3:0]                                state_debug
+    output logic [3:0]                                state_debug,
+
+    // Debug taps. debug_req_lo/hi carry the request bytes that were actually LATCHED for
+    // transmission, and debug_builder_len the length the builder is currently producing. If the two
+    // lengths disagree while the request is going out, the latched header is not the one the builder
+    // just built (the one-run-behind failure mode).
+    output logic [AXI_DATA_BITS-1:0]                  debug_req_lo,
+    output logic [AXI_DATA_BITS-1:0]                  debug_req_hi,
+    output logic [7:0]                                debug_builder_len,
+    output logic [3:0]                                debug_builder_state
 );
 
     localparam logic [3:0] ST_IDLE       = 4'd0;
@@ -93,8 +102,13 @@ module tcp_send_http (
         .rangeEndW3    (rangeEndW3),
         .header_data   (header_data_w),
         .header_len    (header_len_w),
-        .req_ready     (req_ready_w)
+        .req_ready     (req_ready_w),
+        .state_debug   (debug_builder_state)
     );
+
+    assign debug_req_lo      = http_data_q[AXI_DATA_BITS-1:0];
+    assign debug_req_hi      = http_data_q[2*AXI_DATA_BITS-1:AXI_DATA_BITS];
+    assign debug_builder_len = header_len_w[7:0];
 
     function automatic logic [63:0] make_keep(input logic [6:0] count);
         if (count >= 7'd64) begin

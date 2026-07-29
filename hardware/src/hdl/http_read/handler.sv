@@ -124,7 +124,30 @@ module handler (
     logic read_error;
     logic [3:0] read_state_debug;
 
-    assign totalWord = 0;
+    // Packed FSM status, surfaced on HttpConfig read register 2. This used to be hardwired to zero,
+    // which made the host's status readout useless. The sub-FSM state fields are what state_debug
+    // cannot give you: state_debug multiplexes one 4-bit value, so 2, 6, 9 and 10 each alias two
+    // different states and the ILA/host cannot tell them apart. Here every sub-FSM has its own
+    // field and is visible simultaneously.
+    //   [3:0]   handler state (ST_IDLE/TCP_INIT/TCP_SEND/TCP_READ/CLOSE)
+    //   [7:4]   tcp_init      state_debug
+    //   [11:8]  tcp_send_http state_debug
+    //   [15:12] tcp_read      state_debug
+    //   [16]    init_done   [17] init_error
+    //   [18]    send_done   [19] send_error
+    //   [20]    read_done   [21] read_error
+    //   [22]    busy (handler not idle)
+    //   [31:24] session_id[7:0]
+    assign totalWord = {session_id_q[7:0],
+                        1'b0,
+                        state_q != ST_IDLE,
+                        read_error, read_done,
+                        send_error, send_done,
+                        init_error, init_done,
+                        read_state_debug,
+                        send_state_debug,
+                        init_state_debug,
+                        state_q};
 
     tcp_init inst_tcp_init (
         .clk(ap_clk),
@@ -188,7 +211,11 @@ module handler (
         .done(send_done),
         .error(send_error),
         .debug_http_len(debug_http_len),
-        .state_debug(send_state_debug)
+        .state_debug(send_state_debug),
+        .debug_req_lo(debug_req_lo),
+        .debug_req_hi(debug_req_hi),
+        .debug_builder_len(debug_req_cnt),
+        .debug_builder_state(debug_builder_state)
     );
 
     tcp_read inst_tcp_read (
@@ -223,13 +250,13 @@ module handler (
         .state_debug(read_state_debug)
     );
 
+    // debug_builder_state / debug_req_lo / debug_req_hi / debug_req_cnt are driven by
+    // tcp_send_http above. They used to be tied to zero, so the ILA probes for them
+    // (ila_perf_tcp probe38..41) showed nothing -- which is why a request carrying the previous
+    // run's bytes was invisible on the capture.
     assign debug_tx_acc         = '0;
     assign debug_tx_acc_cnt     = '0;
     assign debug_tx_acc_last    = 1'b0;
-    assign debug_builder_state  = 4'd0;
-    assign debug_req_lo         = '0;
-    assign debug_req_hi         = '0;
-    assign debug_req_cnt        = 8'd0;
 
     always_comb begin
         state_d = state_q;

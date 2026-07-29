@@ -27,7 +27,8 @@ module http_req_builder (
     input  logic [31:0]   rangeEndW3,
     output logic [1023:0] header_data,
     output logic [15:0]   header_len,
-    output logic          req_ready
+    output logic          req_ready,
+    output logic [3:0]    state_debug
 );
 
     // ---------------------------------------------------------------
@@ -87,6 +88,10 @@ module http_req_builder (
 
     logic req_ready_q, req_ready_d;
     assign req_ready = req_ready_q;
+    // Exposed so the ILA can see how long the build actually takes. A build walks the header byte
+    // by byte (~135 cycles); a single-cycle visit to any non-IDLE state means the consumer captured
+    // a header it did not wait for.
+    assign state_debug = state_q;
 
     logic       write_en;
     logic [7:0] write_byte;

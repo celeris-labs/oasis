@@ -56,8 +56,14 @@ import http_types::*;
 //
 // Register map (read side):
 //   0  HTTP_CONFIG_ID
-//   1  CLIENT_STATE
-//   2  TOTAL_WORD
+//   1  CLIENT_STATE     ([3:0])      -- handler.sv state_debug (aliased; prefer STATUS)
+//   2  STATUS           ([31:0])     -- packed FSM status, see handler.sv totalWord
+//   3  ECHO_FILE_LEN    ([31:0])
+//   4  ECHO_FILE_W0     ([31:0])     -- path chars 0..3
+//   5  ECHO_FILE_W4     ([31:0])     -- path chars 16..19
+//   6  ECHO_RANGE_BEGIN ([39:32] len, [31:0] first 4 ASCII digits)
+//   7  ECHO_RANGE_END   ([39:32] len, [31:0] first 4 ASCII digits)
+//   8  ECHO_SERVER      ([47:32] port, [31:0] ip)
 // =================================================================================================
 module HttpConfig #(
     parameter integer NUM_PARAM_REGS = 31,
@@ -213,15 +219,32 @@ assign start_raw.ready = start_cfg.ready;
 
 // -------------------------------------------------------------------------------------------------
 // Read register file: host can poll status here.
+//
+// Registers 3..8 echo back the latched request parameters. The write registers above are
+// write-only, so without these there is no way for the host to tell whether the parameters it
+// wrote actually reached the hardware before START sampled them -- which is exactly the blind spot
+// that made the "request is one run behind" bug so hard to pin down. The echoed fields are the
+// discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
+// ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-logic [AXIL_DATA_BITS - 1:0] read_registers[3];
+localparam int NUM_READ_REGS = 9;
+
+logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
 assign read_registers[0] = HTTP_CONFIG_ID;
 assign read_registers[1] = {60'b0, client_state};
 assign read_registers[2] = {32'b0, total_word};
+assign read_registers[3] = {32'b0, cfg.file_len};
+assign read_registers[4] = {32'b0, cfg.file_w0};
+assign read_registers[5] = {32'b0, cfg.file_w4};
+assign read_registers[6] = {24'b0, cfg.range_begin_len, cfg.range_begin_w0};
+assign read_registers[7] = {24'b0, cfg.range_end_len,   cfg.range_end_w0};
+assign read_registers[8] = {16'b0, cfg.server_port[15:0], cfg.server_ip};
+
+`ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
 
 ConfigReadRegisterFile #(
-    .NUM_REGS(3)
+    .NUM_REGS(NUM_READ_REGS)
 ) inst_read_reg_file (
     .clk   (clk),
     .rst_n (reset_synced),
