@@ -12,6 +12,10 @@ always_comb sq_rd.tie_off_m();
 always_comb cq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
 // handler.sv opens/closes TCP itself (legacy Coyote-http style).
+// The ColumnChunkDecoder is now fed by the HTTP stack (not host DMA), so the host-recv streams are unused.
+for (genvar I = 0; I < N_STRM_AXI; I++) begin
+    always_comb axis_host_recv[I].tie_off_s();
+end
 `elsif EN_RDMA
 always_comb rq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
@@ -190,6 +194,9 @@ CQDemultiplexer #(
 
 // -- Decoders -------------------------------------------------------------------------------------
 AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+// EN_TCP feeds its single ColumnChunkDecoder from the HTTP stack below (mirrors the RDMA decoder
+// path), so this host-DMA / RDMA-fed decoder loop is only built for the non-TCP modes.
+`ifndef EN_TCP
 generate
 for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     AXI4S axi_in (.aclk(clk), .aresetn(rst_n));
@@ -251,6 +258,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     );
 end
 endgenerate
+`endif
 
 // -- Bypass stream (last slot, no decoder) --------------------------------------------------------
 localparam BYPASS_ID = NUM_STREAMS - 1;
@@ -392,13 +400,37 @@ DataNormalizer #(
     .out(http_body_norm)
 );
 
+// Mirror the RDMA decoder path: HTTP-fetched raw column-chunk bytes → ColumnChunkDecoder → axi_out[0].
+// The raw bypass is replaced entirely; the host reads DECODED output from stream 0 (like the RDMA
+// oasis_scan flow). column_chunk_conf[0]/profile[0] are the same config slots the RDMA decoder used.
+typed_ndata_i #(DATABEAT_SIZE)          http_typed_out();
+ndata_i       #(data8_t, DATABEAT_SIZE) http_decoded();
+
+ColumnChunkDecoder #(
+    .DATABEAT_SIZE(DATABEAT_SIZE)
+) inst_http_column_chunk_decoder (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .conf(column_chunk_conf[0]),
+    .profile(profile[0]),
+
+    .in(http_body_norm),
+    .out(http_typed_out)
+);
+
+`DATA_ASSIGN(http_typed_out, http_decoded);
+
 NDataToAXI #(data8_t, DATABEAT_SIZE) inst_http_ndata_to_axi (
     .clk(clk),
     .rst_n(rst_n),
 
-    .in(http_body_norm),
-    .out(axi_out[BYPASS_ID])
+    .in(http_decoded),
+    .out(axi_out[0])
 );
+
+// Raw bypass removed — nothing flows to the bypass output slot now.
+always_comb axi_out[BYPASS_ID].tie_off_m();
 
 
 
