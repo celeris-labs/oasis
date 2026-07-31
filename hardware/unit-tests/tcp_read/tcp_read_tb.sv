@@ -118,6 +118,18 @@ module tcp_read_tb;
         make_notif[TCP_SESSION_BITS+TCP_LEN_BITS+32+16]        = closed; // bit 80
     endfunction
 
+    // Probe internal handshakes to localize any beat drop: in_fire = rx->hold (concatenator input),
+    // out_fire = hold->strip_http (concatenator output). If in==out but body is short, strip_http
+    // (skid) drops; if in>out, the concatenator drops.
+    int cnt_in_fire, cnt_out_fire, cnt_fsm2skid, cnt_skidout;
+    always @(posedge clk) if (rst_n) begin
+        if (dut.in_fire)  cnt_in_fire  <= cnt_in_fire  + 1;
+        if (dut.out_fire) cnt_out_fire <= cnt_out_fire + 1;
+        // strip_http internal: FSM presents to skid, and skid emits downstream
+        if (dut.inst_strip_http.fsm_tvalid   && dut.inst_strip_http.fsm_tready)   cnt_fsm2skid <= cnt_fsm2skid + 1;
+        if (dut.inst_strip_http.m_axis_tvalid && dut.inst_strip_http.m_axis_tready) cnt_skidout  <= cnt_skidout  + 1;
+    end
+
     function automatic void flatten(
         input  logic [AXI_DATA_BITS-1:0] data[$],
         input  logic [BYTE_LANES-1:0]    keep[$],
@@ -149,6 +161,62 @@ module tcp_read_tb;
         end
     endtask
 
+    // Real MinIO 206 header -- the EXACT tpch-30 failing response. Its length is 668 bytes, so
+    // 668 mod 64 = 28: the body starts at lane 28 and strip_http must emit a 36-byte first body
+    // beat. The synthetic ~88B build_response header never produces this alignment (it lands on
+    // lane 22-26 = 38-42 byte first beats). The hardware cmp localized the inserted byte to output
+    // offset 37 -- exactly the 36-byte-first-beat merge seam -- so this is the alignment to test.
+    task automatic build_response_minio(ref byte unsigned resp[$], ref byte unsigned body[$],
+                                        input int body_len, input byte unsigned base);
+        resp.delete(); body.delete();
+        push_str(resp, "HTTP/1.1 206 Partial Content"); push_crlf(resp);
+        push_str(resp, "Accept-Ranges: bytes"); push_crlf(resp);
+        push_str(resp, "Content-Length: 262144"); push_crlf(resp);
+        push_str(resp, "Content-Range: bytes 190925654-191187797/191187798"); push_crlf(resp);
+        push_str(resp, "Content-Type: application/octet-stream"); push_crlf(resp);
+        push_str(resp, "ETag: \"492506d8e3a80381773389855aca92f4-3\""); push_crlf(resp);
+        push_str(resp, "Last-Modified: Wed, 25 Mar 2026 10:41:34 GMT"); push_crlf(resp);
+        push_str(resp, "Server: MinIO"); push_crlf(resp);
+        push_str(resp, "Strict-Transport-Security: max-age=31536000; includeSubDomains"); push_crlf(resp);
+        push_str(resp, "Vary: Origin"); push_crlf(resp);
+        push_str(resp, "Vary: Accept-Encoding"); push_crlf(resp);
+        push_str(resp, "X-Amz-Id-2: dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8"); push_crlf(resp);
+        push_str(resp, "X-Amz-Request-Id: 18C7100D915407B4"); push_crlf(resp);
+        push_str(resp, "X-Content-Type-Options: nosniff"); push_crlf(resp);
+        push_str(resp, "X-Ratelimit-Limit: 13103"); push_crlf(resp);
+        push_str(resp, "X-Ratelimit-Remaining: 13103"); push_crlf(resp);
+        push_str(resp, "X-Xss-Protection: 1; mode=block"); push_crlf(resp);
+        push_str(resp, "Date: Thu, 30 Jul 2026 12:10:27 GMT"); push_crlf(resp);
+        push_str(resp, "Connection: close"); push_crlf(resp);
+        push_crlf(resp);
+        $display("[minio] header len = %0d bytes, body starts at lane %0d (first beat %0d bytes)",
+                 resp.size(), resp.size() % 64, 64 - (resp.size() % 64));
+        for (int i = 0; i < body_len; i++) begin
+            resp.push_back(base + i[7:0]);
+            body.push_back(base + i[7:0]);
+        end
+    endtask
+
+    // Build a response whose header is EXACTLY hdr_len bytes (padded via one X-Pad line), so the
+    // body starts at lane (hdr_len % 64) and strip_http emits a (64 - hdr_len%64)-byte first beat.
+    // Sweeping hdr_len over [64,127] exercises every possible first-beat size 1..64.
+    task automatic build_response_len(ref byte unsigned resp[$], ref byte unsigned body[$],
+                                      input int body_len, input byte unsigned base, input int hdr_len);
+        int k;
+        resp.delete(); body.delete();
+        push_str(resp, "HTTP/1.1 206 Partial Content"); push_crlf(resp); // 30 bytes
+        push_str(resp, "X-Pad: ");                                       // 7 bytes
+        k = hdr_len - 41;                                                // 30 + 7 + k + 2(pad crlf) + 2(blank) = 41+k
+        if (k < 0) k = 0;
+        for (int i = 0; i < k; i++) resp.push_back(8'h61);               // 'a' filler
+        push_crlf(resp);
+        push_crlf(resp);                                                 // end of header
+        for (int i = 0; i < body_len; i++) begin
+            resp.push_back(base + i[7:0]);
+            body.push_back(base + i[7:0]);
+        end
+    endtask
+
     task automatic expect_bytes(input string name, input byte unsigned got[$], input byte unsigned exp[$]);
         int first_mismatch, nmin;
         first_mismatch = -1;
@@ -158,6 +226,12 @@ module tcp_read_tb;
         if (got.size() != exp.size() || first_mismatch != -1) begin
             $error("[%s] length got=%0d exp=%0d, first byte mismatch at %0d",
                    name, got.size(), exp.size(), first_mismatch);
+            if (first_mismatch >= 0) begin
+                int lo; lo = (first_mismatch > 4) ? first_mismatch - 4 : 0;
+                for (int i = lo; i < lo + 16 && i < nmin; i++)
+                    $display("    [%0d] got=%02x exp=%02x %s",
+                             i, got[i], exp[i], (got[i] !== exp[i]) ? "<--" : "");
+            end
             fails++; return;
         end
         $display("[PASS] %s (%0d bytes)", name, exp.size());
@@ -262,25 +336,30 @@ module tcp_read_tb;
             end
             // Stop a couple cycles after done so any final beat is captured with tready high.
             if (done) begin
-                m_axis_body_tready = 1'b1;
-                repeat (2) @(posedge clk);
-                if (m_axis_body_tvalid && m_axis_body_tready) begin
-                    col_data.push_back(m_axis_body_tdata);
-                    col_keep.push_back(m_axis_body_tkeep);
-                    if (m_axis_body_tlast) col_nlast++;
+                m_axis_body_tready <= 1'b1;
+                repeat (3) begin
+                    @(posedge clk);
+                    if (m_axis_body_tvalid && m_axis_body_tready) begin
+                        col_data.push_back(m_axis_body_tdata);
+                        col_keep.push_back(m_axis_body_tkeep);
+                        if (m_axis_body_tlast) col_nlast++;
+                    end
                 end
                 break;
             end
             idle++;
-            if (idle > 20000) break;
-            // tready for the next edge: stall 2 of every 4 cycles.
-            m_axis_body_tready = !(bp_enable && ((idle % 4 == 0) || (idle % 4 == 1)));
+            if (idle > 200000) break;
+            // tready for the next edge: stall 2 of every 4 cycles. NON-BLOCKING so tready is stable
+            // at every posedge -- a blocking write here races the DUT (and monitor) sampling tready
+            // at the same edge, and drops beats in the *testbench*, not the DUT.
+            m_axis_body_tready <= !(bp_enable && ((idle % 4 == 0) || (idle % 4 == 1)));
         end
     endtask
 
     task automatic run_request(input string name, input byte unsigned resp[$],
                                input byte unsigned exp_body[$], input int seg_lens[$]);
         byte unsigned got[$];
+        cnt_in_fire = 0; cnt_out_fire = 0; cnt_fsm2skid = 0; cnt_skidout = 0;
         start = 1'b1;
         fork
             producer(resp, seg_lens);
@@ -289,6 +368,8 @@ module tcp_read_tb;
         start = 1'b0;
         repeat (5) @(posedge clk); // let FSM return to IDLE
         flatten(col_data, col_keep, got);
+        $display("    [probe] rx->hold in_fire=%0d, hold->strip out_fire=%0d | strip: fsm->skid=%0d, skid->out=%0d, collected=%0d",
+                 cnt_in_fire, cnt_out_fire, cnt_fsm2skid, cnt_skidout, col_data.size());
         expect_bytes(name, got, exp_body);
         if (col_nlast != 1) begin
             $error("[%s] tlast count got=%0d exp=1", name, col_nlast);
@@ -377,6 +458,64 @@ module tcp_read_tb;
         run_request("sequential_2", r2, b2, s2);
     endtask
 
+    // Chop a `total`-byte response into `seg_len`-byte TCP segments (last is the remainder).
+    function automatic void mss_segments(input int total, input int seg_len, output int segs[$]);
+        int off;
+        segs.delete();
+        off = 0;
+        while (off < total) begin
+            if (total - off >= seg_len) segs.push_back(seg_len);
+            else                        segs.push_back(total - off);
+            off += segs[segs.size()-1];
+        end
+    endfunction
+
+    // Large transfer at a realistic MSS: this is the case the ~300B cases above never reach and
+    // the size at which the hardware loses 1-22 bytes. Header lives inside segment 0; strip_http
+    // strips it once and the body must come out byte-exact across dozens of segment seams.
+    task automatic case_large_mss(input string name, input int body_len, input byte unsigned base,
+                                  input int seg_len, input bit bp);
+        byte unsigned resp[$], body[$];
+        int segs[$];
+        build_response(resp, body, body_len, base);
+        mss_segments(resp.size(), seg_len, segs);
+        bp_enable = bp;
+        $display("--- %s (body %0d, resp %0d, %0d segs of %0d, bp=%0d) ---",
+                 name, body_len, resp.size(), segs.size(), seg_len, bp);
+        run_request(name, resp, body, segs);
+        bp_enable = 1'b0;
+    endtask
+
+    // Real-MinIO-header cases: body-start lane 28 / 36-byte first beat, the exact tpch-30 alignment.
+    task automatic case_minio_single();
+        byte unsigned resp[$], body[$];
+        int segs[$];
+        build_response_minio(resp, body, 800, 8'h00);
+        segs = { resp.size() };               // whole response in one segment
+        $display("--- case_minio_single (resp %0d, body 800, 1 segment) ---", resp.size());
+        run_request("minio_single", resp, body, segs);
+    endtask
+
+    task automatic case_minio_mss();
+        byte unsigned resp[$], body[$];
+        int segs[$];
+        build_response_minio(resp, body, 4096, 8'h60);
+        mss_segments(resp.size(), 1460, segs); // header (668) spans ~11 beats inside segment 0
+        $display("--- case_minio_mss (resp %0d, %0d segs of 1460) ---", resp.size(), segs.size());
+        run_request("minio_mss", resp, body, segs);
+    endtask
+
+    task automatic case_minio_bp();
+        byte unsigned resp[$], body[$];
+        int segs[$];
+        build_response_minio(resp, body, 2048, 8'h90);
+        mss_segments(resp.size(), 512, segs);
+        bp_enable = 1'b1;
+        $display("--- case_minio_bp (resp %0d, %0d segs of 512, backpressure) ---", resp.size(), segs.size());
+        run_request("minio_bp", resp, body, segs);
+        bp_enable = 1'b0;
+    endtask
+
     // ------------------------------------------------------------------ main
     initial begin
         fails  = 0; passes = 0;
@@ -397,6 +536,25 @@ module tcp_read_tb;
         case_combined_close();
         case_backpressure();
         case_sequential();
+
+        // Large, realistic-MSS transfers (the ~300B cases above never reach this scale).
+        case_large_mss("large_1460",     65536, 8'h00, 1460, 1'b0);
+        case_large_mss("large_1460_bp",  65536, 8'h55, 1460, 1'b1);
+        case_large_mss("large_8960",     65536, 8'hAA, 8960, 1'b0);
+        case_large_mss("large_1461_odd", 40000, 8'h11, 1461, 1'b1);
+        case_large_mss("large_536",      49152, 8'h33,  536, 1'b0);
+
+        // Isolation: 64-ALIGNED segments (512 = 8 full beats) => every segment ends on a FULL beat
+        // with tlast. Normal ~88B header (lane 24), so this removes the minio alignment variable.
+        case_large_mss("aligned_512_nobp", 4096, 8'h00,  512, 1'b0); // control: no backpressure
+        case_large_mss("aligned_512_bp",   4096, 8'h00,  512, 1'b1); // suspect: full-beat tlast + bp
+        case_large_mss("aligned_1024_bp",  8192, 8'h22, 1024, 1'b1); // 64-aligned, larger
+        case_large_mss("unaligned_500_bp", 4096, 8'h44,  500, 1'b1); // 500%64!=0 -> partial tail + bp
+
+        // Exact tpch-30 alignment: real 668B MinIO header => body-start lane 28, 36B first beat.
+        case_minio_single();
+        case_minio_mss();
+        case_minio_bp();
 
         $display("========================================");
         $display("tcp_read_tb: %0d passed, %0d failed", passes, fails);
