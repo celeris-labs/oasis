@@ -8,6 +8,7 @@ namespace {
 
 std::atomic<bool> g_httpfpga_debug {false};
 std::atomic<bool> g_httpfpga_cpu_fallback {false};
+std::atomic<bool> g_httpfpga_raw_bypass {false};
 
 } // namespace
 
@@ -25,6 +26,14 @@ bool HttpFpgaCpuFallbackEnabled() {
 
 void SetHttpFpgaCpuFallback(ClientContext &, SetScope, Value &parameter) {
 	g_httpfpga_cpu_fallback.store(!parameter.IsNull() && parameter.GetValue<bool>());
+}
+
+bool HttpFpgaRawBypassEnabled() {
+	return g_httpfpga_raw_bypass.load();
+}
+
+void SetHttpFpgaRawBypass(ClientContext &, SetScope, Value &parameter) {
+	g_httpfpga_raw_bypass.store(!parameter.IsNull() && parameter.GetValue<bool>());
 }
 
 } // namespace duckdb

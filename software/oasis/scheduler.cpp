@@ -21,6 +21,15 @@ libstf::stream_t default_num_streams(OasisContext &ctx) {
 }
 
 size_t default_pipeline_depth(OasisContext &ctx) {
+    // On an HTTP bitstream the source is the FPGA's HTTP client, and HttpConfig is a single-session
+    // FSM: one set of parameter CSRs behind one START pulse. Dispatching a second flow while a GET
+    // is in flight would overwrite those CSRs mid-request and interleave two response bodies into
+    // the same decoder. Pin the pipeline to one flow per stream; the config FIFO depth the decoder
+    // advertises is irrelevant here because the request state, not the config queue, is the
+    // bottleneck. See HTTPSourceOperator.
+    if (ctx.isHTTPEnabled()) {
+        return 1;
+    }
     return ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
 }
 

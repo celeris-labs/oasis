@@ -8,6 +8,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "http_file_system.hpp"
 #include "oasis/oasis_context.hpp"
 #include "oasis/operator.hpp"
 #include "oasis/query_splinter.hpp"
@@ -140,6 +141,15 @@ static std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdm
 	return std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + cc.offset, cc.total_compressed_size);
 }
 
+// The FPGA fetches this column chunk itself: one ranged GET whose stripped body streams straight
+// into the decoder, no host round trip. handle.path is already the bare resource path the GET line
+// wants ("/bucket/object.parquet").
+static std::unique_ptr<oasis::SourceOperator> MakeHTTPSource(HTTPFileHandle &http,
+                                                             const parcore::metadata::ColumnChunk &cc) {
+	return std::make_unique<oasis::HTTPSourceOperator>(http.path, http.server_ip, http.server_port, cc.offset,
+	                                                   cc.total_compressed_size);
+}
+
 static std::unique_ptr<oasis::SourceOperator>
 MakeHostSource(oasis::OasisContext &ctx, const CoalescedFetcher::RangeView &view) {
 	if ((reinterpret_cast<uintptr_t>(view.data()) % 64) == 0) {
@@ -180,6 +190,10 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
                        OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
 	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
 	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
+	auto *http = dynamic_cast<HTTPFileHandle *>(lstate.file_handle.get());
+	// RDMA and HTTP both pull their own bytes; only the plain-file path needs the host to fetch and
+	// DMA them in.
+	const bool fetch_on_host = !rdma && !http;
 
 	// Phase 0: Collect the column chunks that will be decoded in hardware and fetch them.
 	std::vector<size_t> hw_slot; // projection indices of the hardware columns, in order
@@ -211,7 +225,7 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 	}
 
 	CoalescedFetcher::GroupSpan group_span {0, 0};
-	if (!rdma) {
+	if (fetch_on_host) {
 		// Full byte span of the row group: [min chunk offset, max chunk end) over ALL chunks.
 		uint64_t span_begin = std::numeric_limits<uint64_t>::max();
 		uint64_t span_end = 0;
@@ -226,7 +240,7 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 
 	std::vector<CoalescedFetcher::RangeHandle> host_handles;
 	CoalescedFetcher fetcher(*lstate.file_handle, ctx.memory_pool(), group_span);
-	if (!rdma) {
+	if (fetch_on_host) {
 		host_handles.reserve(hw_chunks.size());
 		for (const auto *cc : hw_chunks) {
 			host_handles.push_back(fetcher.Register(cc->offset, cc->total_compressed_size));
@@ -248,13 +262,25 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 		auto type = parcore::metadata::to_libstf_type(cc.type);
 
 		oasis::OperatorFlow flow;
-		if (rdma) {
-			flow.push_back(MakeRDMASource(*rdma, cc));
+		auto decode = std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type);
+
+		if (http) {
+			// Config strictly before trigger. The HTTP source fires a real GET and the response body
+			// streams into the decoder on its own schedule, so unlike the RDMA/local sources — which
+			// the host or the RDMA stack meters — there is no point at which we can be sure the
+			// decoder config would still win a race with arriving bytes. Enqueue it first.
+			// Scheduler::dispatch_to applies non-sink operators in flow order, so this ordering holds.
+			flow.push_back(std::move(decode));
+			flow.push_back(MakeHTTPSource(*http, cc));
 		} else {
-			flow.push_back(MakeHostSource(ctx, fetcher.Resolve(host_handles[k])));
+			if (rdma) {
+				flow.push_back(MakeRDMASource(*rdma, cc));
+			} else {
+				flow.push_back(MakeHostSource(ctx, fetcher.Resolve(host_handles[k])));
+			}
+			flow.push_back(std::move(decode));
 		}
-		flow.push_back(
-		    std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
+
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(hw_slot[k]));
 		splinter.streams.push_back(std::move(flow));
 	}

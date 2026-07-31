@@ -8,6 +8,8 @@
 #include <coyote/cOps.hpp>
 
 #include <cassert>
+#include <stdexcept>
+#include <string>
 
 namespace oasis {
 
@@ -17,6 +19,23 @@ void RDMASourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
 
 void RDMASourceOperator::print(std::ostream &os) const {
     os << "RDMASource(offset=" << offset_ << ", size=" << size_ << ")";
+}
+
+void HTTPSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
+    // HTTP ranges are inclusive on both ends, the column chunk extent is [offset, offset + size).
+    // A zero-length chunk would underflow that conversion into a range ending at 2^64-1, which the
+    // hardware would happily turn into a request for the rest of the object.
+    if (size_ == 0) {
+        throw std::runtime_error("HTTPSourceOperator: zero-length column chunk at offset " +
+                                 std::to_string(offset_) + " in '" + path_ + "'");
+    }
+    ctx.config<HTTPReadConfig>()->read(stream, server_ip_, server_port_, path_, offset_,
+                                       offset_ + size_ - 1, /*session_id*/ 0);
+}
+
+void HTTPSourceOperator::print(std::ostream &os) const {
+    os << "HTTPSource(path=" << path_ << ", range=[" << offset_ << "," << (offset_ + size_ - 1)
+       << "])";
 }
 
 void LocalSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {

@@ -17,13 +17,16 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 
 namespace duckdb {
@@ -196,7 +199,7 @@ unique_ptr<FileHandle> HTTPFileSystem::OpenFile(const string &path, FileOpenFlag
 
 	EnsureInitialized(opener);
 	auto resource_path = NormalizeHttpPath(path.substr(std::strlen(URL_PREFIX)));
-	return make_uniq<HTTPFileHandle>(*this, resource_path, flags, 0);
+	return make_uniq<HTTPFileHandle>(*this, resource_path, flags, 0, server_ip_, server_port_);
 }
 
 bool HTTPFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
@@ -406,9 +409,20 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		throw IOException("HTTP read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 
-	// CPU fallback: bypass the FPGA and fetch over a plain socket. Reliable, but does not exercise
-	// the FPGA data path — a scaffolding aid while the HW receive path is validated.
-	if (HttpFpgaCpuFallbackEnabled()) {
+	// Raw, undecoded bytes have NO hardware return path on an ENABLE_HTTP bitstream. The HTTP body
+	// now feeds the ColumnChunkDecoder directly and axi_out[BYPASS_ID] is tied off
+	// (hardware/src/vfpga_top.svh) — enqueuing on the old bypass stream just blocks forever on an
+	// interrupt that can never fire.
+	//
+	// So the two remaining raw-byte consumers go over an ordinary host socket:
+	//   - the Parquet footer/metadata read in OasisScanBind, and
+	//   - the CPU/string (BYTE_ARRAY) column path in read_oasis, which reads pages via this handle.
+	// Both are small and off the hot path. The FPGA data path is exercised by read_oasis's
+	// HTTPSourceOperator, which streams whole column chunks into the decoder.
+	//
+	// The legacy raw-bypass path below is kept for bringing up a pre-decoder bitstream and is
+	// reachable only via `SET httpfpga_raw_bypass = true`.
+	if (!HttpFpgaRawBypassEnabled() || HttpFpgaCpuFallbackEnabled()) {
 		HTTPReadRangeCpu(path, offset, size, dst);
 		return;
 	}
@@ -452,6 +466,69 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		             http_cfg->request_echo().describe().c_str());
 	}
 
+	// Watchdog: get_next_stream_output blocks with NO timeout, so if the FPGA never reaches its
+	// transfer-done/flush condition — e.g. the server keeps the socket open, or the closing TCP
+	// notification never matches this session and tcp_read parks in ST_WAIT_NOTIFY — this read hangs
+	// forever with no output at all. When debug is on, a side thread periodically dumps the handler
+	// FSM status so a hang self-reports which state it is stuck in (the `read` nibble: 7=WAIT_NOTIFY,
+	// 9=RECV_DATA, 10=FINISH) and how many body bytes have landed (0 => notification/session issue,
+	// >0 => stuck on completion). Read-only CSR poll on a distinct register; the drain thread is
+	// blocked on an interrupt, not touching these CSRs.
+	std::atomic<bool> drain_done {false};
+	std::atomic<size_t> copied_seen {0};
+	std::thread watchdog;
+	if (HttpFpgaDebugEnabled()) {
+		watchdog = std::thread([&]() {
+			// Poll fast (1 ms) so we catch the handler in-flight even if it runs and returns to IDLE
+			// in well under a second. Track the PEAK handler state (totalWord[3:0]) and whether it
+			// was ever "busy" (bit 22 = state != IDLE) across this whole read. That distinguishes
+			// "START never fired the handler" (peak stays 0, never busy => a control/trigger bug, no
+			// GET on the wire) from "handler ran but the body was dropped after receive" (peak
+			// reaches 1/2/3/4 => datapath/DMA bug).
+			uint32_t peak_state = 0;
+			bool ever_busy = false;
+			uint32_t last_status = 0;
+			int ms = 0;
+			int next_bark_ms = 3000;
+			while (!drain_done.load(std::memory_order_relaxed)) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				ms++;
+				try {
+					last_status = http_cfg->debug_status();
+				} catch (...) {
+					continue;
+				}
+				const uint32_t hstate = last_status & 0xF;
+				if (hstate > peak_state) {
+					peak_state = hstate;
+				}
+				if (last_status & (1u << 22)) {
+					ever_busy = true;
+				}
+				if (ms >= next_bark_ms) {
+					next_bark_ms += 3000;
+					std::fprintf(stderr,
+					             "[httpfpga] WATCHDOG %ds: waiting, copied=%llu/%llu | THIS READ peak: "
+					             "handler_max=%u ever_busy=%d | now=[%s]\n",
+					             ms / 1000, (unsigned long long)copied_seen.load(),
+					             (unsigned long long)size, peak_state, ever_busy ? 1 : 0,
+					             DecodeHttpFpgaStatus(last_status).c_str());
+				}
+			}
+		});
+	}
+	// Stop and join the watchdog on every exit path (normal return or throw).
+	struct WatchdogGuard {
+		std::atomic<bool> &done;
+		std::thread &thr;
+		~WatchdogGuard() {
+			done.store(true, std::memory_order_relaxed);
+			if (thr.joinable()) {
+				thr.join();
+			}
+		}
+	} watchdog_guard {drain_done, watchdog};
+
 	// Drain all buffers for this transfer. A body that fits one FPGA buffer is one iteration; larger
 	// ranges are chunked across multiple buffers, each surfaced via its own interrupt. These calls
 	// block until the FPGA writes (or discards) the allocation.
@@ -470,8 +547,32 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		}
 		std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
 		copied += buf->size;
+		copied_seen.store(copied, std::memory_order_relaxed);
 	}
 	if (copied != size) {
+		// Debug triage: dump the bytes the FPGA actually delivered so they can be diffed against the
+		// server's ground truth for this exact range. `cmp` on the two files localizes the loss:
+		//   - identical up to `copied`, true file longer  -> bytes lost at the BACK (close/last-beat)
+		//   - first difference at offset 0                 -> bytes lost/shifted at the FRONT (header strip)
+		//   - first difference somewhere in the middle     -> a seam/framing drop (TOE/normalizer)
+		char dump_path[512];
+		std::snprintf(dump_path, sizeof(dump_path), "/tmp/httpfpga_short_%llu_%llu.bin",
+		              (unsigned long long)offset, (unsigned long long)range_end);
+		if (FILE *df = std::fopen(dump_path, "wb")) {
+			if (copied > 0) {
+				std::fwrite(dst, 1, copied, df);
+			}
+			std::fclose(df);
+			std::fprintf(stderr,
+			             "[httpfpga] SHORT: wrote %llu received bytes to %s\n"
+			             "[httpfpga] triage: curl -s -r %llu-%llu 'http://%s:%u%s' -o /tmp/httpfpga_true.bin "
+			             "&& cmp %s /tmp/httpfpga_true.bin\n",
+			             (unsigned long long)copied, dump_path, (unsigned long long)offset,
+			             (unsigned long long)range_end, server_host_.c_str(),
+			             static_cast<unsigned>(server_port_), path.c_str(), dump_path);
+		} else {
+			std::fprintf(stderr, "[httpfpga] SHORT: could not open %s for dump\n", dump_path);
+		}
 		throw IOException("HTTP read short transfer for '%s' range=[%llu,%llu]: requested %llu bytes, "
 		                  "got %llu [%s] [latched: %s]",
 		                  path, (unsigned long long)offset, (unsigned long long)range_end,

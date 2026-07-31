@@ -63,10 +63,18 @@ private:
 	uint16_t server_port_ = 0;
 };
 
+// `path` is the resource path only ("/bucket/object.parquet"), already normalized — that is exactly
+// what the GET line needs, so read_oasis can hand it to HTTPSourceOperator unchanged.
+//
+// server_ip / server_port are snapshotted at open time rather than read from the filesystem on
+// demand: read_oasis builds its source operators on DuckDB worker threads, and the settings behind
+// those fields are only resolved under the filesystem's init lock.
 class HTTPFileHandle : public FileHandle {
 public:
-	HTTPFileHandle(FileSystem &fs, string path, FileOpenFlags flags, uint64_t file_size)
-	    : FileHandle(fs, std::move(path), flags), cursor(0), known_file_size(file_size) {
+	HTTPFileHandle(FileSystem &fs, string path, FileOpenFlags flags, uint64_t file_size, uint32_t server_ip,
+	               uint16_t server_port)
+	    : FileHandle(fs, std::move(path), flags), cursor(0), known_file_size(file_size), server_ip(server_ip),
+	      server_port(server_port) {
 	}
 
 	void Close() override {
@@ -74,6 +82,8 @@ public:
 
 	uint64_t cursor;
 	uint64_t known_file_size;
+	uint32_t server_ip;
+	uint16_t server_port;
 };
 
 } // namespace duckdb

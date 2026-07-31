@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <ostream>
+#include <string>
 
 namespace oasis {
 
@@ -52,7 +53,41 @@ class RDMASourceOperator final : public SourceOperator {
 };
 
 /**
- * DMA read host bytes into the stream via Coyote LOCAL_READ. Owns the input buffer for the 
+ * Fires a ranged HTTP GET from the FPGA's own HTTP client. The handler opens the TCP connection,
+ * issues the request, strips the response headers and streams the body straight into the stream's
+ * ColumnChunkDecoder -- the bytes never touch host memory, mirroring RDMASourceOperator.
+ *
+ * `offset`/`size` are the column chunk's byte extent in the remote object; they become an inclusive
+ * `Range: bytes=offset-(offset+size-1)` header.
+ *
+ * Single-session constraint: HttpConfig is one set of parameter CSRs behind one START pulse, so at
+ * most one of these may be in flight at a time. Scheduler pins its pipeline depth to 1 on HTTP
+ * bitstreams to enforce that (see default_pipeline_depth in scheduler.cpp); do not relax it without
+ * giving the hardware per-session request state.
+ */
+class HTTPSourceOperator final : public SourceOperator {
+  public:
+    HTTPSourceOperator(std::string path, uint32_t server_ip, uint16_t server_port, uint64_t offset,
+                       size_t size)
+        : path_(std::move(path))
+        , server_ip_(server_ip)
+        , server_port_(server_port)
+        , offset_(offset)
+        , size_(size) {}
+
+    void apply(libstf::stream_t stream, OasisContext &ctx) override;
+    void print(std::ostream &os) const override;
+
+  private:
+    std::string path_;
+    uint32_t    server_ip_;
+    uint16_t    server_port_;
+    uint64_t    offset_;
+    size_t      size_;
+};
+
+/**
+ * DMA read host bytes into the stream via Coyote LOCAL_READ. Owns the input buffer for the
  * splinter's lifetime so it stays mapped until the FPGA has consumed it.
  */
 class LocalSourceOperator final : public SourceOperator {

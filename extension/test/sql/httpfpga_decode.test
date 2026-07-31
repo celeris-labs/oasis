@@ -1,0 +1,87 @@
+# name: test/sql/httpfpga_decode.test
+# description: Smallest end-to-end check of the FPGA HTTP -> ColumnChunkDecoder -> host path.
+#   HARDWARE-GATED: needs an ENABLE_HTTP bitstream programmed AND the object server reachable.
+#   Run on alveo-u55c-04:  ./build/release/test/unittest "test/sql/httpfpga_decode.test"
+#
+# Why read_oasis and not read_parquet:
+#   read_parquet('httpfpga://...') only uses httpfpga:// as a byte source and parses on the CPU.
+#   Since the bitstream ties off axi_out[BYPASS_ID], those raw byte reads now go over a host socket
+#   and the FPGA is not involved at all. read_oasis is what builds an HTTPSourceOperator, so the
+#   FPGA issues the GET itself and the body streams into the ColumnChunkDecoder.
+#
+# Why not count(*):
+#   A bare count(*) projects no columns, so read_oasis takes the emit_cardinality_only path and
+#   answers straight from the Parquet footer. It passes with the FPGA idle. Every query below
+#   projects a real fixed-width column so the decoder actually runs.
+#
+# PATH LENGTH LIMIT: the GET path is carried in 8 CSR words = 32 characters
+#   (HTTP_FILE_WORDS in software/oasis/configuration.cpp, fileWord0..7 in http_config.sv).
+#   A longer path throws at request-build time rather than silently truncating. That is why this
+#   test uses a short prefix and not '/testbench/tpch-30/...' (33+ chars, does not fit).
+
+require oasis
+
+require parquet
+
+statement ok
+SET http_server='10.253.74.70';
+
+statement ok
+SET http_port=9000;
+
+statement ok
+SET httpfpga_debug=true;
+
+# ============================================================================
+# 1. One fixed-width column, decoded in hardware.
+#    TPC-H region has 5 rows with r_regionkey 0..4, so the sum is always 10
+#    regardless of scale factor. r_name / r_comment are BYTE_ARRAY and would
+#    take the CPU path, so they are deliberately not projected here.
+# ============================================================================
+query I
+SELECT sum(r_regionkey) FROM read_oasis('httpfpga://tb/region.parquet');
+----
+10
+
+# Same data, unaggregated: checks ordering and per-row values, not just a total.
+query I
+SELECT r_regionkey FROM read_oasis('httpfpga://tb/region.parquet') ORDER BY r_regionkey;
+----
+0
+1
+2
+3
+4
+
+# ============================================================================
+# 2. Mixed projection: one hardware column plus one CPU/string column. The
+#    string column is decoded on the host from bytes fetched over the socket,
+#    which is the supported arrangement — there is no hardware path for
+#    BYTE_ARRAY yet.
+# ============================================================================
+query II
+SELECT r_regionkey, r_name FROM read_oasis('httpfpga://tb/region.parquet') ORDER BY r_regionkey;
+----
+0	AFRICA
+1	AMERICA
+2	ASIA
+3	EUROPE
+4	MIDDLE EAST
+
+# ============================================================================
+# 3. Slightly larger object: 25 rows, still a single row group. Confirms the
+#    path works for more than one databeat of decoded output.
+# ============================================================================
+query I
+SELECT sum(n_nationkey) FROM read_oasis('httpfpga://tb/nation.parquet');
+----
+300
+
+# ============================================================================
+# 4. Filter pushdown over a hardware-decoded column. Row-group pruning and
+#    row-level filtering both run on the CPU over the FPGA-decoded buffer.
+# ============================================================================
+query I
+SELECT count(*) FROM read_oasis('httpfpga://tb/nation.parquet') WHERE n_nationkey >= 20;
+----
+5

@@ -73,6 +73,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Fetch httpfpga:// reads over an ordinary host socket instead of the FPGA "
 	                          "(correct but bypasses the FPGA data path)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetHttpFpgaCpuFallback);
+	config.AddExtensionOption("httpfpga_raw_bypass",
+	                          "Route raw httpfpga:// byte reads through the FPGA bypass stream. Legacy: only "
+	                          "valid on a pre-decoder bitstream, blocks forever on current ones",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetHttpFpgaRawBypass);
 
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<HTTPFileSystem>(instance));
 
