@@ -232,10 +232,30 @@ idx_t HTTPFileSystem::SeekPosition(FileHandle &handle) {
 	return handle.Cast<HTTPFileHandle>().cursor;
 }
 
+// Returns the object's Content-Length, issuing at most one HEAD per path for the session.
+uint64_t HTTPFileSystem::CachedContentLength(const string &resource_path) {
+	{
+		std::lock_guard<std::mutex> lock(size_cache_mtx_);
+		auto it = size_cache_.find(resource_path);
+		if (it != size_cache_.end()) {
+			return it->second;
+		}
+	}
+
+	// Probe outside the lock: ProbeContentLength does a blocking socket round trip, and holding the
+	// cache mutex across it would serialise every worker's first open. A concurrent probe of the
+	// same path is harmless -- both compute the same value and the second insert is a no-op.
+	const auto size = ProbeContentLength(resource_path);
+
+	std::lock_guard<std::mutex> lock(size_cache_mtx_);
+	size_cache_.emplace(resource_path, size);
+	return size;
+}
+
 int64_t HTTPFileSystem::GetFileSize(FileHandle &handle) {
 	auto &h = handle.Cast<HTTPFileHandle>();
 	if (h.known_file_size == 0) {
-		h.known_file_size = ProbeContentLength(h.path);
+		h.known_file_size = CachedContentLength(h.path);
 	}
 	return static_cast<int64_t>(h.known_file_size);
 }

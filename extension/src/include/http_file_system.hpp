@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -61,6 +62,17 @@ private:
 	std::string server_host_;
 	uint32_t server_ip_ = 0;
 	uint16_t server_port_ = 0;
+
+	// Content-Length cache, keyed by resource path. DuckDB opens the same object several times per
+	// query (bind, glob, per-worker reader init), and GetFileSize probes with a HEAD whenever the
+	// handle reports 0. Caching on the handle meant every reopen paid another round trip -- about
+	// six HEADs for one scan. Keyed on the path here instead, so it is one per object per session.
+	// Objects are assumed immutable for the session's lifetime, which is already assumed elsewhere:
+	// the Parquet footer is read once at bind and reused for every row group.
+	std::mutex size_cache_mtx_;
+	std::unordered_map<std::string, uint64_t> size_cache_;
+
+	uint64_t CachedContentLength(const string &resource_path);
 };
 
 class HTTPFileHandle : public FileHandle {
