@@ -1,8 +1,12 @@
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include <libstf/profiling.hpp>
 #include <oasis/configuration.hpp>
@@ -200,6 +204,37 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
     (void)read_register(HTTP_CLIENT_STATE);
 
     write_register(libstf::ConfigRegister(HTTP_START, 1));
+
+    // Post-START trace, gated on OASIS_HTTP_DEBUG=1. read_oasis fires this request from a scheduler
+    // thread with no DuckDB logging in reach, so without it a request that never left the FPGA is
+    // indistinguishable from one whose response never came back -- both just hang. The echo
+    // registers are the only proof the parameters were latched at all, since the parameter CSRs
+    // themselves are write-only.
+    if (const char *dbg = std::getenv("OASIS_HTTP_DEBUG"); dbg != nullptr && dbg[0] == '1') {
+        std::fprintf(stderr, "[oasis-http] START GET %s range=[%llu,%llu] ip=0x%08x port=%u\n",
+                     path.c_str(), static_cast<unsigned long long>(range_begin),
+                     static_cast<unsigned long long>(range_end), server_ip, server_port);
+        std::fprintf(stderr, "[oasis-http]   latched: %s\n", request_echo().describe().c_str());
+        std::fprintf(stderr, "[oasis-http]   t=0ms      %s\n", describe_status(debug_status()).c_str());
+    }
+}
+
+// Mirrors the totalWord layout in hardware/src/hdl/http_read/handler.sv. The 4-bit client_state CSR
+// multiplexes several sub-FSMs onto one value (2, 6, 9 and 10 each alias two states), so only this
+// packed word can say which stage is actually stuck.
+std::string HTTPReadConfig::describe_status(uint32_t status) {
+    static const char *handler_states[] = {"IDLE", "TCP_INIT", "TCP_SEND", "TCP_READ", "CLOSE"};
+    const auto top = status & 0xFu;
+
+    std::ostringstream oss;
+    oss << "handler=" << (top < 5 ? handler_states[top] : "?") << "(" << top << ")"
+        << " init=" << ((status >> 4) & 0xFu) << " send=" << ((status >> 8) & 0xFu)
+        << " read=" << ((status >> 12) & 0xFu) << " | done i/s/r=" << ((status >> 16) & 1u) << "/"
+        << ((status >> 18) & 1u) << "/" << ((status >> 20) & 1u)
+        << " err i/s/r=" << ((status >> 17) & 1u) << "/" << ((status >> 19) & 1u) << "/"
+        << ((status >> 21) & 1u) << " busy=" << ((status >> 22) & 1u)
+        << " sid=" << ((status >> 24) & 0xFFu);
+    return oss.str();
 }
 
 uint8_t HTTPReadConfig::client_state() {

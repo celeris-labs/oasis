@@ -8,8 +8,12 @@
 #include <coyote/cOps.hpp>
 
 #include <cassert>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace oasis {
 
@@ -31,6 +35,42 @@ void HTTPSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     }
     ctx.config<HTTPReadConfig>()->read(stream, server_ip_, server_port_, path_, offset_,
                                        offset_ + size_ - 1, /*session_id*/ 0);
+
+    // Debug-gated stage tracing. The HTTP handler going back to IDLE only proves the transfer
+    // finished at the network edge; it says nothing about whether the body reached the decoder or
+    // whether the decoder emitted anything. Sampling the decoder's in/out handshake counters
+    // alongside the handler state localises a stall to one stage:
+    //   in=0            -> body never arrived (strip_http / normalizer dropped it)
+    //   in>0, out=0     -> decoder consumed but produced nothing (config or decode failure)
+    //   in>0, out>0     -> decoder produced output, loss is in OutputWriter / OBM delivery
+    // Detached and best-effort: it only reads CSRs, and OasisContext owns both configs for the
+    // whole session so they outlive the samples.
+    if (const char *dbg = std::getenv("OASIS_HTTP_DEBUG"); dbg != nullptr && dbg[0] == '1') {
+        std::thread([&ctx, stream] {
+            auto http = ctx.config<HTTPReadConfig>();
+            auto dec  = ctx.config<parcore::ColumnChunkDecoderConfig>();
+            for (const int ms : {200, 1000, 5000}) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+                const auto prof = dec->read_profile(stream);
+                std::fprintf(stderr,
+                             "[oasis-http]   t=%-5dms %s\n"
+                             "[oasis-http]              decoder in: hs=%llu starved=%llu stalled=%llu | "
+                             "out: hs=%llu starved=%llu stalled=%llu\n",
+                             ms, HTTPReadConfig::describe_status(http->debug_status()).c_str(),
+                             static_cast<unsigned long long>(prof.in.handshakes_cycles),
+                             static_cast<unsigned long long>(prof.in.starved_cycles),
+                             static_cast<unsigned long long>(prof.in.stalled_cycles),
+                             static_cast<unsigned long long>(prof.out.handshakes_cycles),
+                             static_cast<unsigned long long>(prof.out.starved_cycles),
+                             static_cast<unsigned long long>(prof.out.stalled_cycles));
+            }
+            // Coyote's shell counters close the last gap: "Sent local writes" says whether the
+            // OutputWriter ever issued a host DMA, and "Notifications received" whether the
+            // completion interrupt made it back. Decoder counters cannot see either.
+            std::fflush(stderr);
+            ctx.cthread()->printDebug();
+        }).detach();
+    }
 }
 
 void HTTPSourceOperator::print(std::ostream &os) const {

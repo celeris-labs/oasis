@@ -86,6 +86,9 @@ class HTTPReadConfig : public libstf::Config {
     /// Read CSRs 3..8: the request parameters currently latched in hardware.
     HTTPRequestEcho request_echo();
 
+    /// Renders a packed status word from debug_status() into per-sub-FSM fields.
+    static std::string describe_status(uint32_t status);
+
     uint64_t read_stream_register(libstf::stream_t stream, uint32_t reg);
 
     static constexpr uint64_t ID = HTTP_READ_CONFIG_ID;
