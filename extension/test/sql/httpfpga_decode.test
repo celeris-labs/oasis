@@ -24,7 +24,7 @@ require oasis
 require parquet
 
 statement ok
-SET http_server='10.253.74.70';
+SET http_server='10.253.74.74';
 
 statement ok
 SET http_port=9000;

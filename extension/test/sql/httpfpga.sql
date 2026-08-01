@@ -6,7 +6,7 @@
 .bail off
 
 INSTALL parquet; LOAD parquet;
-SET http_server='10.253.74.70';
+SET http_server='10.253.74.74';
 SET http_port=9000;
 SET httpfpga_cpu_fallback=false;
 SET httpfpga_debug=true;
