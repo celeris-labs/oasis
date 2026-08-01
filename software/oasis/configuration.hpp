@@ -15,7 +15,9 @@ constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
 
 // Matches hardware HttpConfig (31 params [0..30] + START at 31 = 32 regs). ID string "HTT".
 // Kept in sync with hardware/src/hdl/http_read/http_config.sv (NUM_PARAM_REGS=31, START_ADDR=31).
-constexpr const uint64_t HTTP_READ_CONFIG_REGS = 32;
+// Must match HTTP_CONFIG_ADDR_SPACE in hardware/src/vfpga_top.svh. Went 32 -> 64 when the GET path
+// grew from 8 to 16 CSR words (32 -> 64 characters), which pushed START from 31 to 39.
+constexpr const uint64_t HTTP_READ_CONFIG_REGS = 64;
 constexpr const uint64_t HTTP_READ_CONFIG_ID   = 0x0000000000485454;
 
 /**
@@ -55,6 +57,7 @@ struct HTTPRequestEcho {
     uint32_t file_len        = 0;
     uint32_t file_w0         = 0; // GET path characters 0..3
     uint32_t file_w4         = 0; // GET path characters 16..19
+    uint32_t file_w8         = 0; // GET path characters 32..35
     uint32_t range_begin_w0  = 0; // first four ASCII digits of the range start
     uint8_t  range_begin_len = 0;
     uint32_t range_end_w0    = 0;

@@ -6,7 +6,7 @@ module http_req_builder (
     input  logic [7:0]    ipHexLen,
     input  logic [127:0]  ipHex,
     input  logic [31:0]   portHex,
-    input  logic [5:0]    fileLen,
+    input  logic [6:0]    fileLen,
     input  logic [31:0]   fileWord0,
     input  logic [31:0]   fileWord1,
     input  logic [31:0]   fileWord2,
@@ -15,6 +15,14 @@ module http_req_builder (
     input  logic [31:0]   fileWord5,
     input  logic [31:0]   fileWord6,
     input  logic [31:0]   fileWord7,
+    input  logic [31:0]   fileWord8,
+    input  logic [31:0]   fileWord9,
+    input  logic [31:0]   fileWord10,
+    input  logic [31:0]   fileWord11,
+    input  logic [31:0]   fileWord12,
+    input  logic [31:0]   fileWord13,
+    input  logic [31:0]   fileWord14,
+    input  logic [31:0]   fileWord15,
     input  logic [7:0]    rangeBeginLen,
     input  logic [31:0]   rangeBeginW0,
     input  logic [31:0]   rangeBeginW1,
@@ -25,7 +33,7 @@ module http_req_builder (
     input  logic [31:0]   rangeEndW1,
     input  logic [31:0]   rangeEndW2,
     input  logic [31:0]   rangeEndW3,
-    output logic [1023:0] header_data,
+    output logic [2047:0] header_data,
     output logic [15:0]   header_len,
     output logic          req_ready,
     output logic [3:0]    state_debug
@@ -81,8 +89,12 @@ module http_req_builder (
     logic [7:0] idx_q, idx_d;         // overall byte position in output buffer
     logic [5:0] sub_idx_q, sub_idx_d; // position within current phase (max 63)
 
-    logic [7:0] buffer_q [127:0];
-    logic [31:0] file_words [7:0];
+    // 256 bytes: 65 fixed header + up to 64 path + 15 IP + 16+16 range digits leaves plenty of
+    // slack. There is still no overflow detection -- idx_q is 8 bits, so a header longer than 256
+    // bytes would wrap and alias rather than fail. The software-side guard in
+    // software/oasis/configuration.cpp is what keeps that from happening.
+    logic [7:0] buffer_q [255:0];
+    logic [31:0] file_words [15:0];
     logic [31:0] range_begin_words [3:0];
     logic [31:0] range_end_words [3:0];
 
@@ -101,6 +113,10 @@ module http_req_builder (
         file_words[2] = fileWord2; file_words[3] = fileWord3;
         file_words[4] = fileWord4; file_words[5] = fileWord5;
         file_words[6] = fileWord6; file_words[7] = fileWord7;
+        file_words[8] = fileWord8; file_words[9] = fileWord9;
+        file_words[10] = fileWord10; file_words[11] = fileWord11;
+        file_words[12] = fileWord12; file_words[13] = fileWord13;
+        file_words[14] = fileWord14; file_words[15] = fileWord15;
         range_begin_words[0] = rangeBeginW0;
         range_begin_words[1] = rangeBeginW1;
         range_begin_words[2] = rangeBeginW2;
@@ -113,7 +129,7 @@ module http_req_builder (
 
     genvar i;
     generate
-        for (i = 0; i < 128; i++) begin : gen_header_pack
+        for (i = 0; i < 256; i++) begin : gen_header_pack
             assign header_data[i*8 +: 8] = buffer_q[i];
         end
     endgenerate
@@ -160,7 +176,8 @@ module http_req_builder (
             end
 
             PATH: begin
-                write_byte = file_words[sub_idx_q[4:2]][sub_idx_q[1:0]*8 +: 8];
+                // [5:2] selects one of 16 words (was [4:2] for 8), [1:0] the byte within it.
+                write_byte = file_words[sub_idx_q[5:2]][sub_idx_q[1:0]*8 +: 8];
                 write_en   = 1'b1;
                 idx_d      = idx_q + 1'b1;
                 sub_idx_d  = sub_idx_q + 1'b1;
@@ -311,7 +328,7 @@ module http_req_builder (
             idx_q       <= '0;
             sub_idx_q   <= '0;
             req_ready_q <= 1'b0;
-            for (int k = 0; k < 128; k++) begin
+            for (int k = 0; k < 256; k++) begin
                 buffer_q[k] <= '0;
             end
         end else begin

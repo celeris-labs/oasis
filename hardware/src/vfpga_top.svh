@@ -38,8 +38,9 @@ localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
 localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
 
 `ifdef EN_TCP
-// HttpConfig: 31 param regs + START; read side has 3 status regs.
-localparam HTTP_CONFIG_ADDR_SPACE = 32;
+// HttpConfig: 39 param regs + START at 39, so 40 in use. The GET path takes 16 of them (64
+// characters); with 8 words this fit in exactly 32. Rounded up to the next power of two.
+localparam HTTP_CONFIG_ADDR_SPACE = 64;
 localparam NUM_CONFIGS   = 3;
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `elsif EN_RDMA
@@ -338,6 +339,14 @@ handler inst_handler (
     .fileWord5                     (http_cfg_q.file_w5),
     .fileWord6                     (http_cfg_q.file_w6),
     .fileWord7                     (http_cfg_q.file_w7),
+    .fileWord8                     (http_cfg_q.file_w8),
+    .fileWord9                     (http_cfg_q.file_w9),
+    .fileWord10                    (http_cfg_q.file_w10),
+    .fileWord11                    (http_cfg_q.file_w11),
+    .fileWord12                    (http_cfg_q.file_w12),
+    .fileWord13                    (http_cfg_q.file_w13),
+    .fileWord14                    (http_cfg_q.file_w14),
+    .fileWord15                    (http_cfg_q.file_w15),
     .rangeBeginLen                 (http_cfg_q.range_begin_len),
     .rangeBeginW0                  (http_cfg_q.range_begin_w0),
     .rangeBeginW1                  (http_cfg_q.range_begin_w1),

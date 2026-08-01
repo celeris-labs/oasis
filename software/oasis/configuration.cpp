@@ -40,16 +40,16 @@ constexpr const uint32_t HTTP_PORT_HEX        = 2;
 constexpr const uint32_t HTTP_IP_HEX_LEN      = 3;
 constexpr const uint32_t HTTP_IP_HEX_W0       = 4;
 constexpr const uint32_t HTTP_FILE_LEN        = 8;
-constexpr const uint32_t HTTP_FILE_W0         = 9;
-constexpr const uint32_t HTTP_NUM_SESSIONS    = 17;
-constexpr const uint32_t HTTP_PKG_WORD_COUNT  = 18;
-constexpr const uint32_t HTTP_USER_FREQUENCY  = 19;
-constexpr const uint32_t HTTP_TIME_IN_SECONDS = 20;
-constexpr const uint32_t HTTP_RANGE_BEGIN_LEN = 21;
-constexpr const uint32_t HTTP_RANGE_BEGIN_W0  = 22; // 22..25
-constexpr const uint32_t HTTP_RANGE_END_LEN   = 26;
-constexpr const uint32_t HTTP_RANGE_END_W0    = 27; // 27..30
-constexpr const uint32_t HTTP_START           = 31;
+constexpr const uint32_t HTTP_FILE_W0         = 9;  // 9..24 (16 words, 64 path characters)
+constexpr const uint32_t HTTP_NUM_SESSIONS    = 25;
+constexpr const uint32_t HTTP_PKG_WORD_COUNT  = 26;
+constexpr const uint32_t HTTP_USER_FREQUENCY  = 27;
+constexpr const uint32_t HTTP_TIME_IN_SECONDS = 28;
+constexpr const uint32_t HTTP_RANGE_BEGIN_LEN = 29;
+constexpr const uint32_t HTTP_RANGE_BEGIN_W0  = 30; // 30..33
+constexpr const uint32_t HTTP_RANGE_END_LEN   = 34;
+constexpr const uint32_t HTTP_RANGE_END_W0    = 35; // 35..38
+constexpr const uint32_t HTTP_START           = 39;
 
 // ASCII words transferred per Range endpoint. Range values are absolute file
 // offsets, so they scale with file size, not with read size: 2 words (8 digits)
@@ -58,15 +58,16 @@ constexpr const uint32_t HTTP_START           = 31;
 constexpr const uint32_t HTTP_RANGE_WORDS = 4;
 constexpr const uint32_t HTTP_RANGE_MAX_DIGITS = HTTP_RANGE_WORDS * 4;
 
-// ASCII words transferred for the GET path (32 chars) and the Host: IP (16 chars).
-constexpr const uint32_t HTTP_FILE_WORDS = 8;
+// ASCII words transferred for the GET path (64 chars) and the Host: IP (16 chars).
+constexpr const uint32_t HTTP_FILE_WORDS = 16;
 constexpr const uint32_t HTTP_IP_WORDS   = 4;
 
-// http_req_builder assembles the request into a fixed 128-byte buffer (buffer_q[127:0]) with no
-// overflow detection -- writes past the end alias instead of failing. The fixed parts are
+// http_req_builder assembles the request into a fixed 256-byte buffer (buffer_q[255:0]) with no
+// overflow detection -- writes past the end alias instead of failing, so this check is the only
+// thing standing between a long path and a silently corrupted request. The fixed parts are
 // "GET " (4) + " HTTP/1.1\r\nHost: " (17) + ":" (1) + port (4) + CRLF (2) +
 // "Range: bytes=" (13) + "-" (1) + CRLF (2) + "Connection: close\r\n\r\n" (21) = 65 bytes.
-constexpr const uint32_t HTTP_HEADER_BUFFER_BYTES = 128;
+constexpr const uint32_t HTTP_HEADER_BUFFER_BYTES = 256;
 constexpr const uint32_t HTTP_HEADER_FIXED_BYTES  = 65;
 
 // Read-side CSRs (see hardware/src/hdl/http_read/http_config.sv).
@@ -78,6 +79,7 @@ constexpr const uint32_t HTTP_ECHO_FILE_W4     = 5;
 constexpr const uint32_t HTTP_ECHO_RANGE_BEGIN = 6;
 constexpr const uint32_t HTTP_ECHO_RANGE_END   = 7;
 constexpr const uint32_t HTTP_ECHO_SERVER      = 8;
+constexpr const uint32_t HTTP_ECHO_FILE_W8     = 9;
 
 // Packs `s` little-endian into `words`. Throws rather than truncating: a silently shortened path
 // makes the FPGA request a different (usually nonexistent) file, and the 404 body then flows through
@@ -219,6 +221,7 @@ HTTPRequestEcho HTTPReadConfig::request_echo() {
     echo.file_len        = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_LEN).value());
     echo.file_w0         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W0).value());
     echo.file_w4         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W4).value());
+    echo.file_w8         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W8).value());
     echo.range_begin_w0  = static_cast<uint32_t>(range_begin & 0xFFFFFFFFULL);
     echo.range_begin_len = static_cast<uint8_t>((range_begin >> 32) & 0xFF);
     echo.range_end_w0    = static_cast<uint32_t>(range_end & 0xFFFFFFFFULL);
@@ -243,6 +246,7 @@ std::string HTTPRequestEcho::describe() const {
     std::ostringstream oss;
     oss << "path_len=" << file_len << " path[0:4]='" << word_to_ascii(file_w0) << "'"
         << " path[16:20]='" << word_to_ascii(file_w4) << "'"
+        << " path[32:36]='" << word_to_ascii(file_w8) << "'"
         << " range=" << static_cast<unsigned>(range_begin_len) << ":'"
         << word_to_ascii(range_begin_w0) << "'-" << static_cast<unsigned>(range_end_len) << ":'"
         << word_to_ascii(range_end_w0) << "'"
