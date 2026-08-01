@@ -195,6 +195,29 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 	// DMA them in.
 	const bool fetch_on_host = !rdma && !http;
 
+	// An ENABLE_HTTP bitstream ties off axis_host_recv and compiles out gen_decoders (both in
+	// hardware/src/vfpga_top.svh), so no host-DMA path into any decoder exists: the FPGA issuing its
+	// own GET is the only way to feed it. A host source would DMA into a stream nothing consumes,
+	// the sink would never complete, and the scan would park forever on a readiness callback that
+	// can never fire -- an unkillable-looking hang with no diagnostic. Fail while we can still say
+	// why.
+	if (fetch_on_host && ctx.isHTTPEnabled()) {
+		throw NotImplementedException(
+		    "read_oasis('%s'): this bitstream was built with ENABLE_HTTP, which does not synthesize a "
+		    "host-DMA path into the column-chunk decoder. Read the file over httpfpga:// so the FPGA "
+		    "fetches it, or program a bitstream built without --http.",
+		    bind.filename.c_str());
+	}
+
+	// The mirror image: an httpfpga:// source needs the HTTP client in the bitstream. Without it
+	// HTTPSourceOperator::apply would fail deep in the config lookup with no mention of the cause.
+	if (http && !ctx.isHTTPEnabled()) {
+		throw NotImplementedException(
+		    "read_oasis('%s'): reading over httpfpga:// requires a bitstream built with --http; this "
+		    "one has no HTTP client.",
+		    bind.filename.c_str());
+	}
+
 	// Phase 0: Collect the column chunks that will be decoded in hardware and fetch them.
 	std::vector<size_t> hw_slot; // projection indices of the hardware columns, in order
 	std::vector<const parcore::metadata::ColumnChunk *> hw_chunks;
