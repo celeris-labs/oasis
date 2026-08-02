@@ -12,6 +12,15 @@ namespace duckdb {
 class DatabaseInstance;
 class FileOpener;
 
+// A reply read off a host socket. `raw` owns the bytes; the rest index into it.
+struct HttpReply {
+	string raw;
+	string status_line;
+	string headers;       // header block, excluding the terminating blank line
+	size_t body_off = 0;  // index of the first body byte in `raw`
+	bool partial = false; // 206 Partial Content rather than 200 OK
+};
+
 class HTTPFileSystem : public FileSystem {
 public:
 	explicit HTTPFileSystem(DatabaseInstance &db);
@@ -53,6 +62,9 @@ private:
 	// Connect to the configured server, send `request`, read the full response until the peer
 	// closes. Returns false on any socket error.
 	bool HttpSocketRequest(const std::string &request, std::string &response);
+	// HttpSocketRequest plus response parsing. Throws on a transport error, a malformed reply, or a
+	// status other than 200/206; `what` names the operation in those messages.
+	HttpReply HttpExchange(const string &request, const char *what, const string &resource);
 
 	DatabaseInstance &instance;
 	std::mutex init_mtx;
