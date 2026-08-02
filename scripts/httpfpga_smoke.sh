@@ -41,63 +41,84 @@ PASS=0
 FAIL=0
 FAILED_CASES=()
 
-# Runs `sql` through the FPGA path and prints rows as comma-separated text.
-run_fpga() {
-	local sql="$1"
-	"$DUCKDB" -csv -noheader -c "
+# Runs `sql` and leaves stdout in RUN_OUT, stderr in RUN_ERR, exit status in RUN_RC.
+#
+# Only stdout is ever compared. The [httpfpga] debug lines and the watchdog go to stderr, so folding
+# stderr into the result would make every case fail the moment HTTPFPGA_DEBUG=true -- and would hide
+# the error text on a genuine failure behind a diff of the wrong thing. `fallback` picks the path:
+# true fetches over an ordinary host socket, false goes through the FPGA.
+run_query() {
+	local fallback="$1" sql="$2"
+	local errfile
+	errfile="$(mktemp)"
+	RUN_OUT="$("$DUCKDB" -csv -noheader -c "
 SET enable_progress_bar=false;
 SET http_server='$SERVER';
 SET http_port=$PORT;
-SET httpfpga_cpu_fallback=false;
+SET httpfpga_cpu_fallback=$fallback;
 SET httpfpga_debug=$DEBUG;
-$sql" 2>&1
+$sql" 2>"$errfile")"
+	RUN_RC=$?
+	RUN_ERR="$(cat "$errfile")"
+	rm -f "$errfile"
 }
 
-# Same query over an ordinary host socket. Bypasses the FPGA entirely -- the reference side of the
-# differential test.
-run_cpu() {
-	local sql="$1"
-	"$DUCKDB" -csv -noheader -c "
-SET enable_progress_bar=false;
-SET http_server='$SERVER';
-SET http_port=$PORT;
-SET httpfpga_cpu_fallback=true;
-SET httpfpga_debug=false;
-$sql" 2>&1
+record_pass() {
+	echo "PASS  $1"
+	PASS=$((PASS + 1))
 }
 
-# check <label> <expected-rows> <sql>
+record_fail() {
+	echo "FAIL  $1"
+	FAIL=$((FAIL + 1))
+	FAILED_CASES+=("$1")
+}
+
+# Indents whatever came out on stderr, so a failure shows the actual exception rather than just an
+# empty result.
+show_err() {
+	[[ -n "$1" ]] && echo "$1" | sed 's/^/          | /'
+}
+
+# check <label> <expected-rows> <sql> -- runs the FPGA path against a known answer.
 check() {
 	local label="$1" expected="$2" sql="$3"
-	local actual
-	actual="$(run_fpga "$sql")"
-	if [[ "$actual" == "$expected" ]]; then
-		echo "PASS  $label"
-		PASS=$((PASS + 1))
+	run_query false "$sql"
+	if [[ $RUN_RC -eq 0 && "$RUN_OUT" == "$expected" ]]; then
+		record_pass "$label"
 	else
-		echo "FAIL  $label"
+		record_fail "$label"
 		echo "        expected: $(echo "$expected" | tr '\n' ' ')"
-		echo "        actual:   $(echo "$actual" | tr '\n' ' ')"
-		FAIL=$((FAIL + 1))
-		FAILED_CASES+=("$label")
+		echo "        actual:   $(echo "$RUN_OUT" | tr '\n' ' ')"
+		show_err "$RUN_ERR"
 	fi
 }
 
 # diff_check <label> <sql> -- no expected value needed; the CPU path is the oracle.
+#
+# The CPU side runs FIRST, on purpose. It is the reference, so if it fails the problem is the server,
+# the object or the query -- not the datapath -- and the run says so instead of blaming the FPGA for
+# someone else's bug. Note the CPU path still initializes the board (OpenFile does that before the
+# fallback is consulted), so this is not a way to test without hardware.
 diff_check() {
 	local label="$1" sql="$2"
-	local a b
-	a="$(run_fpga "$sql")"
-	b="$(run_cpu "$sql")"
-	if [[ "$a" == "$b" ]]; then
-		echo "PASS  $label (fpga == cpu)"
-		PASS=$((PASS + 1))
+	local ref
+	run_query true "$sql"
+	ref="$RUN_OUT"
+	if (( RUN_RC != 0 )); then
+		record_fail "$label -- reference (CPU) side failed, FPGA not judged"
+		show_err "$RUN_ERR"
+		return
+	fi
+
+	run_query false "$sql"
+	if [[ $RUN_RC -eq 0 && "$RUN_OUT" == "$ref" ]]; then
+		record_pass "$label (fpga == cpu)"
 	else
-		echo "FAIL  $label (fpga != cpu)"
-		echo "        fpga: $(echo "$a" | tr '\n' ' ')"
-		echo "        cpu:  $(echo "$b" | tr '\n' ' ')"
-		FAIL=$((FAIL + 1))
-		FAILED_CASES+=("$label")
+		record_fail "$label (fpga != cpu)"
+		echo "        cpu:  $(echo "$ref" | tr '\n' ' ')"
+		echo "        fpga: $(echo "$RUN_OUT" | tr '\n' ' ')"
+		show_err "$RUN_ERR"
 	fi
 }
 
