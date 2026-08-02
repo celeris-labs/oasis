@@ -1,0 +1,121 @@
+# name: test/sql/httpfpga.test
+# description: httpfpga:// reads against the MinIO test server, via the FPGA raw bypass
+# group: [sql]
+#
+# Needs a programmed board and a reachable server, so it is not part of the default `make test` run:
+#   ./build/release/test/unittest test/sql/httpfpga.test
+#
+# Every expected value was computed from the objects actually stored on the server, not from TPC-H
+# reference tables -- a mismatch means the bytes the FPGA delivered differ from the bytes the server
+# holds. Cases run smallest first so a broken datapath fails cheaply.
+
+require oasis
+
+statement ok
+SET enable_progress_bar=false;
+
+statement ok
+SET http_server='10.253.74.74';
+
+statement ok
+SET http_port=9000;
+
+statement ok
+SET httpfpga_cpu_fallback=false;
+
+# 690 bytes, path 24 characters -- the only case that fits the pre-build-88 32-character GET path
+# budget, so it passes even if the widening is broken. If this is the sole survivor, suspect the path.
+query I
+SELECT numbers FROM read_parquet('httpfpga:///testbench/dummy.parquet') ORDER BY numbers;
+----
+1
+2
+3
+4
+
+# 1060 bytes, path 33 -- cheapest case that requires a path longer than 32 characters.
+query II
+SELECT r_regionkey, r_name FROM read_parquet('httpfpga:///throughput/tpch-1/region.parquet') ORDER BY r_regionkey;
+----
+0	AFRICA
+1	AMERICA
+2	ASIA
+3	EUROPE
+4	MIDDLE EAST
+
+# Integer-only, so decimal formatting cannot be mistaken for a data error.
+query III
+SELECT count(*), sum(n_nationkey), sum(n_regionkey) FROM read_parquet('httpfpga:///throughput/tpch-1/nation.parquet');
+----
+25	300	50
+
+query II
+SELECT n_regionkey, count(*) FROM read_parquet('httpfpga:///throughput/tpch-1/nation.parquet') GROUP BY 1 ORDER BY 1;
+----
+0	5
+1	5
+2	5
+3	5
+4	5
+
+# 794 KB, one row group, path 35 -- first read that spans many FPGA buffers.
+query III
+SELECT count(*), sum(s_suppkey), round(sum(s_acctbal),2) FROM read_parquet('httpfpga:///throughput/tpch-1/supplier.parquet');
+----
+10000	50005000	45103548.65
+
+# 6.4 MB across 2 row groups, path 31 (also under the old budget).
+query II
+SELECT count(*), round(avg(p_size),4) FROM read_parquet('httpfpga:///throughput/tpch-1/part.parquet');
+----
+200000	25.4271
+
+# 12 MB, 2 row groups. Strings only: a dropped byte garbles a segment name rather than producing a
+# plausible-looking number.
+query II
+SELECT c_mktsegment, count(*) FROM read_parquet('httpfpga:///throughput/tpch-1/customer.parquet') GROUP BY 1 ORDER BY 1;
+----
+AUTOMOBILE	29752
+BUILDING	30142
+FURNITURE	29968
+HOUSEHOLD	30189
+MACHINERY	29949
+
+# 23 MB, 3 row groups, path 36 -- longest path in the suite.
+query II
+SELECT count(*), round(sum(s_acctbal),2) FROM read_parquet('httpfpga:///throughput/tpch-30/supplier.parquet');
+----
+300000	1348760542.11
+
+# 56 MB, 13 row groups. Range offsets reach 9 digits here, which spans three CSR words instead of
+# two -- the case that exposed the truncated Range header.
+query III
+SELECT o_orderstatus, count(*), round(sum(o_totalprice),2) FROM read_parquet('httpfpga:///throughput/tpch-1/orders.parquet') GROUP BY 1 ORDER BY 1;
+----
+F	729413	109702414613.69
+O	732044	110017774440.76
+P	38543	7109117393.01
+
+query II
+SELECT year(o_orderdate), count(*) FROM read_parquet('httpfpga:///throughput/tpch-1/orders.parquet') GROUP BY 1 ORDER BY 1;
+----
+1992	227089
+1993	226645
+1994	227597
+1995	228637
+1996	228626
+1997	227783
+1998	133623
+
+query III
+SELECT count(*), min(o_orderdate), max(o_orderdate) FROM read_parquet('httpfpga:///throughput/tpch-1/orders.parquet');
+----
+1500000	1992-01-01	1998-08-02
+
+# A missing object must fail rather than hang. This one is also 83 characters, past the 64-character
+# GET path budget, but it does not reach that guard: OpenFile probes size with a host-socket HEAD
+# first, so the 404 is what surfaces. The guard itself is covered by the software unit tests -- it has
+# to be, since any path long enough to trip it names an object the HEAD cannot find.
+statement error
+SELECT count(*) FROM read_parquet('httpfpga:///throughput/tpch-30/this_prefix_exists_only_to_overflow_the_get_path_budget.parquet');
+----
