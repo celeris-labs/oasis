@@ -124,9 +124,13 @@ logic [31:0]                   http_total_word;
 http_config_t                  http_cfg_q;
 logic                          http_run_tx;
 
+// 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
+// 8 to 16 words, which put START on top of RANGE_BEGIN_W1: writing that parameter fired the request
+// mid-configuration, so registers 32..38 -- the rest of the Range begin and all of the Range end --
+// never reached the snapshot and the FPGA sent "Range: bytes=<truncated>-" with no end at all.
 HttpConfig #(
-    .NUM_PARAM_REGS(31),
-    .START_ADDR    (31)
+    .NUM_PARAM_REGS(39),
+    .START_ADDR    (39)
 ) inst_http_config (
     .clk         (clk),
     .rst_n       (rst_n),

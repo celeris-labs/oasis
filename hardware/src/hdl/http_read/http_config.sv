@@ -96,6 +96,17 @@ module HttpConfig #(
 
 localparam logic [AXIL_DATA_BITS - 1:0] HTTP_CONFIG_ID = 64'h0000_0000_0048_5454; // "HTT"
 
+// The map below is hardcoded in the ConfigWriteRegister instantiations, so these parameters cannot
+// move it -- they only place START and size the address space. An instantiation that leaves them at
+// a stale value drops START on top of a parameter register, and a write to that parameter then fires
+// the request mid-configuration: every register after it keeps its previous value while the read-side
+// echo, which reads the LIVE cfg rather than the snapshot the handler took, still shows the correct
+// values. build-88 shipped exactly that (START_ADDR=31, i.e. RANGE_BEGIN_W1). Catch it at elaboration
+// rather than on the wire.
+localparam int LAST_PARAM_ADDR = 38;
+`ASSERT_ELAB(START_ADDR > LAST_PARAM_ADDR)
+`ASSERT_ELAB(NUM_PARAM_REGS > LAST_PARAM_ADDR)
+
 // -------------------------------------------------------------------------------------------------
 // Per-field write registers. Each ConfigWriteRegister latches the AXI-Lite
 // data into its output on a write to its assigned address.

@@ -51,6 +51,17 @@ constexpr const uint32_t HTTP_RANGE_END_LEN   = 34;
 constexpr const uint32_t HTTP_RANGE_END_W0    = 35; // 35..38
 constexpr const uint32_t HTTP_START           = 39;
 
+// Bitstreams up to and including build-88 instantiate HttpConfig with START_ADDR=31: the override in
+// vfpga_top.svh was not moved when the GET path widened from 8 to 16 words. On those, a write to 31
+// -- RANGE_BEGIN_W1 in the map above -- ALSO fires the start trigger, snapshotting the config while
+// registers 32..38 (the rest of the Range begin, all of the Range end) still hold their previous
+// values. The FPGA then sends "Range: bytes=<truncated begin>-" with no end and the server answers
+// 400. Writing this register last, immediately before START, is correct on both: on a fixed bitstream
+// it is an ordinary parameter and START at 39 still comes after it, and on a legacy one the trigger
+// fires only once everything else has landed. ConfigWriteReadyRegister registers its valid, so the
+// snapshot taken on that write includes the register 31 write itself.
+constexpr const uint32_t HTTP_LEGACY_START = 31;
+
 // ASCII words transferred per Range endpoint. Range values are absolute file
 // offsets, so they scale with file size, not with read size: 2 words (8 digits)
 // caps out at ~95 MiB, which any real Parquet file blows past immediately. 4
@@ -185,12 +196,21 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
     write_register(libstf::ConfigRegister(HTTP_TIME_IN_SECONDS, 0));
     write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_LEN, range_begin_len));
     for (uint32_t i = 0; i < HTTP_RANGE_WORDS; i++) {
+        // Deferred to just before START -- see HTTP_LEGACY_START.
+        if (HTTP_RANGE_BEGIN_W0 + i == HTTP_LEGACY_START) {
+            continue;
+        }
         write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_W0 + i, range_begin_words[i]));
     }
     write_register(libstf::ConfigRegister(HTTP_RANGE_END_LEN, range_end_len));
     for (uint32_t i = 0; i < HTTP_RANGE_WORDS; i++) {
         write_register(libstf::ConfigRegister(HTTP_RANGE_END_W0 + i, range_end_words[i]));
     }
+    static_assert(HTTP_LEGACY_START >= HTTP_RANGE_BEGIN_W0 &&
+                      HTTP_LEGACY_START < HTTP_RANGE_BEGIN_W0 + HTTP_RANGE_WORDS,
+                  "HTTP_LEGACY_START must name a Range-begin word for the deferral above to write it");
+    write_register(libstf::ConfigRegister(HTTP_LEGACY_START,
+                                          range_begin_words[HTTP_LEGACY_START - HTTP_RANGE_BEGIN_W0]));
 
     // Barrier before START. The parameter writes above are posted MMIO stores; the START
     // write is just another posted store, so nothing guarantees the parameter registers have
