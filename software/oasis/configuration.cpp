@@ -98,6 +98,12 @@ constexpr const uint32_t HTTP_ECHO_RANGE_BEGIN = 6;
 constexpr const uint32_t HTTP_ECHO_RANGE_END   = 7;
 constexpr const uint32_t HTTP_ECHO_SERVER      = 8;
 constexpr const uint32_t HTTP_ECHO_FILE_W8     = 9;
+constexpr const uint32_t HTTP_INFLIGHT         = 10;
+
+// How long to wait for a request slot before giving up. Reaching this means the pipeline stopped
+// draining -- a response that never arrived, or a connection that never opened -- so it is a
+// diagnosis, not a tuning knob. Generous enough that a slow object server never trips it.
+constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 
 // Packs `s` little-endian into `words`. Throws rather than truncating: a silently shortened path
 // makes the FPGA request a different (usually nonexistent) file, and the 404 body then flows through
@@ -144,19 +150,45 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
 void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint16_t server_port,
                           const std::string &path, uint64_t range_begin, uint64_t range_end,
                           uint16_t /*session_id*/) {
-    // The handler samples runTx only in ST_IDLE, and runTx is a one-cycle pulse: a START written
-    // while it is mid-transfer is dropped and never retried. The scan then blocks forever on a
-    // buffer nothing will fill. There is no reset CSR, so the wedge outlives the process and every
-    // later run inherits it -- the "worked a minute ago, now nothing does" symptom. The tell is
-    // `sid` staying constant across runs, since session_id_q only advances when a fresh tcp_init
-    // completes. Refuse up front and name the way out, rather than hanging with no diagnostic.
-    if (const uint32_t status = debug_status(); (status & (1u << HTTP_STATUS_BUSY_BIT)) != 0) {
-        std::ostringstream msg;
-        msg << "FPGA HTTP handler is still busy from an earlier request [" << describe_status(status)
-            << "]; it only accepts a new request from its IDLE state, so this one would be "
-               "silently dropped and then hang. There is no reset register -- reprogram the "
-               "bitstream to clear it.";
-        throw std::runtime_error(msg.str());
+    // Make sure the hardware can actually take this request before writing any of it.
+    //
+    // ConfigWriteReadyRegister does not back-pressure: a START write that lands while the previous
+    // one is still unconsumed OVERWRITES it, and that request disappears without a trace. So the
+    // host has to police the depth itself.
+    //
+    // On a pipelined bitstream the ring reports its occupancy and we wait for a free slot. On a
+    // pre-pipelining one there is no such register (it reads back zero), and the only signal
+    // available is the busy bit -- there, a request arriving mid-transfer really is dropped for
+    // good, because the old handler sampled runTx as a one-cycle pulse in ST_IDLE only. That is the
+    // wedge that outlives the process and makes every later run fail; with no reset CSR, the only
+    // way out is reprogramming.
+    if (num_slots() == 0) {
+        if (const uint32_t status = debug_status(); (status & (1u << HTTP_STATUS_BUSY_BIT)) != 0) {
+            std::ostringstream msg;
+            msg << "FPGA HTTP handler is still busy from an earlier request ["
+                << describe_status(status)
+                << "]; this bitstream predates the pipelined handler and only accepts a new request "
+                   "from its IDLE state, so this one would be silently dropped and then hang. There "
+                   "is no reset register -- reprogram the bitstream to clear it.";
+            throw std::runtime_error(msg.str());
+        }
+    } else {
+        const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
+        HTTPInflight flight = inflight();
+        while (flight.free_slots() == 0) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                std::ostringstream msg;
+                msg << "FPGA HTTP request ring has been full for "
+                    << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
+                    << "s [" << flight.describe() << "; " << describe_status(debug_status())
+                    << "]. The pipeline has stopped draining: a response never arrived or a "
+                       "connection never opened. There is no reset register -- reprogram the "
+                       "bitstream to clear it.";
+                throw std::runtime_error(msg.str());
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            flight = inflight();
+        }
     }
 
     const auto ip_ascii    = IpToAscii(server_ip);
@@ -283,6 +315,37 @@ uint8_t HTTPReadConfig::client_state() {
 
 uint32_t HTTPReadConfig::debug_status() {
     return static_cast<uint32_t>(read_register(HTTP_TOTAL_WORD).value());
+}
+
+HTTPReadConfig::HTTPInflight HTTPReadConfig::inflight() {
+    const auto word = static_cast<uint32_t>(read_register(HTTP_INFLIGHT).value());
+    HTTPInflight f {};
+    f.occupied     = static_cast<uint8_t>(word & 0xFFu);
+    f.slots        = static_cast<uint8_t>((word >> 8) & 0xFFu);
+    f.pending_mask = static_cast<uint8_t>((word >> 16) & 0xFFu);
+    f.closed_mask  = static_cast<uint8_t>((word >> 24) & 0xFFu);
+    return f;
+}
+
+std::string HTTPReadConfig::HTTPInflight::describe() const {
+    std::ostringstream oss;
+    if (legacy()) {
+        return "inflight=<unsupported: pre-pipelining bitstream>";
+    }
+    oss << "inflight=" << static_cast<unsigned>(occupied) << "/" << static_cast<unsigned>(slots)
+        << " pending=0x" << std::hex << static_cast<unsigned>(pending_mask) << " closed=0x"
+        << static_cast<unsigned>(closed_mask) << std::dec;
+    return oss.str();
+}
+
+uint8_t HTTPReadConfig::num_slots() {
+    // Fixed by the bitstream, so read it once. A pre-pipelining bitstream has no INFLIGHT register;
+    // ConfigReadRegisterFile returns zero for an out-of-range address, which lands here as 0 slots
+    // and selects the legacy single-request path.
+    if (num_slots_ < 0) {
+        num_slots_ = static_cast<int>(inflight().slots);
+    }
+    return static_cast<uint8_t>(num_slots_);
 }
 
 HTTPRequestEcho HTTPReadConfig::request_echo() {

@@ -66,6 +66,14 @@ import http_types::*;
 //   6  ECHO_RANGE_BEGIN ([39:32] len, [31:0] first 4 ASCII digits)
 //   7  ECHO_RANGE_END   ([39:32] len, [31:0] first 4 ASCII digits)
 //   8  ECHO_SERVER      ([47:32] port, [31:0] ip)
+//   10 INFLIGHT         ([7:0] slots occupied, [15:8] NUM_SLOTS, [23:16] pending bitmap,
+//                        [31:24] closed bitmap) -- see handler.sv inflightWord
+//
+// INFLIGHT is not optional bookkeeping. ConfigWriteReadyRegister does NOT back-pressure: a START
+// write that lands while the previous one is still unconsumed overwrites it, and the earlier request
+// is lost without a trace. With the handler pipelined over several slots the host can legitimately
+// have requests outstanding, so it needs to know how many before pushing another. The host reads
+// this register and treats (NUM_SLOTS - occupied) as its credit.
 // =================================================================================================
 module HttpConfig #(
     parameter integer NUM_PARAM_REGS = 39,
@@ -89,7 +97,8 @@ module HttpConfig #(
 
     // Status read back to the host
     input  logic [3:0]  client_state,
-    input  logic [31:0] total_word
+    input  logic [31:0] total_word,
+    input  logic [31:0] inflight_word
 );
 
 `RESET_RESYNC
@@ -264,7 +273,7 @@ assign start_raw.ready = start_cfg.ready;
 // discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
 // ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-localparam int NUM_READ_REGS = 10;
+localparam int NUM_READ_REGS = 11;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -280,6 +289,8 @@ assign read_registers[8] = {16'b0, cfg.server_port[15:0], cfg.server_ip};
 // Path chars 32..35. With 64-character paths the two prefixes under test can now agree all the way
 // through file_w4, so w0/w4 alone no longer discriminate between two long paths.
 assign read_registers[9] = {32'b0, cfg.file_w8};
+// Request-ring occupancy. The host's credit before it may push another START. See the map above.
+assign read_registers[10] = {32'b0, inflight_word};
 
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
 

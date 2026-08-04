@@ -120,13 +120,22 @@ ColumnChunkDecoderConfig #(
 );
 
 `ifdef EN_TCP
-// HttpConfig latches params; START write emits one http_config_t beat → runTx pulse.
+// Requests in flight in the HTTP client. Each slot is one queued ranged GET and, once connected,
+// one concurrently open TCP session -- this is what lets the connect + GET + server think-time for
+// request k+1 overlap the body transfer of request k instead of following it. The host must not
+// enqueue more than this many outstanding requests; it reads the ring occupancy back through
+// HttpConfig's INFLIGHT register, and software/oasis mirrors this number.
+localparam int HTTP_NUM_SLOTS = 4;
+
+// HttpConfig latches params; a START write emits one http_config_t beat, which the handler accepts
+// straight into a free slot. The slot ring IS the request queue, so there is no separate FIFO and
+// no runTx pulse any more -- the old one-cycle pulse was sampled only in ST_IDLE and was silently
+// dropped if it arrived mid-transfer, which is exactly the wedge this replaces.
 http_config_t                  http_cfg_live;
 ready_valid_i #(http_config_t) http_start();
 logic [3:0]                    http_client_state;
 logic [31:0]                   http_total_word;
-http_config_t                  http_cfg_q;
-logic                          http_run_tx;
+logic [31:0]                   http_inflight_word;
 
 // 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
 // 8 to 16 words, which put START on top of RANGE_BEGIN_W1: writing that parameter fired the request
@@ -140,25 +149,12 @@ HttpConfig #(
     .rst_n       (rst_n),
     .write_config(write_configs[2]),
     .read_config (read_configs[2]),
-    .cfg         (http_cfg_live),
-    .start_cfg   (http_start),
-    .client_state(http_client_state),
-    .total_word  (http_total_word)
+    .cfg          (http_cfg_live),
+    .start_cfg    (http_start),
+    .client_state (http_client_state),
+    .total_word   (http_total_word),
+    .inflight_word(http_inflight_word)
 );
-
-assign http_start.ready = 1'b1;
-
-always_ff @(posedge clk) begin
-    if (!rst_n) begin
-        http_cfg_q  <= '0;
-        http_run_tx <= 1'b0;
-    end else if (http_start.valid && http_start.ready) begin
-        http_cfg_q  <= http_start.data;
-        http_run_tx <= 1'b1;
-    end else begin
-        http_run_tx <= 1'b0;
-    end
-end
 `elsif EN_RDMA
 RDMAReadConfig #(
     .NUM_STREAMS(NUM_STREAMS)
@@ -289,7 +285,9 @@ AXI4S axi_http_body (.aclk(clk), .aresetn(rst_n));
 ndata_i #(data8_t, DATABEAT_SIZE) http_body_ndata();
 ndata_i #(data8_t, DATABEAT_SIZE) http_body_norm();
 
-handler inst_handler (
+handler #(
+    .NUM_SLOTS(HTTP_NUM_SLOTS)
+) inst_handler (
     .ap_clk  (clk),
     .ap_rst_n(rst_n),
 
@@ -331,47 +329,13 @@ handler inst_handler (
     .s_axis_tx_status_TREADY       (tcp_tx_stat.ready),
     .s_axis_tx_status_TDATA        (tcp_tx_stat.data),
 
-    .runTx                         (http_run_tx),
-    .numSessions                   (http_cfg_q.num_sessions),
-    .pkgWordCount                  (http_cfg_q.pkg_word_count),
-    .serverIpAddress               (http_cfg_q.server_ip),
-    .ipHexLen                      (http_cfg_q.ip_hex_len),
-    .ipHexWord0                    (http_cfg_q.ip_hex_w0),
-    .ipHexWord1                    (http_cfg_q.ip_hex_w1),
-    .ipHexWord2                    (http_cfg_q.ip_hex_w2),
-    .ipHexWord3                    (http_cfg_q.ip_hex_w3),
-    .portHexWord0                  (http_cfg_q.port_hex),
-    .serverPort                    (http_cfg_q.server_port),
-    .fileLen                       (http_cfg_q.file_len),
-    .fileWord0                     (http_cfg_q.file_w0),
-    .fileWord1                     (http_cfg_q.file_w1),
-    .fileWord2                     (http_cfg_q.file_w2),
-    .fileWord3                     (http_cfg_q.file_w3),
-    .fileWord4                     (http_cfg_q.file_w4),
-    .fileWord5                     (http_cfg_q.file_w5),
-    .fileWord6                     (http_cfg_q.file_w6),
-    .fileWord7                     (http_cfg_q.file_w7),
-    .fileWord8                     (http_cfg_q.file_w8),
-    .fileWord9                     (http_cfg_q.file_w9),
-    .fileWord10                    (http_cfg_q.file_w10),
-    .fileWord11                    (http_cfg_q.file_w11),
-    .fileWord12                    (http_cfg_q.file_w12),
-    .fileWord13                    (http_cfg_q.file_w13),
-    .fileWord14                    (http_cfg_q.file_w14),
-    .fileWord15                    (http_cfg_q.file_w15),
-    .rangeBeginLen                 (http_cfg_q.range_begin_len),
-    .rangeBeginW0                  (http_cfg_q.range_begin_w0),
-    .rangeBeginW1                  (http_cfg_q.range_begin_w1),
-    .rangeBeginW2                  (http_cfg_q.range_begin_w2),
-    .rangeBeginW3                  (http_cfg_q.range_begin_w3),
-    .rangeEndLen                   (http_cfg_q.range_end_len),
-    .rangeEndW0                    (http_cfg_q.range_end_w0),
-    .rangeEndW1                    (http_cfg_q.range_end_w1),
-    .rangeEndW2                    (http_cfg_q.range_end_w2),
-    .rangeEndW3                    (http_cfg_q.range_end_w3),
-    .userFrequency                 (http_cfg_q.user_frequency),
-    .timeInSeconds                 (http_cfg_q.time_in_seconds),
+    // One beat per ranged GET, straight from the START write into a free slot.
+    .req_valid                     (http_start.valid),
+    .req_ready                     (http_start.ready),
+    .req_data                      (http_start.data),
+
     .totalWord                     (http_total_word),
+    .inflightWord                  (http_inflight_word),
     .state_debug                   (http_client_state),
 
     .m_axis_body_tvalid  (axi_http_body.tvalid),

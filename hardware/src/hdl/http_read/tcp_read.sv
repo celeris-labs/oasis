@@ -8,10 +8,20 @@ import lynxTypes::*;
 // server sends `Connection: close`, so it transmits the whole response and then closes.
 //
 // The correct way to receive the full body is therefore a LOOP, exactly like a software
-// `while (recv() > 0)`: keep popping notifications for THIS session, issue a readPkg per data
-// notification, and stop when the `closed` notification arrives. Reading a single notification and
-// quitting (the old behaviour) returned only whatever had arrived by the first read -- a
-// timing-dependent fragment -- which is the "requested N, got 690/367" truncation.
+// `while (recv() > 0)`: keep asking for whatever has arrived for THIS session, issue a readPkg for
+// it, and stop when the peer has FINed and the balance is empty. Reading a single notification and
+// quitting (the original behaviour) returned only whatever had arrived by the first read -- a
+// timing-dependent fragment -- which was the "requested N, got 690/367" truncation.
+//
+// WHERE THE NOTIFICATIONS WENT
+// ----------------------------
+// This module used to pop the notification stream itself and discard everything that was not for
+// its own session. That silently breaks as soon as a second connection is open: the announcement
+// for the other session is consumed and thrown away, and when the reader turns to it, it blocks
+// forever on news that already came and went. Since pipelining exists precisely to have the next
+// response in flight while this one drains, notifications are now owned by tcp_session_table, which
+// records them per slot. This module just reads the balance for its slot and tells the table how
+// much of it was requested. See tcp_session_table.sv.
 //
 // strip_http and the downstream DataNormalizer expect ONE continuous stream terminated by a single
 // tlast (the normalizer accumulates a running byte offset and only resets on tlast). But each
@@ -20,21 +30,17 @@ import lynxTypes::*;
 // another beat follows -- with tlast=0 when the next readPkg's first beat arrives, or with tlast=1
 // when the FSM has seen `closed` and flushes the held beat as the final one. This masks every
 // per-readPkg tlast and produces the single-tlast stream the rest of the pipeline was built for.
-//
-// Only notifications whose session matches session_id are acted on; a leftover notification from a
-// previous (already-closed) connection that happens to reuse the session slot is discarded. Because
-// this FSM drains every notification (data + the closing one) to completion, it also leaves nothing
-// behind in the shared FIFO for the next request to trip over -- which removes the old
-// "each run returns the previous run's body" one-behind as a side effect.
 module tcp_read (
     input  logic                                      clk,
     input  logic                                      rst_n,
     input  logic                                      start,
     input  logic [15:0]                               session_id,
 
-    input  logic                                      s_axis_notifications_TVALID,
-    output logic                                      s_axis_notifications_TREADY,
-    input  logic [TCP_NOTIFY_BITS-1:0]                s_axis_notifications_TDATA,
+    // Receive accounting for THIS response's slot, from tcp_session_table.
+    input  logic [TCP_LEN_BITS-1:0]                   rx_req_len, // min(balance, MAX_READ_BYTES)
+    input  logic                                      rx_closed,  // peer has FINed (sticky)
+    output logic                                      rx_take_en, // we just requested rx_take_len
+    output logic [TCP_LEN_BITS-1:0]                   rx_take_len,
 
     output logic                                      m_axis_read_package_TVALID,
     input  logic                                      m_axis_read_package_TREADY,
@@ -64,10 +70,6 @@ module tcp_read (
     output logic [3:0]                                state_debug
 );
 
-    // Bit position of the `closed` flag inside the packed appNotification struct:
-    //   sessionID[15:0], length[31:16], ipAddress[63:32], dstPort[79:64], closed[80], opened[81].
-    localparam int CLOSED_BIT = TCP_SESSION_BITS + TCP_LEN_BITS + 32 + 16; // = 80
-
     localparam logic [3:0] ST_IDLE          = 4'd0;
     localparam logic [3:0] ST_WAIT_NOTIFY   = 4'd7;
     localparam logic [3:0] ST_REQ_PKG       = 4'd8;
@@ -76,11 +78,9 @@ module tcp_read (
     localparam logic [3:0] ST_DONE          = 4'd15;
 
     logic [3:0] state_q, state_d;
-    logic [TCP_NOTIFY_BITS-1:0] notify_q, notify_d;
     logic rx_meta_received_q, rx_meta_received_d;
-    // Whether the notification that triggered the in-flight readPkg also had closed=1 (last data and
-    // FIN delivered together via the 5-arg appNotification). If so, finish right after this readPkg.
-    logic pending_close_q, pending_close_d;
+    // Length of the readPkg currently being issued / received.
+    logic [TCP_LEN_BITS-1:0] req_len_q, req_len_d;
 
     // ---------------------------------------------------------------
     // 1-beat-delay concatenator (holds the most recent rx beat)
@@ -159,42 +159,34 @@ module tcp_read (
 
     always_comb begin
         state_d             = state_q;
-        notify_d            = notify_q;
         rx_meta_received_d  = rx_meta_received_q;
-        pending_close_d     = pending_close_q;
+        req_len_d           = req_len_q;
 
-        s_axis_notifications_TREADY = 1'b0;
         m_axis_read_package_TVALID  = 1'b0;
-        m_axis_read_package_TDATA   = {notify_q[TCP_LEN_BITS+TCP_SESSION_BITS-1:TCP_SESSION_BITS],
-                                       notify_q[TCP_SESSION_BITS-1:0]};
+        m_axis_read_package_TDATA   = {req_len_q, session_id};
         s_axis_rx_metadata_TREADY   = 1'b0;
         emit_last                   = 1'b0;
+        rx_take_en                  = 1'b0;
+        rx_take_len                 = rx_req_len;
 
         case (state_q)
             ST_IDLE: begin
                 if (start) begin
                     rx_meta_received_d = 1'b0;
-                    pending_close_d    = 1'b0;
                     state_d            = ST_WAIT_NOTIFY;
                 end
             end
 
             ST_WAIT_NOTIFY: begin
-                // Pop notifications; only ones for our session count. A data notification (len>0)
-                // leads to a readPkg; the closing notification (closed=1) finishes the body. A
-                // notification may carry both (last segment + FIN). Non-matching sessions and empty
-                // non-closing notifications are consumed and discarded so we keep waiting for ours.
-                s_axis_notifications_TREADY = 1'b1;
-                if (s_axis_notifications_TVALID && s_axis_notifications_TREADY) begin
-                    if (s_axis_notifications_TDATA[TCP_SESSION_BITS-1:0] == session_id) begin
-                        notify_d        = s_axis_notifications_TDATA;
-                        pending_close_d = s_axis_notifications_TDATA[CLOSED_BIT];
-                        if (s_axis_notifications_TDATA[TCP_LEN_BITS+TCP_SESSION_BITS-1:TCP_SESSION_BITS] != 0) begin
-                            state_d = ST_REQ_PKG;
-                        end else if (s_axis_notifications_TDATA[CLOSED_BIT]) begin
-                            state_d = ST_FINISH;
-                        end
-                    end
+                // Take whatever the session table has recorded for us. Order matters: drain the
+                // balance first and only treat `closed` as end-of-body once nothing is left, because
+                // one notification can carry both the final segment and the FIN.
+                if (rx_req_len != 0) begin
+                    rx_take_en = 1'b1;
+                    req_len_d  = rx_req_len;
+                    state_d    = ST_REQ_PKG;
+                end else if (rx_closed) begin
+                    state_d = ST_FINISH;
                 end
             end
 
@@ -216,10 +208,10 @@ module tcp_read (
                 end
 
                 // rx_data flows into the concatenator (see combinational block above). This readPkg
-                // ends on its rx tlast; the last beat is now held. Decide loop vs finish.
+                // ends on its rx tlast; the last beat is now held. Go back and look for more -- the
+                // balance may already hold the next segment, and `closed` is only honoured there.
                 if (in_fire && s_axis_rx_data_TLAST) begin
-                    if (pending_close_q) state_d = ST_FINISH;
-                    else                 state_d = ST_WAIT_NOTIFY;
+                    state_d = ST_WAIT_NOTIFY;
                 end
             end
 
@@ -245,17 +237,15 @@ module tcp_read (
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             state_q            <= ST_IDLE;
-            notify_q           <= '0;
             rx_meta_received_q <= 1'b0;
-            pending_close_q    <= 1'b0;
+            req_len_q          <= '0;
             hold_data_q        <= '0;
             hold_keep_q        <= '0;
             hold_valid_q       <= 1'b0;
         end else begin
             state_q            <= state_d;
-            notify_q           <= notify_d;
             rx_meta_received_q <= rx_meta_received_d;
-            pending_close_q    <= pending_close_d;
+            req_len_q          <= req_len_d;
             hold_data_q        <= hold_data_d;
             hold_keep_q        <= hold_keep_d;
             hold_valid_q       <= hold_valid_d;

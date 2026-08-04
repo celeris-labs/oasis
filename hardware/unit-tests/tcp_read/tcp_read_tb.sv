@@ -66,11 +66,41 @@ module tcp_read_tb;
     bit                       bp_enable;       // consumer drops tready periodically
     bit                       combined_close;  // last data notification carries closed=1
 
-    tcp_read dut (
-        .clk(clk), .rst_n(rst_n), .start(start), .session_id(SESSION),
+    // tcp_read no longer consumes the notification stream itself -- tcp_session_table does, and
+    // hands it the per-slot balance. The bench still drives raw notifications (that is what the TOE
+    // emits and what these cases are written against), so the table sits between them here exactly
+    // as it does inside handler.sv. A single slot is enough for a single-session test.
+    logic [31:0]             tbl_pending;
+    logic [TCP_LEN_BITS-1:0] tbl_req_len;
+    logic                    tbl_closed;
+    logic                    tbl_take_en;
+    logic [TCP_LEN_BITS-1:0] tbl_take_len;
+    tcp_session_table #(.NUM_SLOTS(1)) tbl (
+        .clk(clk), .rst_n(rst_n),
         .s_axis_notifications_TVALID(s_axis_notifications_TVALID),
         .s_axis_notifications_TREADY(s_axis_notifications_TREADY),
         .s_axis_notifications_TDATA(s_axis_notifications_TDATA),
+        // Re-bind continuously while idle, so the slot is already bound (with a zero balance) by the
+        // time `start` rises. Binding ON the rising edge of start would race the producer's first
+        // notification -- bind zeroes the balance, so a notification landing in the same cycle is
+        // swallowed and the read then waits forever. The handler has no such race: it binds when
+        // tcp_init completes, which is strictly before the GET is sent and therefore before the
+        // server can answer.
+        .bind_en(!start), .bind_slot(1'b0), .bind_sid(SESSION),
+        .release_en(1'b0), .release_slot(1'b0),
+        .q_slot(1'b0),
+        .q_pending(tbl_pending), .q_req_len(tbl_req_len),
+        .q_closed(tbl_closed), .q_bound(),
+        .take_en(tbl_take_en), .take_len(tbl_take_len),
+        .dbg_has_pending(), .dbg_closed()
+    );
+
+    tcp_read dut (
+        .clk(clk), .rst_n(rst_n), .start(start), .session_id(SESSION),
+        .rx_req_len(tbl_req_len),
+        .rx_closed(tbl_closed),
+        .rx_take_en(tbl_take_en),
+        .rx_take_len(tbl_take_len),
         .m_axis_read_package_TVALID(m_axis_read_package_TVALID),
         .m_axis_read_package_TREADY(m_axis_read_package_TREADY),
         .m_axis_read_package_TDATA(m_axis_read_package_TDATA),

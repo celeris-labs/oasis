@@ -1,5 +1,6 @@
 #include "oasis/scheduler.hpp"
 
+#include "oasis/configuration.hpp"
 #include "oasis/oasis_context.hpp"
 
 #include "parcore/configuration.hpp"
@@ -21,14 +22,26 @@ libstf::stream_t default_num_streams(OasisContext &ctx) {
 }
 
 size_t default_pipeline_depth(OasisContext &ctx) {
-    // On an HTTP bitstream the source is the FPGA's HTTP client, and HttpConfig is a single-session
-    // FSM: one set of parameter CSRs behind one START pulse. Dispatching a second flow while a GET
-    // is in flight would overwrite those CSRs mid-request and interleave two response bodies into
-    // the same decoder. Pin the pipeline to one flow per stream; the config FIFO depth the decoder
-    // advertises is irrelevant here because the request state, not the config queue, is the
-    // bottleneck. See HTTPSourceOperator.
+    // On an HTTP bitstream the source is the FPGA's HTTP client, so the depth that matters is how
+    // many ranged GETs that client can hold, not how many configs the decoder will queue.
+    //
+    // The handler keeps a ring of request slots and pipelines them over concurrent TCP sessions, so
+    // the connect + GET + server think-time of request k+1 overlaps the body of request k. Matching
+    // the software depth to the ring is what actually keeps the ring full: at depth 1 the hardware
+    // would have exactly one request to work on and every one of those round trips would again be
+    // dead time on the decoder.
+    //
+    // Depth must never EXCEED the ring, because a START write that arrives with the ring full is
+    // silently swallowed (ConfigWriteReadyRegister does not back-pressure). HTTPReadConfig::read
+    // additionally waits for credit before every request, so this is belt and braces -- but the
+    // wait is what would show up as a stall, and the right depth is what avoids it.
+    //
+    // A pre-pipelining bitstream reports 0 slots. There, one request at a time is the only safe
+    // depth: that handler sampled its start trigger as a one-cycle pulse in ST_IDLE, so a second
+    // request issued mid-transfer is dropped and never retried.
     if (ctx.isHTTPEnabled()) {
-        return 1;
+        const auto slots = ctx.config<HTTPReadConfig>()->num_slots();
+        return slots == 0 ? 1 : static_cast<size_t>(slots);
     }
     return ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
 }
