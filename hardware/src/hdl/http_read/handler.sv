@@ -58,7 +58,12 @@ module handler #(
     // open TCP session, so this is the knob that trades area and TOE session-table pressure for
     // hidden latency. The host must not enqueue more than this many outstanding requests; it reads
     // the occupancy back through HttpConfig (see http_config.sv, INFLIGHT register).
-    parameter int NUM_SLOTS = 4
+    parameter int NUM_SLOTS = 4,
+    // Cycles a stage may sit in RUN before it is declared stalled. Reporting only -- nothing is
+    // aborted or retried, because a skipped column chunk would corrupt the decoder stream. ~1.07 s
+    // at 250 MHz, which is far beyond any legitimate connect, send or body transfer (8 MB at
+    // 100 GbE is under a millisecond). Overridden small in simulation.
+    parameter int STALL_CYCLES = 268435456
 ) (
     input  logic                                      ap_clk,
     input  logic                                      ap_rst_n,
@@ -133,6 +138,7 @@ module handler #(
     output logic [7:0]                                debug_req_cnt,
     output logic [31:0]                               totalWord,
     output logic [31:0]                               inflightWord,
+    output logic [31:0]                               stallWord,
     output logic [3:0]                                state_debug
 );
 
@@ -298,6 +304,37 @@ module handler #(
                            8'(tbl_dbg_has_pending),
                            8'(NUM_SLOTS),
                            8'(occupancy)};
+
+    // ---------------------------------------------------------------------------------------------
+    // Stage stall / error reporting.
+    //
+    // "The request ring is full" is a symptom, not a diagnosis -- it looks identical whether the
+    // connect never completed, the GET never went out, or the body never arrived. The most common
+    // real cause is the first: the TOE re-sends a SYN forever when an ephemeral port is reused while
+    // the peer still holds the old 4-tuple in TIME_WAIT (the port pool is TCP_STACK_MAX_SESSIONS =
+    // 512 entries, ports 32768..33279, and a full benchmark run wraps it in well under the peer's
+    // 60 s). openStatus is then never emitted at all, so tcp_init never even raises `error` and the
+    // CONNECT stage waits forever with nothing to report.
+    //
+    // These flags are sticky and reporting-only. Nothing is aborted or retried: the decoder is
+    // configured per column chunk and expects that chunk's bytes, so dropping a request would
+    // silently corrupt the stream rather than fail. Better to stall visibly and let the host throw.
+    //
+    //   [0] connect stalled   [1] send stalled   [2] read stalled
+    //   [3] tcp_init reported error   [4] tcp_send_http reported error
+    //   [15:8]  slot the connect stage is on   [23:16] slot the read stage is on
+    // ---------------------------------------------------------------------------------------------
+    localparam int STALL_BITS = $clog2(STALL_CYCLES) + 1;
+
+    logic [STALL_BITS-1:0] conn_cnt_q, send_cnt_q, read_cnt_q;
+    logic conn_stall_q, send_stall_q, read_stall_q;
+    logic init_err_q, send_err_q;
+
+    assign stallWord = {8'd0,
+                        8'(read_idx),
+                        8'(conn_idx),
+                        3'd0, send_err_q, init_err_q,
+                        read_stall_q, send_stall_q, conn_stall_q};
 
     // ---------------------------------------------------------------------------------------------
     // CONNECT stage
@@ -528,6 +565,40 @@ module handler #(
             end
             if (send_advance) send_ptr_q <= send_ptr_q + 1'b1;
             if (read_advance) read_ptr_q <= read_ptr_q + 1'b1;
+        end
+    end
+
+    // Stall watchdogs: count while a stage is running, clear when it hands its slot on. Sticky, so a
+    // stall that later resolves is still visible to the host afterwards.
+    always_ff @(posedge ap_clk) begin
+        if (!ap_rst_n) begin
+            conn_cnt_q   <= '0;
+            send_cnt_q   <= '0;
+            read_cnt_q   <= '0;
+            conn_stall_q <= 1'b0;
+            send_stall_q <= 1'b0;
+            read_stall_q <= 1'b0;
+            init_err_q   <= 1'b0;
+            send_err_q   <= 1'b0;
+        end else begin
+            if (conn_advance || conn_state_q == ST_STAGE_IDLE) conn_cnt_q <= '0;
+            else if (conn_cnt_q < STALL_BITS'(STALL_CYCLES))   conn_cnt_q <= conn_cnt_q + 1'b1;
+            else                                               conn_stall_q <= 1'b1;
+
+            if (send_advance || send_state_q == ST_STAGE_IDLE) send_cnt_q <= '0;
+            else if (send_cnt_q < STALL_BITS'(STALL_CYCLES))   send_cnt_q <= send_cnt_q + 1'b1;
+            else                                               send_stall_q <= 1'b1;
+
+            if (read_advance || read_state_q == ST_READ_IDLE)  read_cnt_q <= '0;
+            else if (read_cnt_q < STALL_BITS'(STALL_CYCLES))   read_cnt_q <= read_cnt_q + 1'b1;
+            else                                               read_stall_q <= 1'b1;
+
+            // tcp_init raises `error` when openStatus comes back with success == 0. It is still not
+            // acted on -- the pipeline advances and the read for that slot then stalls -- but it is
+            // at least no longer invisible. Note the port-reuse failure above does NOT set this:
+            // there, openStatus never arrives, so conn_stall_q is the only signal.
+            if (conn_state_q == ST_STAGE_RUN && init_done && init_error) init_err_q <= 1'b1;
+            if (send_state_q == ST_STAGE_RUN && send_done && send_error) send_err_q <= 1'b1;
         end
     end
 

@@ -68,6 +68,8 @@ import http_types::*;
 //   8  ECHO_SERVER      ([47:32] port, [31:0] ip)
 //   10 INFLIGHT         ([7:0] slots occupied, [15:8] NUM_SLOTS, [23:16] pending bitmap,
 //                        [31:24] closed bitmap) -- see handler.sv inflightWord
+//   11 STALL            ([0] connect stalled, [1] send stalled, [2] read stalled, [3] init error,
+//                        [4] send error, [15:8] connect slot, [23:16] read slot)
 //
 // INFLIGHT is not optional bookkeeping. ConfigWriteReadyRegister does NOT back-pressure: a START
 // write that lands while the previous one is still unconsumed overwrites it, and the earlier request
@@ -98,7 +100,8 @@ module HttpConfig #(
     // Status read back to the host
     input  logic [3:0]  client_state,
     input  logic [31:0] total_word,
-    input  logic [31:0] inflight_word
+    input  logic [31:0] inflight_word,
+    input  logic [31:0] stall_word
 );
 
 `RESET_RESYNC
@@ -273,7 +276,7 @@ assign start_raw.ready = start_cfg.ready;
 // discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
 // ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-localparam int NUM_READ_REGS = 11;
+localparam int NUM_READ_REGS = 12;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -291,6 +294,8 @@ assign read_registers[8] = {16'b0, cfg.server_port[15:0], cfg.server_ip};
 assign read_registers[9] = {32'b0, cfg.file_w8};
 // Request-ring occupancy. The host's credit before it may push another START. See the map above.
 assign read_registers[10] = {32'b0, inflight_word};
+// Which stage stalled, so a full ring can be told apart from a dead connect. See handler.sv.
+assign read_registers[11] = {32'b0, stall_word};
 
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
 

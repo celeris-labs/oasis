@@ -85,9 +85,12 @@ module http_pipeline_tb #(
     logic [LANES-1:0] body_tkeep;
     logic             body_tlast;
 
-    logic [31:0] total_word, inflight_word;
+    logic [31:0] total_word, inflight_word, stall_word;
 
-    handler #(.NUM_SLOTS(NUM_SLOTS)) dut (
+    // STALL_CYCLES shrunk so the watchdog is reachable in a simulation: the default is
+    // ~1.07 s of hardware time. 20000 cycles is far longer than any healthy stage here
+    // (the slowest is the 700-cycle server think-time) so a passing run must not trip it.
+    handler #(.NUM_SLOTS(NUM_SLOTS), .STALL_CYCLES(20000)) dut (
         .ap_clk  (clk),
         .ap_rst_n(rst_n),
 
@@ -152,6 +155,7 @@ module http_pipeline_tb #(
         .debug_req_cnt      (),
         .totalWord          (total_word),
         .inflightWord       (inflight_word),
+        .stallWord          (stall_word),
         .state_debug        ()
     );
 
@@ -635,7 +639,13 @@ module http_pipeline_tb #(
         end
 
         $display("--------------------------------------------------------------");
+        // A healthy run must not trip any stage watchdog.
+        if (stall_word[4:0] != 5'd0) begin
+            $error("stage stall/error flags set on a healthy run: stallWord=0x%08x", stall_word);
+            errors++;
+        end
         $display("bodies checked      : %0d / %0d", bodies_seen, NUM_REQS);
+        $display("stallWord           : 0x%08x (flags [4:0] must be 0; upper bytes are slot indices)", stall_word);
         $display("max open sessions   : %0d (NUM_SLOTS = %0d)", max_open_sessions, NUM_SLOTS);
         for (int k = 1; k < NUM_REQS; k++) begin
             $display("  GET[%0d] at %0t vs body[%0d] done at %0t -> overlap %0s",

@@ -172,6 +172,46 @@ than six hours later on the wire.
 | NULLs | **not supported.** The decoder is configured from `num_values`, which counts NULLs, but the page only holds the non-null values, so the read hangs waiting for values that do not exist. TPC-H is unaffected (no NULLs) |
 | Trailing page bytes | a data page carrying padding past the last declared value hangs the decoder. `fastparquet` emits exactly 8 such bytes per page; DuckDB-written files are fine |
 
+### Ephemeral port exhaustion (unfixed, and it will bite a benchmark run)
+
+Every column chunk is a separate connection, and the TOE has **512 ephemeral ports** — ports
+32768–33279, `pt_cursor` wrapping at `TCP_STACK_MAX_SESSIONS`
+(`toe/port_table/port_table.cpp`, `toe/CMakeLists.txt:16`). It releases each one the instant the
+connection closes, with no quiet time. Because the request says `Connection: close`, the **server**
+closes first and therefore holds the 4-tuple in `TIME_WAIT` for 60 s.
+
+Any run that exceeds 512 connections in under a minute reuses a port the server still owns. The
+TOE's ISN is random and uncorrelated with that port's previous sequence space
+(`tx_engine.cpp:541`), so Linux usually refuses to recycle the `TIME_WAIT` socket and answers with a
+challenge ACK. That ACK reaches `rx_engine.cpp:1078`, which writes `clearRetransmitTimer` **one line
+above** the state check that excludes `SYN_SENT`, and the timer update zeroes the retry counter
+unconditionally (`retransmit_timer.cpp:102`). The retry count never reaches its limit of 4, the SYN
+is re-sent at ~1.25 s forever, and `openStatus` is never emitted — so `tcp_init` does not even
+report an error, it simply never completes.
+
+Symptoms: the CONNECT stage stalls with no `init_error`. `HttpConfig` read register 11 reports
+exactly that, and the host's credit timeout names it. **The port cursor lives in the bitstream, so
+the count is cumulative since programming** — restarting DuckDB does not reset it.
+
+No single hand-typed query reaches 512 (49 row groups × ≤8 columns), which is why interactive use
+looks fine; a full `scripts/throughput.sh` run needs ~2,500 and crosses the threshold partway
+through. The script now estimates the count up front and warns.
+
+What actually helps, in order:
+
+1. **Fewer, larger row groups.** `ROW_GROUP_SIZE 1000000` takes a full benchmark run from ~2,500
+   connections to ~350 — under the pool — with no hardware change. This is the only mitigation
+   available today.
+2. **Keep-alive**, which removes the reuse window rather than delaying it. See above for why it is
+   not done yet.
+3. **A monotonic ISN** (`tx_engine.cpp:541`) makes a collision survivable rather than fatal, and
+   **moving the `clearRetransmitTimer` write inside the state check** turns an infinite SYN retry
+   into a reported failure after ~31 s. Both are HLS changes needing a TOE re-run.
+
+Raising `TCP_STACK_MAX_SESSIONS` is *not* a fix: covering a 60 s peer `TIME_WAIT` at ~1 ms per
+request needs ~60,000 ports and only 32,768 exist above 32768. A connection-per-request model cannot
+outrun that at any pool size.
+
 ### When a read hangs
 
 On a pipelined bitstream, `HTTPReadConfig::read` waits for a free request slot and throws after 30 s

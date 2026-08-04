@@ -136,7 +136,45 @@ RG=$(row_groups)
 echo " row groups: ${RG:-unknown}"
 echo "=============================================================================="
 
+# ---------------------------------------------------------------------------------------------
+# Connection budget.
+#
+# Every column chunk is its own ranged GET on its own TCP connection (the request says
+# `Connection: close`; keep-alive is not implemented). The TOE hands out ephemeral ports from a
+# pool of exactly TCP_STACK_MAX_SESSIONS = 512 -- ports 32768..33279, cursor wrapping at 512 --
+# and releases each one the moment the connection closes, with no quiet time. The server closes
+# first, so IT holds the 4-tuple in TIME_WAIT for 60 s.
+#
+# So once a run exceeds 512 connections, every reused port lands on a tuple the server still owns.
+# The TOE presents a random ISN, Linux usually refuses to recycle the TIME_WAIT socket, and the
+# resulting challenge ACK resets the SYN retry counter in the TOE's rx engine -- so the SYN is
+# retried forever and openStatus never arrives. The handler waits in CONNECT and the query dies on
+# the host-side credit timeout.
+#
+# The cursor lives in the bitstream, so this count is CUMULATIVE SINCE PROGRAMMING. Restarting
+# duckdb does not reset it; reprogramming does.
+# ---------------------------------------------------------------------------------------------
+PORT_POOL=512
 [ "$WORKLOAD" = all ] && WORKLOADS="latency q6 q1 wide" || WORKLOADS="$WORKLOAD"
+total_cols=0
+for w in $WORKLOADS; do
+    total_cols=$((total_cols + $(q_cols "$w")))
+done
+CONNS=$((total_cols * ${RG:-0} * REPEAT))
+echo " estimated ranged GETs (== TCP connections) for this run: $CONNS"
+if [ "$CONNS" -ge "$PORT_POOL" ]; then
+    cat <<EOF
+ !! This run needs $CONNS connections but the FPGA only has $PORT_POOL ephemeral ports, and the
+ !! count is cumulative since the bitstream was programmed. It WILL wrap into the server's 60 s
+ !! TIME_WAIT and is likely to wedge partway through with a stalled CONNECT.
+ !!
+ !! Until keep-alive exists, the fix is fewer connections, i.e. fewer/larger row groups:
+ !!   COPY tbl TO 'x.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000000);
+ !! At ~1M-row groups this file would need about $((total_cols * 7 * REPEAT)) connections instead.
+ !! Reprogram the bitstream before the run to start from a fresh port cursor.
+EOF
+fi
+echo "=============================================================================="
 
 for w in $WORKLOADS; do
     cols=$(q_cols "$w")

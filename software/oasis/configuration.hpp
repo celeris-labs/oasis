@@ -108,6 +108,34 @@ class HTTPReadConfig : public libstf::Config {
     };
     HTTPInflight inflight();
 
+    /**
+     * Read CSR 11: which pipeline stage stopped making progress (`stallWord` in handler.sv).
+     *
+     * A full request ring says the pipeline stopped draining but not where. This says where, which
+     * matters because the stages fail for very different reasons. In particular a stalled CONNECT
+     * with no `init_error` is the signature of ephemeral-port reuse: the TOE's pool is
+     * TCP_STACK_MAX_SESSIONS (512) ports at 32768..33279 and it releases them with no quiet time,
+     * while the peer -- which closes first, because the request says `Connection: close` -- holds
+     * the old 4-tuple in TIME_WAIT for 60s. On reuse the TOE presents a random ISN, Linux usually
+     * refuses to recycle, and the resulting challenge ACK resets the SYN retry counter in
+     * rx_engine, so the SYN is retried forever and openStatus is never emitted at all.
+     */
+    struct HTTPStall {
+        bool connect_stalled = false;
+        bool send_stalled    = false;
+        bool read_stalled    = false;
+        bool init_error      = false;
+        bool send_error      = false;
+        uint8_t connect_slot = 0;
+        uint8_t read_slot    = 0;
+
+        bool any() const {
+            return connect_stalled || send_stalled || read_stalled || init_error || send_error;
+        }
+        std::string describe() const;
+    };
+    HTTPStall stall();
+
     /// Requests the hardware can hold at once (0 on a pre-pipelining bitstream). Cached after the
     /// first read; the value is fixed by the bitstream.
     uint8_t num_slots();

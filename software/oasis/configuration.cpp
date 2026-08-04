@@ -99,6 +99,7 @@ constexpr const uint32_t HTTP_ECHO_RANGE_END   = 7;
 constexpr const uint32_t HTTP_ECHO_SERVER      = 8;
 constexpr const uint32_t HTTP_ECHO_FILE_W8     = 9;
 constexpr const uint32_t HTTP_INFLIGHT         = 10;
+constexpr const uint32_t HTTP_STALL            = 11;
 
 // How long to wait for a request slot before giving up. Reaching this means the pipeline stopped
 // draining -- a response that never arrived, or a connection that never opened -- so it is a
@@ -181,9 +182,8 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
                 msg << "FPGA HTTP request ring has been full for "
                     << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
                     << "s [" << flight.describe() << "; " << describe_status(debug_status())
-                    << "]. The pipeline has stopped draining: a response never arrived or a "
-                       "connection never opened. There is no reset register -- reprogram the "
-                       "bitstream to clear it.";
+                    << "]. The pipeline has stopped draining -- " << stall().describe()
+                    << ". There is no reset register -- reprogram the bitstream to clear it.";
                 throw std::runtime_error(msg.str());
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -335,6 +335,44 @@ std::string HTTPReadConfig::HTTPInflight::describe() const {
     oss << "inflight=" << static_cast<unsigned>(occupied) << "/" << static_cast<unsigned>(slots)
         << " pending=0x" << std::hex << static_cast<unsigned>(pending_mask) << " closed=0x"
         << static_cast<unsigned>(closed_mask) << std::dec;
+    return oss.str();
+}
+
+HTTPReadConfig::HTTPStall HTTPReadConfig::stall() {
+    const auto word = static_cast<uint32_t>(read_register(HTTP_STALL).value());
+    HTTPStall s {};
+    s.connect_stalled = (word & (1u << 0)) != 0;
+    s.send_stalled    = (word & (1u << 1)) != 0;
+    s.read_stalled    = (word & (1u << 2)) != 0;
+    s.init_error      = (word & (1u << 3)) != 0;
+    s.send_error      = (word & (1u << 4)) != 0;
+    s.connect_slot    = static_cast<uint8_t>((word >> 8) & 0xFFu);
+    s.read_slot       = static_cast<uint8_t>((word >> 16) & 0xFFu);
+    return s;
+}
+
+std::string HTTPReadConfig::HTTPStall::describe() const {
+    if (!any()) {
+        return "no stage stall reported";
+    }
+    std::ostringstream oss;
+    oss << "stalled:";
+    if (connect_stalled) oss << " CONNECT(slot " << static_cast<unsigned>(connect_slot) << ")";
+    if (send_stalled)    oss << " SEND";
+    if (read_stalled)    oss << " READ(slot " << static_cast<unsigned>(read_slot) << ")";
+    if (init_error)      oss << " init_error";
+    if (send_error)      oss << " send_error";
+
+    // The one failure mode worth naming outright, because it is the common one and nothing else in
+    // the system points at it. See the HTTPStall doc comment for the full chain.
+    if (connect_stalled && !init_error) {
+        oss << ". A connect that stalls without an error means openStatus never arrived at all: "
+               "most likely the TOE reused an ephemeral port (it has 512, at 32768..33279, released "
+               "with no quiet time) while the server still held that 4-tuple in TIME_WAIT, and is "
+               "now retrying the SYN forever. Connections are cumulative since the bitstream was "
+               "programmed, not per process. Fewer, larger row groups reduce the connection count; "
+               "reprogramming resets the port cursor";
+    }
     return oss.str();
 }
 

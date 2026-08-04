@@ -136,6 +136,7 @@ ready_valid_i #(http_config_t) http_start();
 logic [3:0]                    http_client_state;
 logic [31:0]                   http_total_word;
 logic [31:0]                   http_inflight_word;
+logic [31:0]                   http_stall_word;
 
 // 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
 // 8 to 16 words, which put START on top of RANGE_BEGIN_W1: writing that parameter fired the request
@@ -153,7 +154,8 @@ HttpConfig #(
     .start_cfg    (http_start),
     .client_state (http_client_state),
     .total_word   (http_total_word),
-    .inflight_word(http_inflight_word)
+    .inflight_word(http_inflight_word),
+    .stall_word   (http_stall_word)
 );
 `elsif EN_RDMA
 RDMAReadConfig #(
@@ -336,6 +338,7 @@ handler #(
 
     .totalWord                     (http_total_word),
     .inflightWord                  (http_inflight_word),
+    .stallWord                     (http_stall_word),
     .state_debug                   (http_client_state),
 
     .m_axis_body_tvalid  (axi_http_body.tvalid),
