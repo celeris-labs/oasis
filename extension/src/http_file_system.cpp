@@ -139,6 +139,96 @@ uint64_t ParseContentLengthHeader(const string &headers) {
 	return 0;
 }
 
+// Splits a raw reply into status line / headers / body and rejects anything that is not 200 or 206.
+// The HEAD probe and the CPU fallback had a copy of this each; they only differ in `what`.
+HttpReply ParseHttpReply(string raw, const char *what, const string &resource) {
+	HttpReply reply;
+	reply.raw = std::move(raw);
+
+	const auto header_end = reply.raw.find("\r\n\r\n");
+	const auto status_end = reply.raw.find("\r\n");
+	if (header_end == string::npos || status_end == string::npos || reply.raw.rfind("HTTP/", 0) != 0) {
+		throw IOException("%s for '%s': malformed HTTP response", what, resource);
+	}
+
+	reply.status_line = reply.raw.substr(0, status_end);
+	reply.headers = reply.raw.substr(0, header_end);
+	reply.body_off = header_end + 4;
+	reply.partial = reply.status_line.find(" 206 ") != string::npos;
+	if (!reply.partial && reply.status_line.find(" 200 ") == string::npos) {
+		throw IOException("%s for '%s' failed: %s", what, resource, reply.status_line);
+	}
+	return reply;
+}
+
+// The handler is busy (totalWord bit 22 = state != ST_IDLE).
+bool HandlerBusy(uint32_t status) {
+	return (status & (1u << 22)) != 0;
+}
+
+// Polls the handler status for as long as it is alive and prints a summary every three seconds.
+// get_next_stream_output blocks with NO timeout, so without this a stalled FPGA is a silent hang
+// with nothing on stderr at all.
+//
+// Tracks the PEAK handler state and whether it was ever busy across the whole read, which separates
+// "START never fired" (peak stays 0 => a control/trigger bug, no GET on the wire) from "the handler
+// ran but the body was dropped after receive" (peak reaches 1..4 => datapath/DMA bug).
+class HandlerWatchdog {
+public:
+	HandlerWatchdog(oasis::HTTPReadConfig &cfg, size_t expected) : cfg_(cfg), expected_(expected) {
+		thread_ = std::thread([this] { Run(); });
+	}
+	~HandlerWatchdog() {
+		done_.store(true, std::memory_order_relaxed);
+		if (thread_.joinable()) {
+			thread_.join();
+		}
+	}
+	HandlerWatchdog(const HandlerWatchdog &) = delete;
+	HandlerWatchdog &operator=(const HandlerWatchdog &) = delete;
+
+	void Progress(size_t copied) {
+		copied_.store(copied, std::memory_order_relaxed);
+	}
+
+private:
+	void Run() {
+		uint32_t peak_state = 0;
+		bool ever_busy = false;
+		int ms = 0;
+		int next_bark_ms = 3000;
+		// Poll fast so we catch the handler in flight even if it runs and returns to IDLE in well
+		// under a second.
+		while (!done_.load(std::memory_order_relaxed)) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			ms++;
+			uint32_t status = 0;
+			try {
+				status = cfg_.debug_status();
+			} catch (...) {
+				continue;
+			}
+			peak_state = std::max(peak_state, status & 0xFu);
+			ever_busy = ever_busy || HandlerBusy(status);
+			if (ms >= next_bark_ms) {
+				next_bark_ms += 3000;
+				std::fprintf(stderr,
+				             "[httpfpga] WATCHDOG %ds: waiting, copied=%llu/%llu | THIS READ peak: "
+				             "handler_max=%u ever_busy=%d | now=[%s]\n",
+				             ms / 1000, (unsigned long long)copied_.load(),
+				             (unsigned long long)expected_, peak_state, ever_busy ? 1 : 0,
+				             DecodeHttpFpgaStatus(status).c_str());
+			}
+		}
+	}
+
+	oasis::HTTPReadConfig &cfg_;
+	size_t expected_;
+	std::atomic<bool> done_ {false};
+	std::atomic<size_t> copied_ {0};
+	std::thread thread_;
+};
+
 } // namespace
 
 HTTPFileSystem::HTTPFileSystem(DatabaseInstance &instance) : instance(instance) {
@@ -232,10 +322,30 @@ idx_t HTTPFileSystem::SeekPosition(FileHandle &handle) {
 	return handle.Cast<HTTPFileHandle>().cursor;
 }
 
+// Returns the object's Content-Length, issuing at most one HEAD per path for the session.
+uint64_t HTTPFileSystem::CachedContentLength(const string &resource_path) {
+	{
+		std::lock_guard<std::mutex> lock(size_cache_mtx_);
+		auto it = size_cache_.find(resource_path);
+		if (it != size_cache_.end()) {
+			return it->second;
+		}
+	}
+
+	// Probe outside the lock: ProbeContentLength does a blocking socket round trip, and holding the
+	// cache mutex across it would serialise every worker's first open. A concurrent probe of the
+	// same path is harmless -- both compute the same value and the second insert is a no-op.
+	const auto size = ProbeContentLength(resource_path);
+
+	std::lock_guard<std::mutex> lock(size_cache_mtx_);
+	size_cache_.emplace(resource_path, size);
+	return size;
+}
+
 int64_t HTTPFileSystem::GetFileSize(FileHandle &handle) {
 	auto &h = handle.Cast<HTTPFileHandle>();
 	if (h.known_file_size == 0) {
-		h.known_file_size = ProbeContentLength(h.path);
+		h.known_file_size = CachedContentLength(h.path);
 	}
 	return static_cast<int64_t>(h.known_file_size);
 }
@@ -289,40 +399,31 @@ bool HTTPFileSystem::HttpSocketRequest(const std::string &request, std::string &
 	return true;
 }
 
-void HTTPFileSystem::HTTPReadRangeCpu(const string &path, uint64_t offset, size_t size, void *dst) {
-	const auto http_path = NormalizeHttpPath(path);
-	const uint64_t range_end = offset + size - 1;
-	const auto request = "GET " + http_path + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
-	                     std::to_string(server_port_) + "\r\nRange: bytes=" + std::to_string(offset) + "-" +
-	                     std::to_string(range_end) + "\r\nConnection: close\r\n\r\n";
-
+HttpReply HTTPFileSystem::HttpExchange(const string &request, const char *what, const string &resource) {
 	string response;
 	if (!HttpSocketRequest(request, response)) {
-		throw IOException("CPU-fallback GET failed for '%s' (socket error to %s:%u)", path, server_host_,
-		                  server_port_);
+		throw IOException("%s for '%s': socket error to %s:%u", what, resource, server_host_, server_port_);
 	}
+	return ParseHttpReply(std::move(response), what, resource);
+}
 
-	const auto header_end = response.find("\r\n\r\n");
-	const auto status_line_end = response.find("\r\n");
-	if (header_end == string::npos || status_line_end == string::npos || response.rfind("HTTP/", 0) != 0) {
-		throw IOException("CPU-fallback: invalid HTTP response for '%s'", path);
-	}
-	const auto status_line = response.substr(0, status_line_end);
-	const bool partial = status_line.find(" 206 ") != string::npos;
-	if (!partial && status_line.find(" 200 ") == string::npos) {
-		throw IOException("CPU-fallback GET for '%s' failed: %s", path, status_line);
-	}
+void HTTPFileSystem::HTTPReadRangeCpu(const string &path, uint64_t offset, size_t size, void *dst) {
+	const uint64_t range_end = offset + size - 1;
+	const auto request = "GET " + NormalizeHttpPath(path) + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
+	                     std::to_string(server_port_) + "\r\nRange: bytes=" + std::to_string(offset) + "-" +
+	                     std::to_string(range_end) + "\r\nConnection: close\r\n\r\n";
+	const auto reply = HttpExchange(request, "CPU-fallback GET", path);
 
 	// 206 -> body is exactly the requested range. 200 -> the server ignored Range and sent the whole
 	// object, so index into it at `offset`.
-	const size_t body_off = header_end + 4 + (partial ? 0 : static_cast<size_t>(offset));
-	if (response.size() < body_off + size) {
+	const size_t body_off = reply.body_off + (reply.partial ? 0 : static_cast<size_t>(offset));
+	if (reply.raw.size() < body_off + size) {
 		throw IOException("CPU-fallback short body for '%s' range=[%llu,%llu]: have %llu, need %llu", path,
 		                  (unsigned long long)offset, (unsigned long long)range_end,
-		                  (unsigned long long)(response.size() - std::min(response.size(), body_off)),
+		                  (unsigned long long)(reply.raw.size() - std::min(reply.raw.size(), body_off)),
 		                  (unsigned long long)size);
 	}
-	std::memcpy(dst, response.data() + body_off, size);
+	std::memcpy(dst, reply.raw.data() + body_off, size);
 
 	if (HttpFpgaDebugEnabled()) {
 		std::fprintf(stderr, "[httpfpga] CPU-fallback read path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
@@ -335,31 +436,11 @@ uint64_t HTTPFileSystem::ProbeContentLength(const string &resource_path) {
 		throw IOException("httpfpga:// filesystem is not initialized");
 	}
 
-	const auto http_path = NormalizeHttpPath(resource_path);
-	const auto request = "HEAD " + http_path + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
-	                     std::to_string(server_port_) + "\r\nConnection: close\r\n\r\n";
+	const auto request = "HEAD " + NormalizeHttpPath(resource_path) + " HTTP/1.1\r\nHost: " + server_host_ +
+	                     ":" + std::to_string(server_port_) + "\r\nConnection: close\r\n\r\n";
+	const auto reply = HttpExchange(request, "HTTP HEAD", resource_path);
 
-	string response;
-	if (!HttpSocketRequest(request, response)) {
-		throw IOException("Failed to probe size of '%s' (socket error to %s:%u)", resource_path,
-		                  server_host_, server_port_);
-	}
-
-	const auto header_end = response.find("\r\n\r\n");
-	if (header_end == string::npos) {
-		throw IOException("Invalid HTTP response probing size of '%s'", resource_path);
-	}
-
-	const auto status_line_end = response.find("\r\n");
-	if (status_line_end == string::npos || response.rfind("HTTP/", 0) != 0) {
-		throw IOException("Invalid HTTP status line probing size of '%s'", resource_path);
-	}
-	const auto status_line = response.substr(0, status_line_end);
-	if (status_line.find(" 200 ") == string::npos && status_line.find(" 206 ") == string::npos) {
-		throw IOException("HTTP HEAD for '%s' failed: %s", resource_path, status_line);
-	}
-
-	const auto content_length = ParseContentLengthHeader(response.substr(0, header_end));
+	const auto content_length = ParseContentLengthHeader(reply.headers);
 	if (content_length == 0) {
 		throw IOException("HTTP server did not return Content-Length for '%s'", resource_path);
 	}
@@ -440,6 +521,23 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 	// returns the whole body across however many TCP segments it spans.
 	std::lock_guard<std::mutex> lock(mtx);
 
+	// The handler samples runTx only in ST_IDLE (hardware/src/hdl/http_read/handler.sv). runTx is a
+	// one-cycle pulse, so a START written while the handler is mid-transfer is dropped on the floor
+	// and never retried -- the read below would then block forever on a buffer nothing will ever
+	// fill. A previous request that stalled (or a query cancelled with Ctrl-C between trigger and
+	// drain) leaves it exactly there, and there is no reset CSR: nothing short of reprogramming the
+	// bitstream returns it to IDLE. Detect it here instead of hanging, since the wedge outlives the
+	// process and every later run inherits it -- the tell is an unchanged sid across runs, because
+	// session_id_q only moves when a fresh tcp_init completes.
+	const auto pre_status = http_cfg->debug_status();
+	if (HandlerBusy(pre_status)) {
+		throw IOException("httpfpga: the FPGA HTTP handler is still busy from an earlier request "
+		                  "[%s], and it only accepts a new request from its IDLE state -- this read "
+		                  "would be silently dropped and then hang. There is no reset register; "
+		                  "reprogram the bitstream to clear it.",
+		                  DecodeHttpFpgaStatus(pre_status));
+	}
+
 	// Enqueue the destination buffer BEFORE triggering the request. The trigger is a posted CSR
 	// write, so the FPGA can start writing body bytes as soon as the response arrives; if no buffer
 	// has been enqueued for the bypass stream at that point, the StreamWriter targets whatever
@@ -466,68 +564,12 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		             http_cfg->request_echo().describe().c_str());
 	}
 
-	// Watchdog: get_next_stream_output blocks with NO timeout, so if the FPGA never reaches its
-	// transfer-done/flush condition — e.g. the server keeps the socket open, or the closing TCP
-	// notification never matches this session and tcp_read parks in ST_WAIT_NOTIFY — this read hangs
-	// forever with no output at all. When debug is on, a side thread periodically dumps the handler
-	// FSM status so a hang self-reports which state it is stuck in (the `read` nibble: 7=WAIT_NOTIFY,
-	// 9=RECV_DATA, 10=FINISH) and how many body bytes have landed (0 => notification/session issue,
-	// >0 => stuck on completion). Read-only CSR poll on a distinct register; the drain thread is
-	// blocked on an interrupt, not touching these CSRs.
-	std::atomic<bool> drain_done {false};
-	std::atomic<size_t> copied_seen {0};
-	std::thread watchdog;
+	// Reports which state a stall is parked in (the `read` nibble: 7=WAIT_NOTIFY, 9=RECV_DATA,
+	// 10=FINISH) and how many body bytes have landed. Stops and joins on every exit path.
+	unique_ptr<HandlerWatchdog> watchdog;
 	if (HttpFpgaDebugEnabled()) {
-		watchdog = std::thread([&]() {
-			// Poll fast (1 ms) so we catch the handler in-flight even if it runs and returns to IDLE
-			// in well under a second. Track the PEAK handler state (totalWord[3:0]) and whether it
-			// was ever "busy" (bit 22 = state != IDLE) across this whole read. That distinguishes
-			// "START never fired the handler" (peak stays 0, never busy => a control/trigger bug, no
-			// GET on the wire) from "handler ran but the body was dropped after receive" (peak
-			// reaches 1/2/3/4 => datapath/DMA bug).
-			uint32_t peak_state = 0;
-			bool ever_busy = false;
-			uint32_t last_status = 0;
-			int ms = 0;
-			int next_bark_ms = 3000;
-			while (!drain_done.load(std::memory_order_relaxed)) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-				ms++;
-				try {
-					last_status = http_cfg->debug_status();
-				} catch (...) {
-					continue;
-				}
-				const uint32_t hstate = last_status & 0xF;
-				if (hstate > peak_state) {
-					peak_state = hstate;
-				}
-				if (last_status & (1u << 22)) {
-					ever_busy = true;
-				}
-				if (ms >= next_bark_ms) {
-					next_bark_ms += 3000;
-					std::fprintf(stderr,
-					             "[httpfpga] WATCHDOG %ds: waiting, copied=%llu/%llu | THIS READ peak: "
-					             "handler_max=%u ever_busy=%d | now=[%s]\n",
-					             ms / 1000, (unsigned long long)copied_seen.load(),
-					             (unsigned long long)size, peak_state, ever_busy ? 1 : 0,
-					             DecodeHttpFpgaStatus(last_status).c_str());
-				}
-			}
-		});
+		watchdog = make_uniq<HandlerWatchdog>(*http_cfg, size);
 	}
-	// Stop and join the watchdog on every exit path (normal return or throw).
-	struct WatchdogGuard {
-		std::atomic<bool> &done;
-		std::thread &thr;
-		~WatchdogGuard() {
-			done.store(true, std::memory_order_relaxed);
-			if (thr.joinable()) {
-				thr.join();
-			}
-		}
-	} watchdog_guard {drain_done, watchdog};
 
 	// Drain all buffers for this transfer. A body that fits one FPGA buffer is one iteration; larger
 	// ranges are chunked across multiple buffers, each surfaced via its own interrupt. These calls
@@ -547,7 +589,9 @@ void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t s
 		}
 		std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
 		copied += buf->size;
-		copied_seen.store(copied, std::memory_order_relaxed);
+		if (watchdog) {
+			watchdog->Progress(copied);
+		}
 	}
 	if (copied != size) {
 		// Debug triage: dump the bytes the FPGA actually delivered so they can be diffed against the

@@ -19,7 +19,7 @@ typedef struct packed {
     logic [31:0] ip_hex_w1;
     logic [31:0] ip_hex_w2;
     logic [31:0] ip_hex_w3;
-    logic [31:0] file_len;      // Number of bytes of the GET path (0..32)
+    logic [31:0] file_len;      // Number of bytes of the GET path (0..64)
     logic [31:0] file_w0;
     logic [31:0] file_w1;
     logic [31:0] file_w2;
@@ -28,6 +28,14 @@ typedef struct packed {
     logic [31:0] file_w5;
     logic [31:0] file_w6;
     logic [31:0] file_w7;
+    logic [31:0] file_w8;
+    logic [31:0] file_w9;
+    logic [31:0] file_w10;
+    logic [31:0] file_w11;
+    logic [31:0] file_w12;
+    logic [31:0] file_w13;
+    logic [31:0] file_w14;
+    logic [31:0] file_w15;
     // Range endpoints are absolute file offsets, so they need to span the whole
     // file: 4 words = 16 ASCII digits (~8.9 PiB).
     logic [7:0]  range_begin_len; // ASCII digit count for Range start (0..16)

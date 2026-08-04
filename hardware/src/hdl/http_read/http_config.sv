@@ -30,29 +30,30 @@ import http_types::*;
 //   6  IP_HEX_W2
 //   7  IP_HEX_W3
 //   8  FILE_LEN         ([31:0])     -- Length of GET path
-//   9  FILE_W0..16      ([31:0])     -- Path bytes packed little endian
-//   10 FILE_W1
-//   11 FILE_W2
-//   12 FILE_W3
-//   13 FILE_W4
-//   14 FILE_W5
-//   15 FILE_W6
-//   16 FILE_W7
-//   17 NUM_SESSIONS     ([15:0])
-//   18 PKG_WORD_COUNT   ([31:0])
-//   19 USER_FREQUENCY   ([31:0])
-//   20 TIME_IN_SECONDS  ([31:0])
-//   21 RANGE_BEGIN_LEN  ([7:0])
-//   22 RANGE_BEGIN_W0   ([31:0])
-//   23 RANGE_BEGIN_W1   ([31:0])
-//   24 RANGE_BEGIN_W2   ([31:0])
-//   25 RANGE_BEGIN_W3   ([31:0])
-//   26 RANGE_END_LEN    ([7:0])
-//   27 RANGE_END_W0     ([31:0])
-//   28 RANGE_END_W1     ([31:0])
-//   29 RANGE_END_W2     ([31:0])
-//   30 RANGE_END_W3     ([31:0])
-//   31 START            (ConfigWriteReadyRegister)  -- value ignored, write triggers
+//   9  FILE_W0          ([31:0])     -- Path bytes packed little endian
+//   .. FILE_W1..W14                     (9 + n for word n)
+//   24 FILE_W15
+//   25 NUM_SESSIONS     ([15:0])
+//   26 PKG_WORD_COUNT   ([31:0])
+//   27 USER_FREQUENCY   ([31:0])
+//   28 TIME_IN_SECONDS  ([31:0])
+//   29 RANGE_BEGIN_LEN  ([7:0])
+//   30 RANGE_BEGIN_W0   ([31:0])
+//   31 RANGE_BEGIN_W1   ([31:0])
+//   32 RANGE_BEGIN_W2   ([31:0])
+//   33 RANGE_BEGIN_W3   ([31:0])
+//   34 RANGE_END_LEN    ([7:0])
+//   35 RANGE_END_W0     ([31:0])
+//   36 RANGE_END_W1     ([31:0])
+//   37 RANGE_END_W2     ([31:0])
+//   38 RANGE_END_W3     ([31:0])
+//   39 START            (ConfigWriteReadyRegister)  -- value ignored, write triggers
+//
+// The 16 FILE_W words carry a 64-character GET path. Widening from 8 words pushed the map past
+// 32 registers, so HTTP_CONFIG_ADDR_SPACE in vfpga_top.svh is 64 and every address after FILE_W7
+// shifted by +8. software/oasis/configuration.cpp mirrors this map exactly -- if the two ever
+// disagree, every parameter after the path lands in the wrong register and the FPGA builds a
+// garbage request out of whatever happened to be there.
 //
 // Register map (read side):
 //   0  HTTP_CONFIG_ID
@@ -61,13 +62,14 @@ import http_types::*;
 //   3  ECHO_FILE_LEN    ([31:0])
 //   4  ECHO_FILE_W0     ([31:0])     -- path chars 0..3
 //   5  ECHO_FILE_W4     ([31:0])     -- path chars 16..19
+//   9  ECHO_FILE_W8     ([31:0])     -- path chars 32..35 (only meaningful for long paths)
 //   6  ECHO_RANGE_BEGIN ([39:32] len, [31:0] first 4 ASCII digits)
 //   7  ECHO_RANGE_END   ([39:32] len, [31:0] first 4 ASCII digits)
 //   8  ECHO_SERVER      ([47:32] port, [31:0] ip)
 // =================================================================================================
 module HttpConfig #(
-    parameter integer NUM_PARAM_REGS = 31,
-    parameter integer START_ADDR     = 31
+    parameter integer NUM_PARAM_REGS = 39,
+    parameter integer START_ADDR     = 39
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -94,6 +96,17 @@ module HttpConfig #(
 
 localparam logic [AXIL_DATA_BITS - 1:0] HTTP_CONFIG_ID = 64'h0000_0000_0048_5454; // "HTT"
 
+// The map below is hardcoded in the ConfigWriteRegister instantiations, so these parameters cannot
+// move it -- they only place START and size the address space. An instantiation that leaves them at
+// a stale value drops START on top of a parameter register, and a write to that parameter then fires
+// the request mid-configuration: every register after it keeps its previous value while the read-side
+// echo, which reads the LIVE cfg rather than the snapshot the handler took, still shows the correct
+// values. build-88 shipped exactly that (START_ADDR=31, i.e. RANGE_BEGIN_W1). Catch it at elaboration
+// rather than on the wire.
+localparam int LAST_PARAM_ADDR = 38;
+`ASSERT_ELAB(START_ADDR > LAST_PARAM_ADDR)
+`ASSERT_ELAB(NUM_PARAM_REGS > LAST_PARAM_ADDR)
+
 // -------------------------------------------------------------------------------------------------
 // Per-field write registers. Each ConfigWriteRegister latches the AXI-Lite
 // data into its output on a write to its assigned address.
@@ -115,6 +128,14 @@ data64_t reg_file_w4;
 data64_t reg_file_w5;
 data64_t reg_file_w6;
 data64_t reg_file_w7;
+data64_t reg_file_w8;
+data64_t reg_file_w9;
+data64_t reg_file_w10;
+data64_t reg_file_w11;
+data64_t reg_file_w12;
+data64_t reg_file_w13;
+data64_t reg_file_w14;
+data64_t reg_file_w15;
 data64_t reg_num_sessions;
 data64_t reg_pkg_word_count;
 data64_t reg_user_frequency;
@@ -147,20 +168,28 @@ ConfigWriteRegister #(13, data64_t) inst_reg_file_w4          (clk, write_config
 ConfigWriteRegister #(14, data64_t) inst_reg_file_w5          (clk, write_config, reg_file_w5);
 ConfigWriteRegister #(15, data64_t) inst_reg_file_w6          (clk, write_config, reg_file_w6);
 ConfigWriteRegister #(16, data64_t) inst_reg_file_w7          (clk, write_config, reg_file_w7);
-ConfigWriteRegister #(17, data64_t) inst_reg_num_sessions     (clk, write_config, reg_num_sessions);
-ConfigWriteRegister #(18, data64_t) inst_reg_pkg_word_count   (clk, write_config, reg_pkg_word_count);
-ConfigWriteRegister #(19, data64_t) inst_reg_user_frequency   (clk, write_config, reg_user_frequency);
-ConfigWriteRegister #(20, data64_t) inst_reg_time_in_seconds  (clk, write_config, reg_time_in_seconds);
-ConfigWriteRegister #(21, data64_t) inst_reg_range_begin_len    (clk, write_config, reg_range_begin_len);
-ConfigWriteRegister #(22, data64_t) inst_reg_range_begin_w0     (clk, write_config, reg_range_begin_w0);
-ConfigWriteRegister #(23, data64_t) inst_reg_range_begin_w1     (clk, write_config, reg_range_begin_w1);
-ConfigWriteRegister #(24, data64_t) inst_reg_range_begin_w2     (clk, write_config, reg_range_begin_w2);
-ConfigWriteRegister #(25, data64_t) inst_reg_range_begin_w3     (clk, write_config, reg_range_begin_w3);
-ConfigWriteRegister #(26, data64_t) inst_reg_range_end_len      (clk, write_config, reg_range_end_len);
-ConfigWriteRegister #(27, data64_t) inst_reg_range_end_w0       (clk, write_config, reg_range_end_w0);
-ConfigWriteRegister #(28, data64_t) inst_reg_range_end_w1       (clk, write_config, reg_range_end_w1);
-ConfigWriteRegister #(29, data64_t) inst_reg_range_end_w2       (clk, write_config, reg_range_end_w2);
-ConfigWriteRegister #(30, data64_t) inst_reg_range_end_w3       (clk, write_config, reg_range_end_w3);
+ConfigWriteRegister #(17, data64_t) inst_reg_file_w8          (clk, write_config, reg_file_w8);
+ConfigWriteRegister #(18, data64_t) inst_reg_file_w9          (clk, write_config, reg_file_w9);
+ConfigWriteRegister #(19, data64_t) inst_reg_file_w10         (clk, write_config, reg_file_w10);
+ConfigWriteRegister #(20, data64_t) inst_reg_file_w11         (clk, write_config, reg_file_w11);
+ConfigWriteRegister #(21, data64_t) inst_reg_file_w12         (clk, write_config, reg_file_w12);
+ConfigWriteRegister #(22, data64_t) inst_reg_file_w13         (clk, write_config, reg_file_w13);
+ConfigWriteRegister #(23, data64_t) inst_reg_file_w14         (clk, write_config, reg_file_w14);
+ConfigWriteRegister #(24, data64_t) inst_reg_file_w15         (clk, write_config, reg_file_w15);
+ConfigWriteRegister #(25, data64_t) inst_reg_num_sessions     (clk, write_config, reg_num_sessions);
+ConfigWriteRegister #(26, data64_t) inst_reg_pkg_word_count   (clk, write_config, reg_pkg_word_count);
+ConfigWriteRegister #(27, data64_t) inst_reg_user_frequency   (clk, write_config, reg_user_frequency);
+ConfigWriteRegister #(28, data64_t) inst_reg_time_in_seconds  (clk, write_config, reg_time_in_seconds);
+ConfigWriteRegister #(29, data64_t) inst_reg_range_begin_len    (clk, write_config, reg_range_begin_len);
+ConfigWriteRegister #(30, data64_t) inst_reg_range_begin_w0     (clk, write_config, reg_range_begin_w0);
+ConfigWriteRegister #(31, data64_t) inst_reg_range_begin_w1     (clk, write_config, reg_range_begin_w1);
+ConfigWriteRegister #(32, data64_t) inst_reg_range_begin_w2     (clk, write_config, reg_range_begin_w2);
+ConfigWriteRegister #(33, data64_t) inst_reg_range_begin_w3     (clk, write_config, reg_range_begin_w3);
+ConfigWriteRegister #(34, data64_t) inst_reg_range_end_len      (clk, write_config, reg_range_end_len);
+ConfigWriteRegister #(35, data64_t) inst_reg_range_end_w0       (clk, write_config, reg_range_end_w0);
+ConfigWriteRegister #(36, data64_t) inst_reg_range_end_w1       (clk, write_config, reg_range_end_w1);
+ConfigWriteRegister #(37, data64_t) inst_reg_range_end_w2       (clk, write_config, reg_range_end_w2);
+ConfigWriteRegister #(38, data64_t) inst_reg_range_end_w3       (clk, write_config, reg_range_end_w3);
 
 // -------------------------------------------------------------------------------------------------
 // Live snapshot bus. handler.sv samples whichever fields it needs from `cfg`.
@@ -183,6 +212,14 @@ always_comb begin
     cfg.file_w5         = reg_file_w5        [31:0];
     cfg.file_w6         = reg_file_w6        [31:0];
     cfg.file_w7         = reg_file_w7        [31:0];
+    cfg.file_w8         = reg_file_w8        [31:0];
+    cfg.file_w9         = reg_file_w9        [31:0];
+    cfg.file_w10        = reg_file_w10       [31:0];
+    cfg.file_w11        = reg_file_w11       [31:0];
+    cfg.file_w12        = reg_file_w12       [31:0];
+    cfg.file_w13        = reg_file_w13       [31:0];
+    cfg.file_w14        = reg_file_w14       [31:0];
+    cfg.file_w15        = reg_file_w15       [31:0];
     cfg.num_sessions    = reg_num_sessions   [15:0];
     cfg.pkg_word_count  = reg_pkg_word_count [31:0];
     cfg.user_frequency  = reg_user_frequency [31:0];
@@ -227,7 +264,7 @@ assign start_raw.ready = start_cfg.ready;
 // discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
 // ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-localparam int NUM_READ_REGS = 9;
+localparam int NUM_READ_REGS = 10;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -240,6 +277,9 @@ assign read_registers[5] = {32'b0, cfg.file_w4};
 assign read_registers[6] = {24'b0, cfg.range_begin_len, cfg.range_begin_w0};
 assign read_registers[7] = {24'b0, cfg.range_end_len,   cfg.range_end_w0};
 assign read_registers[8] = {16'b0, cfg.server_port[15:0], cfg.server_ip};
+// Path chars 32..35. With 64-character paths the two prefixes under test can now agree all the way
+// through file_w4, so w0/w4 alone no longer discriminate between two long paths.
+assign read_registers[9] = {32'b0, cfg.file_w8};
 
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
 

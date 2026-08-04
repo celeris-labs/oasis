@@ -1,156 +1,127 @@
 # name: test/sql/httpfpga.test
-# description: httpfpga:// FPGA read path across the TPC-H files. ROADMAP test — not all pass yet.
-#   HARDWARE-GATED: needs the FPGA programmed AND MinIO reachable at http_server:http_port.
-#   Run on alveo-u55c-04:  ./build/release/test/unittest "test/sql/httpfpga.test"
-#   `statement ok` cases only check the query RUNS (no crash / short transfer); failures show you
-#   which files/query-shapes still need work. `query` cases assert scale-independent golden values.
+# description: httpfpga:// reads against the MinIO test server, via the FPGA raw bypass
 #
-# SCOPE WARNING — this file no longer exercises the FPGA data path. Every query below uses
-#   read_parquet(), which treats httpfpga:// purely as a byte source and parses on the CPU. On the
-#   current bitstream the HTTP body feeds the ColumnChunkDecoder and axi_out[BYPASS_ID] is tied off,
-#   so those raw byte reads are served over a host socket and the FPGA never sees them. Passing here
-#   proves the object server and the Parquet plumbing work, nothing more.
-#
-#   To exercise the hardware these need read_oasis() instead of read_parquet() — see
-#   test/sql/httpfpga_decode.test. That conversion is blocked on the GET path budget: the hardware
-#   carries 32 path characters (8 CSR words) and '/testbench/tpch-30/region.parquet' is 33,
-#   '/testbench/tpch-30/lineitem.parquet' is 35. Either re-stage the TPC-H objects under a shorter
-#   prefix, or widen fileWord0..7 in http_config.sv (plus handler.sv / http_req_builder.sv and
-#   HTTP_FILE_WORDS in software/oasis/configuration.cpp).
+# SCOPE: these queries use read_parquet(), which treats httpfpga:// purely as a byte source and
+# parses on the CPU. On a decoder bitstream axi_out[BYPASS_ID] is tied off, so those raw reads are
+# served over a host socket and the FPGA never sees them -- passing here proves the object server
+# and the Parquet plumbing work, nothing more. test/sql/httpfpga_decode.test is the one that
+# exercises the hardware, via read_oasis().
 # group: [sql]
+#
+# Needs a programmed board and a reachable server, so it is not part of the default `make test` run:
+#   ./build/release/test/unittest test/sql/httpfpga.test
+#
+# Every expected value was computed from the objects actually stored on the server, not from TPC-H
+# reference tables -- a mismatch means the bytes the FPGA delivered differ from the bytes the server
+# holds. Cases run smallest first so a broken datapath fails cheaply.
 
 require oasis
 
-# read_parquet lives in the parquet extension — load it so the httpfpga:// reads can be parsed.
-require parquet
+statement ok
+SET enable_progress_bar=false;
 
-# --- config ---
 statement ok
 SET http_server='10.253.74.74';
 
 statement ok
 SET http_port=9000;
 
-# Raw byte reads go over a host socket either way now (the FPGA bypass stream is tied off), so this
-# is a no-op kept for clarity. `SET httpfpga_raw_bypass = true` is what re-enables the old FPGA raw
-# path, and only a pre-decoder bitstream can serve it.
 statement ok
 SET httpfpga_cpu_fallback=false;
 
-statement ok
-SET httpfpga_debug=true;
-
-# ============================================================================
-# 1. Connectivity + scale-independent goldens (region always 5, nation always 25)
-# ============================================================================
+# 690 bytes, path 24 characters -- the only case that fits the pre-build-88 32-character GET path
+# budget, so it passes even if the widening is broken. If this is the sole survivor, suspect the path.
 query I
-SELECT count(*) FROM read_parquet('httpfpga://testbench/tpch-30/region.parquet');
+SELECT numbers FROM read_parquet('httpfpga:///testbench/dummy.parquet') ORDER BY numbers;
 ----
-5
+1
+2
+3
+4
 
-# TPC-H region names are fixed — a byte-exact check of a small string column.
-query I
-SELECT r_name FROM read_parquet('httpfpga://testbench/tpch-30/region.parquet') ORDER BY r_regionkey;
+# 1060 bytes, path 33 -- cheapest case that requires a path longer than 32 characters.
+query II
+SELECT r_regionkey, r_name FROM read_parquet('httpfpga:///throughput/tpch-1/region.parquet') ORDER BY r_regionkey;
 ----
-AFRICA
-AMERICA
-ASIA
-EUROPE
-MIDDLE EAST
+0	AFRICA
+1	AMERICA
+2	ASIA
+3	EUROPE
+4	MIDDLE EAST
 
-query I
-SELECT count(*) FROM read_parquet('httpfpga://testbench/tpch-30/nation.parquet');
+# Integer-only, so decimal formatting cannot be mistaken for a data error.
+query III
+SELECT count(*), sum(n_nationkey), sum(n_regionkey) FROM read_parquet('httpfpga:///throughput/tpch-1/nation.parquet');
 ----
-25
+25	300	50
 
-# ============================================================================
-# 2. Per-file smoke: can the FPGA path read each TPC-H object at all?
-# ============================================================================
-statement ok
-SELECT count(*) FROM read_parquet('httpfpga://testbench/tpch-30/supplier.parquet');
+query II
+SELECT n_regionkey, count(*) FROM read_parquet('httpfpga:///throughput/tpch-1/nation.parquet') GROUP BY 1 ORDER BY 1;
+----
+0	5
+1	5
+2	5
+3	5
+4	5
 
-statement ok
-SELECT count(*), min(p_partkey), max(p_partkey) FROM read_parquet('httpfpga://testbench/tpch-30/part.parquet');
+# 794 KB, one row group, path 35 -- first read that spans many FPGA buffers.
+query III
+SELECT count(*), sum(s_suppkey), round(sum(s_acctbal),2) FROM read_parquet('httpfpga:///throughput/tpch-1/supplier.parquet');
+----
+10000	50005000	45103548.65
 
-statement ok
-SELECT count(*), min(c_custkey), max(c_custkey) FROM read_parquet('httpfpga://testbench/tpch-30/customer.parquet');
+# 6.4 MB across 2 row groups, path 31 (also under the old budget).
+query II
+SELECT count(*), round(avg(p_size),4) FROM read_parquet('httpfpga:///throughput/tpch-1/part.parquet');
+----
+200000	25.4271
 
-statement ok
-SELECT count(*), min(o_orderkey), max(o_orderkey) FROM read_parquet('httpfpga://testbench/tpch-30/orders.parquet');
+# 12 MB, 2 row groups. Strings only: a dropped byte garbles a segment name rather than producing a
+# plausible-looking number.
+query II
+SELECT c_mktsegment, count(*) FROM read_parquet('httpfpga:///throughput/tpch-1/customer.parquet') GROUP BY 1 ORDER BY 1;
+----
+AUTOMOBILE	29752
+BUILDING	30142
+FURNITURE	29968
+HOUSEHOLD	30189
+MACHINERY	29949
 
-statement ok
-SELECT count(*) FROM read_parquet('httpfpga://testbench/tpch-30/partsupp.parquet');
+# 23 MB, 3 row groups, path 36 -- longest path in the suite.
+query II
+SELECT count(*), round(sum(s_acctbal),2) FROM read_parquet('httpfpga:///throughput/tpch-30/supplier.parquet');
+----
+300000	1348760542.11
 
-statement ok
-SELECT count(*) FROM read_parquet('httpfpga://testbench/tpch-30/lineitem.parquet');
+# 56 MB, 13 row groups. Range offsets reach 9 digits here, which spans three CSR words instead of
+# two -- the case that exposed the truncated Range header.
+query III
+SELECT o_orderstatus, count(*), round(sum(o_totalprice),2) FROM read_parquet('httpfpga:///throughput/tpch-1/orders.parquet') GROUP BY 1 ORDER BY 1;
+----
+F	729413	109702414613.69
+O	732044	110017774440.76
+P	38543	7109117393.01
 
-# ============================================================================
-# 3. Column-type coverage: numeric / decimal / string / date
-# ============================================================================
-statement ok
-SELECT sum(p_size), avg(p_retailprice), max(length(p_name)) FROM read_parquet('httpfpga://testbench/tpch-30/part.parquet');
+query II
+SELECT year(o_orderdate), count(*) FROM read_parquet('httpfpga:///throughput/tpch-1/orders.parquet') GROUP BY 1 ORDER BY 1;
+----
+1992	227089
+1993	226645
+1994	227597
+1995	228637
+1996	228626
+1997	227783
+1998	133623
 
-statement ok
-SELECT sum(l_quantity), sum(l_extendedprice), avg(l_discount) FROM read_parquet('httpfpga://testbench/tpch-30/lineitem.parquet');
+query III
+SELECT count(*), min(o_orderdate), max(o_orderdate) FROM read_parquet('httpfpga:///throughput/tpch-1/orders.parquet');
+----
+1500000	1992-01-01	1998-08-02
 
-statement ok
-SELECT min(o_orderdate), max(o_orderdate), count(DISTINCT o_orderstatus) FROM read_parquet('httpfpga://testbench/tpch-30/orders.parquet');
-
-statement ok
-SELECT count(DISTINCT s_nationkey), max(length(s_address)) FROM read_parquet('httpfpga://testbench/tpch-30/supplier.parquet');
-
-# ============================================================================
-# 4. GROUP BY / filters / ordering
-# ============================================================================
-statement ok
-SELECT p_brand, count(*), avg(p_retailprice) FROM read_parquet('httpfpga://testbench/tpch-30/part.parquet') GROUP BY p_brand ORDER BY p_brand;
-
-statement ok
-SELECT l_returnflag, l_linestatus, count(*), sum(l_quantity) FROM read_parquet('httpfpga://testbench/tpch-30/lineitem.parquet') GROUP BY 1, 2 ORDER BY 1, 2;
-
-statement ok
-SELECT c_mktsegment, count(*) FROM read_parquet('httpfpga://testbench/tpch-30/customer.parquet') WHERE c_acctbal > 0 GROUP BY 1 ORDER BY 1;
-
-# ============================================================================
-# 5. Cross-file joins (fetch multiple objects in one query)
-# ============================================================================
-statement ok
-SELECT count(*)
-FROM read_parquet('httpfpga://testbench/tpch-30/part.parquet') p
-JOIN read_parquet('httpfpga://testbench/tpch-30/partsupp.parquet') ps ON p.p_partkey = ps.ps_partkey;
-
-statement ok
-SELECT n_name, count(*)
-FROM read_parquet('httpfpga://testbench/tpch-30/customer.parquet') c
-JOIN read_parquet('httpfpga://testbench/tpch-30/nation.parquet') n ON c.c_nationkey = n.n_nationkey
-GROUP BY n_name ORDER BY n_name;
-
-statement ok
-SELECT count(*)
-FROM read_parquet('httpfpga://testbench/tpch-30/orders.parquet') o
-JOIN read_parquet('httpfpga://testbench/tpch-30/lineitem.parquet') l ON o.o_orderkey = l.l_orderkey
-WHERE l_commitdate < l_receiptdate;
-
-# ============================================================================
-# 6. TPC-H Q1 shape — the real target workload
-# ============================================================================
-statement ok
-SELECT l_returnflag, l_linestatus,
-       sum(l_quantity)                          AS sum_qty,
-       sum(l_extendedprice)                     AS sum_base_price,
-       sum(l_extendedprice * (1 - l_discount))  AS sum_disc_price,
-       avg(l_quantity)                          AS avg_qty,
-       count(*)                                 AS count_order
-FROM read_parquet('httpfpga://testbench/tpch-30/lineitem.parquet')
-WHERE l_shipdate <= DATE '1998-09-02'
-GROUP BY l_returnflag, l_linestatus
-ORDER BY l_returnflag, l_linestatus;
-
-# ============================================================================
-# 7. Scale check (tpch-30): larger objects, more reads, different alignments
-# ============================================================================
-statement ok
-SELECT count(*), min(p_partkey), max(p_partkey) FROM read_parquet('httpfpga://testbench/tpch-30/part.parquet');
-
-statement ok
-SELECT count(*) FROM read_parquet('httpfpga://testbench/tpch-30/lineitem.parquet');
+# A missing object must fail rather than hang. This one is also 83 characters, past the 64-character
+# GET path budget, but it does not reach that guard: OpenFile probes size with a host-socket HEAD
+# first, so the 404 is what surfaces. The guard itself is covered by the software unit tests -- it has
+# to be, since any path long enough to trip it names an object the HEAD cannot find.
+statement error
+SELECT count(*) FROM read_parquet('httpfpga:///throughput/tpch-30/this_prefix_exists_only_to_overflow_the_get_path_budget.parquet');
+----

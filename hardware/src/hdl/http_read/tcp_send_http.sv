@@ -20,6 +20,14 @@ module tcp_send_http (
     input  logic [31:0]                               fileWord5,
     input  logic [31:0]                               fileWord6,
     input  logic [31:0]                               fileWord7,
+    input  logic [31:0]                               fileWord8,
+    input  logic [31:0]                               fileWord9,
+    input  logic [31:0]                               fileWord10,
+    input  logic [31:0]                               fileWord11,
+    input  logic [31:0]                               fileWord12,
+    input  logic [31:0]                               fileWord13,
+    input  logic [31:0]                               fileWord14,
+    input  logic [31:0]                               fileWord15,
     input  logic [7:0]                                rangeBeginLen,
     input  logic [31:0]                               rangeBeginW0,
     input  logic [31:0]                               rangeBeginW1,
@@ -65,11 +73,13 @@ module tcp_send_http (
 
     logic [3:0] state_q, state_d;
     logic [15:0] http_len_q, http_len_d;
-    logic [1023:0] http_data_q, http_data_d;
-    logic tx_word_sel_q, tx_word_sel_d;
+    logic [2047:0] http_data_q, http_data_d;
+    // Beat index into http_data_q. The builder's buffer is 256 bytes, so a request is at most four
+    // 64-byte beats; this used to be a single bit because the buffer was 128 bytes.
+    logic [1:0] tx_beat_q, tx_beat_d;
     logic error_q, error_d;
 
-    logic [1023:0] header_data_w;
+    logic [2047:0] header_data_w;
     logic [15:0] header_len_w;
     logic req_ready_w;
 
@@ -81,7 +91,7 @@ module tcp_send_http (
         .ipHexLen      (ipHexLen),
         .ipHex         ({ipHexWord3, ipHexWord2, ipHexWord1, ipHexWord0}),
         .portHex       (portHexWord0),
-        .fileLen       (fileLen[5:0]),
+        .fileLen       (fileLen[6:0]),
         .fileWord0     (fileWord0),
         .fileWord1     (fileWord1),
         .fileWord2     (fileWord2),
@@ -90,6 +100,14 @@ module tcp_send_http (
         .fileWord5     (fileWord5),
         .fileWord6     (fileWord6),
         .fileWord7     (fileWord7),
+        .fileWord8     (fileWord8),
+        .fileWord9     (fileWord9),
+        .fileWord10    (fileWord10),
+        .fileWord11    (fileWord11),
+        .fileWord12    (fileWord12),
+        .fileWord13    (fileWord13),
+        .fileWord14    (fileWord14),
+        .fileWord15    (fileWord15),
         .rangeBeginLen (rangeBeginLen),
         .rangeBeginW0  (rangeBeginW0),
         .rangeBeginW1  (rangeBeginW1),
@@ -120,24 +138,29 @@ module tcp_send_http (
         end
     endfunction
 
-    logic [6:0] tx_bytes0;
-    logic [6:0] tx_bytes1;
+    // Per-beat byte count and end-of-packet, derived from the beat index rather than hardcoded for
+    // two beats. tx_last_beat drives TLAST, so a header of any length up to 256 bytes terminates on
+    // whichever beat actually carries its final byte.
+    logic [15:0] tx_offset;
+    logic [15:0] tx_remaining;
+    logic [6:0]  tx_bytes;
+    logic        tx_last_beat;
+    logic [11:0] tx_bit_base;
 
     always_comb begin
-        if (http_len_q >= 16'd64) begin
-            tx_bytes0 = 7'd64;
-            tx_bytes1 = http_len_q[6:0] - 7'd64;
-        end else begin
-            tx_bytes0 = http_len_q[6:0];
-            tx_bytes1 = 7'd0;
-        end
+        tx_offset    = {14'b0, tx_beat_q} << 6; // tx_beat_q * 64 bytes
+        tx_remaining = (http_len_q > tx_offset) ? (http_len_q - tx_offset) : 16'd0;
+        tx_bytes     = (tx_remaining >= 16'd64) ? 7'd64 : tx_remaining[6:0];
+        tx_last_beat = (tx_remaining <= 16'd64);
     end
+
+    assign tx_bit_base = {10'b0, tx_beat_q} * AXI_DATA_BITS;
 
     always_comb begin
         state_d = state_q;
         http_len_d = http_len_q;
         http_data_d = http_data_q;
-        tx_word_sel_d = tx_word_sel_q;
+        tx_beat_d = tx_beat_q;
         error_d = error_q;
 
         m_axis_tx_meta_TVALID = 1'b0;
@@ -160,7 +183,7 @@ module tcp_send_http (
                 if (req_ready_w) begin
                     http_len_d = header_len_w;
                     http_data_d = header_data_w;
-                    tx_word_sel_d = 1'b0;
+                    tx_beat_d = 2'd0;
                     state_d = ST_SEND_META;
                 end
             end
@@ -185,28 +208,17 @@ module tcp_send_http (
             end
 
             ST_SEND_DATA: begin
-                if (!tx_word_sel_q) begin
-                    m_axis_tx_data_TVALID = 1'b1;
-                    m_axis_tx_data_TDATA  = http_data_q[AXI_DATA_BITS-1:0];
-                    m_axis_tx_data_TKEEP  = make_keep(tx_bytes0);
-                    m_axis_tx_data_TLAST  = (http_len_q <= 16'd64);
-                end else begin
-                    m_axis_tx_data_TVALID = 1'b1;
-                    m_axis_tx_data_TDATA  = http_data_q[2*AXI_DATA_BITS-1:AXI_DATA_BITS];
-                    m_axis_tx_data_TKEEP  = make_keep(tx_bytes1);
-                    m_axis_tx_data_TLAST  = 1'b1;
-                end
+                m_axis_tx_data_TVALID = 1'b1;
+                m_axis_tx_data_TDATA  = http_data_q[tx_bit_base +: AXI_DATA_BITS];
+                m_axis_tx_data_TKEEP  = make_keep(tx_bytes);
+                m_axis_tx_data_TLAST  = tx_last_beat;
 
                 if (m_axis_tx_data_TVALID && m_axis_tx_data_TREADY) begin
-                    if (!tx_word_sel_q) begin
-                        if (http_len_q <= 16'd64) begin
-                            state_d = ST_DONE;
-                        end else begin
-                            tx_word_sel_d = 1'b1;
-                        end
+                    if (tx_last_beat) begin
+                        tx_beat_d = 2'd0;
+                        state_d   = ST_DONE;
                     end else begin
-                        tx_word_sel_d = 1'b0;
-                        state_d = ST_DONE;
+                        tx_beat_d = tx_beat_q + 2'd1;
                     end
                 end
             end
@@ -226,13 +238,13 @@ module tcp_send_http (
             state_q <= ST_IDLE;
             http_len_q <= 16'd0;
             http_data_q <= '0;
-            tx_word_sel_q <= 1'b0;
+            tx_beat_q <= 2'd0;
             error_q <= 1'b0;
         end else begin
             state_q <= state_d;
             http_len_q <= http_len_d;
             http_data_q <= http_data_d;
-            tx_word_sel_q <= tx_word_sel_d;
+            tx_beat_q <= tx_beat_d;
             error_q <= error_d;
         end
     end

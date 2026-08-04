@@ -44,16 +44,27 @@ constexpr const uint32_t HTTP_PORT_HEX        = 2;
 constexpr const uint32_t HTTP_IP_HEX_LEN      = 3;
 constexpr const uint32_t HTTP_IP_HEX_W0       = 4;
 constexpr const uint32_t HTTP_FILE_LEN        = 8;
-constexpr const uint32_t HTTP_FILE_W0         = 9;
-constexpr const uint32_t HTTP_NUM_SESSIONS    = 17;
-constexpr const uint32_t HTTP_PKG_WORD_COUNT  = 18;
-constexpr const uint32_t HTTP_USER_FREQUENCY  = 19;
-constexpr const uint32_t HTTP_TIME_IN_SECONDS = 20;
-constexpr const uint32_t HTTP_RANGE_BEGIN_LEN = 21;
-constexpr const uint32_t HTTP_RANGE_BEGIN_W0  = 22; // 22..25
-constexpr const uint32_t HTTP_RANGE_END_LEN   = 26;
-constexpr const uint32_t HTTP_RANGE_END_W0    = 27; // 27..30
-constexpr const uint32_t HTTP_START           = 31;
+constexpr const uint32_t HTTP_FILE_W0         = 9;  // 9..24 (16 words, 64 path characters)
+constexpr const uint32_t HTTP_NUM_SESSIONS    = 25;
+constexpr const uint32_t HTTP_PKG_WORD_COUNT  = 26;
+constexpr const uint32_t HTTP_USER_FREQUENCY  = 27;
+constexpr const uint32_t HTTP_TIME_IN_SECONDS = 28;
+constexpr const uint32_t HTTP_RANGE_BEGIN_LEN = 29;
+constexpr const uint32_t HTTP_RANGE_BEGIN_W0  = 30; // 30..33
+constexpr const uint32_t HTTP_RANGE_END_LEN   = 34;
+constexpr const uint32_t HTTP_RANGE_END_W0    = 35; // 35..38
+constexpr const uint32_t HTTP_START           = 39;
+
+// Bitstreams up to and including build-88 instantiate HttpConfig with START_ADDR=31: the override in
+// vfpga_top.svh was not moved when the GET path widened from 8 to 16 words. On those, a write to 31
+// -- RANGE_BEGIN_W1 in the map above -- ALSO fires the start trigger, snapshotting the config while
+// registers 32..38 (the rest of the Range begin, all of the Range end) still hold their previous
+// values. The FPGA then sends "Range: bytes=<truncated begin>-" with no end and the server answers
+// 400. Writing this register last, immediately before START, is correct on both: on a fixed bitstream
+// it is an ordinary parameter and START at 39 still comes after it, and on a legacy one the trigger
+// fires only once everything else has landed. ConfigWriteReadyRegister registers its valid, so the
+// snapshot taken on that write includes the register 31 write itself.
+constexpr const uint32_t HTTP_LEGACY_START = 31;
 
 // totalWord bit 22: the handler is outside ST_IDLE. See describe_status() for the full layout.
 constexpr const uint32_t HTTP_STATUS_BUSY_BIT = 22;
@@ -65,15 +76,16 @@ constexpr const uint32_t HTTP_STATUS_BUSY_BIT = 22;
 constexpr const uint32_t HTTP_RANGE_WORDS = 4;
 constexpr const uint32_t HTTP_RANGE_MAX_DIGITS = HTTP_RANGE_WORDS * 4;
 
-// ASCII words transferred for the GET path (32 chars) and the Host: IP (16 chars).
-constexpr const uint32_t HTTP_FILE_WORDS = 8;
+// ASCII words transferred for the GET path (64 chars) and the Host: IP (16 chars).
+constexpr const uint32_t HTTP_FILE_WORDS = 16;
 constexpr const uint32_t HTTP_IP_WORDS   = 4;
 
-// http_req_builder assembles the request into a fixed 128-byte buffer (buffer_q[127:0]) with no
-// overflow detection -- writes past the end alias instead of failing. The fixed parts are
+// http_req_builder assembles the request into a fixed 256-byte buffer (buffer_q[255:0]) with no
+// overflow detection -- writes past the end alias instead of failing, so this check is the only
+// thing standing between a long path and a silently corrupted request. The fixed parts are
 // "GET " (4) + " HTTP/1.1\r\nHost: " (17) + ":" (1) + port (4) + CRLF (2) +
 // "Range: bytes=" (13) + "-" (1) + CRLF (2) + "Connection: close\r\n\r\n" (21) = 65 bytes.
-constexpr const uint32_t HTTP_HEADER_BUFFER_BYTES = 128;
+constexpr const uint32_t HTTP_HEADER_BUFFER_BYTES = 256;
 constexpr const uint32_t HTTP_HEADER_FIXED_BYTES  = 65;
 
 // Read-side CSRs (see hardware/src/hdl/http_read/http_config.sv).
@@ -85,6 +97,7 @@ constexpr const uint32_t HTTP_ECHO_FILE_W4     = 5;
 constexpr const uint32_t HTTP_ECHO_RANGE_BEGIN = 6;
 constexpr const uint32_t HTTP_ECHO_RANGE_END   = 7;
 constexpr const uint32_t HTTP_ECHO_SERVER      = 8;
+constexpr const uint32_t HTTP_ECHO_FILE_W8     = 9;
 
 // Packs `s` little-endian into `words`. Throws rather than truncating: a silently shortened path
 // makes the FPGA request a different (usually nonexistent) file, and the 404 body then flows through
@@ -205,12 +218,21 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
     write_register(libstf::ConfigRegister(HTTP_TIME_IN_SECONDS, 0));
     write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_LEN, range_begin_len));
     for (uint32_t i = 0; i < HTTP_RANGE_WORDS; i++) {
+        // Deferred to just before START -- see HTTP_LEGACY_START.
+        if (HTTP_RANGE_BEGIN_W0 + i == HTTP_LEGACY_START) {
+            continue;
+        }
         write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_W0 + i, range_begin_words[i]));
     }
     write_register(libstf::ConfigRegister(HTTP_RANGE_END_LEN, range_end_len));
     for (uint32_t i = 0; i < HTTP_RANGE_WORDS; i++) {
         write_register(libstf::ConfigRegister(HTTP_RANGE_END_W0 + i, range_end_words[i]));
     }
+    static_assert(HTTP_LEGACY_START >= HTTP_RANGE_BEGIN_W0 &&
+                      HTTP_LEGACY_START < HTTP_RANGE_BEGIN_W0 + HTTP_RANGE_WORDS,
+                  "HTTP_LEGACY_START must name a Range-begin word for the deferral above to write it");
+    write_register(libstf::ConfigRegister(HTTP_LEGACY_START,
+                                          range_begin_words[HTTP_LEGACY_START - HTTP_RANGE_BEGIN_W0]));
 
     // Barrier before START. The parameter writes above are posted MMIO stores; the START
     // write is just another posted store, so nothing guarantees the parameter registers have
@@ -272,6 +294,7 @@ HTTPRequestEcho HTTPReadConfig::request_echo() {
     echo.file_len        = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_LEN).value());
     echo.file_w0         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W0).value());
     echo.file_w4         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W4).value());
+    echo.file_w8         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W8).value());
     echo.range_begin_w0  = static_cast<uint32_t>(range_begin & 0xFFFFFFFFULL);
     echo.range_begin_len = static_cast<uint8_t>((range_begin >> 32) & 0xFF);
     echo.range_end_w0    = static_cast<uint32_t>(range_end & 0xFFFFFFFFULL);
@@ -296,6 +319,7 @@ std::string HTTPRequestEcho::describe() const {
     std::ostringstream oss;
     oss << "path_len=" << file_len << " path[0:4]='" << word_to_ascii(file_w0) << "'"
         << " path[16:20]='" << word_to_ascii(file_w4) << "'"
+        << " path[32:36]='" << word_to_ascii(file_w8) << "'"
         << " range=" << static_cast<unsigned>(range_begin_len) << ":'"
         << word_to_ascii(range_begin_w0) << "'-" << static_cast<unsigned>(range_end_len) << ":'"
         << word_to_ascii(range_end_w0) << "'"

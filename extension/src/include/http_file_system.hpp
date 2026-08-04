@@ -5,11 +5,21 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 namespace duckdb {
 
 class DatabaseInstance;
 class FileOpener;
+
+// A reply read off a host socket. `raw` owns the bytes; the rest index into it.
+struct HttpReply {
+	string raw;
+	string status_line;
+	string headers;       // header block, excluding the terminating blank line
+	size_t body_off = 0;  // index of the first body byte in `raw`
+	bool partial = false; // 206 Partial Content rather than 200 OK
+};
 
 class HTTPFileSystem : public FileSystem {
 public:
@@ -52,6 +62,9 @@ private:
 	// Connect to the configured server, send `request`, read the full response until the peer
 	// closes. Returns false on any socket error.
 	bool HttpSocketRequest(const std::string &request, std::string &response);
+	// HttpSocketRequest plus response parsing. Throws on a transport error, a malformed reply, or a
+	// status other than 200/206; `what` names the operation in those messages.
+	HttpReply HttpExchange(const string &request, const char *what, const string &resource);
 
 	DatabaseInstance &instance;
 	std::mutex init_mtx;
@@ -61,6 +74,17 @@ private:
 	std::string server_host_;
 	uint32_t server_ip_ = 0;
 	uint16_t server_port_ = 0;
+
+	// Content-Length cache, keyed by resource path. DuckDB opens the same object several times per
+	// query (bind, glob, per-worker reader init), and GetFileSize probes with a HEAD whenever the
+	// handle reports 0. Caching on the handle meant every reopen paid another round trip -- about
+	// six HEADs for one scan. Keyed on the path here instead, so it is one per object per session.
+	// Objects are assumed immutable for the session's lifetime, which is already assumed elsewhere:
+	// the Parquet footer is read once at bind and reused for every row group.
+	std::mutex size_cache_mtx_;
+	std::unordered_map<std::string, uint64_t> size_cache_;
+
+	uint64_t CachedContentLength(const string &resource_path);
 };
 
 // `path` is the resource path only ("/bucket/object.parquet"), already normalized — that is exactly
