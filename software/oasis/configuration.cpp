@@ -55,6 +55,9 @@ constexpr const uint32_t HTTP_RANGE_END_LEN   = 26;
 constexpr const uint32_t HTTP_RANGE_END_W0    = 27; // 27..30
 constexpr const uint32_t HTTP_START           = 31;
 
+// totalWord bit 22: the handler is outside ST_IDLE. See describe_status() for the full layout.
+constexpr const uint32_t HTTP_STATUS_BUSY_BIT = 22;
+
 // ASCII words transferred per Range endpoint. Range values are absolute file
 // offsets, so they scale with file size, not with read size: 2 words (8 digits)
 // caps out at ~95 MiB, which any real Parquet file blows past immediately. 4
@@ -128,6 +131,21 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
 void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint16_t server_port,
                           const std::string &path, uint64_t range_begin, uint64_t range_end,
                           uint16_t /*session_id*/) {
+    // The handler samples runTx only in ST_IDLE, and runTx is a one-cycle pulse: a START written
+    // while it is mid-transfer is dropped and never retried. The scan then blocks forever on a
+    // buffer nothing will fill. There is no reset CSR, so the wedge outlives the process and every
+    // later run inherits it -- the "worked a minute ago, now nothing does" symptom. The tell is
+    // `sid` staying constant across runs, since session_id_q only advances when a fresh tcp_init
+    // completes. Refuse up front and name the way out, rather than hanging with no diagnostic.
+    if (const uint32_t status = debug_status(); (status & (1u << HTTP_STATUS_BUSY_BIT)) != 0) {
+        std::ostringstream msg;
+        msg << "FPGA HTTP handler is still busy from an earlier request [" << describe_status(status)
+            << "]; it only accepts a new request from its IDLE state, so this one would be "
+               "silently dropped and then hang. There is no reset register -- reprogram the "
+               "bitstream to clear it.";
+        throw std::runtime_error(msg.str());
+    }
+
     const auto ip_ascii    = IpToAscii(server_ip);
     const auto begin_ascii = std::to_string(range_begin);
     const auto end_ascii   = std::to_string(range_end);
