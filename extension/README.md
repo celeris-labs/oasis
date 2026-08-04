@@ -4,7 +4,12 @@ This repository is based on https://github.com/duckdb/extension-template, check 
 
 ---
 
-This extension, Oasis, allow you to ... <extension_goal>.
+This extension, Oasis, scans Parquet files on an FPGA. It registers the `read_oasis()` table
+function, which decodes column chunks in hardware and maps the decoded buffers into DuckDB vectors
+zero-copy, plus the `httpfpga://` and `rdma://` file systems that supply the bytes.
+
+See the [top-level README](../README.md) for the hardware side, the CSR-map-versus-bitstream rule
+and the current limits of the HTTP path.
 
 
 ## Building
@@ -35,16 +40,29 @@ The main binaries that will be built are:
 ## Running the extension
 To run the extension code, simply start the shell with `./build/release/duckdb`.
 
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `oasis()` that takes a string arguments and returns a string:
+Now we can use the features from the extension directly in DuckDB. `read_oasis()` scans a Parquet
+file with the column chunks decoded on the FPGA:
+
+```sql
+SET http_server='10.253.74.74';
+SET http_port=9000;
+SELECT sum(p_partkey) FROM read_oasis('httpfpga:///throughput/tpch-1/part.parquet');
 ```
-D select oasis('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ Oasis Jane 🐥 │
-└───────────────┘
-```
+
+Settings: `http_server`, `http_port`, `httpfpga_debug`, `httpfpga_cpu_fallback` (fetch over an
+ordinary host socket instead of the FPGA) and `httpfpga_raw_bypass` (legacy raw-byte path).
+
+Two things that surprise people:
+
+- `read_parquet('httpfpga://…')` only uses the URL as a byte source and parses on the CPU. On an
+  `ENABLE_HTTP` bitstream the raw bypass is tied off, so the FPGA is not involved. Use
+  `read_oasis()` to exercise the hardware.
+- A bare `count(*)` projects no columns and is answered from the Parquet footer with the FPGA idle.
+  Project a real fixed-width column if you mean to test the decoder.
+
+Building this extension does **not** rebuild the Oasis library in `../software`. After changing
+branches, rebuild and re-install that first, or a stale `liboasis.so` will drive the FPGA with a
+register map that does not match the loaded bitstream.
 
 ## Running the tests
 Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:

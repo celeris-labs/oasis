@@ -6,7 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 WIP DuckDB extension ("oasis") for running table scans of Parquet files on FPGAs, part of the Oasis project. Built on the DuckDB extension template with CMake + Make, using DuckDB's `extension-ci-tools` submodule for build infrastructure.
 
-## Planned Flow
+## Current state
+
+`read_oasis()` is implemented in `src/oasis_scan.cpp`. It builds one `QuerySplinter` per row group
+(one flow per projected hardware column), submits it to the shared scheduler, and maps the decoded
+buffers into DuckDB vectors. Bytes reach the decoder one of three ways, picked by the file handle:
+`HTTPSourceOperator` (the FPGA issues its own ranged GET), `RDMASourceOperator`, or
+`LocalSourceOperator` (host DMA). Columns the hardware cannot decode are marked `is_cpu` and parsed
+normally.
+
+**Building this extension does not rebuild `../software`.** A stale `liboasis.so` silently survives
+a branch switch and then drives the FPGA with a register map that does not match the loaded
+bitstream — the writes succeed and the hardware emits a corrupt request. Rebuild and re-install the
+Oasis library first. See the top-level README for the full rule and the current HTTP-path limits.
+
+## Original design sketch
 
 1. Open file
 2. Instantiate parcore `FileReader` (or appropriate reader) with all required infra (cthread, pool, tlb, obm, column_chunk_decoder)
@@ -40,6 +54,16 @@ Tests use DuckDB's **SQLLogicTest** format in `test/sql/`. Run a specific test:
 ```
 
 SQLLogicTest syntax: `statement ok`, `statement error`, `query I` (one column), `query II` (two columns), etc. Use `require oasis` to ensure the extension is loaded.
+
+Two suites are **hardware-gated** and excluded from a default `make test` — they need a programmed
+board and a reachable object server:
+
+- `test/sql/httpfpga_decode.test` — `read_oasis()`, the only one that exercises the FPGA decoder
+- `test/sql/httpfpga.test` — `read_parquet('httpfpga://…')`, which on a decoder bitstream is served
+  over a host socket and so only covers the object server and the Parquet plumbing
+
+Their expected values were computed from the objects actually stored on the server, not from TPC-H
+reference tables, so a mismatch means the bytes delivered differ from the bytes the server holds.
 
 ## Architecture
 
