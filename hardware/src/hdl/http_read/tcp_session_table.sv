@@ -28,8 +28,10 @@ import lynxTypes::*;
 // The first version of this module kept `pending` as a single running total and let the reader ask
 // for min(pending, 32 KB), on the assumption that a readPkg returns exactly the number of bytes it
 // names. It does not. Coyote builds the TOE with TCP_STACK_RX_DDR_BYPASS_EN=1
-// (Coyote/hw/services/network/hls/toe/CMakeLists.txt), and on that path the receive buffer is a
-// shared on-chip packet FIFO rather than a per-session circular buffer in DDR:
+// (parcore/libstf/coyote/hw/services/network/hls/toe/CMakeLists.txt -- that is the checkout the
+// hardware build uses; the one under celeris/ is configured differently and is NOT what ships), and
+// on that path the receive buffer is a shared on-chip packet FIFO, not a per-session circular
+// buffer in DDR:
 //
 //   rx_app_stream_if.cpp        #if RX_DDR_BYPASS -> rxBufferReadCmd.write(1);   // a bare token
 //   toe.cpp  rxAppMemDataRead   reads ONE packet, forwarding words until currWord.last
