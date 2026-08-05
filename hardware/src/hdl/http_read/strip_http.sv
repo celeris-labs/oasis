@@ -162,8 +162,11 @@ module strip_http (
     assign avail_w = res_len_q - res_cur_q;
 
     // The one barrel shift. Low byte = next header character; whole word = bottom-justified body.
+    // Only res_cur_q[5:0] is used: the cursor is strictly below res_len_q (<= 64) whenever anything
+    // reads this, so 0..63 covers every real case, and a 6-bit shift amount is an ordinary 64-way
+    // byte barrel shifter instead of the 10-bit one the full-width cursor would infer.
     logic [AXI_DATA_BITS-1:0] shifted_w;
-    assign shifted_w = res_data_q >> {res_cur_q, 3'b000};
+    assign shifted_w = res_data_q >> {res_cur_q[5:0], 3'b000};
 
     logic [7:0] cur_byte_w;
     assign cur_byte_w = shifted_w[7:0];
