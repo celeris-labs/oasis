@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,20 @@
 using libstf::Profiler;
 
 namespace oasis {
+
+namespace {
+std::atomic<bool> g_http_debug {false};
+} // namespace
+
+void set_http_debug(bool enabled) { g_http_debug.store(enabled, std::memory_order_relaxed); }
+
+bool http_debug_enabled() {
+    if (g_http_debug.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    const char *dbg = std::getenv("OASIS_HTTP_DEBUG");
+    return dbg != nullptr && dbg[0] == '1';
+}
 
 constexpr const uint32_t RDMA_READ_VADDR_ADDR = 0;
 constexpr const uint32_t RDMA_READ_SIZE_ADDR  = 1;
@@ -282,7 +297,13 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
     // indistinguishable from one whose response never came back -- both just hang. The echo
     // registers are the only proof the parameters were latched at all, since the parameter CSRs
     // themselves are write-only.
-    if (const char *dbg = std::getenv("OASIS_HTTP_DEBUG"); dbg != nullptr && dbg[0] == '1') {
+    if (http_debug_enabled()) {
+        const auto flight = inflight();
+        // Bitstream identity in one line. slots=0 means a pre-pipelining bitstream, so if this says
+        // 0 when a pipelined one was programmed, the board is not running what you think it is.
+        std::fprintf(stderr, "[oasis-http] bitstream: %s\n",
+                     flight.legacy() ? "pre-pipelining (no INFLIGHT register, depth 1)"
+                                     : flight.describe().c_str());
         std::fprintf(stderr, "[oasis-http] START GET %s range=[%llu,%llu] ip=0x%08x port=%u\n",
                      path.c_str(), static_cast<unsigned long long>(range_begin),
                      static_cast<unsigned long long>(range_end), server_ip, server_port);

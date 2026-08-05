@@ -10,6 +10,19 @@ namespace oasis {
 
 constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A515;
 
+/**
+ * Enable/query the FPGA-side request trace: the latched CSR echo, the handler status word and the
+ * request-ring occupancy.
+ *
+ * This used to be reachable ONLY through the OASIS_HTTP_DEBUG environment variable, while DuckDB's
+ * `SET httpfpga_debug = true` lit up a completely different set of messages (the host-socket path in
+ * the extension's file system). So the obvious thing to switch on produced exactly the output that
+ * cannot explain an FPGA hang, and the output that can stayed dark. The extension setting now calls
+ * set_http_debug(), and the environment variable still works on its own.
+ */
+void set_http_debug(bool enabled);
+bool http_debug_enabled();
+
 constexpr const uint64_t RDMA_READ_CONFIG_REGS = 2;
 constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
 

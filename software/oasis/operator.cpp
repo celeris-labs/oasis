@@ -45,7 +45,7 @@ void HTTPSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     //   in>0, out>0     -> decoder produced output, loss is in OutputWriter / OBM delivery
     // Detached and best-effort: it only reads CSRs, and OasisContext owns both configs for the
     // whole session so they outlive the samples.
-    if (const char *dbg = std::getenv("OASIS_HTTP_DEBUG"); dbg != nullptr && dbg[0] == '1') {
+    if (http_debug_enabled()) {
         std::thread([&ctx, stream] {
             auto http = ctx.config<HTTPReadConfig>();
             auto dec  = ctx.config<parcore::ColumnChunkDecoderConfig>();

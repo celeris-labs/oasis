@@ -19,7 +19,7 @@
 # Usage:
 #   scripts/throughput.sh                         # all workloads on the default file
 #   scripts/throughput.sh --workload latency      # per-request dead time only
-#   scripts/throughput.sh --file /tpch1/lineitem.parquet --repeat 5
+#   scripts/throughput.sh --file /throughput/tpch-1/lineitem.parquet --repeat 5
 #
 # Env overrides: DUCKDB, OASIS_SERVER, OASIS_PORT.
 #
@@ -31,7 +31,9 @@ set -uo pipefail
 DUCKDB=${DUCKDB:-$(dirname "$0")/../extension/build/release/duckdb}
 SERVER=${OASIS_SERVER:-10.253.74.74}
 PORT=${OASIS_PORT:-9000}
-FILE=/tpch1/lineitem.parquet
+# 35 characters, which needs the 64-character GET path budget (build-89 and later). On an
+# older 32-character bitstream use a short alias bucket instead, e.g. /tpch1/lineitem.parquet.
+FILE=/throughput/tpch-1/lineitem.parquet
 REPEAT=3
 WORKLOAD=all
 
