@@ -42,7 +42,7 @@ its own `run.sh` and no dependency on the Coyote build:
 | | |
 |---|---|
 | `http_pipeline/` | the whole client — handler + session table + init/send/read — against a TOE model serving several concurrent sessions. Checks bodies byte-exact and in order, one `tlast` each, and that request k+1's GET goes out before body k finishes. Runs at 4 slots and at 1 |
-| `tcp_read/` | receive path against realistic MinIO responses: multi-segment, back-pressured, unaligned |
+| `tcp_read/` | receive path against realistic MinIO responses: multi-segment, back-pressured, unaligned. `case_burst_notifications` announces every segment (and the FIN) before a single `readPkg` is served, which is what pins the one-readPkg-per-announcement contract |
 | `http_req_builder/` | the assembled GET, byte for byte, including 64-character paths and multi-beat sends |
 | `strip_http/` | header strip in isolation. **4 of its 6 cases currently fail** — the bench drives `strip_http` directly, without the `tcp_read` concatenator that masks per-`readPkg` `tlast`, so its expectations no longer match how the module is used. `tcp_read/` is the authoritative coverage for this module |
 
@@ -108,7 +108,17 @@ Two things this depends on:
 - **`tcp_session_table.sv` owns the notification stream.** `tcp_read` used to pop notifications and
   discard any whose session did not match the one it was reading. With a second connection open that
   silently loses the announcement for it, and the reader then waits forever for news that already
-  came and went. The table records announced bytes and FIN per slot instead.
+  came and went. The table queues the announced segment lengths and the FIN per slot instead.
+- **One `readPkg` per announcement, naming exactly that announcement's length.** Coyote builds the
+  TOE with `TCP_STACK_RX_DDR_BYPASS_EN=1`, so the receive buffer is a shared on-chip *packet* fifo
+  rather than a per-session circular buffer in DDR. On that path `rx_app_stream_if` turns a readPkg
+  into a bare one-bit token and `rxAppMemDataRead` forwards exactly one queued packet, whatever
+  length was asked for; the length is used only to advance the app read pointer the advertised
+  window is computed from. Build-90 and build-91 got this wrong — the table kept a running byte
+  balance and the reader asked for `min(balance, 32 KB)` — so a single readPkg drained one ~4 KB
+  segment while telling the TOE that 32 KB had been consumed. The window ran ahead of reality, the
+  shared fifo backed up until `rx_engine` started dropping segments with `ACK_NODELAY`, and the
+  decoder sat ~100% starved behind a duplicate-ACK storm. **Do not reintroduce coalescing here.**
 - **The host must respect the ring depth.** `ConfigWriteReadyRegister` does not back-pressure: a
   `START` write arriving while the previous one is unconsumed overwrites it and that request is gone
   without a trace. `HttpConfig` read register 10 (`INFLIGHT`) reports occupancy, the scheduler sets

@@ -65,6 +65,7 @@ module tcp_read_tb;
     int                       col_nlast;
     bit                       bp_enable;       // consumer drops tready periodically
     bit                       combined_close;  // last data notification carries closed=1
+    bit                       burst_notifs;    // announce every segment before serving any readPkg
 
     // tcp_read no longer consumes the notification stream itself -- tcp_session_table does, and
     // hands it the per-slot balance. The bench still drives raw notifications (that is what the TOE
@@ -74,7 +75,6 @@ module tcp_read_tb;
     logic [TCP_LEN_BITS-1:0] tbl_req_len;
     logic                    tbl_closed;
     logic                    tbl_take_en;
-    logic [TCP_LEN_BITS-1:0] tbl_take_len;
     tcp_session_table #(.NUM_SLOTS(1)) tbl (
         .clk(clk), .rst_n(rst_n),
         .s_axis_notifications_TVALID(s_axis_notifications_TVALID),
@@ -91,8 +91,8 @@ module tcp_read_tb;
         .q_slot(1'b0),
         .q_pending(tbl_pending), .q_req_len(tbl_req_len),
         .q_closed(tbl_closed), .q_bound(),
-        .take_en(tbl_take_en), .take_len(tbl_take_len),
-        .dbg_has_pending(), .dbg_closed()
+        .take_en(tbl_take_en),
+        .dbg_has_pending(), .dbg_closed(), .dbg_overflow()
     );
 
     tcp_read dut (
@@ -100,7 +100,6 @@ module tcp_read_tb;
         .rx_req_len(tbl_req_len),
         .rx_closed(tbl_closed),
         .rx_take_en(tbl_take_en),
-        .rx_take_len(tbl_take_len),
         .m_axis_read_package_TVALID(m_axis_read_package_TVALID),
         .m_axis_read_package_TREADY(m_axis_read_package_TREADY),
         .m_axis_read_package_TDATA(m_axis_read_package_TDATA),
@@ -331,6 +330,36 @@ module tcp_read_tb;
         int off;
         logic last_seg;
         byte unsigned seg[$];
+
+        if (burst_notifs) begin
+            // Every announcement lands -- including the FIN -- before a single readPkg is served.
+            // That is what happens whenever the peer outruns the reader, and it is the case that
+            // told us nothing until now, because the normal producer serves each notification
+            // before driving the next and so never leaves two of them queued.
+            //
+            // Two properties are under test. First, one readPkg must name exactly ONE announced
+            // segment: with RX_DDR_BYPASS the TOE returns a single queued packet per readPkg
+            // whatever length is asked for, so a reader that sums the outstanding announcements
+            // drains one segment while telling the TOE it consumed all of them. check_readpkg fails
+            // on the summed length. Second, `closed` is already sticky before the body has been
+            // read, so acting on it early would truncate the body -- the byte comparison catches it.
+            m_axis_read_package_TREADY = 1'b0;   // hold the reader in ST_REQ_PKG while we announce
+            for (int s = 0; s < seg_lens.size(); s++) drive_notif(seg_lens[s][15:0], 1'b0);
+            drive_notif(16'd0, 1'b1);            // FIN, announced up front as well
+            m_axis_read_package_TREADY = 1'b1;
+
+            off = 0;
+            for (int s = 0; s < seg_lens.size(); s++) begin
+                seg.delete();
+                for (int i = 0; i < seg_lens[s]; i++) seg.push_back(resp[off + i]);
+                off += seg_lens[s];
+                check_readpkg(seg_lens[s]);
+                drive_metadata();
+                drive_segment(seg);
+            end
+            return;
+        end
+
         off = 0;
         for (int s = 0; s < seg_lens.size(); s++) begin
             last_seg = (s == seg_lens.size() - 1);
@@ -450,6 +479,28 @@ module tcp_read_tb;
         run_request("many_small_segments", resp, body, segs);
     endtask
 
+    // Regression for the coalescing bug that shipped in build-90: several announcements queued
+    // before the reader gets to any of them.
+    task automatic case_burst_notifications();
+        byte unsigned resp[$], body[$];
+        int segs[$], total, off;
+        build_response(resp, body, 900, 8'h60);
+        total = resp.size();
+        segs.delete();
+        segs.push_back(96);              // header plus a little body
+        off = 96;
+        while (off < total) begin
+            if (total - off >= 137) segs.push_back(137);   // deliberately not 64-aligned
+            else                    segs.push_back(total - off);
+            off += segs[segs.size()-1];
+        end
+        burst_notifs = 1'b1;
+        $display("--- case_burst_notifications (%0d bytes, %0d segments announced up front) ---",
+                 total, segs.size());
+        run_request("burst_notifications", resp, body, segs);
+        burst_notifs = 1'b0;
+    endtask
+
     task automatic case_combined_close();
         byte unsigned resp[$], body[$];
         int segs[$], total;
@@ -550,7 +601,7 @@ module tcp_read_tb;
     initial begin
         fails  = 0; passes = 0;
         rst_n  = 1'b0; start = 1'b0;
-        bp_enable = 1'b0; combined_close = 1'b0;
+        bp_enable = 1'b0; combined_close = 1'b0; burst_notifs = 1'b0;
         s_axis_notifications_TVALID = 1'b0;
         s_axis_rx_metadata_TVALID   = 1'b0;
         s_axis_rx_data_TVALID       = 1'b0;
@@ -563,6 +614,7 @@ module tcp_read_tb;
         case_single_segment();
         case_multiseg();
         case_many_small_segments();
+        case_burst_notifications();
         case_combined_close();
         case_backpressure();
         case_sequential();

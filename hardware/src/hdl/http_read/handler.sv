@@ -224,9 +224,9 @@ module handler #(
     logic                    tbl_closed;
     logic                    tbl_bound;
     logic                    tbl_take_en;
-    logic [TCP_LEN_BITS-1:0] tbl_take_len;
     logic [NUM_SLOTS-1:0]    tbl_dbg_has_pending;
     logic [NUM_SLOTS-1:0]    tbl_dbg_closed;
+    logic [NUM_SLOTS-1:0]    tbl_dbg_overflow;
 
     tcp_session_table #(
         .NUM_SLOTS(NUM_SLOTS)
@@ -252,10 +252,10 @@ module handler #(
         .q_bound  (tbl_bound),
 
         .take_en (tbl_take_en),
-        .take_len(tbl_take_len),
 
         .dbg_has_pending(tbl_dbg_has_pending),
-        .dbg_closed     (tbl_dbg_closed)
+        .dbg_closed     (tbl_dbg_closed),
+        .dbg_overflow   (tbl_dbg_overflow)
     );
 
     // ---------------------------------------------------------------------------------------------
@@ -323,6 +323,8 @@ module handler #(
     //   [0] connect stalled   [1] send stalled   [2] read stalled
     //   [3] tcp_init reported error   [4] tcp_send_http reported error
     //   [15:8]  slot the connect stage is on   [23:16] slot the read stage is on
+    //   [31:24] per-slot sticky "announcement queue overflowed" bitmap (see tcp_session_table.sv);
+    //           a set bit means announced segments were dropped and that response is short forever
     // ---------------------------------------------------------------------------------------------
     localparam int STALL_BITS = $clog2(STALL_CYCLES) + 1;
 
@@ -330,7 +332,7 @@ module handler #(
     logic conn_stall_q, send_stall_q, read_stall_q;
     logic init_err_q, send_err_q;
 
-    assign stallWord = {8'd0,
+    assign stallWord = {8'(tbl_dbg_overflow),
                         8'(read_idx),
                         8'(conn_idx),
                         3'd0, send_err_q, init_err_q,
@@ -431,7 +433,6 @@ module handler #(
         .rx_req_len (tbl_req_len),
         .rx_closed  (tbl_closed),
         .rx_take_en (tbl_take_en),
-        .rx_take_len(tbl_take_len),
 
         .m_axis_read_package_TVALID(m_axis_read_package_TVALID),
         .m_axis_read_package_TREADY(m_axis_read_package_TREADY),

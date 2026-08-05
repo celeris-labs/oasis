@@ -369,6 +369,7 @@ HTTPReadConfig::HTTPStall HTTPReadConfig::stall() {
     s.send_error      = (word & (1u << 4)) != 0;
     s.connect_slot    = static_cast<uint8_t>((word >> 8) & 0xFFu);
     s.read_slot       = static_cast<uint8_t>((word >> 16) & 0xFFu);
+    s.overflow_mask   = static_cast<uint8_t>((word >> 24) & 0xFFu);
     return s;
 }
 
@@ -383,6 +384,15 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     if (read_stalled)    oss << " READ(slot " << static_cast<unsigned>(read_slot) << ")";
     if (init_error)      oss << " init_error";
     if (send_error)      oss << " send_error";
+    if (overflow_mask)   oss << " notify_overflow(slots 0x" << std::hex
+                             << static_cast<unsigned>(overflow_mask) << std::dec << ")";
+
+    if (overflow_mask) {
+        oss << ". A slot's announcement queue overflowed, so segments the TOE announced were "
+               "dropped and that response is permanently short. This should be unreachable "
+               "(NOTIFY_DEPTH in tcp_session_table.sv vs the shared rx fifo); if it fires, the "
+               "reader is not draining and the depth needs raising";
+    }
 
     // The one failure mode worth naming outright, because it is the common one and nothing else in
     // the system points at it. See the HTTPStall doc comment for the full chain.

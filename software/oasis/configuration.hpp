@@ -141,9 +141,13 @@ class HTTPReadConfig : public libstf::Config {
         bool send_error      = false;
         uint8_t connect_slot = 0;
         uint8_t read_slot    = 0;
+        /// Per-slot: the announcement queue overflowed and segments were dropped. Sticky, and
+        /// should never fire -- see NOTIFY_DEPTH in hardware/src/hdl/http_read/tcp_session_table.sv.
+        uint8_t overflow_mask = 0;
 
         bool any() const {
-            return connect_stalled || send_stalled || read_stalled || init_error || send_error;
+            return connect_stalled || send_stalled || read_stalled || init_error || send_error
+                   || overflow_mask != 0;
         }
         std::string describe() const;
     };

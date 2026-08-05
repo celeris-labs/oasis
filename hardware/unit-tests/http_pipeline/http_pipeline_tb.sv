@@ -182,6 +182,7 @@ module http_pipeline_tb #(
     int          sess_req      [NUM_REQS];   // which request each session serves
     logic [7:0]  sess_resp     [NUM_REQS][$]; // full response bytes (header + body)
     int          sess_delivered[NUM_REQS];   // bytes handed over via readPkg
+    int          seg_q         [NUM_REQS][$]; // announced-but-not-yet-read segment lengths
     int          sess_announced[NUM_REQS];   // bytes announced via notifications
     bit          sess_get_seen [NUM_REQS];   // the GET for this session has arrived
     bit          sess_open     [NUM_REQS];
@@ -383,6 +384,10 @@ module http_pipeline_tb #(
                 while (sent < total) begin
                     chunk = (total - sent > 96) ? 96 : (total - sent);
                     sent += chunk;
+                    // Record the segment as well as announcing it. The TOE hands back ONE announced
+                    // segment per readPkg (see the readPkg model below), so the model needs the
+                    // announcement boundaries, not just a byte total.
+                    seg_q[g].push_back(chunk);
                     notify_q.push_back(make_notify(SID_BASE + g, chunk, 1'b0));
                     repeat (6) @(posedge clk);
                 end
@@ -438,6 +443,26 @@ module http_pipeline_tb #(
             if (idx < 0 || idx >= NUM_REQS) begin
                 $fatal(1, "readPkg for unknown session %0d", sid);
             end
+
+            // The Coyote TOE is built with TCP_STACK_RX_DDR_BYPASS_EN=1, so the receive buffer is a
+            // shared on-chip PACKET fifo, not a per-session circular buffer. rx_app_stream_if turns
+            // a readPkg into a bare 1-bit token and rxAppMemDataRead then forwards exactly one
+            // queued packet, whatever length the request named; the length is used only to advance
+            // the app read pointer that the advertised window is derived from. So a reader that
+            // coalesces several announcements into one readPkg drains ONE segment while telling the
+            // TOE it consumed all of them -- the receive window runs ahead of reality, the shared
+            // fifo backs up, and rx_engine starts dropping segments with ACK_NODELAY.
+            //
+            // The first version of this bench delivered `len` bytes for any `len`, which is why the
+            // coalescing bug reached hardware. Model the real contract instead, and assert it.
+            if (seg_q[idx].size() == 0) begin
+                $fatal(1, "readPkg on session %0d with no announcement outstanding", sid);
+            end
+            if (len != seg_q[idx][0]) begin
+                $fatal(1, "readPkg asked for %0d bytes but the oldest announcement on session %0d is %0d -- one readPkg must name exactly one announced segment",
+                       len, sid, seg_q[idx][0]);
+            end
+            len = seg_q[idx].pop_front();
             if (sess_delivered[idx] + len > sess_resp[idx].size()) begin
                 $fatal(1, "readPkg asked for %0d bytes at offset %0d but the response is only %0d",
                        len, sess_delivered[idx], sess_resp[idx].size());

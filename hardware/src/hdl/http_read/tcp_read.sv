@@ -20,8 +20,8 @@ import lynxTypes::*;
 // for the other session is consumed and thrown away, and when the reader turns to it, it blocks
 // forever on news that already came and went. Since pipelining exists precisely to have the next
 // response in flight while this one drains, notifications are now owned by tcp_session_table, which
-// records them per slot. This module just reads the balance for its slot and tells the table how
-// much of it was requested. See tcp_session_table.sv.
+// queues them per slot. This module reads the oldest announcement for its slot, issues a readPkg for
+// exactly that many bytes, and retires it. See tcp_session_table.sv.
 //
 // strip_http and the downstream DataNormalizer expect ONE continuous stream terminated by a single
 // tlast (the normalizer accumulates a running byte offset and only resets on tlast). But each
@@ -37,10 +37,9 @@ module tcp_read (
     input  logic [15:0]                               session_id,
 
     // Receive accounting for THIS response's slot, from tcp_session_table.
-    input  logic [TCP_LEN_BITS-1:0]                   rx_req_len, // min(balance, MAX_READ_BYTES)
+    input  logic [TCP_LEN_BITS-1:0]                   rx_req_len, // oldest unread announcement
     input  logic                                      rx_closed,  // peer has FINed (sticky)
-    output logic                                      rx_take_en, // we just requested rx_take_len
-    output logic [TCP_LEN_BITS-1:0]                   rx_take_len,
+    output logic                                      rx_take_en, // retire that announcement
 
     output logic                                      m_axis_read_package_TVALID,
     input  logic                                      m_axis_read_package_TREADY,
@@ -167,7 +166,6 @@ module tcp_read (
         s_axis_rx_metadata_TREADY   = 1'b0;
         emit_last                   = 1'b0;
         rx_take_en                  = 1'b0;
-        rx_take_len                 = rx_req_len;
 
         case (state_q)
             ST_IDLE: begin
@@ -178,9 +176,12 @@ module tcp_read (
             end
 
             ST_WAIT_NOTIFY: begin
-                // Take whatever the session table has recorded for us. Order matters: drain the
-                // balance first and only treat `closed` as end-of-body once nothing is left, because
-                // one notification can carry both the final segment and the FIN.
+                // Take the OLDEST announcement recorded for us and issue a readPkg naming exactly
+                // its length -- one readPkg per announcement, never a coalesced total, because a
+                // readPkg returns one announced segment whatever length it asks for (see the header
+                // of tcp_session_table.sv). Order matters: drain the queue first and only treat
+                // `closed` as end-of-body once nothing is left, because one notification can carry
+                // both the final segment and the FIN.
                 if (rx_req_len != 0) begin
                     rx_take_en = 1'b1;
                     req_len_d  = rx_req_len;
