@@ -48,7 +48,14 @@ typedef struct packed {
     logic [31:0] range_end_w1;
     logic [31:0] range_end_w2;
     logic [31:0] range_end_w3;
-    logic [15:0] num_sessions;
+    // Per-request flags. Bit 0 (body_last) says this response ends the decoder stream: the host
+    // may split one logical column chunk into several ranged GETs to bound how many bytes the
+    // server can have in flight, and the DataNormalizer resets its running byte offset on tlast, so
+    // only the last of them may carry it. This register used to be a dead `num_sessions` field --
+    // reusing it keeps the CSR address map byte-for-byte identical, which matters: every address
+    // after a shifted register lands in the wrong place and the FPGA builds a garbage request out
+    // of whatever happened to be there.
+    logic [15:0] req_flags;
     logic [31:0] pkg_word_count;
     logic [31:0] user_frequency;
     logic [31:0] time_in_seconds;

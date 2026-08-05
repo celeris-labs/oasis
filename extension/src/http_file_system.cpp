@@ -81,7 +81,9 @@ string NormalizeHttpPath(const string &path) {
 // client_state cannot give you: state_debug multiplexes one value, so 2, 6, 9 and 10 each alias two
 // different states.
 string DecodeHttpFpgaStatus(uint32_t status) {
-	static const char *handler_states[] = {"IDLE", "TCP_INIT", "TCP_SEND", "TCP_READ", "CLOSE"};
+	// Mirrors `coarse_state` in hardware/src/hdl/http_read/handler.sv. RECONNECT replaced CLOSE
+	// when the client stopped tearing the connection down after every response.
+	static const char *handler_states[] = {"IDLE", "CONNECT", "SEND", "READ", "RECONNECT"};
 	const auto top = status & 0xF;
 	char buf[256];
 	std::snprintf(buf, sizeof(buf),

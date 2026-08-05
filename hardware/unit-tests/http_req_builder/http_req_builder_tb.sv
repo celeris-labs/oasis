@@ -131,7 +131,7 @@ module http_req_builder_tb;
     function automatic string expected(input string path, input string ip, input string port4,
                                        input string rb, input string re);
         return {"GET ", path, " HTTP/1.1", crlf(), "Host: ", ip, ":", port4, crlf(),
-                "Range: bytes=", rb, "-", re, crlf(), "Connection: close", crlf(), crlf()};
+                "Range: bytes=", rb, "-", re, crlf(), "Connection: keep-alive", crlf(), crlf()};
     endfunction
 
     // -- emulate tcp_send_http's ST_BUILD_HDR exactly ---------------------------------------------

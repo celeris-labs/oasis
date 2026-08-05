@@ -33,7 +33,7 @@ import http_types::*;
 //   9  FILE_W0          ([31:0])     -- Path bytes packed little endian
 //   .. FILE_W1..W14                     (9 + n for word n)
 //   24 FILE_W15
-//   25 NUM_SESSIONS     ([15:0])
+//   25 REQ_FLAGS        ([15:0])     -- bit 0: this response ends the decoder stream
 //   26 PKG_WORD_COUNT   ([31:0])
 //   27 USER_FREQUENCY   ([31:0])
 //   28 TIME_IN_SECONDS  ([31:0])
@@ -66,10 +66,16 @@ import http_types::*;
 //   6  ECHO_RANGE_BEGIN ([39:32] len, [31:0] first 4 ASCII digits)
 //   7  ECHO_RANGE_END   ([39:32] len, [31:0] first 4 ASCII digits)
 //   8  ECHO_SERVER      ([47:32] port, [31:0] ip)
-//   10 INFLIGHT         ([7:0] slots occupied, [15:8] NUM_SLOTS, [23:16] pending bitmap,
-//                        [31:24] closed bitmap) -- see handler.sv inflightWord
+//   10 INFLIGHT         ([7:0] slots occupied, [15:8] NUM_SLOTS, [16] announcement pending,
+//                        [17] peer FINed, [18] connection up) -- see handler.sv inflightWord
 //   11 STALL            ([0] connect stalled, [1] send stalled, [2] read stalled, [3] init error,
-//                        [4] send error, [15:8] connect slot, [23:16] read slot)
+//                        [4] send error, [5] response had no Content-Length, [6] fatal dirty abort,
+//                        [7] status not 200/206, [15:8] reconnects, [23:16] read slot,
+//                        [24] announcement queue overflow)
+//   12 RESP             ([23:0] status digits ASCII, [24] status ok, [25] unframeable response,
+//                        [26] body bytes already emitted for the current response)
+//   13 BODY_REMAINING   ([31:0]) -- bytes of the current body still to stream; a read that is stuck
+//                        with this non-zero is waiting on the network, not on the decoder
 //
 // INFLIGHT is not optional bookkeeping. ConfigWriteReadyRegister does NOT back-pressure: a START
 // write that lands while the previous one is still unconsumed overwrites it, and the earlier request
@@ -101,7 +107,9 @@ module HttpConfig #(
     input  logic [3:0]  client_state,
     input  logic [31:0] total_word,
     input  logic [31:0] inflight_word,
-    input  logic [31:0] stall_word
+    input  logic [31:0] stall_word,
+    input  logic [31:0] resp_word,
+    input  logic [31:0] body_remaining_word
 );
 
 `RESET_RESYNC
@@ -148,7 +156,7 @@ data64_t reg_file_w12;
 data64_t reg_file_w13;
 data64_t reg_file_w14;
 data64_t reg_file_w15;
-data64_t reg_num_sessions;
+data64_t reg_req_flags;
 data64_t reg_pkg_word_count;
 data64_t reg_user_frequency;
 data64_t reg_time_in_seconds;
@@ -188,7 +196,7 @@ ConfigWriteRegister #(21, data64_t) inst_reg_file_w12         (clk, write_config
 ConfigWriteRegister #(22, data64_t) inst_reg_file_w13         (clk, write_config, reg_file_w13);
 ConfigWriteRegister #(23, data64_t) inst_reg_file_w14         (clk, write_config, reg_file_w14);
 ConfigWriteRegister #(24, data64_t) inst_reg_file_w15         (clk, write_config, reg_file_w15);
-ConfigWriteRegister #(25, data64_t) inst_reg_num_sessions     (clk, write_config, reg_num_sessions);
+ConfigWriteRegister #(25, data64_t) inst_reg_req_flags        (clk, write_config, reg_req_flags);
 ConfigWriteRegister #(26, data64_t) inst_reg_pkg_word_count   (clk, write_config, reg_pkg_word_count);
 ConfigWriteRegister #(27, data64_t) inst_reg_user_frequency   (clk, write_config, reg_user_frequency);
 ConfigWriteRegister #(28, data64_t) inst_reg_time_in_seconds  (clk, write_config, reg_time_in_seconds);
@@ -232,7 +240,7 @@ always_comb begin
     cfg.file_w13        = reg_file_w13       [31:0];
     cfg.file_w14        = reg_file_w14       [31:0];
     cfg.file_w15        = reg_file_w15       [31:0];
-    cfg.num_sessions    = reg_num_sessions   [15:0];
+    cfg.req_flags       = reg_req_flags      [15:0];
     cfg.pkg_word_count  = reg_pkg_word_count [31:0];
     cfg.user_frequency  = reg_user_frequency [31:0];
     cfg.time_in_seconds = reg_time_in_seconds[31:0];
@@ -276,7 +284,7 @@ assign start_raw.ready = start_cfg.ready;
 // discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
 // ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-localparam int NUM_READ_REGS = 12;
+localparam int NUM_READ_REGS = 14;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -296,6 +304,11 @@ assign read_registers[9] = {32'b0, cfg.file_w8};
 assign read_registers[10] = {32'b0, inflight_word};
 // Which stage stalled, so a full ring can be told apart from a dead connect. See handler.sv.
 assign read_registers[11] = {32'b0, stall_word};
+// HTTP response framing. On a persistent connection the body is delimited by Content-Length rather
+// than by the FIN, so "the response was a 404 whose XML body happened to parse as column data" and
+// "the response could not be framed at all" are now distinguishable from the host. See strip_http.sv.
+assign read_registers[12] = {32'b0, resp_word};
+assign read_registers[13] = {32'b0, body_remaining_word};
 
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
 

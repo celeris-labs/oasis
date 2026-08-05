@@ -120,11 +120,13 @@ ColumnChunkDecoderConfig #(
 );
 
 `ifdef EN_TCP
-// Requests in flight in the HTTP client. Each slot is one queued ranged GET and, once connected,
-// one concurrently open TCP session -- this is what lets the connect + GET + server think-time for
-// request k+1 overlap the body transfer of request k instead of following it. The host must not
-// enqueue more than this many outstanding requests; it reads the ring occupancy back through
-// HttpConfig's INFLIGHT register, and software/oasis mirrors this number.
+// Requests in flight in the HTTP client. Each slot is one queued ranged GET, PIPELINED over the
+// single persistent TCP connection the handler holds open -- so the GET and the server's think time
+// for request k+1 overlap the body transfer of request k instead of following it. Slots no longer
+// cost a TCP session: one connection serves all of them, which is what makes pipelining safe on a
+// TOE whose receive path does not demultiplex sessions (see handler.sv). The host must not enqueue
+// more than this many outstanding requests; it reads the ring occupancy back through HttpConfig's
+// INFLIGHT register, and software/oasis mirrors this number.
 localparam int HTTP_NUM_SLOTS = 4;
 
 // HttpConfig latches params; a START write emits one http_config_t beat, which the handler accepts
@@ -137,6 +139,8 @@ logic [3:0]                    http_client_state;
 logic [31:0]                   http_total_word;
 logic [31:0]                   http_inflight_word;
 logic [31:0]                   http_stall_word;
+logic [31:0]                   http_resp_word;
+logic [31:0]                   http_body_remaining_word;
 
 // 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
 // 8 to 16 words, which put START on top of RANGE_BEGIN_W1: writing that parameter fired the request
@@ -155,7 +159,9 @@ HttpConfig #(
     .client_state (http_client_state),
     .total_word   (http_total_word),
     .inflight_word(http_inflight_word),
-    .stall_word   (http_stall_word)
+    .stall_word   (http_stall_word),
+    .resp_word           (http_resp_word),
+    .body_remaining_word (http_body_remaining_word)
 );
 `elsif EN_RDMA
 RDMAReadConfig #(
@@ -339,6 +345,8 @@ handler #(
     .totalWord                     (http_total_word),
     .inflightWord                  (http_inflight_word),
     .stallWord                     (http_stall_word),
+    .respWord                      (http_resp_word),
+    .bodyRemainingWord             (http_body_remaining_word),
     .state_debug                   (http_client_state),
 
     .m_axis_body_tvalid  (axi_http_body.tvalid),

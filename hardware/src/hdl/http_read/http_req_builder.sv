@@ -47,7 +47,14 @@ module http_req_builder (
     localparam int LEN_PORT       = 4;  // 4 fixed ASCII chars for port
     localparam int LEN_RANGE_PRE  = 13; // "Range: bytes="
     localparam int LEN_CRLF       = 2;  // "\r\n"
-    localparam int LEN_POST       = 21; // "Connection: close\r\n\r\n"
+    // "Connection: keep-alive\r\n\r\n". HTTP/1.1 is persistent by default, so the header is
+    // redundant on the wire -- it is sent anyway because a packet capture then says outright which
+    // side of the keep-alive change a bitstream is on, and 24 extra request bytes against a
+    // multi-KB response cost nothing. What matters is that "Connection: close" is GONE: it is what
+    // made the server FIN after every response, which forced one TCP connection per ranged GET and
+    // burned an ephemeral port each time (the TOE has 512, and a benchmark run wraps them).
+    // strip_http now delimits the body by Content-Length, so the FIN is no longer the frame marker.
+    localparam int LEN_POST       = 26;
 
     localparam logic [LEN_PRE *8-1:0] STR_PRE  = 32'h20544547; // "GET "
     localparam logic [LEN_HOST*8-1:0] STR_HOST = {
@@ -59,10 +66,14 @@ module http_req_builder (
         8'h3D, 8'h73, 8'h65, 8'h74, 8'h79, 8'h62, 8'h20, 8'h3A,
         8'h65, 8'h67, 8'h6E, 8'h61, 8'h52
     };
+    // Byte 0 of the emitted string is the LAST element of the concatenation (the FSM indexes with
+    // STR_POST[sub_idx*8 +: 8]), so the characters are listed in reverse.
     localparam logic [LEN_POST*8-1:0] STR_POST = {
-        8'h0A, 8'h0D, 8'h0A, 8'h0D, 8'h65, 8'h73, 8'h6F, 8'h6C,
-        8'h63, 8'h20, 8'h3A, 8'h6E, 8'h6F, 8'h69, 8'h74, 8'h63,
-        8'h65, 8'h6E, 8'h6E, 8'h6F, 8'h43
+        8'h0A, 8'h0D, 8'h0A, 8'h0D,                             // "\r\n\r\n"
+        8'h65, 8'h76, 8'h69, 8'h6C, 8'h61, 8'h2D,               // "-alive"
+        8'h70, 8'h65, 8'h65, 8'h6B, 8'h20, 8'h3A,               // ": keep"
+        8'h6E, 8'h6F, 8'h69, 8'h74, 8'h63, 8'h65, 8'h6E, 8'h6E, // "nnection"
+        8'h6F, 8'h43                                            // "Co"
     };
 
     typedef enum logic [3:0] {

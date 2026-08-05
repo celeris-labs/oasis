@@ -67,12 +67,12 @@ SETUP="SET http_server='$SERVER'; SET http_port=$PORT;"
 
 # ---------------------------------------------------------------------------------------------
 # Workload definitions. Each is a query over read_oasis($URL) plus the number of hardware column
-# chunks it fetches PER ROW GROUP -- that count times the row groups is the number of GETs, which
-# is what per-request dead time has to be divided by.
+# chunks it fetches PER ROW GROUP. That count times the row groups is the column-chunk count; each
+# chunk is then split into GETs of at most OASIS_HTTP_CHUNK_BYTES on the one open connection.
 # ---------------------------------------------------------------------------------------------
 q_sql() {
     case "$1" in
-        latency) # one INT64 column, no filter: requests == row groups exactly.
+        latency) # one INT64 column, no filter: column chunks == row groups exactly.
             echo "SELECT sum(l_orderkey) FROM read_oasis('$URL');" ;;
         q6)
             echo "SELECT sum(l_extendedprice * l_discount) AS revenue FROM read_oasis('$URL')
@@ -146,50 +146,38 @@ echo " row groups: ${RG:-unknown}"
 echo "=============================================================================="
 
 # ---------------------------------------------------------------------------------------------
-# Connection budget.
+# Request budget.
 #
-# Every column chunk is its own ranged GET on its own TCP connection (the request says
-# `Connection: close`; keep-alive is not implemented). The TOE hands out ephemeral ports from a
-# pool of exactly TCP_STACK_MAX_SESSIONS = 512 -- ports 32768..33279, cursor wrapping at 512 --
-# and releases each one the moment the connection closes, with no quiet time. The server closes
-# first, so IT holds the 4-tuple in TIME_WAIT for 60 s.
+# Every column chunk is a ranged GET, but they no longer cost a TCP connection each: the client
+# holds ONE persistent connection open across every request and every query (the request says
+# `Connection: keep-alive` and strip_http delimits each response by Content-Length). So the 512
+# ephemeral ports the TOE has -- 32768..33279, cursor wrapping at TCP_STACK_MAX_SESSIONS,
+# CUMULATIVE SINCE PROGRAMMING -- are no longer the limit they were. A run that used to need ~2500
+# connections and wedge partway through now needs one.
 #
-# So once a run exceeds 512 connections, every reused port lands on a tuple the server still owns.
-# The TOE presents a random ISN, Linux usually refuses to recycle the TIME_WAIT socket, and the
-# resulting challenge ACK resets the SYN retry counter in the TOE's rx engine -- so the SYN is
-# retried forever and openStatus never arrives. The handler waits in CONNECT and the query dies on
-# the host-side credit timeout.
-#
-# The cursor lives in the bitstream, so this count is CUMULATIVE SINCE PROGRAMMING. Restarting
-# duckdb does not reset it; reprogramming does.
+# What DOES scale with the request count is the range split. HTTPReadConfig::read cuts each column
+# chunk into GETs of at most OASIS_HTTP_CHUNK_BYTES (default 8 KiB) so that
+# max_inflight() x chunk_bytes() stays under the ~41.5 KB at which the TOE's shared receive fifo
+# starts dropping segments. That multiplies the GET count by chunk_size/8 KiB, which is fine -- they
+# are pipelined on the open connection with no handshake -- but it is the number to look at if the
+# per-request overhead ever shows up in these timings.
 # ---------------------------------------------------------------------------------------------
-PORT_POOL=512
 [ "$WORKLOAD" = all ] && WORKLOADS="latency q6 q1 wide" || WORKLOADS="$WORKLOAD"
 total_cols=0
 for w in $WORKLOADS; do
     total_cols=$((total_cols + $(q_cols "$w")))
 done
-CONNS=$((total_cols * ${RG:-0} * REPEAT))
-echo " estimated ranged GETs (== TCP connections) for this run: $CONNS"
-if [ "$CONNS" -ge "$PORT_POOL" ]; then
-    cat <<EOF
- !! This run needs $CONNS connections but the FPGA only has $PORT_POOL ephemeral ports, and the
- !! count is cumulative since the bitstream was programmed. It WILL wrap into the server's 60 s
- !! TIME_WAIT and is likely to wedge partway through with a stalled CONNECT.
- !!
- !! Until keep-alive exists, the fix is fewer connections, i.e. fewer/larger row groups:
- !!   COPY tbl TO 'x.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000000);
- !! At ~1M-row groups this file would need about $((total_cols * 7 * REPEAT)) connections instead.
- !! Reprogram the bitstream before the run to start from a fresh port cursor.
-EOF
-fi
+CHUNKS=$((total_cols * ${RG:-0} * REPEAT))
+echo " estimated column chunks for this run: $CHUNKS (all on one TCP connection)"
+echo " range split: OASIS_HTTP_CHUNK_BYTES=${OASIS_HTTP_CHUNK_BYTES:-8192} bytes per GET"
+echo " (set OASIS_HTTP_CHUNK_BYTES=0 to send one GET per column chunk and measure what the split costs)"
 echo "=============================================================================="
 
 for w in $WORKLOADS; do
     cols=$(q_cols "$w")
     echo
     echo "##############################################################################"
-    echo "# $w -- $cols hardware column(s) per row group => $((cols * ${RG:-0})) ranged GETs"
+    echo "# $w -- $cols hardware column(s) per row group => $((cols * ${RG:-0})) column chunks"
     echo "##############################################################################"
     for i in $(seq 1 "$REPEAT"); do
         run_one "$w" oasis "$(q_sql "$w")"

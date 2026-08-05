@@ -60,7 +60,10 @@ constexpr const uint32_t HTTP_IP_HEX_LEN      = 3;
 constexpr const uint32_t HTTP_IP_HEX_W0       = 4;
 constexpr const uint32_t HTTP_FILE_LEN        = 8;
 constexpr const uint32_t HTTP_FILE_W0         = 9;  // 9..24 (16 words, 64 path characters)
-constexpr const uint32_t HTTP_NUM_SESSIONS    = 25;
+// Register 25 was a dead `num_sessions` field; it now carries per-request flags (bit 0 = this
+// response ends the decoder stream). Reusing it keeps the address map byte-for-byte identical --
+// shifting any register lands every later parameter in the wrong place, silently.
+constexpr const uint32_t HTTP_REQ_FLAGS       = 25;
 constexpr const uint32_t HTTP_PKG_WORD_COUNT  = 26;
 constexpr const uint32_t HTTP_USER_FREQUENCY  = 27;
 constexpr const uint32_t HTTP_TIME_IN_SECONDS = 28;
@@ -99,9 +102,9 @@ constexpr const uint32_t HTTP_IP_WORDS   = 4;
 // overflow detection -- writes past the end alias instead of failing, so this check is the only
 // thing standing between a long path and a silently corrupted request. The fixed parts are
 // "GET " (4) + " HTTP/1.1\r\nHost: " (17) + ":" (1) + port (4) + CRLF (2) +
-// "Range: bytes=" (13) + "-" (1) + CRLF (2) + "Connection: close\r\n\r\n" (21) = 65 bytes.
+// "Range: bytes=" (13) + "-" (1) + CRLF (2) + "Connection: keep-alive\r\n\r\n" (26) = 70 bytes.
 constexpr const uint32_t HTTP_HEADER_BUFFER_BYTES = 256;
-constexpr const uint32_t HTTP_HEADER_FIXED_BYTES  = 65;
+constexpr const uint32_t HTTP_HEADER_FIXED_BYTES  = 70;
 
 // Read-side CSRs (see hardware/src/hdl/http_read/http_config.sv).
 constexpr const uint32_t HTTP_CLIENT_STATE     = 1;
@@ -115,47 +118,64 @@ constexpr const uint32_t HTTP_ECHO_SERVER      = 8;
 constexpr const uint32_t HTTP_ECHO_FILE_W8     = 9;
 constexpr const uint32_t HTTP_INFLIGHT         = 10;
 constexpr const uint32_t HTTP_STALL            = 11;
+constexpr const uint32_t HTTP_RESP             = 12;
+constexpr const uint32_t HTTP_BODY_REMAINING   = 13;
 
 // How long to wait for a request slot before giving up. Reaching this means the pipeline stopped
 // draining -- a response that never arrived, or a connection that never opened -- so it is a
 // diagnosis, not a tuning knob. Generous enough that a slow object server never trips it.
 constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 
-// How many ranged GETs the host may have in flight on the FPGA at once, regardless of how many ring
-// slots the bitstream advertises.
+// -------------------------------------------------------------------------------------------------
+// The two knobs that together bound how many bytes the server can have in flight to the FPGA.
 //
-// This is 1, and on the TOE we ship it MUST be 1. Coyote builds the stack with
-// TCP_STACK_RX_DDR_BYPASS_EN=1 (parcore/libstf/coyote/hw/services/network/hls/toe/CMakeLists.txt),
-// and on that path the receive side does not demultiplex sessions at all:
+// WHY THAT BOUND MATTERS
+// The Coyote TOE is built with TCP_STACK_RX_DDR_BYPASS_EN=1
+// (parcore/libstf/coyote/hw/services/network/hls/toe/CMakeLists.txt). On that path the entire stack
+// has ONE receive buffer -- `axis_data_fifo_512_d1024 rx_buffer_fifo` in tcp_stack.sv, 1024 x 64 B
+// = 64 KB -- and `rx_sar_table.cpp:71` computes the advertised window from the application read
+// pointer alone, with no knowledge of that buffer: WINDOW_BITS is 18, so it can advertise up to
+// 256 KB. Grep rx_sar_table for `data_count` and you get nothing. Meanwhile `rx_engine.cpp` DROPS a
+// segment and answers ACK_NODELAY -- a duplicate ACK -- once free space falls below 375 beats, i.e.
+// once occupancy passes ~41.5 KB. Out-of-order buffering is disabled on this path, so one drop
+// forces go-back-N. The stack therefore invites the server to send four to six times what it can
+// hold, discards the overflow and re-requests it, and that is what the duplicate-ACK storms are.
 //
-//   * there is exactly one receive buffer for the whole stack -- `axis_data_fifo_512_d1024
-//     rx_buffer_fifo` in tcp_stack.sv, 1024 x 64 B, shared by every session;
-//   * rx_app_stream_if() answers a readPkg by echoing back the session ID the APP ASKED FOR and
-//     writing a bare 1-bit token (rx_app_stream_if.cpp, RX_DDR_BYPASS branch) -- no address, no
-//     length, nothing that identifies a session;
-//   * rxAppMemDataRead() (toe.cpp) consumes that token by popping one packet from the HEAD of the
-//     shared FIFO, until tlast, without ever looking at the session.
+// The proper fix is in the TOE (plumb rxbuffer_data_count into rx_sar_table and clamp the window to
+// real free space) or, cheaply, a bigger FIFO. Neither is done here. Instead the HOST refuses to
+// ask for more than the buffer can hold: a ranged GET's response is bounded by the range, so
 //
-// So the stack's real contract is not "one readPkg per notification" -- it is "readPkg must be
-// issued in the global arrival order of segments across ALL sessions". The FIFO head is whatever
-// arrived first on the wire and it is handed to whoever asked, wearing that asker's session ID.
+//     bytes the server may have in flight  <=  HTTP_DEFAULT_MAX_INFLIGHT * HTTP_DEFAULT_CHUNK_BYTES
 //
-// The handler drains its slots in REQUEST order (read_ptr in handler.sv). With more than one GET in
-// flight to the same server the responses interleave, so request order != arrival order, and a slot
-// receives another slot's bytes labelled as its own. The read FSM's accounting breaks, it stops
-// issuing readPkg, nothing drains the shared FIFO, and once occupancy passes 649 of 1024 beats
-// (~41.5 KB) rx_engine answers every further segment on EVERY session with ACK_NODELAY instead of
-// ACK (rx_engine.cpp: `(rxbuffer_max_data_count - rxbuffer_data_count) > 375`). That is a duplicate
-// ACK, so the server retransmits, gets another duplicate ACK, forever. The retransmission storm is
-// not a separate network fault -- it is this wedge seen from the wire.
+// and keeping that product safely under 41.5 KB means the FIFO cannot overflow no matter how fast
+// the sender is or how slowly the decoder drains. 4 x 8 KiB = 32 KiB leaves ~9 KB of headroom for
+// the response headers and in-flight ACK slack.
 //
-// Depth > 1 is therefore only safe on a TOE rebuilt with TCP_STACK_RX_DDR_BYPASS_EN=0, which gives
-// each session its own circular buffer in DDR and makes readPkg genuinely per-session. The override
-// exists for exactly that experiment and for nothing else.
-constexpr const uint8_t HTTP_DEFAULT_MAX_INFLIGHT = 1;
+// WHY PIPELINING IS SAFE AGAIN
+// Depth > 1 used to wedge the receive path, and the reason was never the depth: it was concurrent
+// SESSIONS. Under RX_DDR_BYPASS `rx_app_stream_if()` answers a readPkg by echoing back the session
+// ID the app asked for plus a bare 1-bit token, and `rxAppMemDataRead()` (toe.cpp) consumes that
+// token by popping one packet from the HEAD of the shared FIFO without ever looking at the session.
+// The real contract is "readPkg must be issued in the global ARRIVAL order across all sessions",
+// which a handler draining slots in REQUEST order cannot honour with several connections open.
+//
+// The handler now holds ONE persistent connection for every request (see handler.sv). With a single
+// session, arrival order and request order are the same thing, so the contract holds by
+// construction and HTTP/1.1 pipelining over that connection is both legal and safe.
+constexpr const uint8_t  HTTP_DEFAULT_MAX_INFLIGHT = 4;
+
+// Largest byte range asked for in one GET. 0 disables splitting entirely (one GET per column
+// chunk), which is the right setting for measuring what the split costs -- and the wrong one on
+// this TOE, because a 1.3 MB column chunk then lives permanently in go-back-N.
+//
+// Splitting is nearly free only because the connection is persistent: the extra requests cost a
+// ~150-byte GET and a ~200-byte response header each, pipelined, with no handshake and no teardown.
+constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 8192;
 
 // Effective request-ring depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override).
-// OASIS_HTTP_MAX_INFLIGHT=0 means "whatever the bitstream advertises" -- see the warning above.
+// OASIS_HTTP_MAX_INFLIGHT=0 means "whatever the bitstream advertises". Raising this without also
+// lowering OASIS_HTTP_CHUNK_BYTES raises the bytes-in-flight bound above -- read the block above
+// before doing that.
 uint8_t HttpMaxInflight(uint8_t slots) {
     static const int configured = [] {
         const char *env = std::getenv("OASIS_HTTP_MAX_INFLIGHT");
@@ -213,9 +233,39 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
                                  uint32_t num_regs)
     : Config(cthread, addr_offset, num_regs) {}
 
+// Splits [range_begin, range_end] into GETs of at most chunk_bytes() and fires them in order. Only
+// the last one is marked body_last, so the whole column chunk still arrives as ONE decoder stream
+// with exactly one tlast -- the DataNormalizer resets its running byte offset on tlast, so an extra
+// one mid-chunk would desynchronise everything after it.
 void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint16_t server_port,
                           const std::string &path, uint64_t range_begin, uint64_t range_end,
                           uint16_t /*session_id*/) {
+    const uint64_t chunk = chunk_bytes();
+    if (chunk == 0 || (range_end - range_begin + 1) <= chunk) {
+        issue_range(server_ip, server_port, path, range_begin, range_end, /*body_last*/ true);
+        return;
+    }
+
+    for (uint64_t begin = range_begin; begin <= range_end; begin += chunk) {
+        const uint64_t end  = std::min(begin + chunk - 1, range_end);
+        const bool     last = (end == range_end);
+        issue_range(server_ip, server_port, path, begin, end, last);
+    }
+}
+
+uint64_t HTTPReadConfig::chunk_bytes() {
+    static const uint64_t configured = [] {
+        const char *env = std::getenv("OASIS_HTTP_CHUNK_BYTES");
+        if (env == nullptr) {
+            return HTTP_DEFAULT_CHUNK_BYTES;
+        }
+        const long long parsed = std::atoll(env);
+        return parsed < 0 ? HTTP_DEFAULT_CHUNK_BYTES : static_cast<uint64_t>(parsed);
+    }();
+    return configured;
+}
+
+void HTTPReadConfig::await_credit() {
     // Make sure the hardware can actually take this request before writing any of it.
     //
     // ConfigWriteReadyRegister does not back-pressure: a START write that lands while the previous
@@ -239,8 +289,8 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
             throw std::runtime_error(msg.str());
         }
     } else {
-        // Cap the depth at HttpMaxInflight() rather than at the ring size. Under RX_DDR_BYPASS that
-        // cap is 1 and it is what keeps this working at all -- see HTTP_DEFAULT_MAX_INFLIGHT.
+        // Cap the depth at HttpMaxInflight() rather than at the ring size: depth x chunk size is
+        // what bounds the bytes the server may have in flight. See HTTP_DEFAULT_MAX_INFLIGHT.
         const uint8_t depth    = max_inflight();
         const auto    deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
         HTTPInflight  flight   = inflight();
@@ -253,18 +303,18 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
                     << "s [" << flight.describe() << "; " << describe_status(debug_status())
                     << "]. The pipeline has stopped draining -- " << stall().describe()
                     << ". There is no reset register -- reprogram the bitstream to clear it.";
-                if (depth > 1) {
-                    msg << " NOTE: depth is above 1, which is only valid on a TOE built with "
-                           "TCP_STACK_RX_DDR_BYPASS_EN=0. On the stack we ship, concurrent sessions "
-                           "read each other's bytes out of the shared rx FIFO and then wedge exactly "
-                           "like this. Unset OASIS_HTTP_MAX_INFLIGHT.";
-                }
+                msg << " " << response().describe() << ".";
                 throw std::runtime_error(msg.str());
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
             flight = inflight();
         }
     }
+}
+
+void HTTPReadConfig::issue_range(uint32_t server_ip, uint16_t server_port, const std::string &path,
+                                 uint64_t range_begin, uint64_t range_end, bool body_last) {
+    await_credit();
 
     const auto ip_ascii    = IpToAscii(server_ip);
     const auto begin_ascii = std::to_string(range_begin);
@@ -319,7 +369,7 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
     for (uint32_t i = 0; i < HTTP_FILE_WORDS; i++) {
         write_register(libstf::ConfigRegister(HTTP_FILE_W0 + i, file_words[i]));
     }
-    write_register(libstf::ConfigRegister(HTTP_NUM_SESSIONS, 1));
+    write_register(libstf::ConfigRegister(HTTP_REQ_FLAGS, body_last ? 1u : 0u));
     write_register(libstf::ConfigRegister(HTTP_PKG_WORD_COUNT, 16));
     write_register(libstf::ConfigRegister(HTTP_USER_FREQUENCY, 256ULL * 1024ULL * 1024ULL));
     write_register(libstf::ConfigRegister(HTTP_TIME_IN_SECONDS, 0));
@@ -364,14 +414,20 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
         if (flight.legacy()) {
             std::fprintf(stderr, "[oasis-http] bitstream: pre-pipelining (no INFLIGHT register, depth 1)\n");
         } else {
-            // Print the cap next to the ring size. "2/4 cap=1" would mean the cap is not being
-            // honoured; "1/4 cap=1" is the healthy picture on the stack we ship.
-            std::fprintf(stderr, "[oasis-http] bitstream: %s cap=%u\n", flight.describe().c_str(),
-                         unsigned(HttpMaxInflight(flight.slots)));
+            // Print the cap and the chunk size next to the ring size: their product is the bound
+            // on how many bytes the server may have in flight, which is the number that has to stay
+            // under the TOE's ~41.5 KB drop threshold.
+            std::fprintf(stderr,
+                         "[oasis-http] bitstream: %s cap=%u chunk=%llu (<=%llu B in flight)\n",
+                         flight.describe().c_str(), unsigned(HttpMaxInflight(flight.slots)),
+                         static_cast<unsigned long long>(chunk_bytes()),
+                         static_cast<unsigned long long>(HttpMaxInflight(flight.slots) *
+                                                         (chunk_bytes() ? chunk_bytes() : 0)));
         }
-        std::fprintf(stderr, "[oasis-http] START GET %s range=[%llu,%llu] ip=0x%08x port=%u\n",
+        std::fprintf(stderr, "[oasis-http] START GET %s range=[%llu,%llu] last=%d ip=0x%08x port=%u\n",
                      path.c_str(), static_cast<unsigned long long>(range_begin),
-                     static_cast<unsigned long long>(range_end), server_ip, server_port);
+                     static_cast<unsigned long long>(range_end), int(body_last), server_ip,
+                     server_port);
         std::fprintf(stderr, "[oasis-http]   latched: %s\n", request_echo().describe().c_str());
         std::fprintf(stderr, "[oasis-http]   t=0ms      %s\n", describe_status(debug_status()).c_str());
     }
@@ -381,7 +437,7 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
 // multiplexes several sub-FSMs onto one value (2, 6, 9 and 10 each alias two states), so only this
 // packed word can say which stage is actually stuck.
 std::string HTTPReadConfig::describe_status(uint32_t status) {
-    static const char *handler_states[] = {"IDLE", "TCP_INIT", "TCP_SEND", "TCP_READ", "CLOSE"};
+    static const char *handler_states[] = {"IDLE", "CONNECT", "SEND", "READ", "RECONNECT"};
     const auto top = status & 0xFu;
 
     std::ostringstream oss;
@@ -406,10 +462,11 @@ uint32_t HTTPReadConfig::debug_status() {
 HTTPReadConfig::HTTPInflight HTTPReadConfig::inflight() {
     const auto word = static_cast<uint32_t>(read_register(HTTP_INFLIGHT).value());
     HTTPInflight f {};
-    f.occupied     = static_cast<uint8_t>(word & 0xFFu);
-    f.slots        = static_cast<uint8_t>((word >> 8) & 0xFFu);
-    f.pending_mask = static_cast<uint8_t>((word >> 16) & 0xFFu);
-    f.closed_mask  = static_cast<uint8_t>((word >> 24) & 0xFFu);
+    f.occupied    = static_cast<uint8_t>(word & 0xFFu);
+    f.slots       = static_cast<uint8_t>((word >> 8) & 0xFFu);
+    f.has_pending = (word & (1u << 16)) != 0;
+    f.peer_closed = (word & (1u << 17)) != 0;
+    f.conn_up     = (word & (1u << 18)) != 0;
     return f;
 }
 
@@ -419,56 +476,100 @@ std::string HTTPReadConfig::HTTPInflight::describe() const {
         return "inflight=<unsupported: pre-pipelining bitstream>";
     }
     oss << "inflight=" << static_cast<unsigned>(occupied) << "/" << static_cast<unsigned>(slots)
-        << " pending=0x" << std::hex << static_cast<unsigned>(pending_mask) << " closed=0x"
-        << static_cast<unsigned>(closed_mask) << std::dec;
+        << " conn=" << (conn_up ? "up" : "down") << (has_pending ? " pending" : "")
+        << (peer_closed ? " peer-closed" : "");
     return oss.str();
 }
 
 HTTPReadConfig::HTTPStall HTTPReadConfig::stall() {
     const auto word = static_cast<uint32_t>(read_register(HTTP_STALL).value());
     HTTPStall s {};
-    s.connect_stalled = (word & (1u << 0)) != 0;
-    s.send_stalled    = (word & (1u << 1)) != 0;
-    s.read_stalled    = (word & (1u << 2)) != 0;
-    s.init_error      = (word & (1u << 3)) != 0;
-    s.send_error      = (word & (1u << 4)) != 0;
-    s.connect_slot    = static_cast<uint8_t>((word >> 8) & 0xFFu);
-    s.read_slot       = static_cast<uint8_t>((word >> 16) & 0xFFu);
-    s.overflow_mask   = static_cast<uint8_t>((word >> 24) & 0xFFu);
+    s.connect_stalled  = (word & (1u << 0)) != 0;
+    s.send_stalled     = (word & (1u << 1)) != 0;
+    s.read_stalled     = (word & (1u << 2)) != 0;
+    s.init_error       = (word & (1u << 3)) != 0;
+    s.send_error       = (word & (1u << 4)) != 0;
+    s.resp_unframeable = (word & (1u << 5)) != 0;
+    s.dirty_abort      = (word & (1u << 6)) != 0;
+    s.status_bad       = (word & (1u << 7)) != 0;
+    s.reconnects       = static_cast<uint8_t>((word >> 8) & 0xFFu);
+    s.read_slot        = static_cast<uint8_t>((word >> 16) & 0xFFu);
+    s.notify_overflow  = (word & (1u << 24)) != 0;
     return s;
 }
 
 std::string HTTPReadConfig::HTTPStall::describe() const {
-    if (!any()) {
-        return "no stage stall reported";
-    }
     std::ostringstream oss;
+    if (!any()) {
+        oss << "no stage stall reported";
+        if (reconnects) oss << " (" << static_cast<unsigned>(reconnects) << " reconnect(s))";
+        return oss.str();
+    }
     oss << "stalled:";
-    if (connect_stalled) oss << " CONNECT(slot " << static_cast<unsigned>(connect_slot) << ")";
-    if (send_stalled)    oss << " SEND";
-    if (read_stalled)    oss << " READ(slot " << static_cast<unsigned>(read_slot) << ")";
-    if (init_error)      oss << " init_error";
-    if (send_error)      oss << " send_error";
-    if (overflow_mask)   oss << " notify_overflow(slots 0x" << std::hex
-                             << static_cast<unsigned>(overflow_mask) << std::dec << ")";
+    if (connect_stalled)  oss << " CONNECT";
+    if (send_stalled)     oss << " SEND";
+    if (read_stalled)     oss << " READ(slot " << static_cast<unsigned>(read_slot) << ")";
+    if (init_error)       oss << " init_error";
+    if (send_error)       oss << " send_error";
+    if (resp_unframeable) oss << " unframeable_response";
+    if (dirty_abort)      oss << " dirty_abort";
+    if (status_bad)       oss << " bad_http_status";
+    if (notify_overflow)  oss << " notify_overflow";
+    if (reconnects)       oss << " reconnects=" << static_cast<unsigned>(reconnects);
 
-    if (overflow_mask) {
-        oss << ". A slot's announcement queue overflowed, so segments the TOE announced were "
-               "dropped and that response is permanently short. This should be unreachable "
-               "(NOTIFY_DEPTH in tcp_session_table.sv vs the shared rx fifo); if it fires, the "
-               "reader is not draining and the depth needs raising";
+    if (resp_unframeable) {
+        oss << ". A response arrived with no Content-Length, so the hardware could not tell where "
+               "its body ends and the next response begins, and stopped rather than guessing. On a "
+               "ranged GET of a static object that should be impossible -- check whether the server "
+               "answered with Transfer-Encoding: chunked, or whether the reply was an error page";
+    }
+    if (dirty_abort) {
+        oss << ". The connection died in the middle of a body whose bytes had already reached the "
+               "decoder. Those cannot be unsent, so the request was NOT replayed -- replaying would "
+               "duplicate them in the column. Reprogram to clear";
+    }
+    if (status_bad) {
+        oss << ". The server answered something other than 200/206, so whatever reached the decoder "
+               "is an error document, not column data";
+    }
+    if (notify_overflow) {
+        oss << ". The announcement queue overflowed, so segments the TOE announced were dropped and "
+               "that response is permanently short. This should be unreachable (NOTIFY_DEPTH in "
+               "tcp_session_table.sv vs the shared rx fifo); if it fires, the reader is not draining";
     }
 
-    // The one failure mode worth naming outright, because it is the common one and nothing else in
-    // the system points at it. See the HTTPStall doc comment for the full chain.
+    // The one failure mode worth naming outright, because nothing else in the system points at it.
     if (connect_stalled && !init_error) {
         oss << ". A connect that stalls without an error means openStatus never arrived at all: "
                "most likely the TOE reused an ephemeral port (it has 512, at 32768..33279, released "
                "with no quiet time) while the server still held that 4-tuple in TIME_WAIT, and is "
                "now retrying the SYN forever. Connections are cumulative since the bitstream was "
-               "programmed, not per process. Fewer, larger row groups reduce the connection count; "
-               "reprogramming resets the port cursor";
+               "programmed, not per process. Keep-alive is what makes this rare -- a whole query now "
+               "costs one connection -- so a high reconnect count next to this is the thing to chase";
     }
+    return oss.str();
+}
+
+HTTPReadConfig::HTTPResponse HTTPReadConfig::response() {
+    const auto word = static_cast<uint32_t>(read_register(HTTP_RESP).value());
+    HTTPResponse r {};
+    for (int i = 0; i < 3; i++) {
+        const auto c = static_cast<char>((word >> (8 * (2 - i))) & 0xFFu);
+        r.status[i]  = (c >= 0x20 && c < 0x7F) ? c : '?';
+    }
+    r.status_ok      = (word & (1u << 24)) != 0;
+    r.unframeable    = (word & (1u << 25)) != 0;
+    r.dirty          = (word & (1u << 26)) != 0;
+    r.body_remaining = static_cast<uint32_t>(read_register(HTTP_BODY_REMAINING).value());
+    return r;
+}
+
+std::string HTTPReadConfig::HTTPResponse::describe() const {
+    std::ostringstream oss;
+    oss << "last response: status=" << std::string(status, 3) << (status_ok ? " (ok)" : " (NOT ok)")
+        << " body_remaining=" << body_remaining;
+    if (unframeable) oss << " UNFRAMEABLE(no Content-Length)";
+    if (dirty)       oss << " partially-delivered";
     return oss.str();
 }
 

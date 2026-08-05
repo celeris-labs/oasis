@@ -59,8 +59,11 @@ module tcp_init (
                     // success == 1 means the connection was established (cThread::openConnTcp
                     // throws when this bit is clear), so an error is success == 0. The polarity
                     // used to be inverted.
-                    // NOTE: handler.sv still ignores this flag; on error the session id is garbage
-                    // and tcp_read waits forever for notifications. See TODO list.
+                    // handler.sv acts on this now: an open that fails leaves nothing bound and
+                    // nothing sent, so it simply retries after a backoff and latches init_err_q.
+                    // Note the common connect failure -- ephemeral-port reuse against the peer's
+                    // TIME_WAIT -- does NOT land here: there openStatus never arrives at all, the
+                    // FSM waits in ST_WAIT, and the handler's connect watchdog is the only signal.
                     error_d = (s_axis_open_status_TDATA[23:16] == 8'd0);
                     state_d = ST_DONE;
                 end

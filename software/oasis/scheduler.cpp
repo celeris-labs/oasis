@@ -26,9 +26,13 @@ size_t default_pipeline_depth(OasisContext &ctx) {
     // many ranged GETs that client can hold, not how many configs the decoder will queue.
     //
     // The handler keeps a ring of request slots, but how many the host may USE is max_inflight(),
-    // not num_slots(). On the TOE we ship (TCP_STACK_RX_DDR_BYPASS_EN=1) that cap is 1, because the
-    // receive path has one shared packet FIFO and no per-session demultiplexing -- see the comment
-    // on HTTP_DEFAULT_MAX_INFLIGHT in configuration.cpp.
+    // not num_slots() -- that cap, times the range-split size, is what bounds how many bytes the
+    // server can have in flight against the TOE's shared receive FIFO. See the comment on
+    // HTTP_DEFAULT_MAX_INFLIGHT in configuration.cpp.
+    //
+    // Note one column chunk may already expand into several ranged GETs inside HTTPReadConfig::read
+    // (it splits at chunk_bytes()), so this depth counts DECODER configs, not GETs; the GET-level
+    // pipelining happens below it.
     //
     // Depth must never EXCEED that cap. HTTPReadConfig::read blocks until there is credit, so
     // over-queueing here would not corrupt anything -- it would just park the dispatcher thread

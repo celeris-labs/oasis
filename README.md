@@ -81,32 +81,29 @@ the URL purely as a byte source and parses on the CPU; on an `ENABLE_HTTP` bitst
 stream is tied off, so those reads are served over an ordinary host socket and the FPGA is not
 involved at all.
 
-### Request pipelining (experimental — disabled in software, see below)
+### Keep-alive and request pipelining
 
-> **The host caps itself at one request in flight, and on the TOE we ship it must.** With
-> `TCP_STACK_RX_DDR_BYPASS_EN=1` the receive path does not demultiplex sessions *at all*: there is
-> one shared packet fifo for the whole stack (`axis_data_fifo_512_d1024 rx_buffer_fifo` in
+> **One TCP connection carries every request.** It is opened lazily on the first ranged GET and then
+> held open across every request and every query; `strip_http` delimits each response by
+> `Content-Length` instead of by the server's FIN, which is what makes that possible.
+>
+> This is not a latency optimisation, it is what makes the client usable at all. The TOE hands out
+> ephemeral ports from a pool of exactly 512, by a linear cursor, released with no quiet time and
+> **cumulative since the bitstream was programmed** — and `Connection: close` meant the *server*
+> closed first, so Linux held each 4-tuple in `TIME_WAIT` for 60 s. A full benchmark run needed
+> thousands of connections and wedged partway through. It now needs one.
+>
+> It also makes pipelining safe again. Depth > 1 used to wedge the receive path, and the reason was
+> never the depth — it was concurrent **sessions**. With `TCP_STACK_RX_DDR_BYPASS_EN=1` there is one
+> shared packet fifo for the whole stack (`axis_data_fifo_512_d1024 rx_buffer_fifo` in
 > `tcp_stack.sv`), `rx_app_stream_if` answers a `readPkg` by echoing back the session id **the
 > application asked for** plus a bare one-bit token, and `rxAppMemDataRead` pops one packet from the
-> **head** of that fifo without ever looking at the session. The stack's real contract is therefore
-> *"readPkg must be issued in the global arrival order of segments across all sessions"* — the head
-> is whatever arrived first on the wire and it goes to whoever asks next, wearing that asker's id.
->
-> `handler.sv` drains slots in **request** order. With two GETs open to the same server the responses
-> interleave, so a slot receives another slot's bytes labelled as its own, the read FSM's accounting
-> breaks, it stops issuing `readPkg`, nothing drains the shared fifo, and once occupancy passes 649
-> of 1024 beats (~41.5 KB) `rx_engine` answers every further segment on *every* session with
-> `ACK_NODELAY` instead of `ACK` — a duplicate ack, so the peer retransmits forever. Builds 90, 91
-> and 92 all died this way; the duplicate-ack storm on the wire *is* the wedge, not a separate fault.
->
-> So `HTTP_DEFAULT_MAX_INFLIGHT` in `software/oasis/configuration.cpp` is **1**, and
-> `HTTPReadConfig::max_inflight()` — not `num_slots()` — is what anything sizing a queue must use.
-> Depth > 1 needs a TOE rebuilt with `TCP_STACK_RX_DDR_BYPASS_EN=0`, which gives each session its own
-> circular buffer in DDR. `OASIS_HTTP_MAX_INFLIGHT` exists to run exactly that experiment.
->
-> The hardware below is correct and stays in the bitstream; only the depth the host uses is pinned.
-> The way to recover the per-request dead time on this stack is **fewer, larger requests** (row-group
-> coalescing) or **keep-alive**, not concurrency.
+> **head** of that fifo without ever looking at the session. The real contract is *"readPkg must be
+> issued in the global arrival order of segments across all sessions"*, which a handler draining
+> slots in **request** order cannot honour with several connections open. Builds 90, 91 and 92 all
+> died that way, and the duplicate-ACK storm on the wire *was* the wedge, not a separate fault.
+> **With a single session, arrival order and request order are the same thing**, so the contract
+> holds by construction and HTTP/1.1 pipelining over that connection is both legal and safe.
 
 The unit of work is one `(row group, column)` column chunk, so a query fetches hundreds of them —
 TPC-H Q6 over `lineitem` at sf1 is 4 columns x 49 row groups = 196 ranged GETs to move 48 MB. When
@@ -114,19 +111,34 @@ each of those was a full connect / GET / body / teardown cycle with nothing over
 per-request round trips dominated: the decoder consumes 64 B/cycle at 250 MHz (16 GB/s, more than
 the 100 GbE link can deliver) and spent the overwhelming majority of a query idle between requests.
 
-`handler.sv` is now three concurrent stages over a ring of `HTTP_NUM_SLOTS` (4) request slots:
+`handler.sv` is a ring of `HTTP_NUM_SLOTS` (4) request slots pipelined over that one connection:
 
 ```
 fill_ptr   host START write lands in a free slot          (one cycle, no handshake)
-conn_ptr   CONNECT: tcp_init -> session id -> bind slot
-send_ptr   SEND:    tcp_send_http builds and transmits the GET
-read_ptr   READ:    tcp_read streams the body out, then closes the session
+send_ptr   SEND:  tcp_send_http builds and transmits the GET on the shared session
+read_ptr   READ:  tcp_read streams exactly one response body out; the connection stays open
 ```
 
-Slots advance strictly in order, so the ring needs no free list and the bodies necessarily arrive in
-the order the host enqueued them — which matters, because they are concatenated into one decoder
-stream. The connect and GET for request k+1 now happen while request k's body is streaming, so the
-server's time-to-first-byte overlaps the previous transfer rather than following it.
+There is no `conn_ptr` any more — the connection is a property of the client, not of a request, and
+a small FSM beside the ring opens it, holds it, and reopens it if it dies. Slots advance strictly in
+order, so the ring needs no free list and the bodies necessarily arrive in the order the host
+enqueued them, which matters because they are concatenated into one decoder stream. HTTP/1.1
+guarantees responses in request order on one connection, so that ordering costs nothing on the
+receive side: `tcp_session_table` is instantiated with a single slot and simply queues the
+announcements for that session in arrival order.
+
+The GET for request k+1 goes out while request k's body is streaming, so the server's
+time-to-first-byte overlaps the previous transfer rather than following it.
+
+**Reconnect and replay.** A persistent connection still dies — MinIO closes an idle one on its own
+timeout. `tcp_read` reports that as an error and the recovery is in the ring: roll `send_ptr` back to
+`read_ptr` and every request that was sent but not answered goes out again on the new connection.
+The descriptors are still in their slots, so that is the whole fix.
+
+That is only safe while the failure is **clean**, i.e. no body byte of the response being read has
+reached the decoder yet. `strip_http` reports `resp_dirty` when it has, and the handler latches a
+fatal flag and stalls visibly instead of replaying — replaying would duplicate those bytes in the
+column. The host sees it as a stalled read plus the dirty bit in the `STALL` CSR.
 
 Two things this depends on:
 
@@ -156,11 +168,60 @@ that as "one request at a time" and keeps the old busy-bit guard, so `build-87` 
 unchanged. Setting `HTTP_NUM_SLOTS` to 1 restores sequential behaviour in hardware if it ever has to
 be ruled out — that configuration is covered by the simulation.
 
-**Keep-alive is *not* implemented.** Every request still opens its own connection. The response is
-delimited by the server's FIN — `strip_http` finds `\r\n\r\n` and then streams until `tlast`, with no
-`Content-Length` parsing and no way to resynchronise mid-beat on a following response's header.
-Sharing one connection means byte-exact reframing inside the module that is already the worst timing
-path in the design. Pipelining hides the connection cost instead of removing it, for much less risk.
+### Response framing
+
+`strip_http` parses the status line and header block byte by byte, extracts `Content-Length`, counts
+the body down and raises `tlast` on the beat carrying its last byte — then keeps the leftover bytes
+of that beat and resumes header parsing at the exact byte after the body. On a persistent connection
+that is mandatory: body *k* is followed immediately by the status line of response *k+1*, frequently
+inside the same 64-byte beat.
+
+One input beat is held in a residue register and consumed through a byte cursor, and everything
+reads it through **one** 512-bit barrel shift — the low byte is the next header character, the whole
+word is the already-bottom-justified body beat. The 64-wide 32-bit comparator tree that used to
+search for `\r\n\r\n` across a 67-byte window is gone, replaced by an 8-bit compare against a
+14-byte ROM, so the module that owned the worst timing cluster on the device now has a shorter cone
+than before. Header parsing costs ~1 cycle per byte (~200 cycles per response, 0.8 µs); bodies still
+move a full beat per cycle.
+
+Two consequences worth knowing:
+
+- **A header block with no `Content-Length` is a hard error.** It cannot be framed, so `resp_error`
+  latches and the framer stops rather than guessing. That covers `Transfer-Encoding: chunked`
+  without parsing it — a ranged GET of a static object must never produce either.
+- **The status code is captured.** A 404 or 416 used to flow into the decoder as if its XML body
+  were column data. `HttpConfig` read register 12 now carries the three status digits.
+
+### Splitting a column chunk across several GETs
+
+`HTTPReadConfig::read` splits a byte range into GETs of at most `OASIS_HTTP_CHUNK_BYTES` (default
+8 KiB) and marks only the last one `body_last`, so the whole chunk still arrives as **one** decoder
+stream with exactly one `tlast` — the `DataNormalizer` resets its running byte offset on `tlast`, so
+an extra one mid-chunk would desynchronise everything after it. The flag rides in `REQ_FLAGS`
+(register 25, formerly a dead `num_sessions` field, so the address map did not move).
+
+This is host-side flow control against the TOE's receive buffer. A ranged GET's response is bounded
+by the range, so `max_inflight() × chunk_bytes()` bounds how many bytes the server can have in
+flight — 4 × 8 KiB = 32 KiB, safely under the ~41.5 KB at which `rx_engine` starts dropping segments
+(see *Receive window* below). Splitting is nearly free only because the connection is persistent:
+each extra request costs a ~150-byte GET and a ~200-byte response header, pipelined, with no
+handshake and no teardown. `OASIS_HTTP_CHUNK_BYTES=0` disables splitting.
+
+### Receive window (unfixed)
+
+`rx_sar_table.cpp:71` computes the advertised window from the application read pointer alone, with
+`WINDOW_BITS = 18`, so it can advertise up to **256 KB** — against a **64 KB** shared fifo. Grep
+`rx_sar_table` for `data_count` and you get nothing: the window has no knowledge of the buffer it
+describes. `rx_engine` drops a segment and answers `ACK_NODELAY` (a duplicate ACK) once free space
+falls below 375 beats, i.e. once occupancy passes ~41.5 KB, and out-of-order buffering is disabled
+on this path so one drop forces go-back-N.
+
+The proper fix is in the TOE — plumb `rxbuffer_data_count` into `rx_sar_table` and advertise
+`min(appd − recvd − 1, free_fifo_bytes)` — or, cheaply, `FIFO_DEPTH {1024}` → `{4096}` in
+`scripts/ip_inst/network_infrastructure.tcl:356` plus the two `16'd1024` literals in
+`tcp_stack.sv`. Neither is done. The range split above is the host-side stand-in: it refuses to ask
+for more than the buffer can hold, which makes the over-advertised window unreachable rather than
+correct.
 
 ### Row group size
 
@@ -173,8 +234,16 @@ row group size — and therefore on how few requests a query needs. `OBM_BUFFER_
 COPY tbl TO 'x.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000000);
 ```
 
-need ~8x fewer requests for the same bytes. That is the cheapest available reduction in dead time and
-needs no resynthesis.
+need ~8x fewer requests for the same bytes.
+
+**This no longer buys what it used to, and it was never free.** Larger row groups were the mitigation
+for port exhaustion, which keep-alive removes outright — a whole query now costs one connection
+whatever the row group size. And measured on build-92 they were *slower*: going from 49 to 7 row
+groups took the `latency` workload from 3.068 s to 6.0–9.1 s, because short transfers finished before
+slow-start ramped the congestion window past the ~41.5 KB drop threshold and 1.3 MB chunks lived
+permanently in go-back-N. With the range split above, the GET size is decoupled from the row group
+size entirely, so pick row groups for decode efficiency and leave the wire to
+`OASIS_HTTP_CHUNK_BYTES`.
 
 ### The CSR map must match the bitstream
 
@@ -204,49 +273,46 @@ than six hours later on the wire.
 | GET path budget | 64 characters (16 CSR words). Was 32 up to `build-88`; longer paths throw rather than truncate |
 | Decoded column chunk | must fit one output buffer (8 MiB), i.e. ~1M rows of an 8-byte type |
 | Compression | SNAPPY and uncompressed only — other codecs throw `codec N not supported by ParCore` |
-| Requests in flight | **1.** The bitstream advertises `HTTP_NUM_SLOTS` (4), but the shared-fifo receive path in the `RX_DDR_BYPASS` TOE cannot demultiplex sessions, so the host pins itself to one. Connections are not reused |
+| Requests in flight | **4** (`HTTP_NUM_SLOTS`), pipelined over one persistent connection. Safe because there is only ever one TCP session; `max_inflight() × OASIS_HTTP_CHUNK_BYTES` is what bounds the bytes in flight against the shared receive fifo |
+| Receive window | the TOE advertises up to 256 KB against a 64 KB shared fifo and drops past ~41.5 KB. Worked around host-side by splitting ranges, not fixed |
+| Response framing | `Content-Length` only. A response without one (e.g. `Transfer-Encoding: chunked`) latches `resp_error` and stalls rather than misparsing |
 | NULLs | **not supported.** The decoder is configured from `num_values`, which counts NULLs, but the page only holds the non-null values, so the read hangs waiting for values that do not exist. TPC-H is unaffected (no NULLs) |
 | Trailing page bytes | a data page carrying padding past the last declared value hangs the decoder. `fastparquet` emits exactly 8 such bytes per page; DuckDB-written files are fine |
 
-### Ephemeral port exhaustion (unfixed, and it will bite a benchmark run)
+### Ephemeral port exhaustion (fixed by keep-alive; the mechanism is worth keeping in mind)
 
-Every column chunk is a separate connection, and the TOE has **512 ephemeral ports** — ports
-32768–33279, `pt_cursor` wrapping at `TCP_STACK_MAX_SESSIONS`
-(`toe/port_table/port_table.cpp`, `toe/CMakeLists.txt:16`). It releases each one the instant the
-connection closes, with no quiet time. Because the request says `Connection: close`, the **server**
-closes first and therefore holds the 4-tuple in `TIME_WAIT` for 60 s.
+The TOE has **512 ephemeral ports** — 32768–33279, `pt_cursor` wrapping at `TCP_STACK_MAX_SESSIONS`
+(`toe/port_table/port_table.cpp`, `toe/CMakeLists.txt:16`) — and releases each one the instant the
+connection closes, with no quiet time. When every column chunk was its own connection and the
+request said `Connection: close`, the **server** closed first and therefore held the 4-tuple in
+`TIME_WAIT` for 60 s.
 
-Any run that exceeds 512 connections in under a minute reuses a port the server still owns. The
-TOE's ISN is random and uncorrelated with that port's previous sequence space
-(`tx_engine.cpp:541`), so Linux usually refuses to recycle the `TIME_WAIT` socket and answers with a
-challenge ACK. That ACK reaches `rx_engine.cpp:1078`, which writes `clearRetransmitTimer` **one line
-above** the state check that excludes `SYN_SENT`, and the timer update zeroes the retry counter
-unconditionally (`retransmit_timer.cpp:102`). The retry count never reaches its limit of 4, the SYN
-is re-sent at ~1.25 s forever, and `openStatus` is never emitted — so `tcp_init` does not even
-report an error, it simply never completes.
+Any run exceeding 512 connections in under a minute reused a port the server still owned. The TOE's
+ISN is random and uncorrelated with that port's previous sequence space (`tx_engine.cpp:541`), so
+Linux usually refuses to recycle the `TIME_WAIT` socket and answers with a challenge ACK. That ACK
+reaches `rx_engine.cpp:1078`, which writes `clearRetransmitTimer` **one line above** the state check
+that excludes `SYN_SENT`, and the timer update zeroes the retry counter unconditionally
+(`retransmit_timer.cpp:102`). The retry count never reaches its limit of 4, the SYN is re-sent at
+~1.25 s forever, and `openStatus` is never emitted — so `tcp_init` does not even report an error, it
+simply never completes. A full `scripts/throughput.sh` run needed ~2,500 connections and died
+partway through; **the port cursor lives in the bitstream, so the count was cumulative since
+programming** and restarting DuckDB did not reset it.
 
-Symptoms: the CONNECT stage stalls with no `init_error`. `HttpConfig` read register 11 reports
-exactly that, and the host's credit timeout names it. **The port cursor lives in the bitstream, so
-the count is cumulative since programming** — restarting DuckDB does not reset it.
+A query now costs one connection, so the pool is no longer reachable in normal use. Two things
+survive from this:
 
-No single hand-typed query reaches 512 (49 row groups × ≤8 columns), which is why interactive use
-looks fine; a full `scripts/throughput.sh` run needs ~2,500 and crosses the threshold partway
-through. The script now estimates the count up front and warns.
+- The symptom is still worth recognising: a CONNECT stage stalled with **no** `init_error` means
+  `openStatus` never arrived at all, which is this. `HttpConfig` read register 11 reports it and the
+  host's credit timeout names it. If it appears now, look at the reconnect count next to it —
+  something is dropping the connection repeatedly.
+- The two TOE bugs are still there. **A monotonic ISN** (`tx_engine.cpp:541`) would make a collision
+  survivable rather than fatal, and **moving the `clearRetransmitTimer` write inside the state
+  check** would turn an infinite SYN retry into a reported failure after ~31 s. Both are HLS changes
+  needing a TOE re-run, and neither is done.
 
-What actually helps, in order:
-
-1. **Fewer, larger row groups.** `ROW_GROUP_SIZE 1000000` takes a full benchmark run from ~2,500
-   connections to ~350 — under the pool — with no hardware change. This is the only mitigation
-   available today.
-2. **Keep-alive**, which removes the reuse window rather than delaying it. See above for why it is
-   not done yet.
-3. **A monotonic ISN** (`tx_engine.cpp:541`) makes a collision survivable rather than fatal, and
-   **moving the `clearRetransmitTimer` write inside the state check** turns an infinite SYN retry
-   into a reported failure after ~31 s. Both are HLS changes needing a TOE re-run.
-
-Raising `TCP_STACK_MAX_SESSIONS` is *not* a fix: covering a 60 s peer `TIME_WAIT` at ~1 ms per
+Raising `TCP_STACK_MAX_SESSIONS` was never the answer: covering a 60 s peer `TIME_WAIT` at ~1 ms per
 request needs ~60,000 ports and only 32,768 exist above 32768. A connection-per-request model cannot
-outrun that at any pool size.
+outrun that at any pool size — which is why the fix had to be to stop opening connections.
 
 ### When a read hangs
 

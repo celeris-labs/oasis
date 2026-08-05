@@ -112,8 +112,9 @@ class HTTPReadConfig : public libstf::Config {
     struct HTTPInflight {
         uint8_t occupied      = 0;
         uint8_t slots         = 0; // 0 => pre-pipelining bitstream
-        uint8_t pending_mask  = 0; // per-slot: bytes announced but not yet read
-        uint8_t closed_mask   = 0; // per-slot: peer has FINed
+        bool    has_pending   = false; // an announced segment is waiting to be read
+        bool    peer_closed   = false; // the peer has FINed
+        bool    conn_up       = false; // the persistent connection is established
 
         bool legacy() const { return slots == 0; }
         uint8_t free_slots() const { return slots > occupied ? uint8_t(slots - occupied) : uint8_t(0); }
@@ -139,19 +140,49 @@ class HTTPReadConfig : public libstf::Config {
         bool read_stalled    = false;
         bool init_error      = false;
         bool send_error      = false;
-        uint8_t connect_slot = 0;
-        uint8_t read_slot    = 0;
-        /// Per-slot: the announcement queue overflowed and segments were dropped. Sticky, and
-        /// should never fire -- see NOTIFY_DEPTH in hardware/src/hdl/http_read/tcp_session_table.sv.
-        uint8_t overflow_mask = 0;
+        /// A response arrived with no Content-Length, so it could not be framed. On a persistent
+        /// connection that is fatal: without the length there is no way to find where the body ends
+        /// and the next response begins. Covers `Transfer-Encoding: chunked` without parsing it.
+        bool resp_unframeable = false;
+        /// The connection died after body bytes had already reached the decoder. Replaying would
+        /// duplicate them, so the handler stops instead of recovering.
+        bool dirty_abort = false;
+        /// A response carried a status other than 200/206 -- the "column data" is an error document.
+        bool status_bad = false;
+        /// Connections re-established since the bitstream was programmed. A few over a long session
+        /// is the server's idle timeout doing its job; a climbing count is a problem.
+        uint8_t reconnects = 0;
+        uint8_t read_slot  = 0;
+        /// The announcement queue overflowed and segments were dropped. Sticky, and should never
+        /// fire -- see NOTIFY_DEPTH in hardware/src/hdl/http_read/tcp_session_table.sv.
+        bool notify_overflow = false;
 
         bool any() const {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
-                   || overflow_mask != 0;
+                   || resp_unframeable || dirty_abort || status_bad || notify_overflow;
         }
         std::string describe() const;
     };
     HTTPStall stall();
+
+    /**
+     * Read CSRs 12/13: how the last HTTP response was framed (`respWord` in handler.sv).
+     *
+     * On a persistent connection the body is delimited by Content-Length rather than by the FIN, so
+     * the hardware now knows the status code and whether it could frame the response at all. Before
+     * this, a 404 whose XML body happened to be the right length was indistinguishable from real
+     * column data.
+     */
+    struct HTTPResponse {
+        char     status[4] = {0, 0, 0, 0}; // e.g. "206"
+        bool     status_ok = false;        // 200 or 206
+        bool     unframeable = false;      // no Content-Length
+        bool     dirty = false;            // body bytes already emitted for the current response
+        uint32_t body_remaining = 0;       // bytes of the current body still to stream
+
+        std::string describe() const;
+    };
+    HTTPResponse response();
 
     /// Requests the hardware can hold at once (0 on a pre-pipelining bitstream). Cached after the
     /// first read; the value is fixed by the bitstream.
@@ -160,13 +191,19 @@ class HTTPReadConfig : public libstf::Config {
     /**
      * Requests the host may actually keep in flight: `min(num_slots(), the depth cap)`.
      *
-     * This is 1 unless `OASIS_HTTP_MAX_INFLIGHT` overrides it, and on the TOE we ship it must stay
-     * 1 -- with `TCP_STACK_RX_DDR_BYPASS_EN=1` the receive path has a single shared packet FIFO and
-     * hands its head to whichever session asks next, so concurrent sessions read each other's
-     * bytes. `num_slots()` is what the bitstream advertises; this is what is safe to use. Anything
-     * sizing a queue against the hardware wants this one.
+     * `num_slots()` is what the bitstream advertises; this is what is safe to use, and anything
+     * sizing a queue against the hardware wants this one. Overridable with `OASIS_HTTP_MAX_INFLIGHT`.
+     *
+     * It is safe to pipeline now only because the handler holds ONE persistent connection: the TOE
+     * (`TCP_STACK_RX_DDR_BYPASS_EN=1`) has a single shared receive FIFO and hands its head to
+     * whichever session asks next, so concurrent SESSIONS read each other's bytes -- but with one
+     * session, arrival order and request order are the same thing. See HTTP_DEFAULT_MAX_INFLIGHT.
      */
     uint8_t max_inflight();
+
+    /// Largest byte range the host will ask for in one GET; 0 means "never split". See
+    /// HTTP_DEFAULT_CHUNK_BYTES.
+    static uint64_t chunk_bytes();
 
     /// Read CSRs 3..8: the request parameters currently latched in hardware.
     HTTPRequestEcho request_echo();
@@ -179,6 +216,14 @@ class HTTPReadConfig : public libstf::Config {
     static constexpr uint64_t ID = HTTP_READ_CONFIG_ID;
 
   private:
+    /// Block until the request ring has room for one more GET, or throw naming the stalled stage.
+    void await_credit();
+
+    /// Write the CSR map for ONE ranged GET and pulse START. `body_last` is false when this GET is
+    /// part of a larger column chunk and the decoder stream continues past it.
+    void issue_range(uint32_t server_ip, uint16_t server_port, const std::string &path,
+                     uint64_t range_begin, uint64_t range_end, bool body_last);
+
     /// -1 until the first inflight() read; then the bitstream's slot count.
     int num_slots_ = -1;
 };
