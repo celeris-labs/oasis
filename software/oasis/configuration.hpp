@@ -157,6 +157,17 @@ class HTTPReadConfig : public libstf::Config {
     /// first read; the value is fixed by the bitstream.
     uint8_t num_slots();
 
+    /**
+     * Requests the host may actually keep in flight: `min(num_slots(), the depth cap)`.
+     *
+     * This is 1 unless `OASIS_HTTP_MAX_INFLIGHT` overrides it, and on the TOE we ship it must stay
+     * 1 -- with `TCP_STACK_RX_DDR_BYPASS_EN=1` the receive path has a single shared packet FIFO and
+     * hands its head to whichever session asks next, so concurrent sessions read each other's
+     * bytes. `num_slots()` is what the bitstream advertises; this is what is safe to use. Anything
+     * sizing a queue against the hardware wants this one.
+     */
+    uint8_t max_inflight();
+
     /// Read CSRs 3..8: the request parameters currently latched in hardware.
     HTTPRequestEcho request_echo();
 

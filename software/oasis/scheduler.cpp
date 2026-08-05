@@ -25,23 +25,22 @@ size_t default_pipeline_depth(OasisContext &ctx) {
     // On an HTTP bitstream the source is the FPGA's HTTP client, so the depth that matters is how
     // many ranged GETs that client can hold, not how many configs the decoder will queue.
     //
-    // The handler keeps a ring of request slots and pipelines them over concurrent TCP sessions, so
-    // the connect + GET + server think-time of request k+1 overlaps the body of request k. Matching
-    // the software depth to the ring is what actually keeps the ring full: at depth 1 the hardware
-    // would have exactly one request to work on and every one of those round trips would again be
-    // dead time on the decoder.
+    // The handler keeps a ring of request slots, but how many the host may USE is max_inflight(),
+    // not num_slots(). On the TOE we ship (TCP_STACK_RX_DDR_BYPASS_EN=1) that cap is 1, because the
+    // receive path has one shared packet FIFO and no per-session demultiplexing -- see the comment
+    // on HTTP_DEFAULT_MAX_INFLIGHT in configuration.cpp.
     //
-    // Depth must never EXCEED the ring, because a START write that arrives with the ring full is
-    // silently swallowed (ConfigWriteReadyRegister does not back-pressure). HTTPReadConfig::read
-    // additionally waits for credit before every request, so this is belt and braces -- but the
-    // wait is what would show up as a stall, and the right depth is what avoids it.
+    // Depth must never EXCEED that cap. HTTPReadConfig::read blocks until there is credit, so
+    // over-queueing here would not corrupt anything -- it would just park the dispatcher thread
+    // inside read() instead of leaving the flow queued where it belongs. Sizing to the cap keeps
+    // that blocking path a backstop rather than the normal case.
     //
     // A pre-pipelining bitstream reports 0 slots. There, one request at a time is the only safe
     // depth: that handler sampled its start trigger as a one-cycle pulse in ST_IDLE, so a second
     // request issued mid-transfer is dropped and never retried.
     if (ctx.isHTTPEnabled()) {
-        const auto slots = ctx.config<HTTPReadConfig>()->num_slots();
-        return slots == 0 ? 1 : static_cast<size_t>(slots);
+        const auto depth = ctx.config<HTTPReadConfig>()->max_inflight();
+        return depth == 0 ? 1 : static_cast<size_t>(depth);
     }
     return ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
 }

@@ -121,6 +121,56 @@ constexpr const uint32_t HTTP_STALL            = 11;
 // diagnosis, not a tuning knob. Generous enough that a slow object server never trips it.
 constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 
+// How many ranged GETs the host may have in flight on the FPGA at once, regardless of how many ring
+// slots the bitstream advertises.
+//
+// This is 1, and on the TOE we ship it MUST be 1. Coyote builds the stack with
+// TCP_STACK_RX_DDR_BYPASS_EN=1 (parcore/libstf/coyote/hw/services/network/hls/toe/CMakeLists.txt),
+// and on that path the receive side does not demultiplex sessions at all:
+//
+//   * there is exactly one receive buffer for the whole stack -- `axis_data_fifo_512_d1024
+//     rx_buffer_fifo` in tcp_stack.sv, 1024 x 64 B, shared by every session;
+//   * rx_app_stream_if() answers a readPkg by echoing back the session ID the APP ASKED FOR and
+//     writing a bare 1-bit token (rx_app_stream_if.cpp, RX_DDR_BYPASS branch) -- no address, no
+//     length, nothing that identifies a session;
+//   * rxAppMemDataRead() (toe.cpp) consumes that token by popping one packet from the HEAD of the
+//     shared FIFO, until tlast, without ever looking at the session.
+//
+// So the stack's real contract is not "one readPkg per notification" -- it is "readPkg must be
+// issued in the global arrival order of segments across ALL sessions". The FIFO head is whatever
+// arrived first on the wire and it is handed to whoever asked, wearing that asker's session ID.
+//
+// The handler drains its slots in REQUEST order (read_ptr in handler.sv). With more than one GET in
+// flight to the same server the responses interleave, so request order != arrival order, and a slot
+// receives another slot's bytes labelled as its own. The read FSM's accounting breaks, it stops
+// issuing readPkg, nothing drains the shared FIFO, and once occupancy passes 649 of 1024 beats
+// (~41.5 KB) rx_engine answers every further segment on EVERY session with ACK_NODELAY instead of
+// ACK (rx_engine.cpp: `(rxbuffer_max_data_count - rxbuffer_data_count) > 375`). That is a duplicate
+// ACK, so the server retransmits, gets another duplicate ACK, forever. The retransmission storm is
+// not a separate network fault -- it is this wedge seen from the wire.
+//
+// Depth > 1 is therefore only safe on a TOE rebuilt with TCP_STACK_RX_DDR_BYPASS_EN=0, which gives
+// each session its own circular buffer in DDR and makes readPkg genuinely per-session. The override
+// exists for exactly that experiment and for nothing else.
+constexpr const uint8_t HTTP_DEFAULT_MAX_INFLIGHT = 1;
+
+// Effective request-ring depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override).
+// OASIS_HTTP_MAX_INFLIGHT=0 means "whatever the bitstream advertises" -- see the warning above.
+uint8_t HttpMaxInflight(uint8_t slots) {
+    static const int configured = [] {
+        const char *env = std::getenv("OASIS_HTTP_MAX_INFLIGHT");
+        if (env == nullptr) {
+            return static_cast<int>(HTTP_DEFAULT_MAX_INFLIGHT);
+        }
+        const int parsed = std::atoi(env);
+        return parsed < 0 ? static_cast<int>(HTTP_DEFAULT_MAX_INFLIGHT) : parsed;
+    }();
+    if (configured == 0 || configured >= static_cast<int>(slots)) {
+        return slots;
+    }
+    return static_cast<uint8_t>(configured);
+}
+
 // Packs `s` little-endian into `words`. Throws rather than truncating: a silently shortened path
 // makes the FPGA request a different (usually nonexistent) file, and the 404 body then flows through
 // the datapath as if it were real data.
@@ -189,16 +239,26 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
             throw std::runtime_error(msg.str());
         }
     } else {
-        const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
-        HTTPInflight flight = inflight();
-        while (flight.free_slots() == 0) {
+        // Cap the depth at HttpMaxInflight() rather than at the ring size. Under RX_DDR_BYPASS that
+        // cap is 1 and it is what keeps this working at all -- see HTTP_DEFAULT_MAX_INFLIGHT.
+        const uint8_t depth    = max_inflight();
+        const auto    deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
+        HTTPInflight  flight   = inflight();
+        while (flight.occupied >= depth) {
             if (std::chrono::steady_clock::now() > deadline) {
                 std::ostringstream msg;
-                msg << "FPGA HTTP request ring has been full for "
+                msg << "FPGA HTTP request ring has been at its depth limit (" << unsigned(depth)
+                    << " of " << unsigned(flight.slots) << " slots) for "
                     << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
                     << "s [" << flight.describe() << "; " << describe_status(debug_status())
                     << "]. The pipeline has stopped draining -- " << stall().describe()
                     << ". There is no reset register -- reprogram the bitstream to clear it.";
+                if (depth > 1) {
+                    msg << " NOTE: depth is above 1, which is only valid on a TOE built with "
+                           "TCP_STACK_RX_DDR_BYPASS_EN=0. On the stack we ship, concurrent sessions "
+                           "read each other's bytes out of the shared rx FIFO and then wedge exactly "
+                           "like this. Unset OASIS_HTTP_MAX_INFLIGHT.";
+                }
                 throw std::runtime_error(msg.str());
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -301,9 +361,14 @@ void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint1
         const auto flight = inflight();
         // Bitstream identity in one line. slots=0 means a pre-pipelining bitstream, so if this says
         // 0 when a pipelined one was programmed, the board is not running what you think it is.
-        std::fprintf(stderr, "[oasis-http] bitstream: %s\n",
-                     flight.legacy() ? "pre-pipelining (no INFLIGHT register, depth 1)"
-                                     : flight.describe().c_str());
+        if (flight.legacy()) {
+            std::fprintf(stderr, "[oasis-http] bitstream: pre-pipelining (no INFLIGHT register, depth 1)\n");
+        } else {
+            // Print the cap next to the ring size. "2/4 cap=1" would mean the cap is not being
+            // honoured; "1/4 cap=1" is the healthy picture on the stack we ship.
+            std::fprintf(stderr, "[oasis-http] bitstream: %s cap=%u\n", flight.describe().c_str(),
+                         unsigned(HttpMaxInflight(flight.slots)));
+        }
         std::fprintf(stderr, "[oasis-http] START GET %s range=[%llu,%llu] ip=0x%08x port=%u\n",
                      path.c_str(), static_cast<unsigned long long>(range_begin),
                      static_cast<unsigned long long>(range_end), server_ip, server_port);
@@ -416,6 +481,8 @@ uint8_t HTTPReadConfig::num_slots() {
     }
     return static_cast<uint8_t>(num_slots_);
 }
+
+uint8_t HTTPReadConfig::max_inflight() { return HttpMaxInflight(num_slots()); }
 
 HTTPRequestEcho HTTPReadConfig::request_echo() {
     const auto range_begin = read_register(HTTP_ECHO_RANGE_BEGIN).value();

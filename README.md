@@ -81,7 +81,32 @@ the URL purely as a byte source and parses on the CPU; on an `ENABLE_HTTP` bitst
 stream is tied off, so those reads are served over an ordinary host socket and the FPGA is not
 involved at all.
 
-### Request pipelining (experimental)
+### Request pipelining (experimental — disabled in software, see below)
+
+> **The host caps itself at one request in flight, and on the TOE we ship it must.** With
+> `TCP_STACK_RX_DDR_BYPASS_EN=1` the receive path does not demultiplex sessions *at all*: there is
+> one shared packet fifo for the whole stack (`axis_data_fifo_512_d1024 rx_buffer_fifo` in
+> `tcp_stack.sv`), `rx_app_stream_if` answers a `readPkg` by echoing back the session id **the
+> application asked for** plus a bare one-bit token, and `rxAppMemDataRead` pops one packet from the
+> **head** of that fifo without ever looking at the session. The stack's real contract is therefore
+> *"readPkg must be issued in the global arrival order of segments across all sessions"* — the head
+> is whatever arrived first on the wire and it goes to whoever asks next, wearing that asker's id.
+>
+> `handler.sv` drains slots in **request** order. With two GETs open to the same server the responses
+> interleave, so a slot receives another slot's bytes labelled as its own, the read FSM's accounting
+> breaks, it stops issuing `readPkg`, nothing drains the shared fifo, and once occupancy passes 649
+> of 1024 beats (~41.5 KB) `rx_engine` answers every further segment on *every* session with
+> `ACK_NODELAY` instead of `ACK` — a duplicate ack, so the peer retransmits forever. Builds 90, 91
+> and 92 all died this way; the duplicate-ack storm on the wire *is* the wedge, not a separate fault.
+>
+> So `HTTP_DEFAULT_MAX_INFLIGHT` in `software/oasis/configuration.cpp` is **1**, and
+> `HTTPReadConfig::max_inflight()` — not `num_slots()` — is what anything sizing a queue must use.
+> Depth > 1 needs a TOE rebuilt with `TCP_STACK_RX_DDR_BYPASS_EN=0`, which gives each session its own
+> circular buffer in DDR. `OASIS_HTTP_MAX_INFLIGHT` exists to run exactly that experiment.
+>
+> The hardware below is correct and stays in the bitstream; only the depth the host uses is pinned.
+> The way to recover the per-request dead time on this stack is **fewer, larger requests** (row-group
+> coalescing) or **keep-alive**, not concurrency.
 
 The unit of work is one `(row group, column)` column chunk, so a query fetches hundreds of them —
 TPC-H Q6 over `lineitem` at sf1 is 4 columns x 49 row groups = 196 ranged GETs to move 48 MB. When
@@ -122,8 +147,9 @@ Two things this depends on:
 - **The host must respect the ring depth.** `ConfigWriteReadyRegister` does not back-pressure: a
   `START` write arriving while the previous one is unconsumed overwrites it and that request is gone
   without a trace. `HttpConfig` read register 10 (`INFLIGHT`) reports occupancy, the scheduler sets
-  its HTTP pipeline depth from the slot count, and `HTTPReadConfig::read` waits for credit before
-  every request.
+  its HTTP pipeline depth from `max_inflight()`, and `HTTPReadConfig::read` blocks until occupancy
+  is below that cap before every request. Both use the cap, not the raw slot count — see the note at
+  the top of this section.
 
 Pre-pipelining bitstreams have no `INFLIGHT` register and read it back as zero; the software treats
 that as "one request at a time" and keeps the old busy-bit guard, so `build-87` still works
@@ -178,7 +204,7 @@ than six hours later on the wire.
 | GET path budget | 64 characters (16 CSR words). Was 32 up to `build-88`; longer paths throw rather than truncate |
 | Decoded column chunk | must fit one output buffer (8 MiB), i.e. ~1M rows of an 8-byte type |
 | Compression | SNAPPY and uncompressed only — other codecs throw `codec N not supported by ParCore` |
-| Requests in flight | `HTTP_NUM_SLOTS` (4). One TCP session per occupied slot; connections are not reused |
+| Requests in flight | **1.** The bitstream advertises `HTTP_NUM_SLOTS` (4), but the shared-fifo receive path in the `RX_DDR_BYPASS` TOE cannot demultiplex sessions, so the host pins itself to one. Connections are not reused |
 | NULLs | **not supported.** The decoder is configured from `num_values`, which counts NULLs, but the page only holds the non-null values, so the read hangs waiting for values that do not exist. TPC-H is unaffected (no NULLs) |
 | Trailing page bytes | a data page carrying padding past the last declared value hangs the decoder. `fastparquet` emits exactly 8 such bytes per page; DuckDB-written files are fine |
 
