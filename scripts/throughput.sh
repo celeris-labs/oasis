@@ -2,10 +2,17 @@
 #
 # Throughput / latency harness for read_oasis() over httpfpga://.
 #
-# Every measurement brackets the query with a read of oasis_stream_profile(). That readout is
-# destructive by design (column_chunk_decoder_config.sv pulses profile[I].stop on the read of the
-# last profile register), so the first call arms a window and the second one reports exactly the
-# cycles the query spent. From those four counters the whole story falls out:
+# Every measurement brackets the query with a read of oasis_stream_profile(). Reading the last
+# profile register pulses profile[I].stop (column_chunk_decoder_config.sv:96), which returns the
+# profiler to WAIT and HOLDS its counters; they are re-zeroed by the next valid data beat, not by
+# the read (stream_profiler.sv:4-7). So the first call ends whatever window was running and the
+# second reports exactly the cycles this query spent -- PROVIDED the query actually moved data.
+#
+# If it did not -- a 404, a scan fully pruned by filter statistics, count(*), or an all-string
+# projection -- the second read returns the PREVIOUS query's numbers rather than zero, and a stale
+# reading is indistinguishable from a real one. Always check the value changed before believing it.
+#
+# From those four counters the whole story falls out:
 #
 #   handshakes  cycles that moved a 64 B beat into the decoder   -> useful work
 #   starved     inside a column chunk, waiting for network bytes -> TCP / MinIO too slow
