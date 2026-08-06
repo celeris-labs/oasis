@@ -155,3 +155,41 @@ exchange for control complexity in the one module whose framing bugs are silent 
   continuously the over-advertisement matters much less, and this would confound the measurement.
   (Note the CMake guard bug that made the flag a no-op was real and is fixed in the Coyote checkout.)
 - **`NUM_SLOTS = 8`.** Deeper pipelining on *one* connection cannot help, for the reason above.
+
+### Implementation plan
+
+Done:
+
+- `axis_fifo.sv` and the decoupling in `tcp_read.sv` (`b238c4e`) — ADR-2.
+- `rx_dispatch.sv` and its testbench (`7f15616`) — written and verified 10/10, **not yet
+  instantiated anywhere**. It is dead code in the build until the steps below land.
+
+Remaining, in order:
+
+1. **Per-connection receive fifos.** One `axis_fifo` per connection, fed from
+   `rx_dispatch.conn_tvalid/tdata/tkeep/tlast`. `conn_space_ok[i]` must mean "room for a whole
+   MSS" (4096 B = 64 beats), not "room for one beat" — the dispatcher gates `readPkg` issuance on
+   it and a packet, once requested, is accepted unconditionally.
+2. **N `strip_http` instances**, one per connection, each permanently owning its connection's byte
+   stream. Not one shared parser with saved context: the residue at a response boundary is
+   mid-beat, so switching parsers between connections would have to save and restore
+   `res_data_q`/`res_cur_q`/`res_len_q`/`hs_q`/`body_left_q`, and framing bugs in that module are
+   silent and permanent. Side benefit: connection *k+1* parses its header while *k* streams its
+   body, so the 550-cycle header walk is hidden rather than moved.
+3. **Output mux in request order.** Exactly one `strip_http` output feeds the `DataNormalizer` at a
+   time, selected by the handler's `read_ptr`. Everything else buffers. This is what makes one
+   decoder correct — see the top of ADR-3.
+4. **`handler.sv`: N persistent connections.** Round-robin assignment of requests to connections, so
+   response *k* always comes from connection *k mod N* and the mux selector is trivial. The existing
+   `CS_DOWN/OPEN/UP/CLOSE` FSM becomes per-connection; reconnect and replay stay per-connection
+   (`send_ptr_q <= read_ptr_q` must rewind only that connection's requests).
+5. **`http_pipeline_tb`: genuinely concurrent sessions.** The current bench opens one connection at a
+   time. Needs a server model that interleaves responses across sessions and announces them
+   out of request order — otherwise the arrival-order property is never exercised end to end and the
+   test passes on a design that reorders.
+6. **Software.** Surface the connection count, `OASIS_HTTP_CONNECTIONS` override, and keep
+   `max_inflight() x chunk_bytes()` bounded per connection rather than globally.
+
+Sequencing note: step 3 is the one that can silently corrupt data (wrong stream to the decoder, one
+`tlast` too many or too few), so it wants an assertion in the bench that the decoder stream is
+byte-identical to the concatenation of the responses in request order — not merely the right length.
