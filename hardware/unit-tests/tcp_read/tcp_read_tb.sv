@@ -61,6 +61,8 @@ module tcp_read_tb;
     logic [23:0] status_ascii;
     logic [31:0] body_remaining;
     logic [3:0]  state_debug;
+    logic [10:0] rx_fifo_level;
+    logic        rx_fifo_stall;
 
     int unsigned fails  = 0;
     int unsigned passes = 0;
@@ -102,11 +104,32 @@ module tcp_read_tb;
         .status_ascii(status_ascii),
         .status_ok(status_ok),
         .body_remaining(body_remaining),
+        .rx_fifo_level(rx_fifo_level),
+        .rx_fifo_stall(rx_fifo_stall),
         .debug_rx_write_ptr(),
         .debug_rx_buffer_w0(),
         .debug_rx_buffer_w1(),
         .state_debug(state_debug)
     );
+
+    // ---------------------------------------------------------------------------------------------
+    // Back-pressure monitor: the point of the whole decoupling.
+    //
+    // strip_http walks a header one byte per cycle. It used to drive s_axis_rx_data_TREADY directly,
+    // so for the ~550 cycles of a MinIO 206 header the TCP stack was told to stop while data kept
+    // arriving into its single shared 64 KB rx fifo. That backlog is what made a 32 KiB response fine
+    // and a 64 KiB one fall off a cliff.
+    //
+    // With the decoupling fifo in between, TREADY may only ever drop because the fifo is genuinely
+    // full -- never because the parser is busy. At these test sizes the fifo never fills, so the
+    // correct count is exactly zero, and any non-zero value means the parser is back in the path.
+    // ---------------------------------------------------------------------------------------------
+    int unsigned stall_cycles = 0;
+    always @(posedge clk) begin
+        if (rst_n && rxdata_valid && !rxdata_ready && (state_debug == 4'd9)) begin
+            stall_cycles <= stall_cycles + 1;
+        end
+    end
 
     // ---------------------------------------------------------------------------------------------
     // TOE model
@@ -446,6 +469,25 @@ module tcp_read_tb;
         case_clean_abort();
         case_dirty_abort();
         case_split_chunk();
+
+        // Every case above ran a real response through the header parser. If the parser were still
+        // in the TCP stack's back-pressure path, each one would have contributed hundreds of stall
+        // cycles. See the monitor above for why zero is the only acceptable answer.
+        $display("--- decoupling ---");
+        if (stall_cycles != 0) begin
+            $error("[decoupling] parser back-pressured the TCP stack for %0d cycles -- strip_http is in the drain path again", stall_cycles);
+            fails++;
+        end else begin
+            $display("[PASS] no_toe_backpressure (0 cycles of TVALID && !TREADY in ST_RECV_DATA)");
+            passes++;
+        end
+        if (rx_fifo_stall !== 1'b0) begin
+            $error("[decoupling] rx_fifo refused the TCP stack -- RX_FIFO_DEPTH is too small");
+            fails++;
+        end else begin
+            $display("[PASS] rx_fifo_never_full (sticky overflow_stall clear)");
+            passes++;
+        end
 
         $display("========================================");
         $display("tcp_read_tb: %0d passed, %0d failed", passes, fails);

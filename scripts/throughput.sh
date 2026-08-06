@@ -63,7 +63,10 @@ if [ ! -x "$DUCKDB" ]; then
 fi
 
 URL="httpfpga://$FILE"
-SETUP="SET http_server='$SERVER'; SET http_port=$PORT;"
+# enable_progress_bar=false is not cosmetic. The bar redraws with carriage returns and leaves
+# partial lines behind, so a captured run comes out full of blank gaps between the query result and
+# its profile readback -- and the redraw thread runs during the window being measured.
+SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=false;"
 
 # ---------------------------------------------------------------------------------------------
 # Workload definitions. Each is a query over read_oasis($URL) plus the number of hardware column
@@ -114,7 +117,12 @@ row_groups() {
 }
 
 run_one() {
-    local name=$1 mode=$2 sql=$3
+    local name=$1 mode=$2 sql=$3 chunks=${4:-0}
+    # GETs actually issued: one per OASIS_HTTP_CHUNK_BYTES slice of every column chunk, or one per
+    # column chunk when splitting is off. Needed to turn the cycle counters into a per-request cost,
+    # which is the number that discriminates "the link is slow" from "each request costs a fixed
+    # amount no matter how big it is".
+    local split=${OASIS_HTTP_CHUNK_BYTES:-8192}
     local sql_file; sql_file=$(mktemp)
     {
         echo "$SETUP"
@@ -125,13 +133,38 @@ run_one() {
         echo "$sql"
         echo ".timer off"
         if [ "$mode" = oasis ]; then
-            echo "SELECT decoder, in_handshakes_cycles AS hs, in_starved_cycles AS starved,
-                         in_stalled_cycles AS stalled, in_idle_cycles AS idle,
-                         out_handshakes_cycles AS out_hs,
-                         round(in_throughput_gbps, 3) AS in_gbps,
-                         round(in_throughput_excl_idle_gbps, 3) AS in_gbps_busy,
-                         round(out_throughput_gbps, 3) AS out_gbps
-                  FROM oasis_stream_profile();"
+            # .mode line, not the default box. The box renderer drops columns to fit the terminal,
+            # and the two it dropped were stalled and idle -- precisely the pair that says whether
+            # the decoder is waiting on the network or on the host. One field per line never lies.
+            echo ".mode line"
+            echo "WITH c AS (
+                    SELECT decoder,
+                           in_handshakes_cycles AS hs, in_starved_cycles AS starved,
+                           in_stalled_cycles AS stalled, in_idle_cycles AS idle,
+                           in_throughput_gbps AS gbps
+                    FROM oasis_stream_profile()
+                  ), t AS (
+                    SELECT *, hs + starved + stalled + idle AS total, hs * 64 AS bytes FROM c
+                  ), g AS (
+                    SELECT *, CASE WHEN $split > 0
+                                   THEN ceil(bytes / greatest(${split}.0, 1.0))
+                                   ELSE $chunks END AS gets
+                    FROM t
+                  )
+                  SELECT decoder, hs, starved, stalled, idle, total,
+                         round(bytes / 1048576.0, 2)                  AS mib_in,
+                         round(total * 4e-9, 4)                       AS fpga_s,
+                         round(100.0 * hs      / nullif(total,0), 3)  AS duty_pct,
+                         round(100.0 * starved / nullif(total,0), 1)  AS starved_pct,
+                         round(100.0 * stalled / nullif(total,0), 1)  AS stalled_pct,
+                         round(100.0 * idle    / nullif(total,0), 1)  AS idle_pct,
+                         CAST(gets AS BIGINT)                         AS gets,
+                         round(bytes / nullif(gets,0) / 1024.0, 1)    AS kib_per_get,
+                         round((starved + idle) * 4e-3 / nullif(gets,0), 1)
+                                                                      AS dead_us_per_get,
+                         round(gbps, 4)                               AS in_gbps
+                  FROM g;"
+            echo ".mode duckbox"
         fi
     } > "$sql_file"
     echo "--- $name [$mode] run"
@@ -180,10 +213,10 @@ for w in $WORKLOADS; do
     echo "# $w -- $cols hardware column(s) per row group => $((cols * ${RG:-0})) column chunks"
     echo "##############################################################################"
     for i in $(seq 1 "$REPEAT"); do
-        run_one "$w" oasis "$(q_sql "$w")"
+        run_one "$w" oasis "$(q_sql "$w")" "$((cols * ${RG:-0}))"
     done
     echo "--- $w CPU baseline (same object over a host socket, DuckDB parquet reader)"
-    run_one "$w" cpu "$(q_cpu_sql "$w")"
+    run_one "$w" cpu "$(q_cpu_sql "$w")" "$((cols * ${RG:-0}))"
 done
 
 cat <<'EOF'

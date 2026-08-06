@@ -25,6 +25,7 @@ xvlog -sv ${TRACE:+-d TRACE} \
   "$HDL/tcp_init.sv" \
   "$HDL/http_req_builder.sv" \
   "$HDL/tcp_send_http.sv" \
+  "$HDL/axis_fifo.sv" \
   "$HDL/strip_http.sv" \
   "$HDL/tcp_read.sv" \
   "$HDL/handler.sv" \

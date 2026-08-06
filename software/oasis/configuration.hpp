@@ -157,10 +157,16 @@ class HTTPReadConfig : public libstf::Config {
         /// The announcement queue overflowed and segments were dropped. Sticky, and should never
         /// fire -- see NOTIFY_DEPTH in hardware/src/hdl/http_read/tcp_session_table.sv.
         bool notify_overflow = false;
+        /// The fifo that decouples the TCP stack from the HTTP parser filled up, so back-pressure
+        /// reached the TOE anyway. Sticky. Not a correctness problem, but it means RX_FIFO_DEPTH in
+        /// tcp_read.sv is too small for this traffic and the whole point of the decoupling -- never
+        /// letting the parser stall the shared 64 KB receive fifo -- has been lost.
+        bool rx_fifo_stall = false;
 
         bool any() const {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
-                   || resp_unframeable || dirty_abort || status_bad || notify_overflow;
+                   || resp_unframeable || dirty_abort || status_bad || notify_overflow
+                   || rx_fifo_stall;
         }
         std::string describe() const;
     };

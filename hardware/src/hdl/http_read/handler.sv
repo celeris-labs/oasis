@@ -372,7 +372,10 @@ module handler #(
     logic conn_stall_q, send_stall_q, read_stall_q;
     logic init_err_q, send_err_q, resp_err_q, status_bad_q;
 
-    assign stallWord = {7'd0,
+    logic rx_fifo_stall_w;
+
+    assign stallWord = {6'd0,
+                        rx_fifo_stall_w,
                         tbl_dbg_overflow,
                         8'(read_idx),
                         reconn_cnt_q,
@@ -515,6 +518,12 @@ module handler #(
         .status_ok(read_status_ok),
         .content_length(read_content_length),
         .body_remaining(read_body_remaining),
+        // Sticky: the decoupling fifo refused the TCP stack at least once, i.e. back-pressure
+        // reached the TOE anyway and RX_FIFO_DEPTH is too small for the traffic that showed up.
+        // Surfaced as a CSR bit because it is the one thing that would silently undo the
+        // decoupling, and nothing else on the host side would reveal it.
+        .rx_fifo_level(),
+        .rx_fifo_stall(rx_fifo_stall_w),
         .debug_rx_write_ptr(debug_rx_write_ptr),
         .debug_rx_buffer_w0(debug_rx_buffer_w0),
         .debug_rx_buffer_w1(debug_rx_buffer_w1),

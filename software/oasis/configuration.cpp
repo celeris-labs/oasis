@@ -498,6 +498,7 @@ HTTPReadConfig::HTTPStall HTTPReadConfig::stall() {
     s.reconnects       = static_cast<uint8_t>((word >> 8) & 0xFFu);
     s.read_slot        = static_cast<uint8_t>((word >> 16) & 0xFFu);
     s.notify_overflow  = (word & (1u << 24)) != 0;
+    s.rx_fifo_stall    = (word & (1u << 25)) != 0;
     return s;
 }
 
@@ -518,7 +519,15 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     if (dirty_abort)      oss << " dirty_abort";
     if (status_bad)       oss << " bad_http_status";
     if (notify_overflow)  oss << " notify_overflow";
+    if (rx_fifo_stall)    oss << " rx_fifo_stall";
     if (reconnects)       oss << " reconnects=" << static_cast<unsigned>(reconnects);
+
+    if (rx_fifo_stall) {
+        oss << ". The fifo between the TCP stack and the HTTP parser filled, so the parser "
+               "back-pressured the TOE after all. Results are still correct, but the shared 64 KB "
+               "receive fifo will have been overrun and recovered by retransmission -- raise "
+               "RX_FIFO_DEPTH in hardware/src/hdl/http_read/tcp_read.sv";
+    }
 
     if (resp_unframeable) {
         oss << ". A response arrived with no Content-Length, so the hardware could not tell where "

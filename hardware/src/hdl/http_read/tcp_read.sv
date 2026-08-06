@@ -38,7 +38,12 @@ import lynxTypes::*;
 // response at all. `error_dirty` says body bytes of THIS response already reached the decoder, so
 // the stream is corrupt and the handler must not silently reconnect and replay. See handler.sv.
 // =================================================================================================
-module tcp_read (
+module tcp_read #(
+    // Beats of slack between the TCP stack and the parser. The header walk is the worst case: a
+    // MinIO 206 header is ~550 bytes at one byte per cycle, during which 550 beats can arrive at
+    // line rate. 1024 x 64 B = 64 KiB covers that with room to spare and costs a handful of BRAMs.
+    parameter int RX_FIFO_DEPTH = 1024
+) (
     input  logic                                      clk,
     input  logic                                      rst_n,
     input  logic                                      start,
@@ -87,6 +92,12 @@ module tcp_read (
     output logic [31:0]                               content_length,
     output logic [31:0]                               body_remaining,
 
+    // Decoupling fifo occupancy, and a sticky bit saying the TCP stack was ever back-pressured
+    // anyway. If rx_fifo_stall ever sets, the fifo is undersized and we are back to stalling the
+    // TOE -- exactly what this whole change exists to prevent, so it is worth a CSR bit.
+    output logic [$clog2(RX_FIFO_DEPTH+1)-1:0]        rx_fifo_level,
+    output logic                                      rx_fifo_stall,
+
     output logic [3:0]                                debug_rx_write_ptr,
     output logic [AXI_DATA_BITS-1:0]                  debug_rx_buffer_w0,
     output logic [AXI_DATA_BITS-1:0]                  debug_rx_buffer_w1,
@@ -98,6 +109,7 @@ module tcp_read (
     localparam logic [3:0] ST_WAIT_NOTIFY = 4'd7;
     localparam logic [3:0] ST_REQ_PKG     = 4'd8;
     localparam logic [3:0] ST_RECV_DATA   = 4'd9;
+    localparam logic [3:0] ST_DRAIN       = 4'd10;
     localparam logic [3:0] ST_ABORT       = 4'd11;
     localparam logic [3:0] ST_DONE        = 4'd15;
 
@@ -109,15 +121,29 @@ module tcp_read (
     logic [TCP_LEN_BITS-1:0] req_len_q, req_len_d;
     logic abort_dirty_q, abort_dirty_d;
 
+    // Settle timer for ST_DRAIN. Reloaded while the parser still has something to chew on, counted
+    // down only once the fifo is empty. 200 cycles is comfortably more than the 64 it takes
+    // strip_http to walk a full residue beat at one byte per cycle.
+    localparam logic [7:0] DRAIN_SETTLE = 8'd200;
+    logic [7:0] drain_cnt_q, drain_cnt_d;
+    logic       parser_quiet_w, drain_settled_w; // driven below, once the fifo signals exist
+
     // strip_http handshake
     logic sh_resp_ack;
     logic sh_resp_done;
     logic sh_resp_dirty;
     logic sh_resp_error;
 
-    // strip_http slave-side stream, fed straight from the TOE rx data.
+    // strip_http slave-side stream. NOT fed straight from the TOE any more -- see inst_rx_fifo.
     logic                       sh_s_tvalid;
     logic                       sh_s_tready;
+    logic [AXI_DATA_BITS-1:0]   sh_s_tdata;
+    logic [AXI_DATA_BITS/8-1:0] sh_s_tkeep;
+    logic                       sh_s_tlast;
+
+    // TOE-side of the fifo.
+    logic                       fifo_s_tvalid;
+    logic                       fifo_s_tready;
 
     logic [AXI_DATA_BITS-1:0] payload_w0;
     logic [AXI_DATA_BITS-1:0] payload_w1;
@@ -126,9 +152,41 @@ module tcp_read (
 
     logic in_fire;
 
-    assign sh_s_tvalid          = (state_q == ST_RECV_DATA) && s_axis_rx_data_TVALID;
-    assign s_axis_rx_data_TREADY = (state_q == ST_RECV_DATA) && sh_s_tready;
+    // THE DECOUPLING. TREADY towards the TCP stack is now decided by fifo space, never by whether
+    // strip_http happens to be free. The parser walks header bytes one per cycle; while it did that
+    // it used to hold TREADY low and let the TOE's single shared 64 KB rx fifo fill behind it --
+    // ~35 KB of backlog per response, which is why a 32 KiB response worked and a 64 KiB one fell
+    // off a cliff at every pipeline depth. See axis_fifo.sv for the full derivation.
+    assign fifo_s_tvalid         = (state_q == ST_RECV_DATA) && s_axis_rx_data_TVALID;
+    assign s_axis_rx_data_TREADY = (state_q == ST_RECV_DATA) && fifo_s_tready;
     assign in_fire               = s_axis_rx_data_TVALID && s_axis_rx_data_TREADY;
+
+    axis_fifo #(
+        .DATA_BITS(AXI_DATA_BITS),
+        .DEPTH(RX_FIFO_DEPTH)
+    ) inst_rx_fifo (
+        .clk(clk),
+        .rst_n(rst_n),
+        // Only on a new connection. Between responses the residue is the next header.
+        .clear(clear_framing),
+        .s_axis_tvalid(fifo_s_tvalid),
+        .s_axis_tready(fifo_s_tready),
+        .s_axis_tdata(s_axis_rx_data_TDATA),
+        .s_axis_tkeep(s_axis_rx_data_TKEEP),
+        .s_axis_tlast(s_axis_rx_data_TLAST),
+        .m_axis_tvalid(sh_s_tvalid),
+        .m_axis_tready(sh_s_tready),
+        .m_axis_tdata(sh_s_tdata),
+        .m_axis_tkeep(sh_s_tkeep),
+        .m_axis_tlast(sh_s_tlast),
+        .level(rx_fifo_level),
+        .overflow_stall(rx_fifo_stall)
+    );
+
+    // Nothing left anywhere between the TCP stack and the parser: the fifo is empty and its output
+    // register has been taken. Used by ST_DRAIN to know when resp_dirty is finally trustworthy.
+    assign parser_quiet_w  = (rx_fifo_level == '0) && !sh_s_tvalid;
+    assign drain_settled_w = parser_quiet_w && (drain_cnt_q == 8'd0);
 
     // One cycle in ST_ARM retires the previous response and re-arms the framer for this one.
     assign sh_resp_ack = (state_q == ST_ARM);
@@ -141,9 +199,9 @@ module tcp_read (
         .body_last(body_last),
         .resp_ack(sh_resp_ack),
         .s_axis_tvalid(sh_s_tvalid),
-        .s_axis_tdata(s_axis_rx_data_TDATA),
-        .s_axis_tkeep(s_axis_rx_data_TKEEP),
-        .s_axis_tlast(s_axis_rx_data_TLAST),
+        .s_axis_tdata(sh_s_tdata),
+        .s_axis_tkeep(sh_s_tkeep),
+        .s_axis_tlast(sh_s_tlast),
         .s_axis_tready(sh_s_tready),
         .m_axis_tvalid(m_axis_body_tvalid),
         .m_axis_tdata(m_axis_body_tdata),
@@ -170,6 +228,10 @@ module tcp_read (
         pkg_active_d       = pkg_active_q;
         req_len_d          = req_len_q;
         abort_dirty_d      = abort_dirty_q;
+        // Hold the timer reloaded everywhere except ST_DRAIN, and reload it inside ST_DRAIN for as
+        // long as the parser still has work, so only genuine quiet counts towards settling.
+        drain_cnt_d        = (state_q == ST_DRAIN && parser_quiet_w && drain_cnt_q != 8'd0)
+                             ? drain_cnt_q - 8'd1 : DRAIN_SETTLE;
 
         m_axis_read_package_TVALID = 1'b0;
         m_axis_read_package_TDATA  = {req_len_q, session_id};
@@ -205,6 +267,23 @@ module tcp_read (
                     req_len_d  = rx_req_len;
                     state_d    = ST_REQ_PKG;
                 end else if (rx_closed) begin
+                    state_d = ST_DRAIN;
+                end
+            end
+
+            // The peer has closed and no announcements are left, so no further bytes will ever
+            // arrive -- but the decoupling fifo may still hold some, and strip_http walks header
+            // bytes one per cycle. Sampling resp_dirty now would report CLEAN for a response whose
+            // body bytes are still queued, the handler would treat the abort as replayable, and
+            // those bytes would be duplicated in the decoder stream. So: let the parser finish
+            // everything already pulled, and only then decide.
+            ST_DRAIN: begin
+                if (sh_resp_error) begin
+                    abort_dirty_d = sh_resp_dirty;
+                    state_d       = ST_ABORT;
+                end else if (sh_resp_done) begin
+                    state_d = ST_DONE;
+                end else if (drain_settled_w) begin
                     abort_dirty_d = sh_resp_dirty;
                     state_d       = ST_ABORT;
                 end
@@ -230,16 +309,24 @@ module tcp_read (
                     abort_dirty_d = sh_resp_dirty;
                     state_d       = ST_ABORT;
                 end else if (in_fire && s_axis_rx_data_TLAST) begin
-                    // The packet is fully handed over. Whether it completed the response is decided
-                    // back in ST_WAIT_NOTIFY, once the framer has drained it.
+                    // The packet is fully handed over TO THE FIFO. Whether it completed the
+                    // response is decided back in ST_WAIT_NOTIFY, once the framer has drained it.
                     pkg_active_d = 1'b0;
                     state_d      = ST_WAIT_NOTIFY;
-                end else if (sh_resp_done) begin
-                    // The response ended inside this packet. Stop here with pkg_active_q set: the
-                    // rest of the packet belongs to the next response and is read by the next
-                    // activation, which resumes in this state.
-                    state_d = ST_DONE;
                 end
+                // resp_done is deliberately NOT an exit from this state any more.
+                //
+                // Before the fifo, ingress and parsing were the same act, so a response finishing
+                // mid-packet had to stop the read and leave the remainder for the next activation
+                // (that is what pkg_active_q was for). Now they are separate: the bytes after a
+                // response boundary belong to the next response and we want them pulled out of the
+                // TOE's shared fifo immediately, not left sitting there while the handler
+                // re-activates us. Stopping here would reintroduce exactly the stall this fifo
+                // exists to remove -- and with more than one session it would hand the next
+                // session's bytes to the wrong reader.
+                //
+                // Completion is therefore recognised only in ST_WAIT_NOTIFY, which already tests
+                // sh_resp_done before it looks for more announcements.
             end
 
             ST_ABORT: begin
@@ -261,11 +348,13 @@ module tcp_read (
             pkg_active_q       <= 1'b0;
             req_len_q          <= '0;
             abort_dirty_q      <= 1'b0;
+            drain_cnt_q        <= DRAIN_SETTLE;
         end else begin
             state_q            <= state_d;
             rx_meta_received_q <= rx_meta_received_d;
             req_len_q          <= req_len_d;
             abort_dirty_q      <= abort_dirty_d;
+            drain_cnt_q        <= drain_cnt_d;
             // A new connection throws the half-read packet away with everything else.
             pkg_active_q       <= clear_framing ? 1'b0 : pkg_active_d;
         end

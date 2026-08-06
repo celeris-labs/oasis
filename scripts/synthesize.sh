@@ -11,6 +11,22 @@ while [ $# -gt 0 ]; do
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
         --decoders) decoders="$2"; shift ;;
         --decoders=*) decoders="${1#*=}" ;;
+        # Make the advertised TCP receive window match the buffer that actually exists.
+        #
+        # WINDOW_SCALING_EN=1 gives WINDOW_BITS = 16 + WINDOW_SCALE_BITS = 18, so the TOE tells the
+        # peer it can accept 1<<18 = 262,144 bytes. With RX_DDR_BYPASS_EN=1 there are no per-session
+        # buffers at all -- every session shares one axis_data_fifo_512_d1024 (tcp_stack.sv:681),
+        # which is 1024 x 64 B = 65,536 bytes. The stack advertises 4x what it has, and rx_engine
+        # decides whether to accept a segment from rxSar pointer arithmetic rather than from the
+        # FIFO fill level; the check that would have used the real level is commented out at
+        # rx_engine.cpp:1123.
+        #
+        # Setting this to 0 gives WINDOW_BITS = 16 and BUFFER_SIZE = 65,536 -- exactly the FIFO. It
+        # does not make the buffer bigger; it stops the stack over-promising, so a peer that fills
+        # the window gets flow-controlled instead of having the overflow dropped and recovered by
+        # go-back-N. Measured motivation: responses up to 32 KiB scale linearly, 64 KiB ones cost
+        # ~10 ms extra each, at every pipeline depth (scripts/sweep.sh).
+        --no-window-scaling) cmake_args+=(-DTCP_STACK_WINDOW_SCALING_EN=0) ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
     shift
