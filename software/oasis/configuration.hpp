@@ -1,6 +1,7 @@
 #pragma once
 
 #include "libstf/common.hpp"
+#include <atomic>
 #include <coyote/cThread.hpp>
 #include <cstdint>
 #include <libstf/configuration.hpp>
@@ -179,7 +180,17 @@ class HTTPReadConfig : public libstf::Config {
         bool     unframeable = false;      // no Content-Length
         bool     dirty = false;            // body bytes already emitted for the current response
         uint32_t body_remaining = 0;       // bytes of the current body still to stream
+        /// Content-Length the server sent for the last response, latched in hardware. Compare
+        /// against `requested`: they differ when the server answered a different question than the
+        /// one asked -- a 200 instead of a 206, a range clamped at EOF, an error document. This is
+        /// the check `body_remaining` cannot do, because it counts down to zero.
+        uint32_t content_length = 0;
+        /// Bytes the host asked for in the most recent ranged GET (host-side, not from hardware).
+        uint32_t requested = 0;
 
+        bool length_mismatch() const {
+            return requested != 0 && content_length != 0 && content_length != requested;
+        }
         std::string describe() const;
     };
     HTTPResponse response();
@@ -216,6 +227,10 @@ class HTTPReadConfig : public libstf::Config {
     static constexpr uint64_t ID = HTTP_READ_CONFIG_ID;
 
   private:
+    /// Bytes asked for in the most recent ranged GET, so response() can compare what the server
+    /// said against what was requested.
+    std::atomic<uint32_t> last_request_bytes_ {0};
+
     /// Block until the request ring has room for one more GET, or throw naming the stalled stage.
     void await_credit();
 

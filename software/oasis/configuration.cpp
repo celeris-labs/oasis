@@ -120,6 +120,7 @@ constexpr const uint32_t HTTP_INFLIGHT         = 10;
 constexpr const uint32_t HTTP_STALL            = 11;
 constexpr const uint32_t HTTP_RESP             = 12;
 constexpr const uint32_t HTTP_BODY_REMAINING   = 13;
+constexpr const uint32_t HTTP_CONTENT_LENGTH   = 14;
 
 // How long to wait for a request slot before giving up. Reaching this means the pipeline stopped
 // draining -- a response that never arrived, or a connection that never opened -- so it is a
@@ -315,6 +316,8 @@ void HTTPReadConfig::await_credit() {
 void HTTPReadConfig::issue_range(uint32_t server_ip, uint16_t server_port, const std::string &path,
                                  uint64_t range_begin, uint64_t range_end, bool body_last) {
     await_credit();
+    last_request_bytes_.store(static_cast<uint32_t>(range_end - range_begin + 1),
+                              std::memory_order_relaxed);
 
     const auto ip_ascii    = IpToAscii(server_ip);
     const auto begin_ascii = std::to_string(range_begin);
@@ -561,15 +564,23 @@ HTTPReadConfig::HTTPResponse HTTPReadConfig::response() {
     r.unframeable    = (word & (1u << 25)) != 0;
     r.dirty          = (word & (1u << 26)) != 0;
     r.body_remaining = static_cast<uint32_t>(read_register(HTTP_BODY_REMAINING).value());
+    r.content_length = static_cast<uint32_t>(read_register(HTTP_CONTENT_LENGTH).value());
+    r.requested      = last_request_bytes_.load(std::memory_order_relaxed);
     return r;
 }
 
 std::string HTTPReadConfig::HTTPResponse::describe() const {
     std::ostringstream oss;
     oss << "last response: status=" << std::string(status, 3) << (status_ok ? " (ok)" : " (NOT ok)")
+        << " Content-Length=" << content_length << " requested=" << requested
         << " body_remaining=" << body_remaining;
     if (unframeable) oss << " UNFRAMEABLE(no Content-Length)";
     if (dirty)       oss << " partially-delivered";
+    if (length_mismatch()) {
+        oss << ". THE SERVER SENT A DIFFERENT LENGTH THAN WAS REQUESTED -- the response is not the "
+               "one this request asked for (a 200 instead of a 206, a range clamped at end of file, "
+               "or an error document), so whatever reached the decoder is not this column chunk";
+    }
     return oss.str();
 }
 

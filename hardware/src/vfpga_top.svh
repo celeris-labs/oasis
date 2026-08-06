@@ -140,6 +140,7 @@ logic [31:0]                   http_total_word;
 logic [31:0]                   http_inflight_word;
 logic [31:0]                   http_stall_word;
 logic [31:0]                   http_resp_word;
+logic [31:0]                   http_content_length_word;
 logic [31:0]                   http_body_remaining_word;
 
 // 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
@@ -161,6 +162,7 @@ HttpConfig #(
     .inflight_word(http_inflight_word),
     .stall_word   (http_stall_word),
     .resp_word           (http_resp_word),
+    .content_length_word (http_content_length_word),
     .body_remaining_word (http_body_remaining_word)
 );
 `elsif EN_RDMA
@@ -346,6 +348,7 @@ handler #(
     .inflightWord                  (http_inflight_word),
     .stallWord                     (http_stall_word),
     .respWord                      (http_resp_word),
+    .contentLengthWord             (http_content_length_word),
     .bodyRemainingWord             (http_body_remaining_word),
     .state_debug                   (http_client_state),
 

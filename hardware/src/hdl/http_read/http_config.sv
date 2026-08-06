@@ -76,6 +76,12 @@ import http_types::*;
 //                        [26] body bytes already emitted for the current response)
 //   13 BODY_REMAINING   ([31:0]) -- bytes of the current body still to stream; a read that is stuck
 //                        with this non-zero is waiting on the network, not on the decoder
+//   14 CONTENT_LENGTH   ([31:0]) -- Content-Length the server sent for the last response, LATCHED.
+//                        The host knows what it asked for; this is what arrived. The two differing
+//                        is the difference between a slow network and a server answering a
+//                        different question (a 200 instead of a 206, a range clamped at EOF, an
+//                        error document). BODY_REMAINING alone cannot say this -- it counts down
+//                        to zero and is meaningless once the response is over.
 //
 // INFLIGHT is not optional bookkeeping. ConfigWriteReadyRegister does NOT back-pressure: a START
 // write that lands while the previous one is still unconsumed overwrites it, and the earlier request
@@ -109,6 +115,7 @@ module HttpConfig #(
     input  logic [31:0] inflight_word,
     input  logic [31:0] stall_word,
     input  logic [31:0] resp_word,
+    input  logic [31:0] content_length_word,
     input  logic [31:0] body_remaining_word
 );
 
@@ -284,7 +291,7 @@ assign start_raw.ready = start_cfg.ready;
 // discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
 // ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-localparam int NUM_READ_REGS = 14;
+localparam int NUM_READ_REGS = 15;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -309,6 +316,7 @@ assign read_registers[11] = {32'b0, stall_word};
 // "the response could not be framed at all" are now distinguishable from the host. See strip_http.sv.
 assign read_registers[12] = {32'b0, resp_word};
 assign read_registers[13] = {32'b0, body_remaining_word};
+assign read_registers[14] = {32'b0, content_length_word};
 
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
 

@@ -113,6 +113,7 @@ module strip_http (
     output logic                           resp_error,     // header block had no Content-Length
     output logic [23:0]                    status_ascii,   // e.g. "206"
     output logic                           status_ok,      // 200 or 206
+    output logic [31:0]                    content_length, // Content-Length of the last response
     output logic [31:0]                    body_remaining, // body bytes still to stream
 
     // Payload start index within the first body beat (0..63)
@@ -207,6 +208,11 @@ module strip_http (
     logic        val_is_cl_q;  // the value being consumed belongs to Content-Length
     logic [31:0] cl_q;
     logic        cl_seen_q;
+    // The parsed Content-Length, LATCHED. body_remaining counts down to zero, so on its own it can
+    // never answer "what did the server say the length was?" after the fact -- and that is exactly
+    // the question when a response turns out not to be the one that was asked for. The host knows
+    // what it requested; this is what arrived, and the two disagreeing is the whole diagnosis.
+    logic [31:0] cl_latched_q;
     logic [23:0] status_q;
     logic [1:0]  status_sp_q;  // spaces seen in the status line (saturating)
     logic [1:0]  status_cnt_q; // status digits captured (0..3)
@@ -324,6 +330,7 @@ module strip_http (
             val_is_cl_q   <= 1'b0;
             cl_q          <= '0;
             cl_seen_q     <= 1'b0;
+            cl_latched_q  <= '0;
             status_q      <= '0;
             status_sp_q   <= '0;
             status_cnt_q  <= '0;
@@ -395,6 +402,7 @@ module strip_http (
                         status_cnt_q <= '0;
                         cl_seen_q    <= 1'b0;
                         cl_q         <= '0;
+                        cl_latched_q <= cl_q;
                         if (!cl_seen_q) begin
                             error_q <= 1'b1;
                         end else if (cl_q == 32'd0) begin
@@ -512,6 +520,7 @@ module strip_http (
     assign resp_error      = error_q;
     assign status_ascii    = status_q;
     assign status_ok       = (status_q == "200") || (status_q == "206");
+    assign content_length  = cl_latched_q;
     assign body_remaining  = body_left_q;
 
 endmodule

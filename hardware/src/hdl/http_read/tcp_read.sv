@@ -84,6 +84,7 @@ module tcp_read (
     output logic                                      resp_error,
     output logic [23:0]                               status_ascii,
     output logic                                      status_ok,
+    output logic [31:0]                               content_length,
     output logic [31:0]                               body_remaining,
 
     output logic [3:0]                                debug_rx_write_ptr,
@@ -158,6 +159,7 @@ module tcp_read (
         .resp_error(sh_resp_error),
         .status_ascii(status_ascii),
         .status_ok(status_ok),
+        .content_length(content_length),
         .body_remaining(body_remaining),
         .out_payload_idx()
     );

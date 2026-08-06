@@ -152,6 +152,7 @@ module handler #(
     output logic [31:0]                               inflightWord,
     output logic [31:0]                               stallWord,
     output logic [31:0]                               respWord,
+    output logic [31:0]                               contentLengthWord,
     output logic [31:0]                               bodyRemainingWord,
     output logic [3:0]                                state_debug
 );
@@ -244,6 +245,7 @@ module handler #(
     logic        read_resp_error;
     logic [23:0] read_status_ascii;
     logic        read_status_ok;
+    logic [31:0] read_content_length;
     logic [31:0] read_body_remaining;
 
     // Stage FSMs. Each sub-module latches `start` as a level and parks in its own DONE state until
@@ -383,6 +385,10 @@ module handler #(
     //   [25]    the last response could not be framed (no Content-Length)
     //   [26]    the current response has already emitted body bytes
     assign respWord = {5'd0, read_error_dirty, read_resp_error, read_status_ok, read_status_ascii};
+    // What the server SAID the body was, latched, next to what is left of it. The host knows what it
+    // asked for, so these two being different is the difference between "the network is slow" and
+    // "the server answered a different question".
+    assign contentLengthWord = read_content_length;
     assign bodyRemainingWord = read_body_remaining;
 
     // ---------------------------------------------------------------------------------------------
@@ -507,6 +513,7 @@ module handler #(
         .resp_error(read_resp_error),
         .status_ascii(read_status_ascii),
         .status_ok(read_status_ok),
+        .content_length(read_content_length),
         .body_remaining(read_body_remaining),
         .debug_rx_write_ptr(debug_rx_write_ptr),
         .debug_rx_buffer_w0(debug_rx_buffer_w0),
