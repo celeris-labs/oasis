@@ -93,11 +93,29 @@ echo "==========================================================================
 # cost of one GET, free of all of it.
 
 # Bytes the decoder will see, from the profiler, so the GET count is exact rather than assumed.
+# stderr is kept, not discarded. This is the one call whose failure aborts the whole sweep, so
+# throwing away the reason it failed leaves nothing to act on -- a wedged board, a 404 and a stale
+# library all abort with the same bare line.
+PROBE_ERR=$(mktemp)
+trap 'rm -f "$PROBE_ERR"' EXIT
 BYTES=$("$DUCKDB" -noheader -list -c "$SETUP
     SELECT count(*) FROM oasis_stream_profile();
     $QUERY
-    SELECT sum(in_handshakes_cycles) * 64 FROM oasis_stream_profile();" 2>/dev/null | tail -1)
-case "$BYTES" in ''|*[!0-9]*) echo "could not read decoder byte count; aborting" >&2; exit 1 ;; esac
+    SELECT sum(in_handshakes_cycles) * 64 FROM oasis_stream_profile();" 2>"$PROBE_ERR" | tail -1)
+case "$BYTES" in ''|*[!0-9]*)
+    echo "could not read decoder byte count; aborting" >&2
+    echo "  the query that failed was:" >&2
+    echo "    $QUERY" >&2
+    if [ -s "$PROBE_ERR" ]; then
+        echo "  duckdb said:" >&2
+        sed 's/^/    /' "$PROBE_ERR" >&2
+    else
+        echo "  duckdb printed nothing on stderr; it returned '$BYTES'." >&2
+        echo "  A blank value with no error usually means the profiler read came back empty --" >&2
+        echo "  check the board is not wedged: OASIS_HTTP_DEBUG=1 with any small read." >&2
+    fi
+    exit 1 ;;
+esac
 echo "decoder bytes per run: $BYTES ($(awk -v b="$BYTES" 'BEGIN{printf "%.2f", b/1048576}') MiB)"
 echo
 
