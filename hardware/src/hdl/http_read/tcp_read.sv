@@ -42,7 +42,19 @@ module tcp_read #(
     // Beats of slack between the TCP stack and the parser. The header walk is the worst case: a
     // MinIO 206 header is ~550 bytes at one byte per cycle, during which 550 beats can arrive at
     // line rate. 1024 x 64 B = 64 KiB covers that with room to spare and costs a handful of BRAMs.
-    parameter int RX_FIFO_DEPTH = 1024
+    // 4096 x 64 B = 256 KiB. Was 1024 (64 KiB), which measured too small: on build-94 the sticky
+    // rx_fifo_stall bit SET during a scale-30 run at the 128 KiB chunk size, meaning the fifo filled
+    // and back-pressure reached the TOE again -- the exact condition this fifo exists to prevent,
+    // and the reason larger chunks stopped paying off in scripts/sweep.sh.
+    //
+    // Sized against what has to fit: one response (up to OASIS_HTTP_CHUNK_BYTES) plus the ~35 KB the
+    // parser's header walk lets accumulate behind it. At 64 KiB that left nothing spare beyond a
+    // 32 KiB response. 256 KiB covers a 128 KiB chunk with room, and matches the window the TOE
+    // already advertises (2^18), so the host can stop sizing requests around a buffer that is
+    // smaller than what the stack promises the sender.
+    //
+    // Cost is 64 RAMB36 instead of 16, out of 2016 on the U55C -- the design uses 25.8%.
+    parameter int RX_FIFO_DEPTH = 4096
 ) (
     input  logic                                      clk,
     input  logic                                      rst_n,
