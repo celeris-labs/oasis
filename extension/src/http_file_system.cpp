@@ -27,6 +27,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <thread>
+#include <cstdlib>
 #include <unistd.h>
 
 namespace duckdb {
@@ -52,10 +53,19 @@ uint64_t GetUIntSetting(optional_ptr<FileOpener> opener, const string &key, uint
 // parseIpBE: 10.253.74.74 -> 0x0AFD4A4A.
 // Used as-is for openConnTcp and HTTP Host CSR (those CSRs do not byte-swap).
 //
-// doArpLookup goes through NET_ARP_REG which byte-reverses the written word
-// (shell_slave IP set path does not). Pass bswap32(parseIpBE) so wire who-has
-// matches 10.253.74.74. Earlier "backwards ARP" with bswap was from YMM multi-beat
-// MMIO, not from the bswap itself (ARP is now a single dword store in libcoyote).
+// The claim that NET_ARP_REG byte-reverses the written word was wrong, and the bswap that
+// compensated for it is what produced the reversed request. cThread::doArpLookup
+// (parcore/libstf/coyote/sw/src/cThread.cpp:1061) stores ip_addr into the register verbatim, and
+// Coyote's own callers pass the driver's IOCTL_GET_IP_ADDRESS word straight through. A capture on
+// 2026-08-07 settled it: with the bswap in place the wire carries "who-has 74.74.253.10" -- exactly
+// the bytes handed to doArpLookup -- while the sender field renders 10.253.74.80 correctly from the
+// same register space. So the register wants ParseIpBE order and nothing else.
+//
+// The warm-up has therefore never resolved anything; it asked for an address that does not exist and
+// waited out the reply that could not come. What kept the design working is a side effect: the
+// request is BROADCAST with the FPGA's own IP and MAC in the sender fields, so every host on the
+// segment learns the FPGA's mapping, including the server -- which is why deleting the call caused
+// the documented "START fires but no SYN leaves" hang, and why fixing the target keeps that.
 uint32_t ParseIpBE(const string &host) {
 	unsigned b0 = 0, b1 = 0, b2 = 0, b3 = 0;
 	if (std::sscanf(host.c_str(), "%u.%u.%u.%u", &b0, &b1, &b2, &b3) != 4 || b0 > 255 ||
@@ -66,7 +76,20 @@ uint32_t ParseIpBE(const string &host) {
 }
 
 uint32_t IpForArpLookup(uint32_t ip_be) {
-	return __builtin_bswap32(ip_be);
+	return ip_be;
+}
+
+// Microseconds to wait after the ARP request before letting the handler open a connection.
+useconds_t ArpSettleMicros() {
+	static const useconds_t configured = [] {
+		const char *env = std::getenv("OASIS_ARP_SETTLE_US");
+		if (!env || !*env) {
+			return useconds_t(50000);
+		}
+		const long parsed = std::strtol(env, nullptr, 10);
+		return parsed < 0 ? useconds_t(50000) : static_cast<useconds_t>(parsed);
+	}();
+	return configured;
 }
 
 string NormalizeHttpPath(const string &path) {
@@ -267,14 +290,24 @@ void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 		             server_host_.c_str(), server_ip_, IpForArpLookup(server_ip_),
 		             static_cast<unsigned>(server_port_));
 	}
-	// Resolve the server MAC into the TOE ARP table, then let it settle. The standalone
-	// bring-up tool (which works) does doArpLookup + sleep(1) before every START; here we
-	// resolve once at init since the entry persists for the session. Without this the handler
-	// reaches START and tries to open the connection before the server MAC is known, then
-	// stalls — START fires but no SYN ever leaves the FPGA (the "fire, then hang, no TCP"
-	// symptom). This call was previously commented out, which is exactly that hang.
+	// Resolve the server MAC into the TOE ARP table, then let it settle. Without this the handler
+	// reaches START and tries to open the connection before the server MAC is known, then stalls —
+	// START fires but no SYN ever leaves the FPGA (the "fire, then hang, no TCP" symptom). This call
+	// was previously commented out, which is exactly that hang.
+	//
+	// The settle time used to be a flat sleep(1), inherited from the standalone bring-up tool. That
+	// second was 1.0 s of the 1.35-1.41 s fixed per-process cost that scripts/sweep.sh measures at
+	// every depth — about seventy percent of it, paid by every duckdb invocation, and it dwarfs the
+	// GETs themselves once chunks are 128 KiB. It was also waiting for a reply that could not
+	// arrive, since the request went to a byte-reversed address (see IpForArpLookup above). With the
+	// right target an ARP reply on a local segment comes back in well under a millisecond, so 50 ms
+	// is still three orders of magnitude of headroom.
+	//
+	// Overridable without a rebuild because the failure it guards against is a wedge that outlives
+	// the process: if a connect ever stalls with no init_error after this changed, set
+	// OASIS_ARP_SETTLE_US=1000000 to get the old behaviour back and say so.
 	ctx.cthread()->doArpLookup(IpForArpLookup(server_ip_));
-	sleep(1);
+	usleep(ArpSettleMicros());
 
 	initialized = true;
 }
