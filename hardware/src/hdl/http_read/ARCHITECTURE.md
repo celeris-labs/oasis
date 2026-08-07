@@ -131,6 +131,34 @@ exchange for control complexity in the one module whose framing bugs are silent 
 
 **Buffering:** N × one response. At 32 KiB that is 128 KiB for N=4 — a few URAMs of 960.
 
+### 2026-08-07: build-94 measured, and the cost/benefit has moved sharply
+
+ADR-2 shipped and worked -- the 32K->64K cliff is gone at every depth. That made a 128 KiB default
+chunk legal (`29d065b`), and a stray `sleep(1)` in the host's ARP warm-up turned out to be 1.0 s of a
+1.36 s fixed per-process cost (`db38b3a`). TPC-H sf1 went **147.1 s -> 40.6 s**, 22/22 still passing,
+and effective decoder throughput is now **70-110 MB/s** against the 40 MB/s this ADR was written on.
+
+**This weakens the case for N connections at small scale, and the arithmetic should be checked before
+building them.** A lineitem scan at sf1, at the best measured point, now decomposes as:
+
+    total 0.441 s  =  fixed 0.388 s (88 %)  +  all 72 GETs 0.053 s (12 %)
+
+So driving the GET cost to *zero* -- which is the very best N connections could ever do -- is a
+**1.14x** win here. Cutting the fixed cost to 0.1 s is **2.9x**. The bottleneck this ADR was written
+to attack is no longer the bottleneck at sf1.
+
+Two things must be settled before this ADR is worth implementing:
+
+1. **How far does chunk size go?** For a latency-bound workload, N connections and N-times-bigger
+   chunks buy the same thing, and chunk size is free. The floor is one GET per column chunk. If that
+   floor is reachable, most of what ADR-3 offers is already available without touching RTL.
+2. **Does it still bind at SF30?** There the GET count is ~100x larger and the fixed cost is
+   irrelevant, so the answer is probably yes -- but "probably" is what this file exists to prevent.
+
+Related: [[toe-rx-no-demux]] records "bigger row groups are slower". That was measured UNDER the
+cliff, where a larger column chunk meant a larger response falling off it. With the cliff gone the
+sign may well have flipped, and bigger row groups mean fewer GETs. Re-test before relying on it.
+
 ### What would overturn this
 
 - **The decoder stops being idle.** If duty rises above ~50 % after the connection count goes up,
