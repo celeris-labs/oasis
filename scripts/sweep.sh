@@ -30,7 +30,9 @@ SERVER=${OASIS_SERVER:-10.253.74.74}
 PORT=${OASIS_PORT:-9000}
 FILE=${FILE:-/throughput/tpch-1/lineitem.parquet}
 DEPTHS=4
-CHUNKS="4096,8192,16384,32768,65536,131072"
+# Extends past 131072 since build-94: the cliff that used to sit between 32K and 64K is gone, so
+# the sweep has to reach far enough to find wherever the new limit is -- if there is one.
+CHUNKS="8192,32768,131072,262144,524288,1048576"
 REPEAT=2
 TIMEOUT=300
 

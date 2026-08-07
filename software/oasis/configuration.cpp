@@ -152,6 +152,16 @@ constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 // the sender is or how slowly the decoder drains. 4 x 8 KiB = 32 KiB leaves ~9 KB of headroom for
 // the response headers and in-flight ACK slack.
 //
+// SUPERSEDED ON build-94 -- read this before trusting the paragraph above. The reasoning is sound
+// but the premise is not: the FIFO backed up because the HTTP PARSER was holding TREADY low for the
+// duration of a header walk, not because the network outran the decoder. The decoder drains at
+// 16 GB/s at 0.25% duty; it was never the slow party. Once b238c4e decoupled the two, responses
+// eight times larger than the whole threshold ran with no penalty at all (the sweep table under
+// HTTP_DEFAULT_CHUNK_BYTES). The bytes-in-flight bound is therefore NOT the invariant that keeps
+// this correct, and sizing a chunk against 41.5 KB now only costs requests. What does keep it
+// correct is that the drain never stops -- which rx_fifo_stall reports on, and which is the bit to
+// read if any of this starts misbehaving.
+//
 // WHY PIPELINING IS SAFE AGAIN
 // Depth > 1 used to wedge the receive path, and the reason was never the depth: it was concurrent
 // SESSIONS. Under RX_DDR_BYPASS `rx_app_stream_if()` answers a readPkg by echoing back the session
@@ -165,13 +175,35 @@ constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 // construction and HTTP/1.1 pipelining over that connection is both legal and safe.
 constexpr const uint8_t  HTTP_DEFAULT_MAX_INFLIGHT = 4;
 
-// Largest byte range asked for in one GET. 0 disables splitting entirely (one GET per column
-// chunk), which is the right setting for measuring what the split costs -- and the wrong one on
-// this TOE, because a 1.3 MB column chunk then lives permanently in go-back-N.
+// Largest byte range asked for in one GET. 0 disables splitting entirely (one GET per column chunk).
+//
+// RAISED 8192 -> 131072 ON build-94. The 8 KiB default existed to keep `depth x chunk` under the
+// ~41.5 KB drop threshold described above. That bound was real, but it was a symptom: the parser
+// held s_axis_rx_data_TREADY low for the ~550 cycles of a header walk, so the shared FIFO backed up
+// behind it and small requests were the only way to stay under the edge. b238c4e put a FIFO between
+// the TOE and the parser, and the edge went with it.
+//
+// Measured on build-94, scripts/sweep.sh, lineitem sf1, per-GET marginal cost in microseconds:
+//
+//            4K->8K   8K->16K  16K->32K  32K->64K  64K->128K
+//   depth 1    1019       988      1116       936        720
+//   depth 2     927       705       786       508        801
+//   depth 4     888       779       719       764        600
+//
+// Flat, at every depth. On build-93 the same sweep showed +10.4 ms/GET at 32K->64K -- a response
+// that no longer fit alongside the parser's backlog. That cliff is gone, so the cost of a GET is now
+// latency and nothing else, and the only thing that matters is issuing fewer of them.
+//
+// 131072 is the largest size actually measured, not a limit. Bigger is very likely still better;
+// sweep further before raising it again, because past here nothing has been observed. Note the
+// bytes-in-flight product is now 4 x 128 KiB = 512 KiB, eight times what the old rule permitted --
+// that is deliberate and is what the sweep above tested, but it means rx_fifo_stall (stallWord bit
+// 25) is the thing to watch: if it ever sets, back-pressure has reached the TOE again and this
+// number is why.
 //
 // Splitting is nearly free only because the connection is persistent: the extra requests cost a
 // ~150-byte GET and a ~200-byte response header each, pipelined, with no handshake and no teardown.
-constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 8192;
+constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 131072;
 
 // Effective request-ring depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override).
 // OASIS_HTTP_MAX_INFLIGHT=0 means "whatever the bitstream advertises". Raising this without also
