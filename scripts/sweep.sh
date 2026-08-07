@@ -19,6 +19,12 @@
 #   ./scripts/sweep.sh                            # depth 4, chunks 4K..128K
 #   ./scripts/sweep.sh --depths 1,2,4             # also vary depth
 #   ./scripts/sweep.sh --repeat 3                 # median of 3 per cell
+#   ./scripts/sweep.sh --check-stall              # ask the hardware where the safe chunk size ends
+#
+# --check-stall reads the sticky rx_fifo_stall bit after every cell and names the first chunk size
+# that sets it. That bit is the ground truth for "this response no longer fits behind the decoupling
+# fifo", which the wall clock only hints at. It is sticky with no reset CSR, so this is only
+# meaningful on an INCREASING sweep from a FRESHLY PROGRAMMED board.
 #
 # Env: DUCKDB, OASIS_SERVER, OASIS_PORT.
 
@@ -35,10 +41,13 @@ DEPTHS=4
 CHUNKS="8192,32768,131072,262144,524288,1048576"
 REPEAT=2
 TIMEOUT=300
+CHECK_STALL=0
+STALL_SEEN=
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --depths)  DEPTHS="$2"; shift ;;
+        --check-stall) CHECK_STALL=1 ;;
         --chunks)  CHUNKS="$2"; shift ;;
         --repeat)  REPEAT="$2"; shift ;;
         --file)    FILE="$2"; shift ;;
@@ -66,6 +75,19 @@ timed_run() {
     timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list -c "$sql" >/dev/null 2>&1; rc=$?
     t1=$(date +%s.%N)
     [ "$rc" = 0 ] && awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.4f", b-a}'
+}
+
+# Reads the sticky stall bits by doing one tiny read with the FPGA debug trace on. Returns the STALL
+# line, or empty if nothing is latched.
+#
+# These bits are STICKY and there is no reset CSR: once rx_fifo_stall sets it stays set until the
+# bitstream is reprogrammed. So this can only ever answer "has it fired by now", which makes the
+# sweep order load-bearing -- run chunks in INCREASING size from a freshly programmed board and the
+# first row that reports it is the ceiling. Reading it after a descending sweep tells you nothing.
+stall_bits() {
+    OASIS_HTTP_DEBUG=1 timeout 60s "$DUCKDB" -noheader -list -c "$SETUP
+        SELECT sum(r_regionkey) FROM read_oasis('httpfpga:///throughput/tpch-1/region.parquet');" 2>&1 \
+        | grep -m1 'STALL:' | sed 's/^.*STALL: //' | cut -c1-90
 }
 
 # Median of REPEAT runs, discarding failures.
@@ -146,6 +168,19 @@ $(awk -v g1="$PREV_G" -v w1="$PREV_W" -v g2="$gets" -v w2="$wall" 'BEGIN{
 EOF
         fi
         printf '%6s %9s %8s %10s %14s  %s\n' "$d" "$c" "$gets" "$wall" "$marg" "$verdict"
+        # Ask the hardware whether this chunk size defeated the decoupling, rather than inferring it
+        # from the wall clock. Reported once, on the row where it first appears: the bit is sticky,
+        # so every later row would repeat it and hide which size actually crossed the line.
+        if [ "$CHECK_STALL" = 1 ] && [ -z "$STALL_SEEN" ]; then
+            sb=$(stall_bits)
+            case "$sb" in *rx_fifo_stall*)
+                STALL_SEEN=1
+                echo "         ^^ rx_fifo_stall FIRST SET AT chunk=$c -- the fifo between the TOE and"
+                echo "            the parser filled here, so back-pressure reached the TCP stack and the"
+                echo "            decoupling is defeated at this size and every larger one."
+                echo "            The largest SAFE chunk is the row above. [$sb]" ;;
+            esac
+        fi
         PREV_G=$gets; PREV_W=$wall
     done
     echo
