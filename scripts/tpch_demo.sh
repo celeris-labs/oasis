@@ -170,6 +170,14 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
     if [ "$fpga_rc" != 0 ]; then
         printf '%-5s %-8s %9s %9s %10s  %s\n' "q$n" "ERROR" "$fpga_s" "$cpu_s" "${hw_mib:--}" \
             "$(tr '\n' ' ' < "$FPGA_RAW" | cut -c1-70)"
+        # Keep the whole thing. Cut to 70 characters, every hardware failure in this design reads
+        # "terminate called after throwing an instance of 'st" -- which names neither the exception
+        # nor the stage, and those are the only two things worth knowing. The tail is where the
+        # handler state and the stall word are.
+        cp "$FPGA_RAW" "/tmp/oasis-q$n-error.txt"
+        echo "         full error kept: /tmp/oasis-q$n-error.txt"
+        sed -n '$p;/rror\|xception\|terminate\|httpfpga\|oasis-http/p' "$FPGA_RAW" \
+            | tail -12 | sed 's/^/         | /'
         FAIL=$((FAIL+1)); FAILED+=("q$n"); continue
     fi
     # cmp, not string equality: a scale-30 result can be hundreds of thousands of rows and holding
