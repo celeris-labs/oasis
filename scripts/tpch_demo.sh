@@ -21,6 +21,12 @@
 #   ./scripts/tpch_demo.sh --scale 3          # tpch-3 (note: lineitem is 657 MB)
 #   ./scripts/tpch_demo.sh --only 1,6,14      # a subset
 #   ./scripts/tpch_demo.sh --timeout 300
+#   ./scripts/tpch_demo.sh --cpu-first        # run the CPU side first, to expose the cache bias
+#
+# ON --cpu-first: both sides fetch the same bytes from the same MinIO, so whichever runs SECOND
+# reads them from the server's page cache. The default order (FPGA first) therefore warms the cache
+# for the CPU baseline on every single query. If the ratio changes when you flip this, the number
+# being reported is partly a cache-hit rate, not a decode rate.
 #
 # Env: DUCKDB, OASIS_SERVER, OASIS_PORT, OASIS_HTTP_MAX_INFLIGHT, OASIS_HTTP_CHUNK_BYTES.
 
@@ -37,12 +43,18 @@ PORT=${OASIS_PORT:-9000}
 SCALE=1
 TIMEOUT=300
 ONLY=""
+# Which side runs first. This is not cosmetic: both sides fetch THE SAME BYTES from MinIO, so
+# whichever runs second reads them out of the server's page cache. Running FPGA-first therefore
+# hands the CPU baseline a warm cache on every query and flatters it. Swap the order and the bias
+# reverses; if the ratio moves, the comparison was measuring caching as much as decoding.
+CPU_FIRST=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --scale)   SCALE="$2"; shift ;;
         --only)    ONLY="$2"; shift ;;
         --timeout) TIMEOUT="$2"; shift ;;
+        --cpu-first) CPU_FIRST=1 ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
         -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
@@ -103,39 +115,48 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
     sql_body=$(cat "$f")
 
     # --- FPGA -------------------------------------------------------------------------------
-    fpga_file=$(mktemp)
-    { echo "$SETUP"; views read_oasis
-      echo "SELECT count(*) FROM oasis_stream_profile();"   # arm the profiler window
-      echo "SELECT '$BEGIN_MARK';"
-      echo "$sql_body"
-      echo "SELECT '$END_MARK';"
-      echo ".mode line"
-      echo "SELECT round(sum(in_handshakes_cycles) * 64 / 1048576.0, 2) AS hw_mib FROM oasis_stream_profile();"
-    } > "$fpga_file"
-    t0=$(date +%s.%N)
-    timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list < "$fpga_file" > "$FPGA_RAW" 2>&1; fpga_rc=$?
-    t1=$(date +%s.%N)
-    rm -f "$fpga_file"
-    fpga_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
-    # the profiler line is the last "hw_mib = N" the shell printed
-    hw_mib=$(grep -oE 'hw_mib *= *[0-9.]+' "$FPGA_RAW" | tail -1 | grep -oE '[0-9.]+$')
-    extract_rows < "$FPGA_RAW" > "$FPGA_ROWS"
-    grep -qF "$END_MARK" "$FPGA_RAW" || fpga_rc=1
+    run_fpga() {
+        fpga_file=$(mktemp)
+        { echo "$SETUP"; views read_oasis
+          echo "SELECT count(*) FROM oasis_stream_profile();"   # arm the profiler window
+          echo "SELECT '$BEGIN_MARK';"
+          echo "$sql_body"
+          echo "SELECT '$END_MARK';"
+          echo ".mode line"
+          echo "SELECT round(sum(in_handshakes_cycles) * 64 / 1048576.0, 2) AS hw_mib FROM oasis_stream_profile();"
+        } > "$fpga_file"
+        t0=$(date +%s.%N)
+        timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list < "$fpga_file" > "$FPGA_RAW" 2>&1; fpga_rc=$?
+        t1=$(date +%s.%N)
+        rm -f "$fpga_file"
+        fpga_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+        # the profiler line is the last "hw_mib = N" the shell printed
+        hw_mib=$(grep -oE 'hw_mib *= *[0-9.]+' "$FPGA_RAW" | tail -1 | grep -oE '[0-9.]+$')
+        extract_rows < "$FPGA_RAW" > "$FPGA_ROWS"
+        grep -qF "$END_MARK" "$FPGA_RAW" || fpga_rc=1
+
+    }
 
     # --- CPU --------------------------------------------------------------------------------
-    cpu_file=$(mktemp)
-    { echo "$SETUP"; echo "SET httpfpga_cpu_fallback=true;"; views read_parquet
-      echo "SELECT '$BEGIN_MARK';"
-      echo "$sql_body"
-      echo "SELECT '$END_MARK';"
-    } > "$cpu_file"
-    t0=$(date +%s.%N)
-    timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list < "$cpu_file" > "$CPU_RAW" 2>&1; cpu_rc=$?
-    t1=$(date +%s.%N)
-    rm -f "$cpu_file"
-    cpu_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
-    extract_rows < "$CPU_RAW" > "$CPU_ROWS"
-    grep -qF "$END_MARK" "$CPU_RAW" || cpu_rc=1
+    run_cpu() {
+        cpu_file=$(mktemp)
+        { echo "$SETUP"; echo "SET httpfpga_cpu_fallback=true;"; views read_parquet
+          echo "SELECT '$BEGIN_MARK';"
+          echo "$sql_body"
+          echo "SELECT '$END_MARK';"
+        } > "$cpu_file"
+        t0=$(date +%s.%N)
+        timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list < "$cpu_file" > "$CPU_RAW" 2>&1; cpu_rc=$?
+        t1=$(date +%s.%N)
+        rm -f "$cpu_file"
+        cpu_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+        extract_rows < "$CPU_RAW" > "$CPU_ROWS"
+        grep -qF "$END_MARK" "$CPU_RAW" || cpu_rc=1
+
+    }
+
+    # Second reader gets MinIO's page cache warm, so the order is a measurement choice.
+    if [ "$CPU_FIRST" = 1 ]; then run_cpu; run_fpga; else run_fpga; run_cpu; fi
 
     # --- verdict ----------------------------------------------------------------------------
     if [ "$fpga_rc" = 124 ]; then
