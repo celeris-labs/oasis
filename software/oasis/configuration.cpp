@@ -567,15 +567,20 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     if (rx_fifo_stall)    oss << " rx_fifo_stall";
     if (reconnects)       oss << " reconnects=" << static_cast<unsigned>(reconnects);
 
+    // One explanation per line. These are sticky bits and several latch together over a long query,
+    // so run as prose they produce a paragraph in which every sentence contradicts the next -- a
+    // connect-stall essay attached to a run whose connection is up, wrapped around the one line that
+    // actually mattered. Newline-separated, the reader can see which conditions are present at all.
     if (rx_fifo_stall) {
-        oss << ". The fifo between the TCP stack and the HTTP parser filled, so the parser "
-               "back-pressured the TOE after all. Results are still correct, but the shared 64 KB "
-               "receive fifo will have been overrun and recovered by retransmission -- raise "
-               "RX_FIFO_DEPTH in hardware/src/hdl/http_read/tcp_read.sv";
+        oss << "\n    rx_fifo_stall: the fifo between the TCP stack and the HTTP parser filled, so "
+               "the parser back-pressured the TOE after all. Results stay correct -- the shared "
+               "64 KB receive fifo is overrun and recovered by retransmission -- but the decoupling "
+               "is defeated and throughput suffers. Either lower OASIS_HTTP_CHUNK_BYTES or raise "
+               "RX_FIFO_DEPTH in hardware/src/hdl/http_read/tcp_read.sv (needs a resynthesis).";
     }
 
     if (resp_unframeable) {
-        oss << ". A response arrived with no Content-Length, so the hardware could not tell where "
+        oss << "\n    unframeable: a response arrived with no Content-Length, so the hardware could not tell where "
                "its body ends and the next response begins, and stopped rather than guessing. On a "
                "ranged GET of a static object that should be impossible -- check whether the server "
                "answered with Transfer-Encoding: chunked, or whether the reply was an error page";
@@ -597,7 +602,7 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
 
     // The one failure mode worth naming outright, because nothing else in the system points at it.
     if (connect_stalled && !init_error) {
-        oss << ". A connect that stalls without an error means openStatus never arrived at all: "
+        oss << "\n    connect_stalled: openStatus never arrived at all: "
                "most likely the TOE reused an ephemeral port (it has 512, at 32768..33279, released "
                "with no quiet time) while the server still held that 4-tuple in TIME_WAIT, and is "
                "now retrying the SYN forever. Connections are cumulative since the bitstream was "
