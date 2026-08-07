@@ -162,6 +162,9 @@ class HTTPReadConfig : public libstf::Config {
         /// tcp_read.sv is too small for this traffic and the whole point of the decoupling -- never
         /// letting the parser stall the shared 64 KB receive fifo -- has been lost.
         bool rx_fifo_stall = false;
+        /// The stallWord exactly as read, so a caller can tell a condition it has already reported
+        /// from a new one. The named bools above are for reading; this is for comparing.
+        uint32_t raw = 0;
 
         bool any() const {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
@@ -236,6 +239,10 @@ class HTTPReadConfig : public libstf::Config {
     /// Bytes asked for in the most recent ranged GET, so response() can compare what the server
     /// said against what was requested.
     std::atomic<uint32_t> last_request_bytes_ {0};
+
+    /// The stallWord already reported on the debug path. The stall bits are sticky, so without this
+    /// every remaining request in the query would reprint the same condition and bury the first.
+    uint32_t stall_reported_ {0};
 
     /// Block until the request ring has room for one more GET, or throw naming the stalled stage.
     void await_credit();

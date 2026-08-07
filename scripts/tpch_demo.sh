@@ -28,6 +28,10 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DUCKDB=${DUCKDB:-$ROOT/extension/build/release/duckdb}
+# The bitstream the reprogram hint below points at. Resolved to the newest build that actually
+# produced one, because hardcoding a build number here sends you to a stale bitstream and costs
+# a full board cycle to notice.
+BITSTREAM=$(ls -dt "$ROOT"/hardware/build-*/bitstreams/cyt_top.bit 2>/dev/null | head -1)
 SERVER=${OASIS_SERVER:-10.253.74.74}
 PORT=${OASIS_PORT:-9000}
 SCALE=1
@@ -151,7 +155,7 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
             echo
             echo "  then reprogram:"
             echo "    cd $ROOT/parcore/libstf/coyote/util && ./program_hacc_local.sh \\"
-            echo "        $ROOT/hardware/build-93/bitstreams/cyt_top.bit \\"
+            echo "        ${BITSTREAM:-$ROOT/hardware/<newest>/bitstreams/cyt_top.bit} \\"
             echo "        $ROOT/parcore/libstf/coyote/driver/build/coyote_driver.ko"
             break
         fi

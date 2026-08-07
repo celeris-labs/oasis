@@ -433,6 +433,18 @@ void HTTPReadConfig::issue_range(uint32_t server_ip, uint16_t server_port, const
                      server_port);
         std::fprintf(stderr, "[oasis-http]   latched: %s\n", request_echo().describe().c_str());
         std::fprintf(stderr, "[oasis-http]   t=0ms      %s\n", describe_status(debug_status()).c_str());
+
+        // The sticky stall bits, reported the moment they change rather than only when a read times
+        // out. They are the only evidence for conditions that do NOT stop the query -- rx_fifo_stall
+        // above all, which says the decoupling fifo filled and back-pressure reached the TOE anyway.
+        // A run that succeeds is not evidence that it did not happen, so it has to be read on the
+        // success path or it is never read at all. Printed on transition, not per request: the bits
+        // are sticky, so repeating them for every remaining GET would bury the first occurrence.
+        const auto stalls = stall();
+        if (stalls.any() && stall_reported_ != stalls.raw) {
+            stall_reported_ = stalls.raw;
+            std::fprintf(stderr, "[oasis-http]   STALL: %s\n", stalls.describe().c_str());
+        }
     }
 }
 
@@ -487,6 +499,7 @@ std::string HTTPReadConfig::HTTPInflight::describe() const {
 HTTPReadConfig::HTTPStall HTTPReadConfig::stall() {
     const auto word = static_cast<uint32_t>(read_register(HTTP_STALL).value());
     HTTPStall s {};
+    s.raw              = word;
     s.connect_stalled  = (word & (1u << 0)) != 0;
     s.send_stalled     = (word & (1u << 1)) != 0;
     s.read_stalled     = (word & (1u << 2)) != 0;
