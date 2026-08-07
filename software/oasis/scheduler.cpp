@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <exception>
 
 namespace oasis {
 
@@ -213,7 +214,19 @@ void Scheduler::dispatch_loop() {
         streams_[*stream]->enqueued.fetch_add(1, std::memory_order_relaxed);
 
         lock.unlock();
-        dispatch_to(*stream, pending);
+        // dispatch_to runs operator apply() -- which talks to the FPGA and throws on any hardware
+        // fault (a credit timeout, a wedged handler, an exhausted huge-page pool). This thread has
+        // no handler above it, so an escaping exception meant std::terminate: the process died
+        // mid-transfer and left the handler outside ST_IDLE, costing a reprogram to recover. Route
+        // it to the consumer instead, where it surfaces as an ordinary query error, and keep the
+        // dispatcher running so the remaining flows and the shutdown path still work.
+        try {
+            dispatch_to(*stream, pending);
+        } catch (...) {
+            if (pending.completion && pending.completion->channel) {
+                pending.completion->channel->fail(std::current_exception());
+            }
+        }
         lock.lock();
         libstf::Profiler::close_regions({profiler_prefix + "dispatch_loop"});
     }
@@ -277,8 +290,15 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         // Both counters are atomic, so this never nests dispatch_mutex_ with ss.mutex. acq_rel makes
         // the channel pushes happen-before the observed close/done.
         handle->add_callback([this, &ss, stream, slot, completion, handle, tag](libstf::stream_t) {
-            while (handle->stream_has_more_output(stream)) {
-                completion->channel->push_batch(tag, handle->get_next_stream_output(stream));
+            // Same reasoning as dispatch_loop, on the interrupt path: this runs on the handle's own
+            // thread with nothing above it, so a throw here would terminate the process too. The
+            // bookkeeping below MUST still run either way or the slot never retires.
+            try {
+                while (handle->stream_has_more_output(stream)) {
+                    completion->channel->push_batch(tag, handle->get_next_stream_output(stream));
+                }
+            } catch (...) {
+                completion->channel->fail(std::current_exception());
             }
             // Whole-splinter close: exactly once, by whichever sink (across all flows) finishes last.
             if (completion->outstanding_sinks.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -304,10 +324,24 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         });
     }
 
-    for (auto &op : slot->flow) {
-        if (dynamic_cast<LocalSinkOperator *>(op.get()) == nullptr) {
-            op->apply(stream, ctx_);
+    // Nothing has been triggered yet, so if an apply() throws no completion callback will EVER fire
+    // for this slot -- it would sit in in_flight forever holding a pipeline slot, and `enqueued`
+    // would never come back down, so the dispatcher would stop placing work on this stream. Retire
+    // it here, then let the exception continue to dispatch_loop, which owns telling the consumer.
+    try {
+        for (auto &op : slot->flow) {
+            if (dynamic_cast<LocalSinkOperator *>(op.get()) == nullptr) {
+                op->apply(stream, ctx_);
+            }
         }
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> slock(ss.mutex);
+            slot->done = true;
+        }
+        ss.enqueued.fetch_sub(1, std::memory_order_relaxed);
+        libstf::Profiler::close_regions({profiler_prefix + "dispatch_to"});
+        throw;
     }
 
     if (libstf::should_log(libstf::LogLevel::DEBUG)) {

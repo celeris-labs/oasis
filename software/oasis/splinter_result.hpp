@@ -3,6 +3,7 @@
 #include <libstf/buffer.hpp>
 
 #include <condition_variable>
+#include <exception>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -51,6 +52,34 @@ class SplinterResultChannel {
         }
     }
 
+    // Producer: the flow died. Stores the exception, closes the channel, and every consumer call
+    // from here on rethrows it.
+    //
+    // Without this a failed flow could only close() -- indistinguishable from a clean end of stream,
+    // so a hardware error became a SILENTLY TRUNCATED result rather than an error. The alternative
+    // that was actually happening is worse still: the exception escaped the dispatcher thread, which
+    // has no handler, and std::terminate killed the process mid-transfer -- leaving the FPGA handler
+    // outside ST_IDLE, where only reprogramming the bitstream recovers it.
+    //
+    // Queued batches are deliberately discarded. The result is incomplete by definition, and handing
+    // the consumer a prefix of it is the one outcome worse than either failure above.
+    void fail(std::exception_ptr err) {
+        std::function<void()> cb;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) {
+                return;
+            }
+            error_  = std::move(err);
+            closed_ = true;
+            cb      = take_ready_callback();
+        }
+        cv_.notify_all();
+        if (cb) {
+            cb();
+        }
+    }
+
     // Producer: No more batches will be pushed. First close wins.
     void close() {
         std::function<void()> cb;
@@ -73,6 +102,9 @@ class SplinterResultChannel {
     std::optional<Batch> get_next_batch() {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this] { return !batches_.empty() || closed_; });
+        if (error_) {
+            std::rethrow_exception(error_);
+        }
         return pop_locked();
     }
 
@@ -90,6 +122,9 @@ class SplinterResultChannel {
         std::lock_guard<std::mutex> lock(mutex_);
         if (batches_.empty() && !closed_) {
             return {false, std::nullopt};
+        }
+        if (error_) {
+            std::rethrow_exception(error_);
         }
         return {true, pop_locked()};
     }
@@ -112,6 +147,9 @@ class SplinterResultChannel {
     }
 
   private:
+    // Set by fail(). Non-null means every consumer call rethrows instead of returning data.
+    std::exception_ptr error_;
+
     // Pops the front batch (or nullopt at clean close). Caller must hold mutex_ and have ensured the
     // wait predicate (!batches_.empty() || closed_) holds.
     std::optional<Batch> pop_locked() {
