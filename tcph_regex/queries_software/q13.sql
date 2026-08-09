@@ -8,7 +8,7 @@ FROM (
     FROM
         customer
     LEFT OUTER JOIN orders ON c_custkey = o_custkey
-    AND NOT o_comment LIKE '%special%requests%'
+    AND NOT o_comment LIKE '%spec%requ%'
 GROUP BY
     c_custkey) AS c_orders (c_custkey,
         c_count)

@@ -8,7 +8,7 @@ FROM (
         extract(year FROM o_orderdate) AS o_year,
         l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount
     FROM
-        part,
+        regex_fpga_scan('part', regex_column := 'p_name', pattern := '.*green.*') AS part,
         supplier,
         lineitem,
         partsupp,
@@ -20,8 +20,7 @@ FROM (
         AND ps_partkey = l_partkey
         AND p_partkey = l_partkey
         AND o_orderkey = l_orderkey
-        AND s_nationkey = n_nationkey
-        AND regex_fpga(p_name, '.*green.*')) AS profit
+        AND s_nationkey = n_nationkey) AS profit
 GROUP BY
     nation,
     o_year

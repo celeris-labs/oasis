@@ -7,12 +7,12 @@ SELECT
     count(*) AS freemail_customers,
     sum(c_acctbal) AS total_acctbal
 FROM
-    customer,
+    regex_fpga_scan('customer', regex_column := 'c_email',
+        pattern := '[ -~]*@[ghoy][ -~]*\.com') AS customer,
     nation
 WHERE
     c_nationkey = n_nationkey
     AND c_mktsegment IN ('BUILDING', 'AUTOMOBILE')
-    AND regex_fpga(c_email, '.*@(gmail|yahoo|hotmail|outlook)\.com')
 GROUP BY
     n_name
 ORDER BY

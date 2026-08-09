@@ -8,9 +8,8 @@ SELECT
     count(*) AS premium_part_count,
     avg(p_retailprice) AS avg_retailprice
 FROM
-    part
-WHERE
-    regex_fpga(p_sku, '[A-Z][A-Z][A-Z]-[0-9]+-(EU|US|AS)')
+    regex_fpga_scan('part', regex_column := 'p_sku',
+        pattern := '[A-Z][A-Z][A-Z]-[0-9]+-(EU|US|AS)') AS part
 GROUP BY
     p_mfgr
 ORDER BY

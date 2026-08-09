@@ -15,9 +15,7 @@ WHERE
                 SELECT
                     p_partkey
                 FROM
-                    part
-                WHERE
-                    regex_fpga(p_name, 'forest.*'))
+                    regex_fpga_scan('part', regex_column := 'p_name', pattern := 'forest.*') AS part)
                 AND ps_availqty > (
                     SELECT
                         0.5 * sum(l_quantity)

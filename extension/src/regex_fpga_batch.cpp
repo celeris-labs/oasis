@@ -24,7 +24,12 @@ void EnsureCelerisContext() {
 		celeris::CelerisContext::init(std::move(mem_pool), libstf::BYTES_PER_FPGA_TRANSFER);
 #else
 		std::unique_ptr<libstf::MemoryPool> mem_pool = std::make_unique<libstf::HugePageMemoryPool>();
-		celeris::CelerisContext::init(std::move(mem_pool), 1 << 21);
+		// One output buffer holds at most REGEX_FPGA_MAX_ACCUM_COUNT match bits (65536 / 8 = 8 KiB),
+		// so the FPGA's minimum transfer granularity is already 8x more than we can ever use.
+		// Oversizing here is costly: libstf's OBM enqueues a fresh buffer of this size on every
+		// interrupt but only reclaims one when bytes_written > 0, so each empty interrupt leaks
+		// exactly this many bytes out of the huge-page pool.
+		celeris::CelerisContext::init(std::move(mem_pool), libstf::BYTES_PER_FPGA_TRANSFER);
 #endif
 	}
 }

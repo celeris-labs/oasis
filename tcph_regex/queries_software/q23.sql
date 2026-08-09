@@ -12,7 +12,7 @@ FROM
 WHERE
     c_nationkey = n_nationkey
     AND c_mktsegment IN ('BUILDING', 'AUTOMOBILE')
-    AND c_email SIMILAR TO '.*@(gmail|yahoo|hotmail|outlook)\\.com'
+    AND c_email SIMILAR TO '[ -~]*@[ghoy][ -~]*\.com'
 GROUP BY
     n_name
 ORDER BY

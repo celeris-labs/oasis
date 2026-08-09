@@ -15,7 +15,7 @@ WHERE
     AND l_partkey = p_partkey
     AND l_shipdate >= pr_startdate
     AND l_shipdate <= pr_enddate
-    AND pr_code SIMILAR TO '(SUMMER|WINTER|SPRING|FALL)-2026-.*'
+    AND pr_code SIMILAR TO '[A-Z]+-2026-[ -~]*'
 GROUP BY
     pr_channel
 ORDER BY

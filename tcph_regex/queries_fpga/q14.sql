@@ -1,6 +1,11 @@
 SELECT
     100.00 * sum(
-        CASE WHEN regex_fpga(p_type, 'PROMO.*') THEN
+        CASE WHEN p_partkey IN (
+                SELECT
+                    p_partkey
+                FROM
+                    regex_fpga_scan('part', regex_column := 'p_type',
+                        pattern := 'PROMO.*') AS promo_part) THEN
             l_extendedprice * (1 - l_discount)
         ELSE
             0

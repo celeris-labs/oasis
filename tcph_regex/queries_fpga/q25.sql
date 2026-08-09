@@ -7,7 +7,8 @@ SELECT
     count(DISTINCT pr_promokey) AS campaign_count,
     sum(l_extendedprice * (1 - l_discount)) AS promo_revenue
 FROM
-    promotion,
+    regex_fpga_scan('promotion', regex_column := 'pr_code',
+        pattern := '[A-Z]+-2026-[ -~]*') AS promotion,
     part,
     lineitem
 WHERE
@@ -15,7 +16,6 @@ WHERE
     AND l_partkey = p_partkey
     AND l_shipdate >= pr_startdate
     AND l_shipdate <= pr_enddate
-    AND regex_fpga(pr_code, '(SUMMER|WINTER|SPRING|FALL)-2026-.*')
 GROUP BY
     pr_channel
 ORDER BY

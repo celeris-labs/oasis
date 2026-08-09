@@ -9,6 +9,12 @@
 #include "duckdb/common/vector_size.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/column_definition.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "libstf/buffer.hpp"
@@ -33,6 +39,9 @@ static LogicalType GetScanColumnType(const DuckTableEntry &table, const ColumnIn
 	}
 	return table.GetColumns().GetColumn(column_index.ToLogical()).Type();
 }
+
+static unique_ptr<TableFilterSet> BuildScanFilterSet(const TableFunctionInitInput &input,
+                                                     const vector<LogicalType> &scan_types);
 
 static void BuildScanColumns(const RegexFpgaScanBindData &bind_data, const TableFunctionInitInput &input,
                              vector<ColumnIndex> &scan_column_indexes, vector<StorageIndex> &scan_storage_ids,
@@ -178,7 +187,9 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 
 	auto &storage = bind_data.table.GetStorage();
 	// Push scan filters (e.g. c_nationkey = 7) into the storage scan so the FPGA only sees surviving rows.
-	lstate->scan_state.Initialize(scan_storage_ids, context.client, input.filters.get());
+	lstate->scan_filter_set = BuildScanFilterSet(input, lstate->scanned_types);
+	lstate->scan_state.Initialize(scan_storage_ids, context.client,
+	                              lstate->scan_filter_set ? lstate->scan_filter_set.get() : input.filters.get());
 	lstate->output_cache.Initialize(context.client, lstate->output_types, REGEX_FPGA_MAX_ACCUM_COUNT);
 	lstate->batch_row_refs.reserve(REGEX_FPGA_MAX_ACCUM_COUNT);
 	lstate->match_sel_scratch.Initialize(STANDARD_VECTOR_SIZE);
@@ -203,6 +214,84 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	return std::move(lstate);
 }
 
+// Makes the columns listed in @p column_ids self-contained so the chunk can outlive the scan that
+// produced it: flattens dictionary/constant vectors (which otherwise share a selection buffer that
+// later scans overwrite) and copies non-inlined strings into the vector's own string buffer
+// (VARCHAR payloads otherwise point into storage blocks pinned only until the next Scan()).
+// Only these columns need it — the regex column is read through ToUnifiedFormat and consumed
+// immediately, so it stays untouched unless it is also emitted.
+static void MaterializeRetainedColumns(DataChunk &chunk, const vector<idx_t> &column_ids) {
+	for (const auto col_idx : column_ids) {
+		auto &vec = chunk.data[col_idx];
+		vec.Flatten(chunk.size());
+		if (vec.GetType().InternalType() != PhysicalType::VARCHAR) {
+			continue;
+		}
+		auto strings = FlatVector::GetDataMutable<string_t>(vec);
+		auto &validity = FlatVector::Validity(vec);
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			if (!validity.RowIsValid(row) || strings[row].IsInlined()) {
+				continue;
+			}
+			strings[row] = StringVector::AddStringOrBlob(vec, strings[row]);
+		}
+	}
+}
+
+// Returns the real predicate hidden inside an "optional" filter wrapper, or nullptr if @p expr is
+// not such a wrapper. DuckDB pushes OR/IN/LIKE predicates down wrapped in an internal marker
+// function whose own evaluation is hard-coded to return all-true, parking the actual predicate in
+// the wrapper's bind data. A scan that just evaluates the pushed filter therefore filters nothing;
+// to benefit we have to reach in and take the child expression.
+static optional_ptr<const Expression> UnwrapOptionalFilter(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return nullptr;
+	}
+	auto &func = expr.Cast<BoundFunctionExpression>();
+	if (!func.BindInfo()) {
+		return nullptr;
+	}
+	if (func.Function().GetName() == OptionalFilterScalarFun::NAME) {
+		return func.BindInfo()->Cast<OptionalFilterFunctionData>().child_filter_expr.get();
+	}
+	if (func.Function().GetName() == SelectivityOptionalFilterScalarFun::NAME) {
+		return func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().child_filter_expr.get();
+	}
+	return nullptr;
+}
+
+// Rewrites the pushed-down filter set, replacing every optional wrapper with the real predicate it
+// hides, and returns the result for the storage scan to enforce. The scan applies these while it
+// reads each column, so filtered rows cost no FPGA work and no output materialization -- strictly
+// better than re-filtering the chunk afterwards. Returns nullptr when there is nothing to rewrite,
+// in which case the caller keeps using the filters DuckDB supplied.
+static unique_ptr<TableFilterSet> BuildScanFilterSet(const TableFunctionInitInput &input,
+                                                     const vector<LogicalType> &scan_types) {
+	if (!input.filters || !input.filters->HasFilters()) {
+		return nullptr;
+	}
+	auto rewritten = make_uniq<TableFilterSet>();
+	bool unwrapped_any = false;
+	for (auto &entry : *input.filters) {
+		const auto filter_idx = entry.GetIndex();
+		auto &filter = entry.Filter();
+		if (filter.filter_type != TableFilterType::EXPRESSION_FILTER || filter_idx >= scan_types.size()) {
+			return nullptr; // unfamiliar filter shape - leave the original set untouched
+		}
+		auto &expr_filter = ExpressionFilter::GetExpressionFilter(filter, "regex_fpga_scan");
+		auto child = UnwrapOptionalFilter(*expr_filter.expr);
+		if (child) {
+			// Keep the child's own BOUND_REF placeholder: the scan evaluates a table filter against
+			// a single-column chunk holding just the filtered column.
+			rewritten->PushFilter(filter_idx, make_uniq<ExpressionFilter>(child->Copy()));
+			unwrapped_any = true;
+		} else {
+			rewritten->PushFilter(filter_idx, expr_filter.Copy());
+		}
+	}
+	return unwrapped_any ? std::move(rewritten) : nullptr;
+}
+
 static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindData &bind_data,
                                RegexFpgaScanGlobalState &global_state, RegexFpgaScanLocalState &lstate) {
 	CALI_CXX_MARK_FUNCTION;
@@ -219,6 +308,11 @@ static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindDa
 		CALI_MARK_BEGIN("table_scan");
 		storage.Scan(transaction, *retained, lstate.scan_state);
 		CALI_MARK_END("table_scan");
+		// A scanned chunk is only borrowed, but we retain chunks across several scans while an
+		// FPGA batch fills up, so make the columns we will emit self-contained before holding on.
+		CALI_MARK_BEGIN("materialize_chunk");
+		MaterializeRetainedColumns(*retained, lstate.output_column_map);
+		CALI_MARK_END("materialize_chunk");
 		lstate.chunk_offset = 0;
 		if (retained->size() > 0) {
 			lstate.retained_chunks.push_back(std::move(retained));
@@ -278,6 +372,14 @@ static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const std::vector
 		}
 		projected.ReferenceColumns(*lstate.retained_chunks[chunk_idx], lstate.output_column_map);
 		lstate.output_cache.Append(projected, lstate.match_sel_scratch, row_indices.size());
+		// Append copies string_t values, which are pointers into the source chunk's string buffer.
+		// The retained chunks are released as soon as this batch is flushed, so hold a reference to
+		// their heaps or the cached strings dangle until the caller drains output_cache.
+		for (idx_t out_idx = 0; out_idx < projected.ColumnCount(); out_idx++) {
+			if (projected.data[out_idx].GetType().InternalType() == PhysicalType::VARCHAR) {
+				StringVector::AddHeapReference(lstate.output_cache.data[out_idx], projected.data[out_idx]);
+			}
+		}
 	}
 }
 

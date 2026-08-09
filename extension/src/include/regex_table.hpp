@@ -1,9 +1,12 @@
 #pragma once
 
 #include "celeris/celeris_context.hpp"
+#include "syslog_undef.hpp" // must follow the celeris include, precede the duckdb ones
+
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -62,6 +65,12 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	// Reusable scratch for compacting matched rows, sized once to avoid per-flush allocation.
 	vector<vector<idx_t>> match_indices_scratch;
 	SelectionVector match_sel_scratch;
+
+	// Filters DuckDB pushed down as "optional": it does not enforce them (their evaluation is a
+	// no-op marker) and keeps a FILTER above us instead. We unwrap them into a real filter set and
+	// hand that to the storage scan, so rows are dropped during column reading and never reach the
+	// FPGA. Must outlive scan_state, which only borrows it.
+	unique_ptr<TableFilterSet> scan_filter_set;
 
 	idx_t current_retained_chunk_idx = DConstants::INVALID_INDEX;
 	idx_t chunk_offset = 0;

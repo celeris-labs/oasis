@@ -1,6 +1,8 @@
 #pragma once
 
 #include "celeris/celeris_context.hpp"
+#include "syslog_undef.hpp" // must follow the celeris include, precede the duckdb ones
+
 #include "duckdb/common/types/string_type.hpp"
 #include "libstf/buffer.hpp"
 

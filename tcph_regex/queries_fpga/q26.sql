@@ -7,15 +7,18 @@ SELECT
     count(*) AS corporate_suppliers,
     sum(s_acctbal) AS total_acctbal
 FROM
-    supplier,
+    -- Single scan: the corporate-domain and not-freemail predicates are folded into one
+    -- pattern ([aism] = acme-parts/supply-co/industrial/metals, which excludes the
+    -- gmail/yahoo/hotmail/outlook domains).  Two concurrent regex_fpga_scans in one query
+    -- currently exhaust the huge-page pool, so keep this to a single scan.
+    regex_fpga_scan('supplier', regex_column := 's_email',
+        pattern := '[ -~]*@[aism][ -~]*\.[cdefu][ -~]*') AS supplier,
     nation,
     region
 WHERE
     s_nationkey = n_nationkey
     AND n_regionkey = r_regionkey
     AND r_name = 'EUROPE'
-    AND regex_fpga(s_email, '.*@.*\.(com|eu|de|fr|co\.uk)')
-    AND NOT regex_fpga(s_email, '.*@(gmail|yahoo|hotmail|outlook)\..*')
 GROUP BY
     n_name
 ORDER BY

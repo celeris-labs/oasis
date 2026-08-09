@@ -14,8 +14,7 @@ WHERE
     s_nationkey = n_nationkey
     AND n_regionkey = r_regionkey
     AND r_name = 'EUROPE'
-    AND s_email SIMILAR TO '.*@.*\.(com|eu|de|fr|co\.uk)'
-    AND NOT s_email SIMILAR TO '.*@(gmail|yahoo|hotmail|outlook)\..*'
+    AND s_email SIMILAR TO '[ -~]*@[aism][ -~]*\.[cdefu][ -~]*'
 GROUP BY
     n_name
 ORDER BY
