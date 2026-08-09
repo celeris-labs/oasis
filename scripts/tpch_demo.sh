@@ -22,6 +22,7 @@
 #   ./scripts/tpch_demo.sh --only 1,6,14      # a subset
 #   ./scripts/tpch_demo.sh --timeout 300
 #   ./scripts/tpch_demo.sh --cpu-first        # run the CPU side first, to expose the cache bias
+#   ./scripts/tpch_demo.sh --threads 1        # pin BOTH sides to one DuckDB thread
 #
 # ON --cpu-first: both sides fetch the same bytes from the same MinIO, so whichever runs SECOND
 # reads them from the server's page cache. The default order (FPGA first) therefore warms the cache
@@ -48,6 +49,13 @@ ONLY=""
 # hands the CPU baseline a warm cache on every query and flatters it. Swap the order and the bias
 # reverses; if the ratio moves, the comparison was measuring caching as much as decoding.
 CPU_FIRST=0
+# DuckDB worker threads, applied to BOTH sides. Empty means DuckDB's default (one per core).
+#
+# --threads 1 is the honest like-for-like comparison. By default DuckDB decodes Parquet across every
+# core while the FPGA path decodes in one piece of hardware, so the wall-clock gap is partly a core
+# count. Pinning both to one thread removes that and asks the question actually being asked: for the
+# same amount of parallelism, is decoding in hardware faster?
+THREADS=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -55,6 +63,7 @@ while [ $# -gt 0 ]; do
         --only)    ONLY="$2"; shift ;;
         --timeout) TIMEOUT="$2"; shift ;;
         --cpu-first) CPU_FIRST=1 ;;
+        --threads) THREADS="$2"; shift ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
         -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
@@ -83,6 +92,7 @@ views() {
 }
 
 SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=false;"
+[ -n "$THREADS" ] && SETUP="$SETUP SET threads=$THREADS;"
 
 # The FPGA script has to arm the profiler before the query and read it back after, and both of those
 # print rows of their own. Rather than trying to filter them out by shape -- which silently broke
