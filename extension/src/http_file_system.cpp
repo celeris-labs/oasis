@@ -80,15 +80,15 @@ uint32_t IpForArpLookup(uint32_t ip_be) {
 	return __builtin_bswap32(ip_be);
 }
 
-// Microseconds to wait after the ARP request before letting the handler open a connection.
+// Extra microseconds to wait after the ARP request. ZERO by default -- see EnsureInitialized.
 useconds_t ArpSettleMicros() {
 	static const useconds_t configured = [] {
 		const char *env = std::getenv("OASIS_ARP_SETTLE_US");
 		if (!env || !*env) {
-			return useconds_t(50000);
+			return useconds_t(0);
 		}
 		const long parsed = std::strtol(env, nullptr, 10);
-		return parsed < 0 ? useconds_t(50000) : static_cast<useconds_t>(parsed);
+		return parsed < 0 ? useconds_t(0) : static_cast<useconds_t>(parsed);
 	}();
 	return configured;
 }
@@ -296,21 +296,22 @@ void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	// START fires but no SYN ever leaves the FPGA (the "fire, then hang, no TCP" symptom). This call
 	// was previously commented out, which is exactly that hang.
 	//
-	// This second is expensive and is known to be expensive: it is 1.0 s of the ~1.36 s fixed
-	// per-process cost scripts/sweep.sh measures at every depth, and once chunks are 128 KiB it
-	// dwarfs every GET in the query put together (72 GETs for a whole lineitem scan = 53 ms).
+	// NO settle time. There used to be a flat sleep(1) here and it was never load-bearing -- it was
+	// leftover debugging. It cost 1.0 s of wall clock on EVERY duckdb invocation, about seventy
+	// percent of the fixed per-query cost and more than every GET in an sf1 scan put together.
 	//
-	// It was cut to 50 ms on 2026-08-07, reverted the same day on a misdiagnosis, and restored on
-	// 2026-08-09. The failures blamed on it were an exhausted huge-page pool -- an uncaught
-	// std::runtime_error out of OutputBufferManager that killed the process -- not this sleep. 50 ms
-	// has since carried several full TPC-H runs at scale 1 and scale 30 with no stall.
+	// A full 22-query TPC-H run at OASIS_ARP_SETTLE_US=5 -- five microseconds -- passes 22/22, which
+	// is as close to removing it as makes no difference. doArpLookup already usleeps 100 us internally
+	// (cThread.cpp:1074) and the handler opens its connection lazily on the first START, so the slack
+	// that made this look necessary is still there without paying for it.
 	//
-	// It stays a knob rather than a constant because the failure it guards against is a wedge that
-	// outlives the process: if a connect ever stalls with NO init_error after a change here, set
-	// OASIS_ARP_SETTLE_US=1000000 to get the old behaviour back, and say so.
-	// Whatever this is really waiting for, it is not a local ARP round trip, which is microseconds.
+	// The knob stays, defaulting to zero, ONLY because the failure it was once believed to guard
+	// against is a wedge that outlives the process. If a connect ever stalls with no init_error, try
+	// OASIS_ARP_SETTLE_US=1000000 and say so -- do not re-add this blindly.
 	ctx.cthread()->doArpLookup(IpForArpLookup(server_ip_));
-	usleep(ArpSettleMicros());
+	if (const useconds_t settle = ArpSettleMicros()) {
+		usleep(settle);
+	}
 
 	initialized = true;
 }
