@@ -120,7 +120,11 @@ echo "==========================================================================
 # library all abort with the same bare line.
 PROBE_ERR=$(mktemp)
 trap 'rm -f "$PROBE_ERR"' EXIT
-BYTES=$("$DUCKDB" -noheader -list -c "$SETUP
+# At the SMALLEST chunk in the sweep, not the default. This probe runs the whole query before the
+# first cell, so at the default (131072) it latched rx_fifo_stall itself and every --check-stall run
+# then blamed the first row. That is measuring the instrument instead of the thing.
+SMALLEST_CHUNK=$(printf '%s\n' ${CHUNKS//,/ } | sort -n | head -1)
+BYTES=$(OASIS_HTTP_CHUNK_BYTES="$SMALLEST_CHUNK" "$DUCKDB" -noheader -list -c "$SETUP
     SELECT count(*) FROM oasis_stream_profile();
     $QUERY
     SELECT sum(in_handshakes_cycles) * 64 FROM oasis_stream_profile();" 2>"$PROBE_ERR" | tail -1)
@@ -148,11 +152,19 @@ for d in ${DEPTHS//,/ }; do
     PREV_G=""; PREV_W=""
     for c in ${CHUNKS//,/ }; do
         gets=$(awk -v b="$BYTES" -v c="$c" 'BEGIN{printf "%d", (b+c-1)/c}')
+        # 262144 is 2^18 = BUFFER_SIZE = 1 << WINDOW_BITS, the window the TOE advertises. A response
+        # at or above it asks the peer to fill the whole window at once, and that is exactly where
+        # every sweep so far has hung. Flagged, not skipped: whether a given bitstream still does
+        # this is the thing worth knowing.
+        [ "$c" -ge 262144 ] && echo "         (chunk >= 2^18 = the advertised TCP window -- where previous sweeps hung)"
         wall=$(OASIS_HTTP_MAX_INFLIGHT="$d" OASIS_HTTP_CHUNK_BYTES="$c" \
                median_run "$SETUP $QUERY")
         if [ -z "$wall" ]; then
             printf '%6s %9s %8s %10s %14s  %s\n' "$d" "$c" "$gets" "FAIL" "-" "timed out"
-            continue
+            echo "         stopping this depth here. Every larger chunk means a bigger response, so"
+            echo "         continuing only spends TIMEOUT again per cell and risks leaving the"
+            echo "         handler out of ST_IDLE, which costs a reprogram to clear."
+            break
         fi
         marg="-"; verdict=""
         if [ -n "$PREV_G" ]; then
