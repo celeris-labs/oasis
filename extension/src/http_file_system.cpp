@@ -85,10 +85,10 @@ useconds_t ArpSettleMicros() {
 	static const useconds_t configured = [] {
 		const char *env = std::getenv("OASIS_ARP_SETTLE_US");
 		if (!env || !*env) {
-			return useconds_t(1000000);
+			return useconds_t(50000);
 		}
 		const long parsed = std::strtol(env, nullptr, 10);
-		return parsed < 0 ? useconds_t(1000000) : static_cast<useconds_t>(parsed);
+		return parsed < 0 ? useconds_t(50000) : static_cast<useconds_t>(parsed);
 	}();
 	return configured;
 }
@@ -300,15 +300,14 @@ void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	// per-process cost scripts/sweep.sh measures at every depth, and once chunks are 128 KiB it
 	// dwarfs every GET in the query put together (72 GETs for a whole lineitem scan = 53 ms).
 	//
-	// It was cut to 50 ms on 2026-08-07 and PUT BACK the same day. At 50 ms, `tpch_demo --only 1`
-	// on a cold board stalled with no traffic, ran at full speed once traffic finally started, and
-	// then hit the 30 s host credit timeout -- and the abort left the handler mid-transfer, which
-	// costs a reprogram. The 17.62 s q1 in the preceding full run was very likely the same failure
-	// staying just under the timeout.
+	// It was cut to 50 ms on 2026-08-07, reverted the same day on a misdiagnosis, and restored on
+	// 2026-08-09. The failures blamed on it were an exhausted huge-page pool -- an uncaught
+	// std::runtime_error out of OutputBufferManager that killed the process -- not this sleep. 50 ms
+	// has since carried several full TPC-H runs at scale 1 and scale 30 with no stall.
 	//
-	// So the number is a knob, not a constant, and the default is the value that has worked for
-	// weeks. Lower it by measurement: OASIS_ARP_SETTLE_US=50000 reproduces the failure above,
-	// and the useful experiment is to find where between 50 ms and 1 s a cold board stops stalling.
+	// It stays a knob rather than a constant because the failure it guards against is a wedge that
+	// outlives the process: if a connect ever stalls with NO init_error after a change here, set
+	// OASIS_ARP_SETTLE_US=1000000 to get the old behaviour back, and say so.
 	// Whatever this is really waiting for, it is not a local ARP round trip, which is microseconds.
 	ctx.cthread()->doArpLookup(IpForArpLookup(server_ip_));
 	usleep(ArpSettleMicros());
