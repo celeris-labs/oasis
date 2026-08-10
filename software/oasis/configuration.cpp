@@ -217,6 +217,11 @@ constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 196608;
 // OASIS_HTTP_MAX_INFLIGHT=0 means "whatever the bitstream advertises". Raising this without also
 // lowering OASIS_HTTP_CHUNK_BYTES raises the bytes-in-flight bound above -- read the block above
 // before doing that.
+// The TCP window the stack advertises: 1 << WINDOW_BITS with WINDOW_BITS = 16 + WINDOW_SCALE_BITS
+// and WINDOW_SCALE_BITS = 2 (toe_config.hpp.in). Since build-95 the receive fifo is the same size,
+// so this one number is both what the peer is invited to send and what can actually be held.
+constexpr const uint64_t HTTP_RX_WINDOW_BYTES = 262144;
+
 uint8_t HttpMaxInflight(uint8_t slots) {
     static const int configured = [] {
         const char *env = std::getenv("OASIS_HTTP_MAX_INFLIGHT");
@@ -226,10 +231,27 @@ uint8_t HttpMaxInflight(uint8_t slots) {
         const int parsed = std::atoi(env);
         return parsed < 0 ? static_cast<int>(HTTP_DEFAULT_MAX_INFLIGHT) : parsed;
     }();
-    if (configured == 0 || configured >= static_cast<int>(slots)) {
-        return slots;
+
+    int depth = (configured == 0 || configured >= static_cast<int>(slots))
+                    ? static_cast<int>(slots)
+                    : configured;
+
+    // Bound in-flight BYTES, not in-flight REQUESTS. This used to be a bare count, which was safe
+    // only because the chunk size happened to be small: at 4 x 8 KiB the product was 32 KiB. Raising
+    // the chunk to 192 KiB silently made it 768 KiB -- three times the window and three times the
+    // fifo -- and the result was real retransmissions on the wire (server resending the same segment
+    // while the FPGA dup-ACKed it, seconds apart, with the whole query stalled behind it).
+    //
+    // A count cannot express the constraint that matters. The peer may not be invited to send more
+    // than can be held, so the product is what has to be capped, and the chunk size is the term that
+    // moves. Always at least 1: a single response larger than the window is a separate problem and
+    // is handled by keeping HTTP_DEFAULT_CHUNK_BYTES below it.
+    const uint64_t chunk = HTTPReadConfig::chunk_bytes();
+    if (chunk > 0) {
+        const int by_bytes = static_cast<int>(HTTP_RX_WINDOW_BYTES / chunk);
+        depth = std::max(1, std::min(depth, by_bytes));
     }
-    return static_cast<uint8_t>(configured);
+    return static_cast<uint8_t>(depth);
 }
 
 // Packs `s` little-endian into `words`. Throws rather than truncating: a silently shortened path
