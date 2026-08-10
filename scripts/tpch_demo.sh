@@ -198,6 +198,15 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
             "CPU baseline itself failed: $(tr '\n' ' ' < "$CPU_RAW" | cut -c1-60)"
         SKIP=$((SKIP+1)); continue
     fi
+    # 130 = SIGINT, 143 = SIGTERM. You pressed Ctrl-C; the query was alive and working. Calling that
+    # ERROR sent a previous debugging session looking for a fault that had not happened -- and the
+    # interrupt leaves the handler mid-transfer, so the board needs a reprogram before the next run.
+    if [ "$fpga_rc" = 130 ] || [ "$fpga_rc" = 143 ]; then
+        printf '%-5s %-8s %9s %9s %10s  %s\n' "q$n" "INTERRUPTED" "$fpga_s" "$cpu_s" "${hw_mib:--}" \
+            "killed by hand while still running -- not a failure"
+        echo "         the handler was mid-transfer when it died: reprogram before the next run."
+        FAIL=$((FAIL+1)); FAILED+=("q$n"); break
+    fi
     if [ "$fpga_rc" != 0 ]; then
         printf '%-5s %-8s %9s %9s %10s  %s\n' "q$n" "ERROR" "$fpga_s" "$cpu_s" "${hw_mib:--}" \
             "$(tr '\n' ' ' < "$FPGA_RAW" | cut -c1-70)"
