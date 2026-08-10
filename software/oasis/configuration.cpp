@@ -203,7 +203,15 @@ constexpr const uint8_t  HTTP_DEFAULT_MAX_INFLIGHT = 4;
 //
 // Splitting is nearly free only because the connection is persistent: the extra requests cost a
 // ~150-byte GET and a ~200-byte response header each, pipelined, with no handshake and no teardown.
-constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 131072;
+// 196608 = 192 KiB. Raised from 131072 on build-95, where the rx fifo went 64 KiB -> 256 KiB on both
+// sides (ours and the TOE's). rx_fifo_stall no longer sets at any size up to here, which it did at
+// 131072 on build-94 -- so the decoupling now actually holds at the size we ask for.
+//
+// Deliberately NOT 262144. That is 2^18 = BUFFER_SIZE = 1 << WINDOW_BITS, exactly the window the TOE
+// advertises, and every sweep that has hung has hung at or above it. The buffer got bigger in
+// build-95 but WINDOW_BITS did not, so that boundary is untouched and is not worth walking into for
+// a few percent.
+constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 196608;
 
 // Effective request-ring depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override).
 // OASIS_HTTP_MAX_INFLIGHT=0 means "whatever the bitstream advertises". Raising this without also
