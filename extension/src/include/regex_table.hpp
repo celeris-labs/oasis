@@ -48,6 +48,9 @@ struct RegexFpgaScanGlobalState : public GlobalTableFunctionState {
 struct StagedRowRef {
 	idx_t chunk_idx;
 	idx_t row_idx;
+	// Batch slot whose match bit decides this row. Usually one slot per row, but rows sharing a
+	// dictionary entry share a slot -- see the dictionary fast path in AccumulateRows.
+	idx_t slot_idx;
 };
 
 struct RegexFpgaScanLocalState : public LocalTableFunctionState {
@@ -77,9 +80,20 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	idx_t output_cache_read_idx = 0;
 	idx_t rows_in_current_row_group = 0;
 
-	idx_t accum_count = 0;
+	idx_t accum_count = 0; // distinct strings staged for the FPGA in this batch
+	idx_t staged_rows = 0; // rows this batch decides; >= accum_count once rows share a slot
 	uint64_t raw_used = 0;
 	bool finished = false;
+
+	// Dictionary fast path. When the regex column arrives dictionary-encoded, every row with the
+	// same dictionary entry has the same string and therefore the same answer, so the string is
+	// sent to the FPGA once and the rest of the rows read the result out of the same slot.
+	// dict_slot_of maps a dictionary index to that slot; dict_slot_stamp records which
+	// (chunk, batch) the mapping belongs to, so invalidating the whole map is a counter bump
+	// rather than a clear -- it is invalidated on every flush and on every new chunk.
+	vector<idx_t> dict_slot_of;
+	vector<uint64_t> dict_slot_stamp;
+	uint64_t dict_stamp = 0;
 
 	std::shared_ptr<libstf::Buffer> struct_buffer;
 	std::shared_ptr<libstf::Buffer> raw_buffer;

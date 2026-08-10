@@ -330,8 +330,11 @@ static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindDa
 
 static void ResetFpgaAccumulation(RegexFpgaScanLocalState &lstate, bool keep_current_retained_chunk = false) {
 	lstate.accum_count = 0;
+	lstate.staged_rows = 0;
 	lstate.raw_used = 0;
 	lstate.batch_row_refs.clear();
+	// The slots those dictionary entries pointed at are gone with the batch.
+	lstate.dict_stamp++;
 
 	if (keep_current_retained_chunk && lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX) {
 		unique_ptr<DataChunk> kept = std::move(lstate.retained_chunks[lstate.current_retained_chunk_idx]);
@@ -350,11 +353,12 @@ static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const std::vector
 	for (auto &row_indices : matches_by_chunk) {
 		row_indices.clear();
 	}
-	for (idx_t i = 0; i < lstate.accum_count; i++) {
-		if (!matches[i]) {
+	// One entry per row the batch decides, which is more than the strings sent to the FPGA whenever
+	// rows shared a dictionary entry: several rows then read the same slot's match bit.
+	for (const auto &row_ref : lstate.batch_row_refs) {
+		if (!matches[row_ref.slot_idx]) {
 			continue;
 		}
-		const auto &row_ref = lstate.batch_row_refs[i];
 		matches_by_chunk[row_ref.chunk_idx].push_back(row_ref.row_idx);
 	}
 
@@ -403,7 +407,18 @@ static void FlushFpgaBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 	ResetFpgaAccumulation(lstate, keep_current_retained_chunk);
 }
 
-static bool WouldExceedFpgaBatch(const RegexFpgaScanLocalState &lstate, uint64_t next_raw_cost) {
+// Whether staging one more *distinct* string would overrun the batch. `next_raw_cost` is 0 for a
+// row that reuses an already-staged dictionary entry, which costs no descriptor and no payload.
+static bool WouldExceedFpgaBatch(const RegexFpgaScanLocalState &lstate, uint64_t next_raw_cost, bool needs_slot) {
+	// Rows are capped independently of strings: when a dictionary column resolves millions of rows
+	// to a handful of distinct values the string budget would never fill, and the retained chunks
+	// backing those rows would grow without bound.
+	if (lstate.staged_rows >= REGEX_FPGA_MAX_ACCUM_COUNT) {
+		return true;
+	}
+	if (!needs_slot) {
+		return false;
+	}
 	if (lstate.accum_count >= REGEX_FPGA_MAX_ACCUM_COUNT) {
 		return true;
 	}
@@ -425,40 +440,80 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 
 		auto &current_chunk = CurrentRetainedChunk(lstate);
 		auto &regex_vector = current_chunk.data[lstate.scanned_regex_column_idx];
+		// A dictionary- or constant-encoded vector resolves many rows onto few distinct strings.
+		// Read before ToUnifiedFormat, which may attach a flattened child to the vector.
+		const auto regex_vector_type = regex_vector.GetVectorType();
+		const bool dedup = regex_vector_type == VectorType::DICTIONARY_VECTOR ||
+		                   regex_vector_type == VectorType::CONSTANT_VECTOR;
+
 		UnifiedVectorFormat regex_format;
 		regex_vector.ToUnifiedFormat(regex_format);
 		const string_t *regex_data = UnifiedVectorFormat::GetData<string_t>(regex_format);
 
+		auto *descriptors = reinterpret_cast<string_t *>(lstate.struct_buffer->ptr);
+		auto *raw_base = static_cast<char *>(lstate.raw_buffer ? lstate.raw_buffer->ptr : nullptr);
+		if (dedup) {
+			// Dictionary indices only mean anything within the chunk that produced them.
+			lstate.dict_stamp++;
+		}
+
 		CALI_MARK_BEGIN("stage_rows_for_fpga_batch");
 		while (lstate.chunk_offset < current_chunk.size() && lstate.output_cache.size() == 0) {
-			const idx_t row_idx = lstate.chunk_offset++;
+			const idx_t row_idx = lstate.chunk_offset;
 			const idx_t regex_idx = regex_format.sel->get_index(row_idx);
 			if (!regex_format.validity.RowIsValid(regex_idx)) {
+				lstate.chunk_offset++;
 				continue;
 			}
 
+			// Reuse the slot if this dictionary entry has already been sent in this batch.
+			idx_t slot = DConstants::INVALID_INDEX;
+			if (dedup && regex_idx < lstate.dict_slot_stamp.size() &&
+			    lstate.dict_slot_stamp[regex_idx] == lstate.dict_stamp) {
+				slot = lstate.dict_slot_of[regex_idx];
+			}
+			const bool needs_slot = slot == DConstants::INVALID_INDEX;
+
 			const string_t &regex_value = regex_data[regex_idx];
-			const uint64_t raw_cost = RegexFpgaNonInlinedRawCost(regex_value);
-			if (WouldExceedFpgaBatch(lstate, raw_cost)) {
+			const uint64_t raw_cost = needs_slot ? RegexFpgaNonInlinedRawCost(regex_value) : 0;
+			if (raw_cost > REGEX_FPGA_RAW_BATCH_LIMIT) {
+				throw InvalidInputException(
+				    "regex_fpga_scan: a %llu byte value in column %s does not fit the %llu byte FPGA payload buffer",
+				    (unsigned long long)regex_value.GetSize(), bind_data.regex_column.c_str(),
+				    (unsigned long long)REGEX_FPGA_RAW_BATCH_LIMIT);
+			}
+
+			if (lstate.staged_rows > 0 && WouldExceedFpgaBatch(lstate, raw_cost, needs_slot)) {
+				// Send what we have and retry this row against a fresh batch. chunk_offset is left
+				// pointing at the row, so it is staged exactly once. Keeping the current chunk is
+				// required even at offset 0: it still holds the rows we are about to stage.
 				CALI_MARK_END("stage_rows_for_fpga_batch");
-				const bool keep_current_chunk = lstate.chunk_offset > 0;
-				FlushFpgaBatch(bind_data, global_state, lstate, keep_current_chunk);
-				lstate.chunk_offset--;
+				FlushFpgaBatch(bind_data, global_state, lstate, true);
 				if (lstate.output_cache.size() > 0) {
 					return;
 				}
 				CALI_MARK_BEGIN("stage_rows_for_fpga_batch");
+				continue;
 			}
 
-			auto *descriptors = reinterpret_cast<string_t *>(lstate.struct_buffer->ptr);
-			RegexFpgaPackString(&descriptors[lstate.accum_count],
-			                    static_cast<char *>(lstate.raw_buffer ? lstate.raw_buffer->ptr : nullptr),
-			                    lstate.raw_used, regex_value);
+			if (needs_slot) {
+				slot = lstate.accum_count;
+				RegexFpgaPackString(&descriptors[slot], raw_base, lstate.raw_used, regex_value);
+				lstate.raw_used += raw_cost;
+				lstate.accum_count++;
+				if (dedup) {
+					if (regex_idx >= lstate.dict_slot_stamp.size()) {
+						lstate.dict_slot_of.resize(regex_idx + 1, 0);
+						lstate.dict_slot_stamp.resize(regex_idx + 1, 0);
+					}
+					lstate.dict_slot_of[regex_idx] = slot;
+					lstate.dict_slot_stamp[regex_idx] = lstate.dict_stamp;
+				}
+			}
 
-			lstate.batch_row_refs.push_back({lstate.current_retained_chunk_idx, row_idx});
-
-			lstate.raw_used += raw_cost;
-			lstate.accum_count++;
+			lstate.batch_row_refs.push_back({lstate.current_retained_chunk_idx, row_idx, slot});
+			lstate.staged_rows++;
+			lstate.chunk_offset++;
 		}
 		CALI_MARK_END("stage_rows_for_fpga_batch");
 	}
