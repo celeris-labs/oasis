@@ -43,6 +43,12 @@ PORT=${OASIS_PORT:-9000}
 FILE=/throughput/tpch-1/lineitem.parquet
 REPEAT=3
 WORKLOAD=all
+# EXPORTED, not assumed. This used to default to 8192 for its own arithmetic while the library used
+# whatever HTTP_DEFAULT_CHUNK_BYTES had become -- so every derived column (gets, kib_per_get,
+# dead_us_per_get) was computed from a split that was not in force. At the 192 KiB default that made
+# the GET count wrong by 24x. Exporting it means the number printed is the number used.
+# Keep in step with HTTP_DEFAULT_CHUNK_BYTES in software/oasis/configuration.cpp.
+export OASIS_HTTP_CHUNK_BYTES=${OASIS_HTTP_CHUNK_BYTES:-196608}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -124,7 +130,7 @@ run_one() {
     # column chunk when splitting is off. Needed to turn the cycle counters into a per-request cost,
     # which is the number that discriminates "the link is slow" from "each request costs a fixed
     # amount no matter how big it is".
-    local split=${OASIS_HTTP_CHUNK_BYTES:-8192}
+    local split=$OASIS_HTTP_CHUNK_BYTES
     local sql_file; sql_file=$(mktemp)
     {
         echo "$SETUP"
@@ -204,7 +210,7 @@ for w in $WORKLOADS; do
 done
 CHUNKS=$((total_cols * ${RG:-0} * REPEAT))
 echo " estimated column chunks for this run: $CHUNKS (all on one TCP connection)"
-echo " range split: OASIS_HTTP_CHUNK_BYTES=${OASIS_HTTP_CHUNK_BYTES:-8192} bytes per GET"
+echo " range split: OASIS_HTTP_CHUNK_BYTES=$OASIS_HTTP_CHUNK_BYTES bytes per GET"
 echo " (set OASIS_HTTP_CHUNK_BYTES=0 to send one GET per column chunk and measure what the split costs)"
 echo "=============================================================================="
 
