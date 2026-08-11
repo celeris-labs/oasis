@@ -22,9 +22,11 @@ struct ProfileRow {
 
 	parcore::DecoderProfile profile;
 
-	double in_throughput_gbps;            // over the whole profiled window (includes idle cycles)
+	// GIGABYTES per second, not gigabits. ThroughputGBps returns bytes/s / 1e9, and the old name
+	// `_gbps` reads as gigabits to everyone -- an eight-fold understatement in any report.
+	double in_throughput_gbytes_s;           // over the whole profiled window (includes idle cycles)
 	double in_throughput_excl_idle_gbps;  // excluding inter-stream idle cycles
-	double out_throughput_gbps;
+	double out_throughput_gbytes_s;
 	double out_throughput_excl_idle_gbps;
 };
 
@@ -52,9 +54,9 @@ ProfileRow MakeRow(uint64_t decoder, const parcore::DecoderProfile &p) {
 	    p.out.handshakes_cycles + p.out.starved_cycles + p.out.stalled_cycles + p.out.idle_cycles;
 	uint64_t out_busy = p.out.handshakes_cycles + p.out.starved_cycles + p.out.stalled_cycles;
 
-	row.in_throughput_gbps = ThroughputGBps(p.in.handshakes_cycles, in_total);
+	row.in_throughput_gbytes_s = ThroughputGBps(p.in.handshakes_cycles, in_total);
 	row.in_throughput_excl_idle_gbps = ThroughputGBps(p.in.handshakes_cycles, in_busy);
-	row.out_throughput_gbps = ThroughputGBps(p.out.handshakes_cycles, out_total);
+	row.out_throughput_gbytes_s = ThroughputGBps(p.out.handshakes_cycles, out_total);
 	row.out_throughput_excl_idle_gbps = ThroughputGBps(p.out.handshakes_cycles, out_busy);
 	return row;
 }
@@ -93,9 +95,9 @@ void DefineColumns(vector<string> &names, vector<LogicalType> &types) {
 	add("out_stalled_cycles", LogicalType::UBIGINT);
 	add("out_idle_cycles", LogicalType::UBIGINT);
 
-	add("in_throughput_gbps", LogicalType::DOUBLE);
+	add("in_throughput_gbytes_s", LogicalType::DOUBLE);
 	add("in_throughput_excl_idle_gbps", LogicalType::DOUBLE);
-	add("out_throughput_gbps", LogicalType::DOUBLE);
+	add("out_throughput_gbytes_s", LogicalType::DOUBLE);
 	add("out_throughput_excl_idle_gbps", LogicalType::DOUBLE);
 }
 
@@ -151,9 +153,9 @@ void OasisProfileFunction(ClientContext &context, TableFunctionInput &data_p, Da
 		output.SetValue(col++, i, Value::UBIGINT(p.out.stalled_cycles));
 		output.SetValue(col++, i, Value::UBIGINT(p.out.idle_cycles));
 
-		output.SetValue(col++, i, Value::DOUBLE(row.in_throughput_gbps));
+		output.SetValue(col++, i, Value::DOUBLE(row.in_throughput_gbytes_s));
 		output.SetValue(col++, i, Value::DOUBLE(row.in_throughput_excl_idle_gbps));
-		output.SetValue(col++, i, Value::DOUBLE(row.out_throughput_gbps));
+		output.SetValue(col++, i, Value::DOUBLE(row.out_throughput_gbytes_s));
 		output.SetValue(col++, i, Value::DOUBLE(row.out_throughput_excl_idle_gbps));
 	}
 

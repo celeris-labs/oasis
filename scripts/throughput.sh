@@ -149,7 +149,7 @@ run_one() {
                     SELECT decoder,
                            in_handshakes_cycles AS hs, in_starved_cycles AS starved,
                            in_stalled_cycles AS stalled, in_idle_cycles AS idle,
-                           in_throughput_gbps AS gbps
+                           in_throughput_gbytes_s AS gbytes_s
                     FROM oasis_stream_profile()
                   ), t AS (
                     SELECT *, hs + starved + stalled + idle AS total, hs * 64 AS bytes FROM c
@@ -170,7 +170,7 @@ run_one() {
                          round(bytes / nullif(gets,0) / 1024.0, 1)    AS kib_per_get,
                          round((starved + idle) * 4e-3 / nullif(gets,0), 1)
                                                                       AS dead_us_per_get,
-                         round(gbps, 4)                               AS in_gbps
+                         round(gbytes_s * 1000.0, 1)                  AS in_mbytes_s
                   FROM g;"
             echo ".mode duckbox"
         fi
