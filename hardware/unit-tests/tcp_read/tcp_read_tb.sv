@@ -61,13 +61,20 @@ module tcp_read_tb;
     logic [23:0] status_ascii;
     logic [31:0] body_remaining;
     logic [3:0]  state_debug;
-    logic [10:0] rx_fifo_level;
+    // $clog2(RX_FIFO_DEPTH+1). Was 11 when the fifo was 1024 deep; 4096 needs 13, and a too-narrow
+    // net here silently truncates the level the assertions read.
+    logic [12:0] rx_fifo_level;
     logic        rx_fifo_stall;
+    logic        read_timeout;
 
     int unsigned fails  = 0;
     int unsigned passes = 0;
 
-    tcp_read dut (
+    // WATCHDOG_BITS is dialled down from the synthesis default of 29 (~2.1 s at 250 MHz) to 12
+    // (4096 cycles = 41 us here). The whole rest of this bench runs in ~8 us, so it cannot fire by
+    // accident, and case_read_watchdog below can actually reach it. At the real value a test would
+    // have to simulate two seconds of wall clock to prove the timeout exists at all.
+    tcp_read #(.WATCHDOG_BITS(12)) dut (
         .clk(clk),
         .rst_n(rst_n),
         .start(start),
@@ -106,6 +113,7 @@ module tcp_read_tb;
         .body_remaining(body_remaining),
         .rx_fifo_level(rx_fifo_level),
         .rx_fifo_stall(rx_fifo_stall),
+        .read_timeout(read_timeout),
         .debug_rx_write_ptr(),
         .debug_rx_buffer_w0(),
         .debug_rx_buffer_w1(),
@@ -378,6 +386,46 @@ module tcp_read_tb;
         finish_read();
     endtask
 
+    // Nothing ever arrives. Before the watchdog, ST_WAIT_NOTIFY had no exit for this at all: it left
+    // only on the framer finishing, an announcement arriving, or the connection closing. After a
+    // reconnect none of those can happen if the pending announcement belonged to the dead session,
+    // so the reader waited forever and the board needed a reprogram. A scale-30 run hit exactly this
+    // and burned 900 seconds.
+    task automatic case_read_watchdog();
+        int unsigned waited;
+        $display("--- case_read_watchdog ---");
+        reset_all();
+        // No announcement, no data, no close. The one situation with no way out.
+        rx_req_len = '0;
+        rx_closed  = 1'b0;
+
+        start = 1'b1;
+        waited = 0;
+        while (!done && waited < 20000) begin
+            @(posedge clk);
+            waited++;
+        end
+
+        if (!done) begin
+            $error("[watchdog] still waiting after %0d cycles -- ST_WAIT_NOTIFY has no timeout and this hangs the board", waited);
+            fails++;
+        end else if (!error) begin
+            $error("[watchdog] finished without reporting an error -- the handler would treat a dead read as a success");
+            fails++;
+        end else if (error_dirty) begin
+            $error("[watchdog] reported DIRTY -- no byte was ever delivered, so the handler must be allowed to replay");
+            fails++;
+        end else if (!read_timeout) begin
+            $error("[watchdog] aborted but read_timeout is clear -- the host cannot tell a timeout from a server error");
+            fails++;
+        end else begin
+            $display("[PASS] read_watchdog (aborted after %0d cycles, clean, timeout flagged)", waited);
+            passes++;
+        end
+        start = 1'b0;
+        @(posedge clk);
+    endtask
+
     // The peer FINs in the middle of a body. Those bytes are already downstream: not replayable.
     task automatic case_dirty_abort();
         $display("--- case_dirty_abort ---");
@@ -469,6 +517,7 @@ module tcp_read_tb;
         case_clean_abort();
         case_dirty_abort();
         case_split_chunk();
+        case_read_watchdog();
 
         // Every case above ran a real response through the header parser. If the parser were still
         // in the TCP stack's back-pressure path, each one would have contributed hundreds of stall

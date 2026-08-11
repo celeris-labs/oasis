@@ -162,6 +162,11 @@ class HTTPReadConfig : public libstf::Config {
         /// tcp_read.sv is too small for this traffic and the whole point of the decoupling -- never
         /// letting the parser stall the shared 64 KB receive fifo -- has been lost.
         bool rx_fifo_stall = false;
+        /// A read gave up waiting instead of failing outright: nothing arrived for ~2 s while a
+        /// request was outstanding. Sticky. Distinguishes "the response never came" from "the server
+        /// said no", which the other bits cannot -- and it is the condition that used to hang the
+        /// board until it was reprogrammed.
+        bool read_timeout = false;
         /// The stallWord exactly as read, so a caller can tell a condition it has already reported
         /// from a new one. The named bools above are for reading; this is for comparing.
         uint32_t raw = 0;
@@ -169,7 +174,7 @@ class HTTPReadConfig : public libstf::Config {
         bool any() const {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
                    || resp_unframeable || dirty_abort || status_bad || notify_overflow
-                   || rx_fifo_stall;
+                   || rx_fifo_stall || read_timeout;
         }
         std::string describe() const;
     };

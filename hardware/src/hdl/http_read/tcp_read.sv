@@ -54,7 +54,22 @@ module tcp_read #(
     // smaller than what the stack promises the sender.
     //
     // Cost is 64 RAMB36 instead of 16, out of 2016 on the U55C -- the design uses 25.8%.
-    parameter int RX_FIFO_DEPTH = 4096
+    parameter int RX_FIFO_DEPTH = 4096,
+
+    // Cycles to wait for ANY progress before giving up on a response. At 250 MHz, 2^29 is ~2.1 s.
+    //
+    // ST_WAIT_NOTIFY used to have no way out at all: it left only when the framer finished, an
+    // announcement arrived, or the connection closed. After a reconnect none of those can happen if
+    // the pending announcement was bound to the session that just died -- the reader waits on a
+    // notification that no longer exists and the query hangs until the host's 30 s credit timeout,
+    // leaving the handler outside ST_IDLE where only reprogramming clears it. That cost a 900 s
+    // scale-30 timeout and a board cycle.
+    //
+    // A response should land in single-digit milliseconds; the slowest ever measured against MinIO
+    // was ~8 ms. Two seconds is three orders of magnitude of headroom, so this fires only when
+    // something is genuinely never going to arrive -- and then it aborts, which the handler already
+    // knows how to turn into a reconnect and replay.
+    parameter int WATCHDOG_BITS = 29
 ) (
     input  logic                                      clk,
     input  logic                                      rst_n,
@@ -99,6 +114,7 @@ module tcp_read #(
 
     // Response framing status, surfaced to the host through HttpConfig.
     output logic                                      resp_error,
+    output logic                                      read_timeout,
     output logic [23:0]                               status_ascii,
     output logic                                      status_ok,
     output logic [31:0]                               content_length,
@@ -132,6 +148,12 @@ module tcp_read #(
     logic pkg_active_q, pkg_active_d;
     logic [TCP_LEN_BITS-1:0] req_len_q, req_len_d;
     logic abort_dirty_q, abort_dirty_d;
+
+    // Progress watchdog. Cleared by any forward motion, counted while waiting.
+    logic [WATCHDOG_BITS-1:0] wdog_q, wdog_d;
+    logic                     wdog_expired;
+    logic                     wdog_timeout_q, wdog_timeout_d;
+    assign wdog_expired = (wdog_q == '1);
 
     // Settle timer for ST_DRAIN. Reloaded while the parser still has something to chew on, counted
     // down only once the fifo is empty. 200 cycles is comfortably more than the 64 it takes
@@ -240,6 +262,16 @@ module tcp_read #(
         pkg_active_d       = pkg_active_q;
         req_len_d          = req_len_q;
         abort_dirty_d      = abort_dirty_q;
+        wdog_timeout_d     = wdog_timeout_q;
+        // Progress watchdog. Counts only while a request is genuinely outstanding, and is cleared by
+        // any forward motion: a beat of body data, an announcement, or the framer changing its mind.
+        // Idle states reload it so it can never fire on a reader that has nothing to do.
+        if (state_q == ST_IDLE || state_q == ST_DONE || state_q == ST_ABORT ||
+            s_axis_rx_data_TVALID || (rx_req_len != 0) || sh_resp_done || sh_resp_error) begin
+            wdog_d = '0;
+        end else begin
+            wdog_d = wdog_expired ? wdog_q : (wdog_q + 1'b1);
+        end
         // Hold the timer reloaded everywhere except ST_DRAIN, and reload it inside ST_DRAIN for as
         // long as the parser still has work, so only genuine quiet counts towards settling.
         drain_cnt_d        = (state_q == ST_DRAIN && parser_quiet_w && drain_cnt_q != 8'd0)
@@ -280,6 +312,13 @@ module tcp_read #(
                     state_d    = ST_REQ_PKG;
                 end else if (rx_closed) begin
                     state_d = ST_DRAIN;
+                end else if (wdog_expired) begin
+                    // Nothing is coming. Abort rather than wait forever: the handler turns a
+                    // non-dirty error into a reconnect and replay, which is recoverable, whereas
+                    // hanging here is not -- it needs a reprogram.
+                    wdog_timeout_d = 1'b1;
+                    abort_dirty_d  = sh_resp_dirty;
+                    state_d        = ST_ABORT;
                 end
             end
 
@@ -361,12 +400,16 @@ module tcp_read #(
             req_len_q          <= '0;
             abort_dirty_q      <= 1'b0;
             drain_cnt_q        <= DRAIN_SETTLE;
+            wdog_q             <= '0;
+            wdog_timeout_q     <= 1'b0;
         end else begin
             state_q            <= state_d;
             rx_meta_received_q <= rx_meta_received_d;
             req_len_q          <= req_len_d;
             abort_dirty_q      <= abort_dirty_d;
             drain_cnt_q        <= drain_cnt_d;
+            wdog_q             <= wdog_d;
+            wdog_timeout_q     <= wdog_timeout_d;
             // A new connection throws the half-read packet away with everything else.
             pkg_active_q       <= clear_framing ? 1'b0 : pkg_active_d;
         end
@@ -376,6 +419,9 @@ module tcp_read #(
     assign error              = (state_q == ST_ABORT);
     assign error_dirty        = (state_q == ST_ABORT) && abort_dirty_q;
     assign resp_error         = sh_resp_error;
+    // Sticky, for the host: this abort was a watchdog expiry, not a server error. Distinguishes
+    // "nothing ever arrived" from "the server said no", which look identical from the CSRs otherwise.
+    assign read_timeout       = wdog_timeout_q;
     assign debug_rx_write_ptr = payload_w1_valid ? 4'd2 : payload_w0_valid ? 4'd1 : 4'd0;
     assign debug_rx_buffer_w0 = payload_w0;
     assign debug_rx_buffer_w1 = payload_w1;

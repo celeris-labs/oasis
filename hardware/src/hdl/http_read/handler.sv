@@ -373,8 +373,10 @@ module handler #(
     logic init_err_q, send_err_q, resp_err_q, status_bad_q;
 
     logic rx_fifo_stall_w;
+    logic read_timeout_w;
 
-    assign stallWord = {6'd0,
+    assign stallWord = {5'd0,
+                        read_timeout_w,
                         rx_fifo_stall_w,
                         tbl_dbg_overflow,
                         8'(read_idx),
@@ -517,6 +519,8 @@ module handler #(
         .status_ascii(read_status_ascii),
         .status_ok(read_status_ok),
         .content_length(read_content_length),
+        // Sticky: a read gave up waiting rather than failing outright. See WATCHDOG_BITS.
+        .read_timeout(read_timeout_w),
         .body_remaining(read_body_remaining),
         // Sticky: the decoupling fifo refused the TCP stack at least once, i.e. back-pressure
         // reached the TOE anyway and RX_FIFO_DEPTH is too small for the traffic that showed up.

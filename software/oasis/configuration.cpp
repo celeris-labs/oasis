@@ -574,6 +574,7 @@ HTTPReadConfig::HTTPStall HTTPReadConfig::stall() {
     s.read_slot        = static_cast<uint8_t>((word >> 16) & 0xFFu);
     s.notify_overflow  = (word & (1u << 24)) != 0;
     s.rx_fifo_stall    = (word & (1u << 25)) != 0;
+    s.read_timeout     = (word & (1u << 26)) != 0;
     return s;
 }
 
@@ -595,12 +596,20 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     if (status_bad)       oss << " bad_http_status";
     if (notify_overflow)  oss << " notify_overflow";
     if (rx_fifo_stall)    oss << " rx_fifo_stall";
+    if (read_timeout)     oss << " read_timeout";
     if (reconnects)       oss << " reconnects=" << static_cast<unsigned>(reconnects);
 
     // One explanation per line. These are sticky bits and several latch together over a long query,
     // so run as prose they produce a paragraph in which every sentence contradicts the next -- a
     // connect-stall essay attached to a run whose connection is up, wrapped around the one line that
     // actually mattered. Newline-separated, the reader can see which conditions are present at all.
+    if (read_timeout) {
+        oss << "\n    read_timeout: a read waited ~2 s with nothing arriving and gave up. The most "
+               "likely cause is a reconnect: the announcement the reader was waiting on belonged to "
+               "the session that just closed, so it could never arrive. Before the watchdog existed "
+               "this hung until the host's credit timeout and left the handler out of ST_IDLE, which "
+               "only reprogramming clears. Now it aborts and the handler replays the request.";
+    }
     if (rx_fifo_stall) {
         oss << "\n    rx_fifo_stall: the fifo between the TCP stack and the HTTP parser filled, so "
                "the parser back-pressured the TOE after all. Results stay correct -- the shared "
