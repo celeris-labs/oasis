@@ -220,7 +220,55 @@ constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 196608;
 // The TCP window the stack advertises: 1 << WINDOW_BITS with WINDOW_BITS = 16 + WINDOW_SCALE_BITS
 // and WINDOW_SCALE_BITS = 2 (toe_config.hpp.in). Since build-95 the receive fifo is the same size,
 // so this one number is both what the peer is invited to send and what can actually be held.
+//
+// MEASURED, against MinIO on 10.253.74.74, one keep-alive connection, 48 MB per point. The budget
+// is chunk x depth and every row inside it spends the same 256 KiB:
+//
+//     chunk  depth  in-flight    MB/s
+//      192K      1       192K   148.2   <- the default
+//      256K      1       256K   179.3   best that fits today
+//      128K      2       256K   137.3
+//       64K      4       256K    68.1
+//       32K      8       256K    42.9
+//      512K      1       512K   293.6   needs a bigger window
+//     1024K      1      1024K   423.1   needs a bigger window
+//      512K      2      1024K   384.1
+//
+// Two things follow, and the second one is the surprise. First, throughput is very nearly LINEAR in
+// chunk size, because a request costs ~1.4 ms of MinIO time-to-first-byte whatever its size, so
+// doubling the chunk halves how often that is paid. Second, DEPTH IS ACTIVELY HARMFUL under a fixed
+// budget: 64K x 4 is 2.2x SLOWER than 192K x 1 for exactly the same bytes in flight. HTTP/1.1
+// pipelining is strictly ordered and MinIO overlaps only ~1.5x of the queued work, which never pays
+// for the 4x smaller requests it was bought with. One big request beats several small ones at every
+// budget tested -- 512K x 1 > 256K x 2, 1024K x 1 > 512K x 2.
+//
+// So the ONE thing that raises single-connection throughput is a bigger window, and the only reason
+// the chunk is not already larger is that this number caps it.
 constexpr const uint64_t HTTP_RX_WINDOW_BYTES = 262144;
+
+// Overridable because the window is a property of the BITSTREAM, not of this build: a bitstream with
+// WINDOW_SCALE_BITS raised can hold more, and there is no CSR that reports it. Setting this HIGHER
+// than the running bitstream's real window re-creates the failure d0224ee fixed -- the peer is
+// invited to send more than the fifo holds, the overflow is dropped, and the wire fills with genuine
+// retransmissions and duplicate ACKs seconds apart. Raise it only together with the bitstream.
+uint64_t HttpRxWindowBytes() {
+    static const uint64_t configured = [] {
+        const char *env = std::getenv("OASIS_HTTP_RX_WINDOW_BYTES");
+        if (env == nullptr || *env == '\0') {
+            return HTTP_RX_WINDOW_BYTES;
+        }
+        const long long parsed = std::atoll(env);
+        if (parsed <= 0) {
+            return HTTP_RX_WINDOW_BYTES;
+        }
+        std::fprintf(stderr,
+                     "oasis: OASIS_HTTP_RX_WINDOW_BYTES=%lld overrides the built-in %llu. This must "
+                     "not exceed 1 << WINDOW_BITS of the PROGRAMMED bitstream.\n",
+                     parsed, static_cast<unsigned long long>(HTTP_RX_WINDOW_BYTES));
+        return static_cast<uint64_t>(parsed);
+    }();
+    return configured;
+}
 
 uint8_t HttpMaxInflight(uint8_t slots) {
     static const int configured = [] {
@@ -248,7 +296,7 @@ uint8_t HttpMaxInflight(uint8_t slots) {
     // is handled by keeping HTTP_DEFAULT_CHUNK_BYTES below it.
     const uint64_t chunk = HTTPReadConfig::chunk_bytes();
     if (chunk > 0) {
-        const int by_bytes = static_cast<int>(HTTP_RX_WINDOW_BYTES / chunk);
+        const int by_bytes = static_cast<int>(HttpRxWindowBytes() / chunk);
         depth = std::max(1, std::min(depth, by_bytes));
     }
     return static_cast<uint8_t>(depth);
