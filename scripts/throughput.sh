@@ -47,6 +47,8 @@ WORKLOAD=all
 while [ $# -gt 0 ]; do
     case "$1" in
         --file)     FILE="$2"; shift ;;
+        # Convenience, so this takes the same argument as tpch_demo.sh instead of a full path.
+        --scale)    FILE="/throughput/tpch-$2/lineitem.parquet"; shift ;;
         --repeat)   REPEAT="$2"; shift ;;
         --server)   SERVER="$2"; shift ;;
         --port)     PORT="$2"; shift ;;
