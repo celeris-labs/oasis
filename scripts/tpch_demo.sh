@@ -9,7 +9,10 @@
 # WHAT THIS DOES AND DOES NOT PROVE
 #   It proves: the hardware decoder returns bit-identical results to DuckDB's own Parquet reader
 #   across the full TPC-H workload, including joins, aggregation, sorting and filters.
-#   It does not prove anything about speed -- see scripts/throughput.sh for that.
+#   On speed it reports one thing only: total wall clock for the suite, each side against the other,
+#   summed over the queries where both sides finished. That is a fair end-to-end number but it says
+#   nothing about WHERE the time went -- for the decomposition into fetch, decode, idle and stall,
+#   use scripts/throughput.sh.
 #
 # WHERE THE HARDWARE ACTUALLY RUNS. read_oasis decodes FIXED-WIDTH columns on the FPGA. BYTE_ARRAY
 # (string) columns have no hardware path and are decoded on the host from bytes fetched over the
@@ -23,6 +26,9 @@
 #   ./scripts/tpch_demo.sh --timeout 300
 #   ./scripts/tpch_demo.sh --cpu-first        # run the CPU side first, to expose the cache bias
 #   ./scripts/tpch_demo.sh --threads 1        # pin BOTH sides to one DuckDB thread
+#
+# The summary ends with the total for each side and the ratio between them. --threads 1 is the
+# comparison to quote: without it the CPU column is every core at once against one decoder.
 #
 # ON --cpu-first: both sides fetch the same bytes from the same MinIO, so whichever runs SECOND
 # reads them from the server's page cache. The default order (FPGA first) therefore warms the cache
@@ -66,7 +72,7 @@ while [ $# -gt 0 ]; do
         --threads) THREADS="$2"; shift ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
-        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -117,6 +123,15 @@ printf '%-5s %-8s %9s %9s %10s  %s\n' "query" "result" "fpga_s" "cpu_s" "hw_MiB"
 
 PASS=0; FAIL=0; SKIP=0; CONSEC_TIMEOUT=0
 FAILED=()
+# Totals, summed only over queries where BOTH sides ran to completion. A query that timed out on the
+# FPGA or errored on the CPU contributes to neither, because adding a 300 s timeout to one column and
+# nothing to the other turns the total into a fiction.
+FPGA_TOTAL=0; CPU_TOTAL=0; TIMED=0
+accumulate() {
+    FPGA_TOTAL=$(awk -v a="$FPGA_TOTAL" -v b="$fpga_s" 'BEGIN{printf "%.2f", a+b}')
+    CPU_TOTAL=$(awk -v a="$CPU_TOTAL" -v b="$cpu_s" 'BEGIN{printf "%.2f", a+b}')
+    TIMED=$((TIMED+1))
+}
 
 for f in "$ROOT"/scripts/tpch/q*.sql; do
     n=$(basename "$f" .sql); n=${n#q}; n=$((10#$n))
@@ -229,7 +244,7 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
         awk -v m="${hw_mib:-0}" 'BEGIN{exit !(m+0 < 0.01)}' &&
             note="$note, all-CPU query (no fixed-width column fetched)"
         printf '%-5s %-8s %9s %9s %10s  %s\n' "q$n" "PASS" "$fpga_s" "$cpu_s" "${hw_mib:--}" "$note"
-        PASS=$((PASS+1))
+        PASS=$((PASS+1)); accumulate
     else
         nf=$(wc -l < "$FPGA_ROWS" | tr -d ' '); nc=$(wc -l < "$CPU_ROWS" | tr -d ' ')
         if [ "$nf" != "$nc" ]; then
@@ -239,7 +254,7 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
                      | sed -n '2,3p' | tr '\n' ' ' | cut -c1-70)"
         fi
         printf '%-5s %-8s %9s %9s %10s  %s\n' "q$n" "MISMATCH" "$fpga_s" "$cpu_s" "${hw_mib:--}" "$detail"
-        FAIL=$((FAIL+1)); FAILED+=("q$n")
+        FAIL=$((FAIL+1)); FAILED+=("q$n"); accumulate
         cp "$FPGA_ROWS" "/tmp/oasis-q$n-fpga.txt"; cp "$CPU_ROWS" "/tmp/oasis-q$n-cpu.txt"
         echo "         full outputs kept: /tmp/oasis-q$n-{fpga,cpu}.txt"
     fi
@@ -248,5 +263,33 @@ done
 echo "=============================================================================="
 printf ' pass %d   fail %d   skip %d\n' "$PASS" "$FAIL" "$SKIP"
 [ "${#FAILED[@]}" -gt 0 ] && printf ' failed: %s\n' "$(printf '%s ' "${FAILED[@]}")"
+
+# The headline number: total wall clock for the whole suite, each side against the other. This is
+# just the sum of the per-query columns above, over the queries where both sides finished.
+if [ "$TIMED" -gt 0 ]; then
+    echo "------------------------------------------------------------------------------"
+    printf ' total over %d queries where both sides completed\n' "$TIMED"
+    printf '   FPGA %8.2f s\n' "$FPGA_TOTAL"
+    printf '   CPU  %8.2f s   (threads=%s)\n' "$CPU_TOTAL" "${THREADS:-all cores}"
+    awk -v f="$FPGA_TOTAL" -v c="$CPU_TOTAL" 'BEGIN{
+        if (f <= 0) exit
+        r = c / f
+        if (r >= 1) printf "   FPGA is %.2fx faster\n", r
+        else        printf "   CPU is %.2fx faster\n", 1/r
+    }'
+    if [ -z "$THREADS" ]; then
+        echo "   NOTE: the CPU side used every core. For a like-for-like comparison against one"
+        echo "         decoder, rerun with --threads 1."
+    fi
+    # Whichever side ran second read the same bytes out of MinIO's page cache. Say which that was,
+    # because a ratio measured in one order is not the same claim as the other.
+    if [ "$CPU_FIRST" = 1 ]; then
+        echo "   ORDER: CPU ran first, so the FPGA read a warm server cache. Flip with the default"
+        echo "          order to see how much of the ratio is caching."
+    else
+        echo "   ORDER: FPGA ran first, so the CPU read a warm server cache. Rerun with --cpu-first"
+        echo "          to see how much of the ratio is caching."
+    fi
+fi
 echo "=============================================================================="
 [ "$FAIL" -eq 0 ]
