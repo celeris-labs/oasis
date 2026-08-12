@@ -344,14 +344,12 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
             echo "         full error kept: /tmp/oasis-q$n-cpu-error.txt"
             sed -n '/rror\|xception\|xtension/p' "$CPU_RAW" | head -6 | sed 's/^/         | /'
             [ "$CPU_BASELINE" = httpfs ] && cat <<'HINT'
-         The baseline needs stock httpfs. If it refuses to LOAD, this build is not on a released
-         tag (git describe says v1.5.2-1-gXXXXXXX), so DuckDB namespaces extensions by COMMIT and
-         rejects the official v1.5.2 binary. Either:
-             duckdb -c "SET allow_extensions_metadata_mismatch=true; LOAD httpfs;"   # quick
-         or build httpfs against THIS duckdb by adding to extension/extension_config.cmake:
-             duckdb_extension_load(httpfs GIT_URL https://github.com/duckdb/duckdb-httpfs
-                                          GIT_TAG main)
-         or run with --cpu-baseline fallback, whose ratio is not quotable.
+         The baseline needs stock httpfs, and INSTALL httpfs CANNOT provide it here. This duckdb
+         is one commit past v1.5.2, so it looks for .duckdb/extensions/<commit>/... and the
+         repository has no build for that commit. Do NOT substitute the v1.5.2 binary: the extra
+         commit adds fields to TableFunction, so the layouts differ and it corrupts rather than
+         fails. httpfs is declared in extension/extension_config.cmake -- rebuild the extension.
+         Until then, --cpu-baseline fallback runs, but its ratio is not quotable.
 HINT
         fi
         SKIP=$((SKIP+1)); continue
