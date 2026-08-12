@@ -141,7 +141,10 @@ trap 'rm -f "$FPGA_RAW" "$FPGA_ROWS" "$CPU_RAW" "$CPU_ROWS"' EXIT
 
 echo "=============================================================================="
 echo " TPC-H conformance   scale=$SCALE  server=$SERVER:$PORT"
-echo " inflight=${OASIS_HTTP_MAX_INFLIGHT:-default}  chunk=${OASIS_HTTP_CHUNK_BYTES:-default}"
+# threads goes in the banner, not only in the summary. Two runs at different chunk sizes were once
+# compared as if only the chunk had moved, when one of them had also been left on every core -- and
+# the pasted output gave no hint of it until 40 lines later.
+echo " inflight=${OASIS_HTTP_MAX_INFLIGHT:-default}  chunk=${OASIS_HTTP_CHUNK_BYTES:-default}  threads=${THREADS:-ALL CORES}"
 echo " read_oasis() decodes fixed-width columns on the FPGA; strings are decoded on the host."
 echo "=============================================================================="
 [ "$PHASES" = 1 ] || \
