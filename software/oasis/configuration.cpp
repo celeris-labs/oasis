@@ -660,10 +660,14 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     }
     if (rx_fifo_stall) {
         oss << "\n    rx_fifo_stall: the fifo between the TCP stack and the HTTP parser filled, so "
-               "the parser back-pressured the TOE after all. Results stay correct -- the shared "
-               "64 KB receive fifo is overrun and recovered by retransmission -- but the decoupling "
-               "is defeated and throughput suffers. Either lower OASIS_HTTP_CHUNK_BYTES or raise "
-               "RX_FIFO_DEPTH in hardware/src/hdl/http_read/tcp_read.sv (needs a resynthesis).";
+               "the parser back-pressured the TOE after all. Results stay correct -- the TOE's "
+               "receive fifo is overrun and recovered by retransmission -- but the decoupling is "
+               "defeated and throughput suffers. This says the PARSER is not draining fast enough; "
+               "it says nothing about how big either fifo is, and no register reports that. The "
+               "TOE's is 1 << WINDOW_BITS, which differs per bitstream (256 KiB up to build-96, "
+               "1 MiB from build-97) -- read it off the wire instead, as the window the FPGA "
+               "advertises in its ACKs. Either lower OASIS_HTTP_CHUNK_BYTES or raise RX_FIFO_DEPTH "
+               "in hardware/src/hdl/http_read/tcp_read.sv (needs a resynthesis).";
     }
 
     if (resp_unframeable) {

@@ -160,7 +160,9 @@ class HTTPReadConfig : public libstf::Config {
         /// The fifo that decouples the TCP stack from the HTTP parser filled up, so back-pressure
         /// reached the TOE anyway. Sticky. Not a correctness problem, but it means RX_FIFO_DEPTH in
         /// tcp_read.sv is too small for this traffic and the whole point of the decoupling -- never
-        /// letting the parser stall the shared 64 KB receive fifo -- has been lost.
+        /// letting the parser stall the TOE's shared receive fifo -- has been lost. Carries no
+        /// information about the size of either fifo; the TOE's is 1 << WINDOW_BITS and varies per
+        /// bitstream.
         bool rx_fifo_stall = false;
         /// A read gave up waiting instead of failing outright: nothing arrived for ~2 s while a
         /// request was outstanding. Sticky. Distinguishes "the response never came" from "the server
