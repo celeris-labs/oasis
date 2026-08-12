@@ -208,8 +208,15 @@ class HTTPReadConfig : public libstf::Config {
         /// the check `body_remaining` cannot do, because it counts down to zero.
         uint32_t content_length = 0;
         /// Bytes the host asked for in the most recent ranged GET (host-side, not from hardware).
+        /// ZERO when more than one request can be outstanding: `content_length` is latched by the
+        /// hardware from whichever response is being framed, while this is simply the last range the
+        /// host issued, and once those are different requests comparing them is meaningless. It
+        /// would not be a harmless inaccuracy either -- pipelined GETs of a split column chunk have
+        /// genuinely different lengths, so the check would fire on every healthy run and train the
+        /// reader to ignore it.
         uint32_t requested = 0;
 
+        /// False whenever `requested` is 0, which includes the pipelined case above.
         bool length_mismatch() const {
             return requested != 0 && content_length != 0 && content_length != requested;
         }

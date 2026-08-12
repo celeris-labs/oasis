@@ -737,7 +737,9 @@ HTTPReadConfig::HTTPResponse HTTPReadConfig::response() {
     r.dirty          = (word & (1u << 26)) != 0;
     r.body_remaining = static_cast<uint32_t>(read_register(HTTP_BODY_REMAINING).value());
     r.content_length = static_cast<uint32_t>(read_register(HTTP_CONTENT_LENGTH).value());
-    r.requested      = last_request_bytes_.load(std::memory_order_relaxed);
+    // Only meaningful while requests are strictly one at a time -- see HTTPResponse::requested.
+    r.requested      = (max_inflight() > 1) ? 0u
+                                            : last_request_bytes_.load(std::memory_order_relaxed);
     return r;
 }
 
