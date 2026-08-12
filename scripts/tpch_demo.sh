@@ -10,6 +10,8 @@
 #   It proves: the hardware decoder returns bit-identical results to DuckDB's own Parquet reader
 #   across the full TPC-H workload, including joins, aggregation, sorting and filters.
 #   On speed it reports one thing only: total wall clock for the suite, each side against the other,
+#   with the CPU side running STOCK DuckDB (its httpfs filesystem, its parquet reader) over the same
+#   objects on the same server, so nothing we wrote is inside the baseline.
 #   summed over the queries where both sides finished. That is a fair end-to-end number but it says
 #   nothing about WHERE the time went -- for the decomposition into fetch, decode, idle and stall,
 #   use scripts/throughput.sh.
@@ -27,6 +29,11 @@
 #   ./scripts/tpch_demo.sh --cpu-first        # run the CPU side first, to expose the cache bias
 #   ./scripts/tpch_demo.sh --threads 1        # pin BOTH sides to one DuckDB thread
 #   ./scripts/tpch_demo.sh --phases           # all FPGA queries, THEN all CPU ones
+#   ./scripts/tpch_demo.sh --cpu-baseline fallback   # time our own CPU path instead of stock DuckDB
+#
+# The CPU baseline is STOCK DuckDB by default -- its httpfs filesystem and its parquet reader,
+# reading the same objects from the same MinIO. One-time setup, with the proxy still set:
+#     duckdb -c 'INSTALL httpfs;'
 #
 # USE --phases AT SCALE 30. Interleaved, the FPGA's persistent connection idles through every CPU
 # baseline run, and MinIO closes it after ~30 s -- the next FPGA query then sends into a dead socket
@@ -74,6 +81,19 @@ CPU_FIRST=0
 # In phases the FPGA gap between queries is one process start, about a second, and the connection never
 # goes idle long enough to be closed. The cache bias is the reverse of --cpu-first and is reported.
 PHASES=0
+# Which CPU baseline to time.
+#   httpfs   (default) stock DuckDB: its own httpfs filesystem and its own parquet reader, over plain
+#            HTTP to the same MinIO. No code of ours in the baseline at all. This is the number to
+#            quote, and the one a reviewer will ask for. Needs a one-time `INSTALL httpfs;` with the
+#            proxy still set -- this script unsets it, so do that separately.
+#   fallback read_parquet over our httpfpga:// filesystem with httpfpga_cpu_fallback=true. Same
+#            filesystem on both sides, so it isolates the DECODER more tightly -- but it is our code,
+#            and it fetches without keep-alive, so it flatters the FPGA by roughly a third.
+#
+# Expect stock httpfs to be considerably FASTER than the old fallback: it pools connections and
+# prefetches in parallel. That is the point. If the ratio moves against us, that was always the real
+# number.
+CPU_BASELINE=httpfs
 # DuckDB worker threads, applied to BOTH sides. Empty means DuckDB's default (one per core).
 #
 # --threads 1 is the honest like-for-like comparison. By default DuckDB decodes Parquet across every
@@ -89,6 +109,7 @@ while [ $# -gt 0 ]; do
         --timeout) TIMEOUT="$2"; shift ;;
         --cpu-first) CPU_FIRST=1 ;;
         --phases)  PHASES=1 ;;
+        --cpu-baseline) CPU_BASELINE="$2"; shift ;;
         --threads) THREADS="$2"; shift ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
@@ -97,6 +118,12 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+case "$CPU_BASELINE" in
+    httpfs|fallback) ;;
+    *) echo "--cpu-baseline must be 'httpfs' (stock DuckDB) or 'fallback' (ours): got '$CPU_BASELINE'" >&2
+       exit 2 ;;
+esac
 
 if [ "$PHASES" = 1 ] && [ "$CPU_FIRST" = 1 ]; then
     echo "--phases already fixes the order (all FPGA, then all CPU); ignoring --cpu-first." >&2
@@ -119,6 +146,22 @@ views() {
     local reader=$1 t
     for t in $TABLES; do
         echo "CREATE OR REPLACE VIEW $t AS SELECT * FROM ${reader}('httpfpga://${PREFIX}/${t}.parquet');"
+    done
+}
+
+# The CPU baseline, over STOCK DuckDB: the httpfs filesystem and the parquet reader, both shipped by
+# DuckDB, reading the same objects from the same MinIO over plain HTTP.
+#
+# It used to run read_parquet over OUR httpfpga:// filesystem with httpfpga_cpu_fallback=true. That
+# was a mistake in the comparison, not merely in its speed: HTTPReadRangeCpu was written as a
+# debugging aid and opens a fresh TCP connection per range with Connection: close, which measures
+# ~1.35x slower than keep-alive against this server. Patching it would have helped, but the deeper
+# problem is that a baseline we wrote is a baseline we can be accused of shaping. Stock httpfs takes
+# our code out of the measurement entirely, and it is what a reviewer means by "DuckDB".
+views_cpu() {
+    local t
+    for t in $TABLES; do
+        echo "CREATE OR REPLACE VIEW $t AS SELECT * FROM read_parquet('http://${SERVER}:${PORT}${PREFIX}/${t}.parquet');"
     done
 }
 
@@ -145,6 +188,9 @@ echo " TPC-H conformance   scale=$SCALE  server=$SERVER:$PORT"
 # compared as if only the chunk had moved, when one of them had also been left on every core -- and
 # the pasted output gave no hint of it until 40 lines later.
 echo " inflight=${OASIS_HTTP_MAX_INFLIGHT:-default}  chunk=${OASIS_HTTP_CHUNK_BYTES:-default}  threads=${THREADS:-ALL CORES}"
+echo " cpu baseline: $([ "$CPU_BASELINE" = httpfs ] \
+        && echo 'stock DuckDB httpfs + read_parquet over plain HTTP' \
+        || echo 'OUR httpfpga:// cpu fallback -- not a neutral baseline')"
 echo " read_oasis() decodes fixed-width columns on the FPGA; strings are decoded on the host."
 echo "=============================================================================="
 [ "$PHASES" = 1 ] || \
@@ -188,7 +234,12 @@ run_fpga() {
 # --- CPU --------------------------------------------------------------------------------
 run_cpu() {
     cpu_file=$(mktemp)
-    { echo "$SETUP"; echo "SET httpfpga_cpu_fallback=true;"; views read_parquet
+    { echo "$SETUP"
+      if [ "$CPU_BASELINE" = httpfs ]; then
+          echo "LOAD httpfs;"; views_cpu
+      else
+          echo "SET httpfpga_cpu_fallback=true;"; views read_parquet
+      fi
       echo "SELECT '$BEGIN_MARK';"
       echo "$sql_body"
       echo "SELECT '$END_MARK';"
@@ -344,7 +395,8 @@ if [ "$TIMED" -gt 0 ]; then
     echo "------------------------------------------------------------------------------"
     printf ' total over %d queries where both sides completed\n' "$TIMED"
     printf '   FPGA %8.2f s\n' "$FPGA_TOTAL"
-    printf '   CPU  %8.2f s   (threads=%s)\n' "$CPU_TOTAL" "${THREADS:-all cores}"
+    printf '   CPU  %8.2f s   (threads=%s, baseline=%s)\n' "$CPU_TOTAL" "${THREADS:-all cores}" \
+        "$([ "$CPU_BASELINE" = httpfs ] && echo 'stock DuckDB' || echo 'our cpu fallback')"
     awk -v f="$FPGA_TOTAL" -v c="$CPU_TOTAL" 'BEGIN{
         if (f <= 0) exit
         r = c / f
@@ -354,6 +406,11 @@ if [ "$TIMED" -gt 0 ]; then
     if [ -z "$THREADS" ]; then
         echo "   NOTE: the CPU side used every core. For a like-for-like comparison against one"
         echo "         decoder, rerun with --threads 1."
+    fi
+    if [ "$CPU_BASELINE" != httpfs ]; then
+        echo "   WARNING: the baseline is OUR cpu fallback, which opens a TCP connection per range"
+        echo "            with Connection: close. Measured ~1.35x slower than keep-alive against this"
+        echo "            server, so this ratio flatters the FPGA. Do not quote it -- use the default."
     fi
     # Whichever side ran second read the same bytes out of MinIO's page cache. Say which that was,
     # because a ratio measured in one order is not the same claim as the other.
