@@ -56,11 +56,32 @@ import lynxTypes::*;
 // slot instead of being consumed from a stream that serves every session at once.
 module tcp_session_table #(
     parameter int NUM_SLOTS    = 4,
-    // Announcements that may be outstanding for one slot before the reader gets to it. The TOE
-    // announces one segment at a time (MSS = 4096 on this build) and the shared rx FIFO is far
-    // smaller than 32 x MSS, so this cannot fill in practice; if it ever does, the notification is
-    // dropped and `dbg_overflow` latches rather than the stream silently losing sync.
-    parameter int NOTIFY_DEPTH = 32,
+    // Announcements that may be outstanding for one slot before the reader gets to it.
+    //
+    // THIS IS NOT A TUNING KNOB. It has a hard lower bound, and violating it deadlocks the receive
+    // path permanently rather than slowing it down: the TOE announces EVERY segment it accepts, this
+    // queue is the only record of them, and an announcement dropped here is data that sits in the
+    // TOE's FIFO which nobody will ever issue a readPkg for. The reader then waits forever for an
+    // announcement that already came and went -- exactly the failure the module header describes,
+    // reached from the other direction.
+    //
+    //     NOTIFY_DEPTH  >=  bytes the TOE's shared rx FIFO can hold  /  MSS
+    //
+    // Today, with rx_buffer_fifo at 16384 beats x 64 B = 1 MiB (coyote
+    // scripts/ip_inst/network_infrastructure.tcl) and MSS = 4096 B (hw/services/network/
+    // CMakeLists.txt), that is 1048576 / 4096 = 256 full-MSS segments.
+    //
+    // It was 32, chosen when the rx FIFO was 1024 beats = 64 KiB, where the comment here could
+    // correctly say the FIFO was "far smaller than 32 x MSS". Sizing the FIFO to the advertised
+    // window broke that silently -- 256 KiB at build-95 already needed 64, and 1 MiB at build-97
+    // needs 256 -- and nothing failed until requests were pipelined deeply enough to keep the FIFO
+    // full, at which point it deadlocked on q5 of a scale-30 run with notify_overflow set.
+    //
+    // 512 rather than 256 because a partial segment (the tail of each response) costs a queue entry
+    // but less than an MSS of FIFO, so the true worst case is above the ratio above. The storage is
+    // NOTIFY_DEPTH x 16 bits per slot -- 1 KB here -- so headroom is nearly free and running out is
+    // not survivable.
+    parameter int NOTIFY_DEPTH = 512,
     // $clog2(1) is 0, which would make every slot-index port [-1:0] and fail elaboration. One slot
     // is a legitimate configuration -- it is what the single-session tcp_read bench uses and the
     // fallback if pipelining ever has to be switched off -- so clamp the width to 1.
@@ -123,6 +144,21 @@ module tcp_session_table #(
     logic [PTR_BITS-1:0]     wr_ptr_q [NUM_SLOTS];
     logic [PTR_BITS-1:0]     rd_ptr_q [NUM_SLOTS];
     logic [CNT_BITS-1:0]     cnt_q    [NUM_SLOTS];
+
+    // Guard the invariant in the NOTIFY_DEPTH comment, because the last time it was only a comment
+    // it went stale without anything failing for two bitstreams. MIN_NOTIFY_DEPTH is the TOE's rx
+    // FIFO in whole MSS segments; raise it whenever that FIFO grows, in the same commit.
+    localparam int MIN_NOTIFY_DEPTH = 256; // 1 MiB rx_buffer_fifo / 4096 B MSS
+    initial begin
+        if (NOTIFY_DEPTH < MIN_NOTIFY_DEPTH) begin
+            $error("tcp_session_table: NOTIFY_DEPTH=%0d cannot record the %0d segments the TOE's rx fifo holds; a dropped announcement deadlocks the receive path",
+                   NOTIFY_DEPTH, MIN_NOTIFY_DEPTH);
+        end
+        if (NOTIFY_DEPTH & (NOTIFY_DEPTH - 1)) begin
+            $error("tcp_session_table: NOTIFY_DEPTH=%0d must be a power of two (the pointers wrap on it)",
+                   NOTIFY_DEPTH);
+        end
+    end
 
     // Never stall the TOE.
     assign s_axis_notifications_TREADY = 1'b1;
