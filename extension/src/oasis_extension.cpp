@@ -78,7 +78,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "valid on a pre-decoder bitstream, blocks forever on current ones",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetHttpFpgaRawBypass);
 
-	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<HTTPFileSystem>(instance));
+	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<OasisHTTPFileSystem>(instance));
 
 	// Get the OasisContext to establish the connection to the FPGA.
 	Connection conn(instance);

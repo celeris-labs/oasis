@@ -21,15 +21,20 @@ struct HttpReply {
 	bool partial = false; // 206 Partial Content rather than 200 OK
 };
 
-class HTTPFileSystem : public FileSystem {
+// NAMED WITH THE PREFIX ON PURPOSE. DuckDB's own httpfs extension declares duckdb::HTTPFileSystem
+// and duckdb::HTTPFileHandle, and scripts/tpch_demo.sh now links httpfs into the same binary to use
+// it as the CPU baseline. Sharing the unqualified names produced a wall of "multiple definition of
+// duckdb::HTTPFileSystem::Read" at link time. Anything added here that mirrors a stock httpfs type
+// needs the prefix too.
+class OasisHTTPFileSystem : public FileSystem {
 public:
-	explicit HTTPFileSystem(DatabaseInstance &db);
-	~HTTPFileSystem() override;
+	explicit OasisHTTPFileSystem(DatabaseInstance &db);
+	~OasisHTTPFileSystem() override;
 
 	static constexpr const char *URL_PREFIX = "httpfpga://";
 
 	std::string GetName() const override {
-		return "HTTPFileSystem";
+		return "OasisHTTPFileSystem";
 	}
 
 	bool CanHandleFile(const string &fpath) override;
@@ -93,9 +98,9 @@ private:
 // server_ip / server_port are snapshotted at open time rather than read from the filesystem on
 // demand: read_oasis builds its source operators on DuckDB worker threads, and the settings behind
 // those fields are only resolved under the filesystem's init lock.
-class HTTPFileHandle : public FileHandle {
+class OasisHTTPFileHandle : public FileHandle {
 public:
-	HTTPFileHandle(FileSystem &fs, string path, FileOpenFlags flags, uint64_t file_size, uint32_t server_ip,
+	OasisHTTPFileHandle(FileSystem &fs, string path, FileOpenFlags flags, uint64_t file_size, uint32_t server_ip,
 	               uint16_t server_port)
 	    : FileHandle(fs, std::move(path), flags), cursor(0), known_file_size(file_size), server_ip(server_ip),
 	      server_port(server_port) {

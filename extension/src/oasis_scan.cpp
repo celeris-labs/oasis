@@ -144,7 +144,7 @@ static std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdm
 // The FPGA fetches this column chunk itself: one ranged GET whose stripped body streams straight
 // into the decoder, no host round trip. handle.path is already the bare resource path the GET line
 // wants ("/bucket/object.parquet").
-static std::unique_ptr<oasis::SourceOperator> MakeHTTPSource(HTTPFileHandle &http,
+static std::unique_ptr<oasis::SourceOperator> MakeHTTPSource(OasisHTTPFileHandle &http,
                                                              const parcore::metadata::ColumnChunk &cc) {
 	return std::make_unique<oasis::HTTPSourceOperator>(http.path, http.server_ip, http.server_port, cc.offset,
 	                                                   cc.total_compressed_size);
@@ -190,7 +190,7 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
                        OasisScanLocalState &lstate, const OasisScanBindData &bind, size_t group) {
 	const size_t buffer_capacity = ctx.output_buffer_manager()->buffer_capacity();
 	auto *rdma = dynamic_cast<RDMAFileHandle *>(lstate.file_handle.get());
-	auto *http = dynamic_cast<HTTPFileHandle *>(lstate.file_handle.get());
+	auto *http = dynamic_cast<OasisHTTPFileHandle *>(lstate.file_handle.get());
 	// RDMA and HTTP both pull their own bytes; only the plain-file path needs the host to fetch and
 	// DMA them in.
 	const bool fetch_on_host = !rdma && !http;

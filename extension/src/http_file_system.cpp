@@ -257,12 +257,12 @@ private:
 
 } // namespace
 
-HTTPFileSystem::HTTPFileSystem(DatabaseInstance &instance) : instance(instance) {
+OasisHTTPFileSystem::OasisHTTPFileSystem(DatabaseInstance &instance) : instance(instance) {
 }
 
-HTTPFileSystem::~HTTPFileSystem() = default;
+OasisHTTPFileSystem::~OasisHTTPFileSystem() = default;
 
-void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
+void OasisHTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	std::lock_guard<std::mutex> lock(init_mtx);
 	if (initialized) {
 		return;
@@ -316,11 +316,11 @@ void HTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	initialized = true;
 }
 
-bool HTTPFileSystem::CanHandleFile(const string &fpath) {
+bool OasisHTTPFileSystem::CanHandleFile(const string &fpath) {
 	return fpath.rfind(URL_PREFIX, 0) == 0;
 }
 
-unique_ptr<FileHandle> HTTPFileSystem::OpenFile(const string &path, FileOpenFlags flags,
+unique_ptr<FileHandle> OasisHTTPFileSystem::OpenFile(const string &path, FileOpenFlags flags,
                                                 optional_ptr<FileOpener> opener) {
 	if (flags.OpenForWriting()) {
 		throw IOException("httpfpga:// filesystem is read-only");
@@ -328,10 +328,10 @@ unique_ptr<FileHandle> HTTPFileSystem::OpenFile(const string &path, FileOpenFlag
 
 	EnsureInitialized(opener);
 	auto resource_path = NormalizeHttpPath(path.substr(std::strlen(URL_PREFIX)));
-	return make_uniq<HTTPFileHandle>(*this, resource_path, flags, 0, server_ip_, server_port_);
+	return make_uniq<OasisHTTPFileHandle>(*this, resource_path, flags, 0, server_ip_, server_port_);
 }
 
-bool HTTPFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
+bool OasisHTTPFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
 	if (!CanHandleFile(filename)) {
 		return false;
 	}
@@ -343,26 +343,26 @@ bool HTTPFileSystem::FileExists(const string &filename, optional_ptr<FileOpener>
 	return true;
 }
 
-vector<OpenFileInfo> HTTPFileSystem::Glob(const string &path, FileOpener *opener) {
+vector<OpenFileInfo> OasisHTTPFileSystem::Glob(const string &path, FileOpener *opener) {
 	if (!HasGlob(path)) {
 		if (FileExists(path, opener)) {
 			return {OpenFileInfo(path)};
 		}
 		return {};
 	}
-	throw NotImplementedException("HTTPFileSystem: wildcard glob patterns are not supported");
+	throw NotImplementedException("OasisHTTPFileSystem: wildcard glob patterns are not supported");
 }
 
-void HTTPFileSystem::Seek(FileHandle &handle, idx_t location) {
-	handle.Cast<HTTPFileHandle>().cursor = location;
+void OasisHTTPFileSystem::Seek(FileHandle &handle, idx_t location) {
+	handle.Cast<OasisHTTPFileHandle>().cursor = location;
 }
 
-idx_t HTTPFileSystem::SeekPosition(FileHandle &handle) {
-	return handle.Cast<HTTPFileHandle>().cursor;
+idx_t OasisHTTPFileSystem::SeekPosition(FileHandle &handle) {
+	return handle.Cast<OasisHTTPFileHandle>().cursor;
 }
 
 // Returns the object's Content-Length, issuing at most one HEAD per path for the session.
-uint64_t HTTPFileSystem::CachedContentLength(const string &resource_path) {
+uint64_t OasisHTTPFileSystem::CachedContentLength(const string &resource_path) {
 	{
 		std::lock_guard<std::mutex> lock(size_cache_mtx_);
 		auto it = size_cache_.find(resource_path);
@@ -381,15 +381,15 @@ uint64_t HTTPFileSystem::CachedContentLength(const string &resource_path) {
 	return size;
 }
 
-int64_t HTTPFileSystem::GetFileSize(FileHandle &handle) {
-	auto &h = handle.Cast<HTTPFileHandle>();
+int64_t OasisHTTPFileSystem::GetFileSize(FileHandle &handle) {
+	auto &h = handle.Cast<OasisHTTPFileHandle>();
 	if (h.known_file_size == 0) {
 		h.known_file_size = CachedContentLength(h.path);
 	}
 	return static_cast<int64_t>(h.known_file_size);
 }
 
-bool HTTPFileSystem::HttpSocketRequest(const std::string &request, std::string &response) {
+bool OasisHTTPFileSystem::HttpSocketRequest(const std::string &request, std::string &response) {
 	addrinfo hints {};
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
@@ -438,7 +438,7 @@ bool HTTPFileSystem::HttpSocketRequest(const std::string &request, std::string &
 	return true;
 }
 
-HttpReply HTTPFileSystem::HttpExchange(const string &request, const char *what, const string &resource) {
+HttpReply OasisHTTPFileSystem::HttpExchange(const string &request, const char *what, const string &resource) {
 	string response;
 	if (!HttpSocketRequest(request, response)) {
 		throw IOException("%s for '%s': socket error to %s:%u", what, resource, server_host_, server_port_);
@@ -446,7 +446,7 @@ HttpReply HTTPFileSystem::HttpExchange(const string &request, const char *what, 
 	return ParseHttpReply(std::move(response), what, resource);
 }
 
-void HTTPFileSystem::HTTPReadRangeCpu(const string &path, uint64_t offset, size_t size, void *dst) {
+void OasisHTTPFileSystem::HTTPReadRangeCpu(const string &path, uint64_t offset, size_t size, void *dst) {
 	const uint64_t range_end = offset + size - 1;
 	const auto request = "GET " + NormalizeHttpPath(path) + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
 	                     std::to_string(server_port_) + "\r\nRange: bytes=" + std::to_string(offset) + "-" +
@@ -470,7 +470,7 @@ void HTTPFileSystem::HTTPReadRangeCpu(const string &path, uint64_t offset, size_
 	}
 }
 
-uint64_t HTTPFileSystem::ProbeContentLength(const string &resource_path) {
+uint64_t OasisHTTPFileSystem::ProbeContentLength(const string &resource_path) {
 	if (!initialized) {
 		throw IOException("httpfpga:// filesystem is not initialized");
 	}
@@ -486,13 +486,13 @@ uint64_t HTTPFileSystem::ProbeContentLength(const string &resource_path) {
 	return content_length;
 }
 
-timestamp_t HTTPFileSystem::GetLastModifiedTime(FileHandle &handle) {
+timestamp_t OasisHTTPFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	// Remote HTTP objects are treated as immutable for metadata caching.
 	return timestamp_t(0);
 }
 
-void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
-	auto &h = handle.Cast<HTTPFileHandle>();
+void OasisHTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
+	auto &h = handle.Cast<OasisHTTPFileHandle>();
 	if (nr_bytes < 0) {
 		throw IOException("Negative read size on %s", handle.path);
 	}
@@ -504,8 +504,8 @@ void HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, id
 	HTTPReadRange(h.path, location, static_cast<size_t>(nr_bytes), buffer);
 }
 
-int64_t HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
-	auto &h = handle.Cast<HTTPFileHandle>();
+int64_t OasisHTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
+	auto &h = handle.Cast<OasisHTTPFileHandle>();
 	if (nr_bytes < 0) {
 		throw IOException("Negative read size on %s", handle.path);
 	}
@@ -521,7 +521,7 @@ int64_t HTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes)
 	return static_cast<int64_t>(to_read);
 }
 
-void HTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst) {
+void OasisHTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst) {
 	if (size == 0) {
 		return;
 	}
