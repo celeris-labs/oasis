@@ -336,6 +336,24 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
     if [ "$cpu_rc" != 0 ]; then
         printf '%-5s %-8s %9s %9s %10s  %s\n' "q$n" "SKIP" "$fpga_s" "$cpu_s" "${hw_mib:--}" \
             "CPU baseline itself failed: $(tr '\n' ' ' < "$CPU_RAW" | cut -c1-60)"
+        # Keep the whole thing, and print it ONCE. The FPGA side learned this the hard way and the
+        # CPU side did not: 60 characters of "IO Error: Extension /home/.../extensions/f1b9c" names
+        # neither the extension nor why it was refused, and both are the only things worth knowing.
+        cp "$CPU_RAW" "/tmp/oasis-q$n-cpu-error.txt"
+        if [ "$SKIP" -eq 0 ]; then
+            echo "         full error kept: /tmp/oasis-q$n-cpu-error.txt"
+            sed -n '/rror\|xception\|xtension/p' "$CPU_RAW" | head -6 | sed 's/^/         | /'
+            [ "$CPU_BASELINE" = httpfs ] && cat <<'HINT'
+         The baseline needs stock httpfs. If it refuses to LOAD, this build is not on a released
+         tag (git describe says v1.5.2-1-gXXXXXXX), so DuckDB namespaces extensions by COMMIT and
+         rejects the official v1.5.2 binary. Either:
+             duckdb -c "SET allow_extensions_metadata_mismatch=true; LOAD httpfs;"   # quick
+         or build httpfs against THIS duckdb by adding to extension/extension_config.cmake:
+             duckdb_extension_load(httpfs GIT_URL https://github.com/duckdb/duckdb-httpfs
+                                          GIT_TAG main)
+         or run with --cpu-baseline fallback, whose ratio is not quotable.
+HINT
+        fi
         SKIP=$((SKIP+1)); continue
     fi
     # 130 = SIGINT, 143 = SIGTERM. You pressed Ctrl-C; the query was alive and working. Calling that
