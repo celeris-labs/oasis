@@ -140,6 +140,12 @@ class HTTPReadConfig : public libstf::Config {
         bool send_stalled    = false;
         bool read_stalled    = false;
         bool init_error      = false;
+        /// The TOE refused a send: it would not reserve room in its tx buffer for the length the
+        /// handler announced. Sticky, and NOT a lost request -- the handler skips the data beats and
+        /// re-sends, because nothing went out and there is nothing to unwind. Seeing this means the
+        /// tx buffer is being filled faster than it drains, which only happens once requests are
+        /// queued back to back; a climbing count says the request ring is deeper than the tx path
+        /// can absorb.
         bool send_error      = false;
         /// A response arrived with no Content-Length, so it could not be framed. On a persistent
         /// connection that is fatal: without the length there is no way to find where the body ends

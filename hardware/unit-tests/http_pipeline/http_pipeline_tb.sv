@@ -49,6 +49,17 @@ module http_pipeline_tb #(
     // After this request has been answered, the server drops the connection between responses.
     localparam int RECONNECT_AFTER = 2;
 
+    // The TOE REFUSES this many'th tx_meta: error != 0 on tx_status, meaning it did not reserve room
+    // for the length just announced. This is not a network fault -- it is local back-pressure from
+    // the TOE's own tx buffer, and it becomes reachable the moment requests are queued back to back
+    // instead of one at a time.
+    //
+    // What must happen: NOT ONE data beat may follow, because those beats would enter the stream
+    // with no reservation behind them and the boundary between this request and the next would be
+    // lost -- corrupting every later request on the connection, not just this one. The handler must
+    // then re-send the same request, since nothing went out and there is nothing to unwind.
+    localparam int REJECT_ON_META = 3;
+
     logic clk = 0;
     logic rst_n = 0;
     always #2 clk = ~clk;   // 250 MHz
@@ -212,6 +223,14 @@ module http_pipeline_tb #(
     int  get_q[$];               // request indices whose GET has arrived on the live connection
     int  gets_seen = 0;
     bit  keepalive_seen = 0;
+
+    // TX-rejection bookkeeping. `expect_no_data` is armed the moment a refusal is answered and
+    // cleared by the next tx_meta; any data beat seen while it is armed is the exact corruption this
+    // case exists to catch.
+    int  metas_seen   = 0;
+    int  rejects_done = 0;
+    bit  expect_no_data = 0;
+    int  beats_after_reject = 0;
     bit  close_seen_in_get = 0;
 
     // `time` is a 64-bit reg type and therefore initialises to X, not 0 -- so these MUST be zeroed
@@ -350,6 +369,24 @@ module http_pipeline_tb #(
             if (txmeta_valid && txmeta_ready) begin
                 sid = int'(txmeta_data[TCP_SESSION_BITS-1:0]);
                 len = int'(txmeta_data[31:16]);
+                metas_seen++;
+                expect_no_data = 1'b0;
+
+                if (metas_seen == REJECT_ON_META) begin
+                    repeat (3) @(posedge clk);
+                    // error != 0 and no room: the TOE rejected the reservation.
+                    txstat_data  <= {2'd1, 30'd0, 16'(len), 16'(sid)};
+                    txstat_valid <= 1'b1;
+                    @(posedge clk);
+                    while (!txstat_ready) @(posedge clk);
+                    txstat_valid <= 1'b0;
+                    rejects_done++;
+                    // Nothing may now appear on tx_data until the next tx_meta. Deliberately do not
+                    // consume data beats here: a model that drained them anyway would hide exactly
+                    // the bug this checks for.
+                    expect_no_data = 1'b1;
+                    continue;
+                end
 
                 repeat (3) @(posedge clk);
                 // {error[63:62], remaining_space[61:32], len[31:16], sid[15:0]}, error = 0.
@@ -393,6 +430,14 @@ module http_pipeline_tb #(
                 gets_seen++;
                 get_q.push_back(r);
             end
+        end
+    end
+
+    // Monitor for the refusal window. Every beat here is a byte the TOE never made room for.
+    always @(posedge clk) begin
+        if (rst_n && expect_no_data && txdata_valid && txdata_ready) begin
+            beats_after_reject++;
+            $error("tx data beat at %0t after a refused send: pushed anyway, stream boundary lost", $time);
         end
     end
 
@@ -716,6 +761,33 @@ module http_pipeline_tb #(
             end
         end
 
+        // -- TX rejection assertions --------------------------------------------------------------
+        // The refusal must have happened at all: if the bench never got to REJECT_ON_META the case
+        // silently tested nothing.
+        if (rejects_done != 1) begin
+            $error("the TOE was supposed to refuse exactly one send, it refused %0d", rejects_done);
+            errors++;
+        end
+        // The refusal must also be VISIBLE to the host, or a board quietly retrying sends forever
+        // looks identical to a healthy one from software.
+        if (!stall_word[4]) begin
+            $error("a send was refused but stallWord[4] (send_err) is clear: 0x%08x", stall_word);
+            errors++;
+        end
+        // Nothing may have been pushed into a reservation that does not exist.
+        if (beats_after_reject != 0) begin
+            $error("%0d tx data beats followed a refused send", beats_after_reject);
+            errors++;
+        end
+        // And the refused request must have been re-sent rather than dropped. One extra tx_meta over
+        // the accepted GETs is exactly the retry; without it the host would sit out its 30 s credit
+        // timeout waiting for a response to a request that never left.
+        if (metas_seen != gets_seen + 1) begin
+            $error("refused request not retried: %0d tx_meta for %0d GETs (expected one more)",
+                   metas_seen, gets_seen);
+            errors++;
+        end
+
         // The request must keep the connection open.
         if (!keepalive_seen) begin
             $error("no GET carried 'Connection: keep-alive'");
@@ -741,16 +813,23 @@ module http_pipeline_tb #(
         $display("--------------------------------------------------------------");
         // A healthy run must not trip a stage watchdog, an unframeable response, a dirty abort or a
         // bad status. Reconnects (stallWord[15:8]) are expected here and are not a failure.
-        if (stall_word[7:0] != 8'd0) begin
+        //
+        // send_err (bit 4) is also expected and MUST be set: this bench deliberately makes the TOE
+        // refuse one send, and the bit is how that is reported. It is sticky and says "a send was
+        // refused and retried", not "a request was lost" -- the retry is asserted separately above.
+        if ((stall_word[7:0] & ~8'h10) != 8'd0) begin
             $error("stage stall/error flags set on a healthy run: stallWord=0x%08x", stall_word);
             errors++;
         end
         $display("decoder streams     : %0d / %0d", streams_seen, NUM_STREAMS);
         $display("connections opened  : %0d   closed by us: %0d   server FINs: %0d",
                  opens_seen, closes_seen, fins_sent);
+        $display("tx refusals         : %0d refused, %0d beats pushed anyway (must be 0), %0d tx_meta",
+                 rejects_done, beats_after_reject, metas_seen);
         $display("GETs on the wire    : %0d (%0d requests, %0d replayed after the reconnect)",
                  gets_seen, NUM_REQS, gets_seen - NUM_REQS);
-        $display("stallWord           : 0x%08x (flags [7:0] must be 0; [15:8] = reconnects)", stall_word);
+        $display("stallWord           : 0x%08x (flags [7:0] must be 0 except bit 4 send_err, which this bench causes; [15:8] = reconnects)",
+                 stall_word);
         $display("respWord            : 0x%08x (status '%s')", resp_word, string'(resp_word[23:0]));
         $display("GET[1] first seen at %0t vs stream[0] done at %0t -> overlap %s",
                  t_get_rx[1], t_body_done[0],

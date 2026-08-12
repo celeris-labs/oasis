@@ -51,6 +51,8 @@ module tcp_send_http (
     input  logic [TCP_TX_STAT_BITS-1:0]               s_axis_tx_status_TDATA,
     output logic                                      done,
     output logic                                      error,
+    // Bytes the TOE said it still had room for, from the last tx status. Credit for a deeper ring.
+    output logic [29:0]                               tx_space,
     output logic [15:0]                               debug_http_len,
     output logic [3:0]                                state_debug,
 
@@ -78,6 +80,10 @@ module tcp_send_http (
     // 64-byte beats; this used to be a single bit because the buffer was 128 bytes.
     logic [1:0] tx_beat_q, tx_beat_d;
     logic error_q, error_d;
+    // remaining_space from the last tx status, in bytes. Not used to gate anything here -- the
+    // rejection path above is what keeps this correct -- but it is the credit signal a deeper
+    // request ring needs in order to hold off BEFORE being rejected rather than after.
+    logic [29:0] space_q, space_d;
 
     logic [2047:0] header_data_w;
     logic [15:0] header_len_w;
@@ -162,6 +168,7 @@ module tcp_send_http (
         http_data_d = http_data_q;
         tx_beat_d = tx_beat_q;
         error_d = error_q;
+        space_d = space_q;
 
         m_axis_tx_meta_TVALID = 1'b0;
         m_axis_tx_meta_TDATA = {http_len_q, session_id};
@@ -200,10 +207,20 @@ module tcp_send_http (
                 if (s_axis_tx_status_TVALID && s_axis_tx_status_TREADY) begin
                     // tcp_tx_stat_t is {error[63:62], remaining_space[61:32], len[31:16], sid[15:0]}.
                     // This used to read [1:0], which is sid[1:0] -- not the error code.
-                    // NOTE: `error` is still not acted upon; on error != 0 the TOE has rejected the
-                    // send and pushing the data beats anyway desyncs the TX path. See TODO list.
-                    error_d = (s_axis_tx_status_TDATA[TCP_TX_STAT_BITS-1 -: TCP_ERROR_BITS] != '0);
-                    state_d = ST_SEND_DATA;
+                    error_d  = (s_axis_tx_status_TDATA[TCP_TX_STAT_BITS-1 -: TCP_ERROR_BITS] != '0);
+                    space_d  = s_axis_tx_status_TDATA[TCP_TX_STAT_BITS-TCP_ERROR_BITS-1 -: 30];
+
+                    // A rejection means the TOE did NOT reserve room for the length we announced on
+                    // tx_meta. Pushing the data beats anyway is not "a failed request": the beats go
+                    // into the stream with no reservation behind them, so the byte boundary between
+                    // this request and the next is lost and EVERY later request on this connection
+                    // is garbage. Skip straight to DONE with error set and let the handler retry --
+                    // nothing was transmitted, so there is nothing to unwind.
+                    //
+                    // At depth 1 this never fired: one ~200 byte GET at a time against a TX buffer
+                    // orders of magnitude larger. It becomes reachable as soon as requests are
+                    // queued back to back, which is why it is fixed before the ring is deepened.
+                    state_d  = error_d ? ST_DONE : ST_SEND_DATA;
                 end
             end
 
@@ -240,17 +257,20 @@ module tcp_send_http (
             http_data_q <= '0;
             tx_beat_q <= 2'd0;
             error_q <= 1'b0;
+            space_q <= '0;
         end else begin
             state_q <= state_d;
             http_len_q <= http_len_d;
             http_data_q <= http_data_d;
             tx_beat_q <= tx_beat_d;
             error_q <= error_d;
+            space_q <= space_d;
         end
     end
 
     assign done = (state_q == ST_DONE);
     assign error = error_q;
+    assign tx_space = space_q;
     assign debug_http_len = http_len_q;
     assign state_debug = (state_q == ST_DONE) ? 4'd6 : state_q;
 

@@ -225,6 +225,14 @@ module handler #(
     localparam int RETRY_BITS = 16;
     logic [RETRY_BITS-1:0] retry_wait_q;
 
+    // Backoff after a send the TOE REFUSED (no room in its tx buffer). Much shorter than the connect
+    // backoff above, because this waits on a local buffer draining at line rate rather than on a
+    // remote peer: ~4 us at 250 MHz. Without it a full tx buffer becomes a rebuild-and-reject loop
+    // that occupies the header builder permanently and starves nothing but itself -- harmless, but
+    // it makes the stall counters unreadable.
+    localparam int SEND_RETRY_BITS = 10;
+    logic [SEND_RETRY_BITS-1:0] send_wait_q;
+
     // strip_http keeps its residue across responses, so it may only be cleared when the byte stream
     // it is framing goes away -- i.e. exactly while there is no connection.
     logic clear_framing;
@@ -238,6 +246,7 @@ module handler #(
     logic [3:0]  init_state_debug;
 
     logic send_done, send_error;
+    logic [29:0] send_tx_space;
     logic [3:0]  send_state_debug;
 
     logic read_done, read_error, read_error_dirty;
@@ -473,6 +482,7 @@ module handler #(
         .s_axis_tx_status_TDATA(s_axis_tx_status_TDATA),
         .done(send_done),
         .error(send_error),
+        .tx_space(send_tx_space),
         .debug_http_len(debug_http_len),
         .state_debug(send_state_debug),
         .debug_req_lo(debug_req_lo),
@@ -605,13 +615,22 @@ module handler #(
         // -- SEND -----------------------------------------------------------------------------
         case (send_state_q)
             ST_STAGE_IDLE: begin
-                if (send_has_work && (cs_q == CS_UP) && !reconn_q && !fatal_q) begin
+                if (send_has_work && (cs_q == CS_UP) && !reconn_q && !fatal_q &&
+                    (send_wait_q == '0)) begin
                     send_state_d = ST_STAGE_RUN;
                 end
             end
             ST_STAGE_RUN: begin
                 if (send_done) begin
-                    send_advance = 1'b1;
+                    // Do NOT advance on a rejected send. tcp_send_http skips the data beats when the
+                    // TOE refuses the reservation, so nothing went out and the request is still
+                    // entirely unsent -- leaving send_ptr where it is retries it, exactly the way
+                    // reconnect replay does. Advancing here would consume the slot and drop the GET
+                    // silently, and the host would then wait out its 30 s credit timeout for a
+                    // response to a request that was never asked for.
+                    //
+                    // Unlike a read error this needs no reconnect: the byte stream is untouched.
+                    send_advance = !send_error;
                     send_state_d = ST_STAGE_IDLE;
                 end
             end
@@ -653,6 +672,7 @@ module handler #(
             fatal_q      <= 1'b0;
             reconn_cnt_q <= '0;
             retry_wait_q <= '0;
+            send_wait_q  <= '0;
         end else begin
             cs_q         <= cs_d;
             send_state_q <= send_state_d;
@@ -669,6 +689,9 @@ module handler #(
 
             if (retry_wait_q != '0) retry_wait_q <= retry_wait_q - 1'b1;
             if ((cs_q == CS_OPEN) && init_done && init_error) retry_wait_q <= '1;
+
+            if (send_wait_q != '0) send_wait_q <= send_wait_q - 1'b1;
+            if ((send_state_q == ST_STAGE_RUN) && send_done && send_error) send_wait_q <= '1;
 
             if (conn_bind) begin
                 conn_sid_q   <= init_session_id;

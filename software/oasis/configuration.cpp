@@ -658,6 +658,14 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
                "this hung until the host's credit timeout and left the handler out of ST_IDLE, which "
                "only reprogramming clears. Now it aborts and the handler replays the request.";
     }
+    if (send_error) {
+        oss << "\n    send_error: the TOE refused to reserve tx buffer room for a request. Sticky, "
+               "and NOT a lost request -- the handler skips the data beats and re-sends, because "
+               "nothing went out. It means requests are being queued faster than the tx path drains "
+               "them, which only becomes possible once they are issued back to back. If this is set "
+               "and throughput is fine, ignore it; if it is set and the run is slow, the request "
+               "ring is deeper than the tx path can absorb.";
+    }
     if (rx_fifo_stall) {
         oss << "\n    rx_fifo_stall: the fifo between the TCP stack and the HTTP parser filled, so "
                "the parser back-pressured the TOE after all. Results stay correct -- the TOE's "
