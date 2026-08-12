@@ -62,6 +62,12 @@ private:
 	// Connect to the configured server, send `request`, read the full response until the peer
 	// closes. Returns false on any socket error.
 	bool HttpSocketRequest(const std::string &request, std::string &response);
+	// Same, but over a per-thread connection that is kept between requests, framing the response on
+	// Content-Length rather than on the peer closing. Used by the CPU fallback so that the baseline
+	// and the FPGA path both amortise one connection over many ranges -- otherwise the comparison
+	// measures our fallback's handshakes as if they were DuckDB's cost.
+	bool HttpSocketRequestKeepAlive(const std::string &request, std::string &response);
+	HttpReply HttpExchangeKeepAlive(const string &request, const char *what, const string &resource);
 	// HttpSocketRequest plus response parsing. Throws on a transport error, a malformed reply, or a
 	// status other than 200/206; `what` names the operation in those messages.
 	HttpReply HttpExchange(const string &request, const char *what, const string &resource);
