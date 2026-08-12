@@ -25,8 +25,6 @@
 #include <limits>
 #include <memory>
 #include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <thread>
 #include <cstdlib>
@@ -391,100 +389,6 @@ int64_t HTTPFileSystem::GetFileSize(FileHandle &handle) {
 	return static_cast<int64_t>(h.known_file_size);
 }
 
-
-// ---------------------------------------------------------------------------------------------
-// Keep-alive transport for the CPU fallback.
-//
-// The fallback was written as a scaffolding aid (see the header): Connection: close and recv until
-// FIN is the simplest HTTP client that can be obviously correct, because framing needs no parsing
-// at all. That was the right call while the hardware receive path was the thing under suspicion.
-//
-// It stopped being the right call when tpch_demo started TIMING it. The FPGA path holds one
-// persistent connection for a whole query; a baseline that pays a TCP handshake and a fresh slow
-// start on every column chunk is not the same experiment, and measured against MinIO the gap is
-// 1.33x at a 768 KiB range and 1.38x at 192 KiB. Comparing against it overstates the hardware by
-// about that much.
-//
-// So: same protocol, same server, same one-range-per-request pattern. The only difference is that
-// the socket is kept.
-// ---------------------------------------------------------------------------------------------
-
-// Content-Length ONLY. ParseContentLengthHeader also accepts Content-Range and returns the TOTAL
-// object size from it, which is exactly right for a HEAD probe and exactly wrong for framing a 206:
-// the body is the range, not the object.
-static bool ParseBodyLength(const string &headers, uint64_t &out) {
-	size_t pos = 0;
-	while (pos < headers.size()) {
-		auto line_end = headers.find("\r\n", pos);
-		if (line_end == string::npos) {
-			break;
-		}
-		auto line = headers.substr(pos, line_end - pos);
-		pos = line_end + 2;
-		if (StartsWithIgnoreCase(line, "content-length:")) {
-			auto value = line.substr(std::strlen("content-length:"));
-			value.erase(0, value.find_first_not_of(" \t"));
-			out = std::stoull(value);
-			return true;
-		}
-	}
-	return false;
-}
-
-// Reads exactly one response. False means the socket is no longer usable and the caller must not
-// try to read another response from it.
-static bool ReadFramedResponse(int fd, string &response) {
-	response.clear();
-	char buffer[65536];
-
-	size_t hdr_end = string::npos;
-	while ((hdr_end = response.find("\r\n\r\n")) == string::npos) {
-		const auto n = recv(fd, buffer, sizeof(buffer), 0);
-		if (n <= 0) {
-			return false; // peer closed or errored before the header block was complete
-		}
-		response.append(buffer, static_cast<size_t>(n));
-	}
-
-	uint64_t body_len = 0;
-	if (!ParseBodyLength(response.substr(0, hdr_end), body_len)) {
-		// Transfer-Encoding: chunked, or an error page. Neither is framed here, and guessing is how
-		// a response boundary gets misplaced and every later read on this socket is garbage.
-		return false;
-	}
-
-	const size_t want = hdr_end + 4 + static_cast<size_t>(body_len);
-	response.reserve(want);
-	while (response.size() < want) {
-		const auto n = recv(fd, buffer, std::min(sizeof(buffer), want - response.size()), 0);
-		if (n <= 0) {
-			return false;
-		}
-		response.append(buffer, static_cast<size_t>(n));
-	}
-	return true;
-}
-
-namespace {
-// One connection per THREAD, not one shared connection. DuckDB scans with as many threads as it has
-// workers, and a single mutex-guarded socket would serialise them -- swapping the handshake handicap
-// for a concurrency one and still not measuring the same thing the FPGA does.
-struct CpuKeepAliveConn {
-	int fd = -1;
-	string host;
-	uint16_t port = 0;
-	~CpuKeepAliveConn() {
-		if (fd >= 0) {
-			::close(fd);
-		}
-	}
-};
-CpuKeepAliveConn &ThreadConn() {
-	static thread_local CpuKeepAliveConn conn;
-	return conn;
-}
-} // namespace
-
 bool HTTPFileSystem::HttpSocketRequest(const std::string &request, std::string &response) {
 	addrinfo hints {};
 	hints.ai_family = AF_INET;
@@ -534,75 +438,6 @@ bool HTTPFileSystem::HttpSocketRequest(const std::string &request, std::string &
 	return true;
 }
 
-bool HTTPFileSystem::HttpSocketRequestKeepAlive(const std::string &request, std::string &response) {
-	// Two attempts. A keep-alive connection can be closed by the server between requests -- MinIO
-	// does it after ~30 s idle -- and the host cannot tell until the send lands on a dead socket.
-	// Retrying a ranged GET is safe here in a way it is NOT safe on the FPGA path: the whole body is
-	// buffered before anything is handed on, so a partial read is discarded rather than half-decoded
-	// into a column. That asymmetry is why the handler needs a peer_closed check and this does not.
-	for (int attempt = 0; attempt < 2; attempt++) {
-		auto &conn = ThreadConn();
-
-		if (conn.fd >= 0 && (conn.host != server_host_ || conn.port != server_port_)) {
-			::close(conn.fd);
-			conn.fd = -1;
-		}
-
-		if (conn.fd < 0) {
-			addrinfo hints {};
-			hints.ai_family = AF_INET;
-			hints.ai_socktype = SOCK_STREAM;
-			addrinfo *result = nullptr;
-			const auto port_str = std::to_string(server_port_);
-			if (getaddrinfo(server_host_.c_str(), port_str.c_str(), &hints, &result) != 0) {
-				return false;
-			}
-			int sock = -1;
-			for (auto *rp = result; rp != nullptr; rp = rp->ai_next) {
-				sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-				if (sock < 0) {
-					continue;
-				}
-				if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
-					break;
-				}
-				::close(sock);
-				sock = -1;
-			}
-			freeaddrinfo(result);
-			if (sock < 0) {
-				return false;
-			}
-			const int one = 1;
-			setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-			conn.fd = sock;
-			conn.host = server_host_;
-			conn.port = server_port_;
-		}
-
-		bool ok = send(conn.fd, request.data(), request.size(), MSG_NOSIGNAL) >= 0 &&
-		          ReadFramedResponse(conn.fd, response);
-		if (ok) {
-			return true;
-		}
-
-		// Unusable now, whatever the reason. Drop it; the next pass opens a fresh one.
-		::close(conn.fd);
-		conn.fd = -1;
-	}
-	return false;
-}
-
-HttpReply HTTPFileSystem::HttpExchangeKeepAlive(const string &request, const char *what,
-                                                const string &resource) {
-	string response;
-	if (!HttpSocketRequestKeepAlive(request, response)) {
-		throw IOException("%s for '%s': socket error to %s:%u", what, resource, server_host_,
-		                  server_port_);
-	}
-	return ParseHttpReply(std::move(response), what, resource);
-}
-
 HttpReply HTTPFileSystem::HttpExchange(const string &request, const char *what, const string &resource) {
 	string response;
 	if (!HttpSocketRequest(request, response)) {
@@ -615,11 +450,8 @@ void HTTPFileSystem::HTTPReadRangeCpu(const string &path, uint64_t offset, size_
 	const uint64_t range_end = offset + size - 1;
 	const auto request = "GET " + NormalizeHttpPath(path) + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
 	                     std::to_string(server_port_) + "\r\nRange: bytes=" + std::to_string(offset) + "-" +
-	                     std::to_string(range_end) + "\r\nConnection: keep-alive\r\n\r\n";
-	// Keep-alive, so the baseline pays for the bytes and not for a handshake per column chunk. The
-	// HEAD probe below stays on Connection: close: it is cached per path, so it costs one connection
-	// per file per process and is not worth the HEAD-has-no-body special case in the framer.
-	const auto reply = HttpExchangeKeepAlive(request, "CPU-fallback GET", path);
+	                     std::to_string(range_end) + "\r\nConnection: close\r\n\r\n";
+	const auto reply = HttpExchange(request, "CPU-fallback GET", path);
 
 	// 206 -> body is exactly the requested range. 200 -> the server ignored Range and sent the whole
 	// object, so index into it at `offset`.
