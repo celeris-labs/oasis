@@ -541,9 +541,16 @@ void HTTPReadConfig::issue_range(uint32_t server_ip, uint16_t server_port, const
         if (flight.legacy()) {
             std::fprintf(stderr, "[oasis-http] bitstream: pre-pipelining (no INFLIGHT register, depth 1)\n");
         } else {
-            // Print the cap and the chunk size next to the ring size: their product is the bound
-            // on how many bytes the server may have in flight, which is the number that has to stay
-            // under the TOE's ~41.5 KB drop threshold.
+            // cap is how many requests may be outstanding, occupied/slots the ring RIGHT NOW. The
+            // two answer different questions and are easy to confuse: a query touching one column
+            // chunk shows occupied=1 however deep the ring is, because there is only ever one
+            // request to make. cap is what says pipelining is enabled; occupancy is what says it is
+            // being used.
+            //
+            // The byte product printed last is no longer a limit that must be respected -- TCP flow
+            // control bounds what is actually in flight now (see HttpMaxInflight). It is printed
+            // because it is still the useful scale: how much the server has been invited to send
+            // before the window makes it wait.
             std::fprintf(stderr,
                          "[oasis-http] bitstream: %s cap=%u chunk=%llu (<=%llu B in flight)\n",
                          flight.describe().c_str(), unsigned(HttpMaxInflight(flight.slots)),
