@@ -26,6 +26,11 @@
 #   ./scripts/tpch_demo.sh --timeout 300
 #   ./scripts/tpch_demo.sh --cpu-first        # run the CPU side first, to expose the cache bias
 #   ./scripts/tpch_demo.sh --threads 1        # pin BOTH sides to one DuckDB thread
+#   ./scripts/tpch_demo.sh --phases           # all FPGA queries, THEN all CPU ones
+#
+# USE --phases AT SCALE 30. Interleaved, the FPGA's persistent connection idles through every CPU
+# baseline run, and MinIO closes it after ~30 s -- the next FPGA query then sends into a dead socket
+# and dies unrecoverably. See the PHASES comment below for the mechanism.
 #
 # The summary ends with the total for each side and the ratio between them. --threads 1 is the
 # comparison to quote: without it the CPU column is every core at once against one decoder.
@@ -55,6 +60,20 @@ ONLY=""
 # hands the CPU baseline a warm cache on every query and flatters it. Swap the order and the bias
 # reverses; if the ratio moves, the comparison was measuring caching as much as decoding.
 CPU_FIRST=0
+# Run every FPGA query first, then every CPU query, instead of alternating per query.
+#
+# This is not a style preference, it is a correctness fix for the FPGA side. The handler holds ONE
+# persistent TCP connection to the object store and it outlives the duckdb PROCESS -- connections are
+# cumulative since the bitstream was programmed. MinIO closes an idle connection after ~30 s (measured:
+# keep-alive probe at 15.3 s, FIN at 30.25 s). Interleaved, the FPGA's connection sits idle for the
+# whole of each CPU baseline run, so any query whose cpu_s approaches 30 s hands the NEXT FPGA query a
+# connection the server has already closed. The handler does not test peer_closed before transmitting,
+# so it sends into the dead socket, and because earlier body bytes had already reached the decoder the
+# abort is DIRTY -- unreplayable, fatal, reprogram to clear.
+#
+# In phases the FPGA gap between queries is one process start, about a second, and the connection never
+# goes idle long enough to be closed. The cache bias is the reverse of --cpu-first and is reported.
+PHASES=0
 # DuckDB worker threads, applied to BOTH sides. Empty means DuckDB's default (one per core).
 #
 # --threads 1 is the honest like-for-like comparison. By default DuckDB decodes Parquet across every
@@ -69,6 +88,7 @@ while [ $# -gt 0 ]; do
         --only)    ONLY="$2"; shift ;;
         --timeout) TIMEOUT="$2"; shift ;;
         --cpu-first) CPU_FIRST=1 ;;
+        --phases)  PHASES=1 ;;
         --threads) THREADS="$2"; shift ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
@@ -77,6 +97,11 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$PHASES" = 1 ] && [ "$CPU_FIRST" = 1 ]; then
+    echo "--phases already fixes the order (all FPGA, then all CPU); ignoring --cpu-first." >&2
+    CPU_FIRST=0
+fi
 
 [ -x "$DUCKDB" ] || { echo "no duckdb shell at $DUCKDB" >&2; exit 2; }
 [ -d "$ROOT/scripts/tpch" ] || { echo "missing scripts/tpch/*.sql" >&2; exit 2; }
@@ -119,7 +144,8 @@ echo " TPC-H conformance   scale=$SCALE  server=$SERVER:$PORT"
 echo " inflight=${OASIS_HTTP_MAX_INFLIGHT:-default}  chunk=${OASIS_HTTP_CHUNK_BYTES:-default}"
 echo " read_oasis() decodes fixed-width columns on the FPGA; strings are decoded on the host."
 echo "=============================================================================="
-printf '%-5s %-8s %9s %9s %10s  %s\n' "query" "result" "fpga_s" "cpu_s" "hw_MiB" "note"
+[ "$PHASES" = 1 ] || \
+    printf '%-5s %-8s %9s %9s %10s  %s\n' "query" "result" "fpga_s" "cpu_s" "hw_MiB" "note"
 
 PASS=0; FAIL=0; SKIP=0; CONSEC_TIMEOUT=0
 FAILED=()
@@ -133,55 +159,100 @@ accumulate() {
     TIMED=$((TIMED+1))
 }
 
+# --- FPGA -------------------------------------------------------------------------------
+run_fpga() {
+    fpga_file=$(mktemp)
+    { echo "$SETUP"; views read_oasis
+      echo "SELECT count(*) FROM oasis_stream_profile();"   # arm the profiler window
+      echo "SELECT '$BEGIN_MARK';"
+      echo "$sql_body"
+      echo "SELECT '$END_MARK';"
+      echo ".mode line"
+      echo "SELECT round(sum(in_handshakes_cycles) * 64 / 1048576.0, 2) AS hw_mib FROM oasis_stream_profile();"
+    } > "$fpga_file"
+    t0=$(date +%s.%N)
+    timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list < "$fpga_file" > "$FPGA_RAW" 2>&1; fpga_rc=$?
+    t1=$(date +%s.%N)
+    rm -f "$fpga_file"
+    fpga_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+    # the profiler line is the last "hw_mib = N" the shell printed
+    hw_mib=$(grep -oE 'hw_mib *= *[0-9.]+' "$FPGA_RAW" | tail -1 | grep -oE '[0-9.]+$')
+    extract_rows < "$FPGA_RAW" > "$FPGA_ROWS"
+    grep -qF "$END_MARK" "$FPGA_RAW" || fpga_rc=1
+
+}
+
+# --- CPU --------------------------------------------------------------------------------
+run_cpu() {
+    cpu_file=$(mktemp)
+    { echo "$SETUP"; echo "SET httpfpga_cpu_fallback=true;"; views read_parquet
+      echo "SELECT '$BEGIN_MARK';"
+      echo "$sql_body"
+      echo "SELECT '$END_MARK';"
+    } > "$cpu_file"
+    t0=$(date +%s.%N)
+    timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list < "$cpu_file" > "$CPU_RAW" 2>&1; cpu_rc=$?
+    t1=$(date +%s.%N)
+    rm -f "$cpu_file"
+    cpu_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+    extract_rows < "$CPU_RAW" > "$CPU_ROWS"
+    grep -qF "$END_MARK" "$CPU_RAW" || cpu_rc=1
+
+}
+
+
+# ---------------------------------------------------------------------------------------------
+# PHASE 1 (--phases only): every FPGA query, back to back, before any CPU baseline runs.
+#
+# Results are cached to files and replayed by the main loop below, so the verdict, the totals and
+# every error path stay in exactly one place. A wedge still stops the pass -- carrying on past two
+# consecutive timeouts costs (remaining queries x TIMEOUT) of nothing.
+# ---------------------------------------------------------------------------------------------
+declare -A P_S P_RC P_MIB
+PHASE_CACHE=""
+if [ "$PHASES" = 1 ]; then
+    PHASE_CACHE=$(mktemp -d)
+    trap 'rm -f "$FPGA_RAW" "$FPGA_ROWS" "$CPU_RAW" "$CPU_ROWS"; rm -rf "$PHASE_CACHE"' EXIT
+    echo "phase 1/2: FPGA, all queries back to back (keeps the connection from going idle)"
+    ct=0
+    for f in "$ROOT"/scripts/tpch/q*.sql; do
+        n=$(basename "$f" .sql); n=${n#q}; n=$((10#$n))
+        if [ -n "$ONLY" ] && ! printf ',%s,' "$ONLY" | grep -q ",$n,"; then continue; fi
+        sql_body=$(cat "$f")
+        run_fpga
+        P_S[$n]=$fpga_s; P_RC[$n]=$fpga_rc; P_MIB[$n]=$hw_mib
+        cp "$FPGA_ROWS" "$PHASE_CACHE/q$n.rows"
+        cp "$FPGA_RAW"  "$PHASE_CACHE/q$n.raw"
+        printf '  q%-3s %8ss  rc=%s\n' "$n" "$fpga_s" "$fpga_rc"
+        if [ "$fpga_rc" = 124 ]; then
+            ct=$((ct+1))
+            [ "$ct" -ge 2 ] && { echo "  two consecutive timeouts -- stopping the FPGA phase."; break; }
+        else
+            ct=0
+        fi
+    done
+    echo "phase 2/2: CPU baseline"
+    echo
+    printf '%-5s %-8s %9s %9s %10s  %s\n' "query" "result" "fpga_s" "cpu_s" "hw_MiB" "note"
+fi
+
+# Replays what phase 1 measured. Defined AFTER run_fpga so it wins the name.
+replay_fpga() {
+    fpga_s=${P_S[$n]:-0}; fpga_rc=${P_RC[$n]:-1}; hw_mib=${P_MIB[$n]:-}
+    cp "$PHASE_CACHE/q$n.rows" "$FPGA_ROWS" 2>/dev/null || : > "$FPGA_ROWS"
+    cp "$PHASE_CACHE/q$n.raw"  "$FPGA_RAW"  2>/dev/null || : > "$FPGA_RAW"
+}
+
 for f in "$ROOT"/scripts/tpch/q*.sql; do
     n=$(basename "$f" .sql); n=${n#q}; n=$((10#$n))
     if [ -n "$ONLY" ] && ! printf ',%s,' "$ONLY" | grep -q ",$n,"; then continue; fi
 
     sql_body=$(cat "$f")
 
-    # --- FPGA -------------------------------------------------------------------------------
-    run_fpga() {
-        fpga_file=$(mktemp)
-        { echo "$SETUP"; views read_oasis
-          echo "SELECT count(*) FROM oasis_stream_profile();"   # arm the profiler window
-          echo "SELECT '$BEGIN_MARK';"
-          echo "$sql_body"
-          echo "SELECT '$END_MARK';"
-          echo ".mode line"
-          echo "SELECT round(sum(in_handshakes_cycles) * 64 / 1048576.0, 2) AS hw_mib FROM oasis_stream_profile();"
-        } > "$fpga_file"
-        t0=$(date +%s.%N)
-        timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list < "$fpga_file" > "$FPGA_RAW" 2>&1; fpga_rc=$?
-        t1=$(date +%s.%N)
-        rm -f "$fpga_file"
-        fpga_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
-        # the profiler line is the last "hw_mib = N" the shell printed
-        hw_mib=$(grep -oE 'hw_mib *= *[0-9.]+' "$FPGA_RAW" | tail -1 | grep -oE '[0-9.]+$')
-        extract_rows < "$FPGA_RAW" > "$FPGA_ROWS"
-        grep -qF "$END_MARK" "$FPGA_RAW" || fpga_rc=1
-
-    }
-
-    # --- CPU --------------------------------------------------------------------------------
-    run_cpu() {
-        cpu_file=$(mktemp)
-        { echo "$SETUP"; echo "SET httpfpga_cpu_fallback=true;"; views read_parquet
-          echo "SELECT '$BEGIN_MARK';"
-          echo "$sql_body"
-          echo "SELECT '$END_MARK';"
-        } > "$cpu_file"
-        t0=$(date +%s.%N)
-        timeout "${TIMEOUT}s" "$DUCKDB" -noheader -list < "$cpu_file" > "$CPU_RAW" 2>&1; cpu_rc=$?
-        t1=$(date +%s.%N)
-        rm -f "$cpu_file"
-        cpu_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
-        extract_rows < "$CPU_RAW" > "$CPU_ROWS"
-        grep -qF "$END_MARK" "$CPU_RAW" || cpu_rc=1
-
-    }
-
     # Second reader gets MinIO's page cache warm, so the order is a measurement choice.
-    if [ "$CPU_FIRST" = 1 ]; then run_cpu; run_fpga; else run_fpga; run_cpu; fi
+    if   [ "$PHASES" = 1 ];    then replay_fpga; run_cpu
+    elif [ "$CPU_FIRST" = 1 ]; then run_cpu; run_fpga
+    else                            run_fpga; run_cpu; fi
 
     # --- verdict ----------------------------------------------------------------------------
     if [ "$fpga_rc" = 124 ]; then
@@ -283,7 +354,11 @@ if [ "$TIMED" -gt 0 ]; then
     fi
     # Whichever side ran second read the same bytes out of MinIO's page cache. Say which that was,
     # because a ratio measured in one order is not the same claim as the other.
-    if [ "$CPU_FIRST" = 1 ]; then
+    if [ "$PHASES" = 1 ]; then
+        echo "   ORDER: every FPGA query ran before any CPU query, so the CPU side read a warm"
+        echo "          server cache -- by a whole phase, not by one query. Required at scale 30:"
+        echo "          interleaved, MinIO closes the FPGA's idle connection during the CPU runs."
+    elif [ "$CPU_FIRST" = 1 ]; then
         echo "   ORDER: CPU ran first, so the FPGA read a warm server cache. Flip with the default"
         echo "          order to see how much of the ratio is caching."
     else
