@@ -128,39 +128,37 @@ constexpr const uint32_t HTTP_CONTENT_LENGTH   = 14;
 constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 
 // -------------------------------------------------------------------------------------------------
-// The two knobs that together bound how many bytes the server can have in flight to the FPGA.
+// How many requests may be outstanding, and how big each one is.
 //
-// WHY THAT BOUND MATTERS
-// The Coyote TOE is built with TCP_STACK_RX_DDR_BYPASS_EN=1
-// (parcore/libstf/coyote/hw/services/network/hls/toe/CMakeLists.txt). On that path the entire stack
-// has ONE receive buffer -- `axis_data_fifo_512_d1024 rx_buffer_fifo` in tcp_stack.sv, 1024 x 64 B
-// = 64 KB -- and `rx_sar_table.cpp:71` computes the advertised window from the application read
-// pointer alone, with no knowledge of that buffer: WINDOW_BITS is 18, so it can advertise up to
-// 256 KB. Grep rx_sar_table for `data_count` and you get nothing. Meanwhile `rx_engine.cpp` DROPS a
-// segment and answers ACK_NODELAY -- a duplicate ACK -- once free space falls below 375 beats, i.e.
-// once occupancy passes ~41.5 KB. Out-of-order buffering is disabled on this path, so one drop
-// forces go-back-N. The stack therefore invites the server to send four to six times what it can
-// hold, discards the overflow and re-requests it, and that is what the duplicate-ACK storms are.
+// WHAT BOUNDS THE BYTES IN FLIGHT: TCP DOES.
+// The stack is built with TCP_STACK_RX_DDR_BYPASS_EN=1, so the whole thing has ONE receive buffer --
+// `rx_buffer_fifo` in tcp_stack.sv -- and since coyote f248089d/b21b4ec6 that fifo is sized to
+// exactly 1 << WINDOW_BITS, today 16384 x 64 B = 1 MiB. The advertised window is computed in
+// rx_sar_table as (appd - recvd) - 1, i.e. the buffer minus what the application has been told about
+// but not yet read, and `appd` advances only when tcp_read issues a readPkg. With exactly one
+// session the logical per-session buffer IS that physical fifo, so the number on the wire is the
+// truth: if the reader falls behind, the window shrinks and the sender stops. Nothing here has to
+// arrange that.
 //
-// The proper fix is in the TOE (plumb rxbuffer_data_count into rx_sar_table and clamp the window to
-// real free space) or, cheaply, a bigger FIFO. Neither is done here. Instead the HOST refuses to
-// ask for more than the buffer can hold: a ranged GET's response is bounded by the range, so
+// IT WAS NOT ALWAYS TRUE, WHICH IS WHY THIS COMMENT IS LONG.
+// Up to build-94 the fifo was 1024 beats (64 KB) while the same arithmetic advertised up to 256 KB.
+// The stack invited four times what it could hold, rx_engine dropped the overflow once free space
+// fell below 375 beats, and with out-of-order buffering disabled every drop cost a go-back-N -- the
+// duplicate-ACK storms, seconds apart, with a query stalled behind them. The only lever the host had
+// was to refuse to ASK for more than the buffer could hold, so HTTP_DEFAULT_MAX_INFLIGHT *
+// HTTP_DEFAULT_CHUNK_BYTES was capped under ~41.5 KB. That is where the 4 x 8 KiB default came from.
 //
-//     bytes the server may have in flight  <=  HTTP_DEFAULT_MAX_INFLIGHT * HTTP_DEFAULT_CHUNK_BYTES
+// Two things then removed the need for it, in order. b238c4e put a fifo between the TOE and the HTTP
+// parser, which showed the backlog had been the parser holding TREADY low through a header walk
+// rather than the network outrunning the decoder -- the decoder drains at ~16 GB/s and was never the
+// slow party. Then the rx fifo was sized to the window, which made the advertised number honest. The
+// bytes-in-flight cap in HttpMaxInflight was removed after that; see the comment there for what
+// still needs watching (a window that reaches zero is expensive to reopen).
 //
-// and keeping that product safely under 41.5 KB means the FIFO cannot overflow no matter how fast
-// the sender is or how slowly the decoder drains. 4 x 8 KiB = 32 KiB leaves ~9 KB of headroom for
-// the response headers and in-flight ACK slack.
-//
-// SUPERSEDED ON build-94 -- read this before trusting the paragraph above. The reasoning is sound
-// but the premise is not: the FIFO backed up because the HTTP PARSER was holding TREADY low for the
-// duration of a header walk, not because the network outran the decoder. The decoder drains at
-// 16 GB/s at 0.25% duty; it was never the slow party. Once b238c4e decoupled the two, responses
-// eight times larger than the whole threshold ran with no penalty at all (the sweep table under
-// HTTP_DEFAULT_CHUNK_BYTES). The bytes-in-flight bound is therefore NOT the invariant that keeps
-// this correct, and sizing a chunk against 41.5 KB now only costs requests. What does keep it
-// correct is that the drain never stops -- which rx_fifo_stall reports on, and which is the bit to
-// read if any of this starts misbehaving.
+// So the chunk size is no longer sized against a drop threshold. It is sized against latency: a GET
+// costs the object store roughly the same time whatever its size, so bigger chunks amortise it. What
+// reports trouble if any of this regresses is rx_fifo_stall -- the drain stopping is the failure
+// mode now, not the arithmetic.
 //
 // WHY PIPELINING IS SAFE AGAIN
 // Depth > 1 used to wedge the receive path, and the reason was never the depth: it was concurrent
@@ -173,7 +171,13 @@ constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 // The handler now holds ONE persistent connection for every request (see handler.sv). With a single
 // session, arrival order and request order are the same thing, so the contract holds by
 // construction and HTTP/1.1 pipelining over that connection is both legal and safe.
-constexpr const uint8_t  HTTP_DEFAULT_MAX_INFLIGHT = 4;
+//
+// 0 MEANS "WHATEVER THE BITSTREAM ADVERTISES". It was 4 to match NUM_SLOTS in vfpga_top.svh, which
+// made the two numbers a pair that had to be kept in step by hand -- and silently capped a deeper
+// ring back to 4 if only the hardware moved. The handler reports its own ring size in the INFLIGHT
+// register; that is the authority. OASIS_HTTP_MAX_INFLIGHT still overrides, which is how to walk the
+// depth back without a rebuild if a run misbehaves.
+constexpr const uint8_t  HTTP_DEFAULT_MAX_INFLIGHT = 0;
 
 // Largest byte range asked for in one GET. 0 disables splitting entirely (one GET per column chunk).
 //
@@ -213,10 +217,9 @@ constexpr const uint8_t  HTTP_DEFAULT_MAX_INFLIGHT = 4;
 // a few percent.
 constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 196608;
 
-// Effective request-ring depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override).
-// OASIS_HTTP_MAX_INFLIGHT=0 means "whatever the bitstream advertises". Raising this without also
-// lowering OASIS_HTTP_CHUNK_BYTES raises the bytes-in-flight bound above -- read the block above
-// before doing that.
+// Effective request-ring depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override), and
+// both 0 and any value >= the ring size mean "use the whole ring". No longer clamped by a
+// bytes-in-flight product -- see HttpMaxInflight for why that cap was removed.
 // The TCP window the stack advertises: 1 << WINDOW_BITS with WINDOW_BITS = 16 + WINDOW_SCALE_BITS
 // and WINDOW_SCALE_BITS = 2 (toe_config.hpp.in). Since build-95 the receive fifo is the same size,
 // so this one number is both what the peer is invited to send and what can actually be held.
@@ -284,21 +287,32 @@ uint8_t HttpMaxInflight(uint8_t slots) {
                     ? static_cast<int>(slots)
                     : configured;
 
-    // Bound in-flight BYTES, not in-flight REQUESTS. This used to be a bare count, which was safe
-    // only because the chunk size happened to be small: at 4 x 8 KiB the product was 32 KiB. Raising
-    // the chunk to 192 KiB silently made it 768 KiB -- three times the window and three times the
-    // fifo -- and the result was real retransmissions on the wire (server resending the same segment
-    // while the FPGA dup-ACKed it, seconds apart, with the whole query stalled behind it).
+    // THE BYTES-IN-FLIGHT CAP IS GONE. It used to clamp depth to HttpRxWindowBytes()/chunk_bytes(),
+    // which at the 768 KiB chunk evaluates to 262144/786432 = 0 -> 1: the hardware's whole request
+    // ring reduced to one outstanding GET, so every request paid the server's full service latency
+    // serially.
     //
-    // A count cannot express the constraint that matters. The peer may not be invited to send more
-    // than can be held, so the product is what has to be capped, and the chunk size is the term that
-    // moves. Always at least 1: a single response larger than the window is a separate problem and
-    // is handled by keeping HTTP_DEFAULT_CHUNK_BYTES below it.
-    const uint64_t chunk = HTTPReadConfig::chunk_bytes();
-    if (chunk > 0) {
-        const int by_bytes = static_cast<int>(HttpRxWindowBytes() / chunk);
-        depth = std::max(1, std::min(depth, by_bytes));
-    }
+    // The cap was right when it was written and is wrong now, and the reason is a hardware change,
+    // not a change of mind. It existed because the TOE advertised a window FOUR TIMES larger than
+    // the fifo behind it: rx_engine accepted on pointer arithmetic, the overflow was dropped, and
+    // with out-of-order buffering disabled every drop cost a go-back-N -- the duplicate-ACK storms
+    // seconds apart that this cap was added to stop. The host capping what it ASKED for was the only
+    // lever available, because the stack's own promise could not be trusted.
+    //
+    // Since the fifo was sized to 1 << WINDOW_BITS (coyote f248089d, then b21b4ec6 at 1 MiB) the
+    // promise is honest. The advertised window is (appd - recvd) - 1, computed in rx_sar_table from
+    // how much the application has actually read -- not a constant. With exactly one session the
+    // TOE's logical buffer IS the physical fifo, and appd only advances as tcp_read issues readPkg.
+    // So if the reader falls behind, the window shrinks and the sender is throttled by TCP, which is
+    // what TCP is for. Over-committing is no longer a way to lose data; it is just flow control.
+    //
+    // What has NOT gone away: the TOE never sends an unsolicited window update -- rx_app_stream_if
+    // has no event-engine output at all -- so a window that reaches ZERO reopens only when the
+    // peer's persist timer probes, which on Linux starts near 200 ms and backs off. That is the one
+    // expensive failure here, and what keeps it away is drain margin rather than arithmetic: the
+    // decoder consumes at ~16 GB/s against ~1 GB/s arriving, so occupancy stays far from full. If a
+    // profile ever shows multi-hundred-millisecond gaps with no retransmissions on the wire, this
+    // is the mechanism to suspect, and OASIS_HTTP_MAX_INFLIGHT is the way to walk it back.
     return static_cast<uint8_t>(depth);
 }
 
