@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <libstf/configuration.hpp>
 #include <string>
+#include <vector>
 
 namespace oasis {
 
@@ -90,6 +91,33 @@ struct HTTPRequestEcho {
 class HTTPReadConfig : public libstf::Config {
   public:
     HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset, uint32_t num_regs);
+
+    /// A query's worth of requests, built as text on the host.
+    ///
+    /// The descriptor path writes ~40 CSRs per request and then waits for a slot in the hardware
+    /// ring; measured on a scale-30 lineitem scan that ring is full for 1462 of 1465 requests, so
+    /// the host is blocked for essentially the whole query. Here the FPGA stores nothing per
+    /// request -- the text IS the request -- and the queue holds one bit per expected response.
+    struct RequestBatch {
+        /// Every GET, concatenated, in the order the responses will come back.
+        std::string text;
+        /// One entry per request: does this response end a decoder stream? A column chunk split
+        /// across several ranged GETs sets it only on the last, because the DataNormalizer resets
+        /// its running byte offset on tlast.
+        std::vector<bool> body_last;
+    };
+
+    /// Append one column chunk's GETs to `batch`, splitting at chunk_bytes() exactly as read() does.
+    void read_streamed(uint32_t server_ip, uint16_t server_port, const std::string &path,
+                       uint64_t range_begin, uint64_t range_end, RequestBatch &batch);
+
+    /// Push the batch's body_last bits, then arm the transfer. The caller DMAs `batch.text` into
+    /// the request stream afterwards -- this only tells the hardware what is coming.
+    void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch);
+
+    /// The exact bytes http_req_builder used to assemble in hardware.
+    static std::string BuildGet(const std::string &host, uint16_t port, const std::string &path,
+                                uint64_t range_begin, uint64_t range_end);
 
     /// Fire one ranged GET. `stream` / `session_id` ignored (single HttpConfig; HW opens).
     void read(libstf::stream_t stream, uint32_t server_ip, uint16_t server_port, const std::string &path,

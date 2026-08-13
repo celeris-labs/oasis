@@ -78,6 +78,61 @@ void HTTPSourceOperator::print(std::ostream &os) const {
        << "])";
 }
 
+void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
+    auto config = ctx.config<HTTPReadConfig>();
+
+    // 1. Build the text for every chunk. The ranges live only here now -- there is no descriptor
+    //    for the FPGA to rebuild them from.
+    HTTPReadConfig::RequestBatch batch;
+    for (const auto &c : chunks_) {
+        // Ranges are inclusive on both ends and the chunk extent is [offset, offset + size). A
+        // zero-length chunk would underflow into a range ending at 2^64-1, i.e. a request for the
+        // rest of the object.
+        if (c.size == 0) {
+            throw std::runtime_error("HTTPBatchSourceOperator: zero-length column chunk at offset " +
+                                     std::to_string(c.offset) + " in '" + path_ + "'");
+        }
+        config->read_streamed(server_ip_, server_port_, path_, c.offset, c.offset + c.size - 1,
+                              batch);
+    }
+    if (batch.body_last.empty()) {
+        return;
+    }
+
+    // 2. Into a Coyote-visible buffer. LOCAL_READ needs a 64 B-aligned source or it emits databeats
+    //    with a broken keep signal, which the memory pool guarantees.
+    libstf::Status status;
+    text_buffer_ = libstf::make_buffer(ctx.memory_pool(), batch.text.size(), status);
+    if (!text_buffer_) {
+        throw std::runtime_error("HTTPBatchSourceOperator: could not allocate " +
+                                 std::to_string(batch.text.size()) + " bytes for request text");
+    }
+    std::memcpy(text_buffer_->ptr, batch.text.data(), batch.text.size());
+    text_buffer_->size = batch.text.size();
+    ctx.tlb_manager()->ensure_tlb_mapping(text_buffer_->ptr, text_buffer_->capacity);
+
+    // 3. Tell the hardware what is coming: one bit per expected response, then the arm. This must
+    //    precede the DMA -- the arm is what opens the connection, and the queue entries have to be
+    //    in place before any response can arrive.
+    config->submit_batch(server_ip_, server_port_, batch);
+
+    // 4. The text itself.
+    auto  *byte_ptr = static_cast<std::byte *>(text_buffer_->ptr);
+    for (size_t off = 0; off < text_buffer_->size; off += coyote::MAX_TRANSFER_SIZE) {
+        coyote::localSg sg;
+        sg.addr   = reinterpret_cast<void *>(byte_ptr + off);
+        sg.len    = std::min(text_buffer_->size - off, coyote::MAX_TRANSFER_SIZE);
+        sg.stream = coyote::STRM_HOST;
+        sg.dest   = stream;
+        const bool last = off + coyote::MAX_TRANSFER_SIZE >= text_buffer_->size;
+        ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last);
+    }
+}
+
+void HTTPBatchSourceOperator::print(std::ostream &os) const {
+    os << "HTTPBatchSource(path=" << path_ << ", chunks=" << chunks_.size() << ")";
+}
+
 void LocalSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     // LOCAL_READ into `stream`, chunked at MAX_TRANSFER_SIZE. The TLB mapping must exist first.
     const auto &buffer   = input_buffer_;

@@ -8,6 +8,7 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <vector>
 
 namespace oasis {
 
@@ -84,6 +85,45 @@ class HTTPSourceOperator final : public SourceOperator {
     uint16_t    server_port_;
     uint64_t    offset_;
     size_t      size_;
+};
+
+/**
+ * Every ranged GET of a row group, built as text on the host and handed over in one go.
+ *
+ * HTTPSourceOperator issues ONE range and blocks until the hardware ring has a free slot. Measured
+ * on a scale-30 lineitem scan that ring is full for 1462 of 1465 requests, so the query spends
+ * essentially all of its time waiting for a descriptor slot rather than for the server.
+ *
+ * This builds the text for every chunk it was given, pushes one body_last bit per expected
+ * response, arms the transfer and DMAs the text. The FPGA stores nothing per request, so there is
+ * no slot to wait for: how many requests may be outstanding becomes a question about host memory.
+ *
+ * The buffer must outlive the DMA, which is why it is a member rather than a local.
+ */
+class HTTPBatchSourceOperator final : public SourceOperator {
+  public:
+    struct Chunk {
+        uint64_t offset;
+        size_t   size;
+    };
+
+    HTTPBatchSourceOperator(std::string path, uint32_t server_ip, uint16_t server_port,
+                            std::vector<Chunk> chunks)
+        : path_(std::move(path))
+        , server_ip_(server_ip)
+        , server_port_(server_port)
+        , chunks_(std::move(chunks)) {}
+
+    void apply(libstf::stream_t stream, OasisContext &ctx) override;
+    void print(std::ostream &os) const override;
+
+  private:
+    std::string        path_;
+    uint32_t           server_ip_;
+    uint16_t           server_port_;
+    std::vector<Chunk> chunks_;
+    /// The request text, alive until the DMA that reads it has completed.
+    std::shared_ptr<libstf::Buffer> text_buffer_;
 };
 
 /**

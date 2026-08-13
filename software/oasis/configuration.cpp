@@ -72,6 +72,9 @@ constexpr const uint32_t HTTP_RANGE_BEGIN_W0  = 30; // 30..33
 constexpr const uint32_t HTTP_RANGE_END_LEN   = 34;
 constexpr const uint32_t HTTP_RANGE_END_W0    = 35; // 35..38
 constexpr const uint32_t HTTP_START           = 39;
+// 40, above START. See the map comment in http_config.sv for why it is above rather than below:
+// 0..38 was full, and moving START would shift every parameter after it.
+constexpr const uint32_t HTTP_REQ_TOTAL_BYTES = 40;
 
 // Bitstreams up to and including build-88 instantiate HttpConfig with START_ADDR=31: the override in
 // vfpga_top.svh was not moved when the GET path widened from 8 to 16 words. On those, a write to 31
@@ -362,6 +365,76 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
 // the last one is marked body_last, so the whole column chunk still arrives as ONE decoder stream
 // with exactly one tlast -- the DataNormalizer resets its running byte offset on tlast, so an extra
 // one mid-chunk would desynchronise everything after it.
+// -------------------------------------------------------------------------------------------------
+// Streamed requests: build every GET of a column chunk as TEXT and hand the lot over at once.
+//
+// The descriptor path below writes ~40 CSRs per request and then waits for a free slot in the
+// hardware ring. Measured on a scale-30 lineitem scan that ring is full for 1462 of 1465 requests,
+// so the host spends essentially the whole query blocked. Here the FPGA stores nothing per request:
+// the text is the request, and the queue holds one bit per expected response.
+//
+// The text must match what http_req_builder used to assemble byte for byte, because strip_http
+// frames responses by Content-Length and the server is the same one either way.
+// -------------------------------------------------------------------------------------------------
+std::string HTTPReadConfig::BuildGet(const std::string &host, uint16_t port, const std::string &path,
+                                     uint64_t range_begin, uint64_t range_end) {
+    std::ostringstream oss;
+    oss << "GET " << path << " HTTP/1.1\r\n"
+        << "Host: " << host << ":" << port << "\r\n"
+        << "Range: bytes=" << range_begin << "-" << range_end << "\r\n"
+        << "Connection: keep-alive\r\n\r\n";
+    return oss.str();
+}
+
+void HTTPReadConfig::read_streamed(uint32_t server_ip, uint16_t server_port,
+                                   const std::string &path, uint64_t range_begin,
+                                   uint64_t range_end, RequestBatch &batch) {
+    const auto     host  = IpToAscii(server_ip);
+    const uint64_t chunk = chunk_bytes();
+
+    // Same split as read(): only the LAST GET of the chunk ends the decoder stream, because the
+    // DataNormalizer resets its running byte offset on tlast and an extra one mid-chunk would
+    // desynchronise every column after it.
+    if (chunk == 0 || (range_end - range_begin + 1) <= chunk) {
+        batch.text += BuildGet(host, server_port, path, range_begin, range_end);
+        batch.body_last.push_back(true);
+        return;
+    }
+    for (uint64_t begin = range_begin; begin <= range_end; begin += chunk) {
+        const uint64_t end = std::min(begin + chunk - 1, range_end);
+        batch.text += BuildGet(host, server_port, path, begin, end);
+        batch.body_last.push_back(end == range_end);
+    }
+}
+
+void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
+                                  const RequestBatch &batch) {
+    if (batch.body_last.empty()) {
+        return;
+    }
+    // 1. One queue entry per expected response, carrying only its body_last bit. req_total_bytes
+    //    stays 0 on these beats, which is what tells the hardware they are entries and not an arm.
+    for (const bool last : batch.body_last) {
+        write_register(libstf::ConfigRegister(HTTP_REQ_FLAGS, last ? 1u : 0u));
+        write_register(libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, 0u));
+        (void)read_register(HTTP_CLIENT_STATE);   // ordering barrier, see issue_range
+        write_register(libstf::ConfigRegister(HTTP_START, 1));
+    }
+
+    // 2. The arm: server address plus the byte count, which is what opens the connection.
+    write_register(libstf::ConfigRegister(HTTP_SERVER_IP, server_ip));
+    write_register(libstf::ConfigRegister(HTTP_SERVER_PORT, server_port));
+    write_register(
+        libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, static_cast<uint64_t>(batch.text.size())));
+    (void)read_register(HTTP_CLIENT_STATE);
+    write_register(libstf::ConfigRegister(HTTP_START, 1));
+
+    if (http_debug_enabled()) {
+        std::fprintf(stderr, "[oasis-http] batch: %zu requests, %zu bytes of text\n",
+                     batch.body_last.size(), batch.text.size());
+    }
+}
+
 void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint16_t server_port,
                           const std::string &path, uint64_t range_begin, uint64_t range_end,
                           uint16_t /*session_id*/) {
