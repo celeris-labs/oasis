@@ -124,6 +124,9 @@ constexpr const uint32_t HTTP_STALL            = 11;
 constexpr const uint32_t HTTP_RESP             = 12;
 constexpr const uint32_t HTTP_BODY_REMAINING   = 13;
 constexpr const uint32_t HTTP_CONTENT_LENGTH   = 14;
+// The true response-queue depth. inflightWord's slot/occupancy fields are byte-wide and saturate at
+// 255; this is how a host learns it may push thousands. Reads 0 on bitstreams predating it.
+constexpr const uint32_t HTTP_QUEUE_DEPTH      = 15;
 
 // How long to wait for a request slot before giving up. Reaching this means the pipeline stopped
 // draining -- a response that never arrived, or a connection that never opened -- so it is a
@@ -379,8 +382,18 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
 // Requests one batch may carry. The queue holds one entry per expected response and the host pushes
 // every entry BEFORE arming the transfer, so a batch larger than the queue can never drain.
 size_t HTTPReadConfig::max_batch_requests() {
-    const auto slots = num_slots();
-    return (slots == 0) ? 1u : static_cast<size_t>(slots);
+    static const size_t cached = [this] {
+        // Prefer the dedicated register: inflightWord's fields saturate at 255, and splitting a row
+        // group at 255 when the hardware holds 8192 reintroduces exactly the batching this design
+        // exists to remove.
+        const auto reported = static_cast<uint32_t>(read_register(HTTP_QUEUE_DEPTH).value());
+        if (reported > 0) {
+            return static_cast<size_t>(reported);
+        }
+        const auto slots = num_slots();
+        return (slots == 0) ? size_t(1) : static_cast<size_t>(slots);
+    }();
+    return cached;
 }
 
 std::string HTTPReadConfig::BuildGet(const std::string &host, uint16_t port, const std::string &path,

@@ -83,6 +83,7 @@ import http_types::*;
 //   13 BODY_REMAINING   ([31:0]) -- bytes of the current body still to stream; a read that is stuck
 //                        with this non-zero is waiting on the network, not on the decoder
 //   14 CONTENT_LENGTH   ([31:0]) -- Content-Length the server sent for the last response, LATCHED.
+//   15 QUEUE_DEPTH      ([31:0]) -- entries the response queue holds. 0 on bitstreams predating it.
 //                        The host knows what it asked for; this is what arrived. The two differing
 //                        is the difference between a slow network and a server answering a
 //                        different question (a 200 instead of a 206, a range clamped at EOF, an
@@ -119,6 +120,7 @@ module HttpConfig #(
     input  logic [3:0]  client_state,
     input  logic [31:0] total_word,
     input  logic [31:0] inflight_word,
+    input  logic [31:0] queue_depth_word,
     input  logic [31:0] stall_word,
     input  logic [31:0] resp_word,
     input  logic [31:0] content_length_word,
@@ -310,7 +312,7 @@ assign start_raw.ready = start_cfg.ready;
 // discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
 // ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-localparam int NUM_READ_REGS = 15;
+localparam int NUM_READ_REGS = 16;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -336,6 +338,11 @@ assign read_registers[11] = {32'b0, stall_word};
 assign read_registers[12] = {32'b0, resp_word};
 assign read_registers[13] = {32'b0, body_remaining_word};
 assign read_registers[14] = {32'b0, content_length_word};
+// How many requests may be queued before the transfer is armed. inflightWord's slot/occupancy
+// fields are byte-wide and saturate at 255 -- widening them would have silently broken every host
+// reading an older bitstream -- so the true depth lives here. A host that reads 0 is on a bitstream
+// that predates this register and must fall back to the saturated byte.
+assign read_registers[15] = {32'b0, queue_depth_word};
 
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
 

@@ -39,9 +39,12 @@ import http_types::*;
 //   - the consumer applies back-pressure.
 // =================================================================================================
 module http_stream_tb #(
-    // The queue is one bit per response, so depth is not a variable worth sweeping. 8 is small
-    // enough that the pointer wrap is exercised by NUM_REQS = 6 plus the arm.
-    parameter int QUEUE_DEPTH = 8
+    // Deliberately SMALLER than NUM_REQS. The queue is one bit per response, so the shipped depth
+    // is 8192 and no realistic workload comes close -- which means a bench at the shipped depth
+    // tests nothing about wrapping. At 4 with 6 requests the write pointer wraps mid-run and the
+    // entries the reader is still consuming are being overwritten behind it if the occupancy check
+    // is wrong.
+    parameter int QUEUE_DEPTH = 4
 );
 
     localparam int NUM_REQS   = 6;   // > NUM_SLOTS so the slot ring wraps
@@ -108,7 +111,7 @@ localparam int RECONNECT_AFTER = 999;
     logic                       rqs_last  = 0;
 
     byte req_text [$];        // every GET, concatenated, exactly as the host would build it
-    int  req_text_len;
+
 
     logic             body_tvalid, body_tready;
     logic [AXI_DATA_BITS-1:0] body_tdata;
@@ -681,64 +684,76 @@ localparam int RECONNECT_AFTER = 999;
 
     // The tx model identifies a request from the third digit after "bytes=", so the range text has
     // to carry r there -- same encoding the descriptor version used, now written directly.
-    task automatic build_request_text();
-        req_text.delete();
-        for (int r = 0; r < NUM_REQS; r++) begin
-            append_str("GET /t.parquet HTTP/1.1\r\n");
-            append_str("Host: 10.253.74.74:9000\r\n");
-            append_str($sformatf("Range: bytes=00%0d-999\r\n", r));
-            append_str("Connection: keep-alive\r\n\r\n");
-        end
-        req_text_len = req_text.size();
+    // Text for ONE request, so the driver can split a batch at a queue boundary.
+    task automatic append_request(input int r);
+        append_str("GET /t.parquet HTTP/1.1\r\n");
+        append_str("Host: 10.253.74.74:9000\r\n");
+        append_str($sformatf("Range: bytes=00%0d-999\r\n", r));
+        append_str("Connection: keep-alive\r\n\r\n");
     endtask
 
-    initial begin
+    // Stream `n` bytes of req_text starting at `from`, the way Coyote LOCAL_READ delivers them.
+    task automatic dma_text(input int from, input int n);
         int off;
-        req_valid = 1'b0;
-        req_data  = '0;
-        @(posedge rst_n);
-        repeat (4) @(posedge clk);
-
-        build_request_text();
-
-        // 1. the queue entries
-        for (int r = 0; r < NUM_REQS; r++) begin
-            req_data  <= make_entry(r);
-            req_valid <= 1'b1;
-            @(posedge clk);
-            while (!req_ready) @(posedge clk);
-            req_valid <= 1'b0;
-            @(posedge clk);
-        end
-
-        // 2. arm
-        req_data  <= make_arm(req_text_len);
-        req_valid <= 1'b1;
-        @(posedge clk);
-        while (!req_ready) @(posedge clk);
-        req_valid <= 1'b0;
-        @(posedge clk);
-
-        // 3. the text, in 64-byte beats, with the DMA stalling now and then
         off = 0;
-        while (off < req_text_len) begin
-            automatic int n = (req_text_len - off >= LANES) ? LANES : (req_text_len - off);
+        while (off < n) begin
+            automatic int m = (n - off >= LANES) ? LANES : (n - off);
             rqs_data = '0; rqs_keep = '0;
-            for (int l = 0; l < n; l++) begin
-                rqs_data[l*8 +: 8] = req_text[off + l];
+            for (int l = 0; l < m; l++) begin
+                rqs_data[l*8 +: 8] = req_text[from + off + l];
                 rqs_keep[l]        = 1'b1;
             end
-            rqs_last  = (off + n >= req_text_len);
+            rqs_last  = (off + m >= n);
             rqs_valid = 1'b1;
             @(posedge clk);
             while (!rqs_ready) @(posedge clk);
-            off += n;
+            off += m;
             if ((off % 192) == 0) begin
                 rqs_valid = 1'b0;
                 repeat (5) @(posedge clk);
             end
         end
         rqs_valid = 1'b0;
+    endtask
+
+    task automatic push_cfg(input http_config_t c);
+        req_data  <= c;
+        req_valid <= 1'b1;
+        @(posedge clk);
+        while (!req_ready) @(posedge clk);
+        req_valid <= 1'b0;
+        @(posedge clk);
+    endtask
+
+    // The production sequence, including the split. A batch may not be larger than the queue: the
+    // host pushes every entry BEFORE arming, so an oversized batch does not back-pressure, it
+    // deadlocks -- the host waits on a free entry and entries are freed only by responses, which
+    // cannot arrive until the arm that comes after them. QUEUE_DEPTH here is deliberately smaller
+    // than NUM_REQS so this path is taken.
+    initial begin
+        int r, sub_lo, sub_hi, text_lo, text_hi;
+        req_valid = 1'b0;
+        req_data  = '0;
+        @(posedge rst_n);
+        repeat (4) @(posedge clk);
+
+        r = 0;
+        while (r < NUM_REQS) begin
+            sub_lo = r;
+            sub_hi = ((r + QUEUE_DEPTH) < NUM_REQS) ? (r + QUEUE_DEPTH) : NUM_REQS;
+
+            // build this sub-batch's text
+            text_lo = req_text.size();
+            for (int k = sub_lo; k < sub_hi; k++) append_request(k);
+            text_hi = req_text.size();
+
+            // entries, then the arm, then the text
+            for (int k = sub_lo; k < sub_hi; k++) push_cfg(make_entry(k));
+            push_cfg(make_arm(text_hi - text_lo));
+            dma_text(text_lo, text_hi - text_lo);
+
+            r = sub_hi;
+        end
     end
 
 `ifdef TRACE
@@ -823,12 +838,19 @@ localparam int RECONNECT_AFTER = 999;
             $error("expected exactly %0d GETs on the wire, saw %0d", NUM_REQS, gets_seen);
             errors++;
         end
-        // All of them in one reservation. If this ever needs more than one it is because the text
-        // exceeded TX_CHUNK_BYTES, not because requests went out one at a time -- but at this size
-        // more than one means something has started serialising them again.
-        if (metas_seen != 1) begin
-            $error("the %0d GETs took %0d transmissions; they should fit in one", gets_seen, metas_seen);
-            errors++;
+        // One transmission per BATCH, and a batch is as large as the queue allows. With the shipped
+        // 8192-entry queue that is one transmission for any real row group; here the queue is
+        // deliberately 4 so the split is exercised, giving ceil(6/4) = 2.
+        //
+        // What this actually guards is that requests are not going out one at a time. Anything
+        // above the batch count means something has started serialising them again.
+        begin
+            automatic int expect_metas = (NUM_REQS + QUEUE_DEPTH - 1) / QUEUE_DEPTH;
+            if (metas_seen != expect_metas) begin
+                $error("%0d GETs took %0d transmissions, expected %0d (one per full batch)",
+                       gets_seen, metas_seen, expect_metas);
+                errors++;
+            end
         end
 
         // The request must keep the connection open.
@@ -872,7 +894,8 @@ localparam int RECONNECT_AFTER = 999;
         // THE number this bench exists to produce: how many TCP transmissions carried the six
         // requests. One means every GET was handed to the stack in a single go, which is what the
         // descriptor ring could not do at any depth.
-        $display("GETs per transmission: %0d GETs in %0d tx_meta reservation(s)", gets_seen, metas_seen);
+        $display("GETs per transmission: %0d GETs in %0d tx_meta reservation(s), queue=%0d",
+                 gets_seen, metas_seen, QUEUE_DEPTH);
         $display("GETs on the wire    : %0d (%0d requests, %0d replayed after the reconnect)",
                  gets_seen, NUM_REQS, gets_seen - NUM_REQS);
         $display("stallWord           : 0x%08x (flags [7:0] must be 0 except bit 4 send_err, which this bench causes; [15:8] = reconnects)",

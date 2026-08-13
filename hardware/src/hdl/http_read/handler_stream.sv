@@ -46,10 +46,13 @@ import http_types::*;
 // entry sufficient: the k-th response belongs to the k-th entry, by construction.
 // =================================================================================================
 module handler_stream #(
-    // Entries, i.e. responses that may be outstanding. One bit each. 512 is not a considered
-    // optimum, it is "large enough that the host is never the one waiting" at a cost that does not
-    // merit thinking about.
-    parameter int QUEUE_DEPTH = 512,
+    // Entries, i.e. responses that may be outstanding. ONE BIT EACH, so this is not a resource
+    // decision -- 8192 entries cost 1 KB. It is sized so that a whole row group always fits in one
+    // batch: the host pushes every entry before arming the transfer, so a row group that does not
+    // fit has to be split into several batches that each wait on the previous to drain, which is
+    // the only place left where anything is chunked for a reason that is not TCP's own interface.
+    // A wide scale-30 row group at a 768 KiB chunk is a few thousand GETs.
+    parameter int QUEUE_DEPTH = 8192,
     // Cycles a stage may make no progress before its stall bit latches. See handler.sv.
     parameter int STALL_CYCLES = 268435456,
     // Bytes announced to the TOE per transmit reservation.
@@ -124,6 +127,9 @@ module handler_stream #(
 
     output logic [31:0]                               totalWord,
     output logic [31:0]                               inflightWord,
+    // The real queue depth. inflightWord's fields are byte-wide and saturate, which is all a
+    // build-98 host can read; this is how a host learns it may push thousands rather than 255.
+    output logic [31:0]                               queueDepthWord,
     output logic [31:0]                               stallWord,
     output logic [31:0]                               respWord,
     output logic [31:0]                               contentLengthWord,
@@ -153,8 +159,26 @@ module handler_stream #(
     logic [31:0] server_ip_q, server_port_q;
     logic        armed_q;          // a request-text transfer has been armed
 
+    logic        stream_busy, stream_refused;
+    logic [29:0] stream_space;
+    logic [3:0]  stream_state_debug;
+
     logic cfg_fire, cfg_is_arm, cfg_is_entry;
-    assign req_ready     = (occupancy < PTR_BITS'(QUEUE_DEPTH));
+
+    // The two beat kinds have different admission rules, and conflating them deadlocks.
+    //
+    // An ENTRY consumes a queue slot, so it waits for room. An ARM consumes nothing -- it carries
+    // the server address and the byte count -- but it is what STARTS the transfer that drains the
+    // queue. Gating it on queue room means a batch that exactly fills the queue can never begin:
+    // the arm waits for space, space is freed by responses, and no response can arrive because the
+    // arm has not happened. The host splits batches to the queue depth, so "exactly fills" is the
+    // normal case, not a corner.
+    //
+    // An arm instead waits for the PREVIOUS transfer's text to have gone out, so successive batches
+    // self-pace without overwriting a transfer in progress.
+    assign req_ready     = (req_data.req_total_bytes != 32'd0)
+                             ? !stream_busy
+                             : (occupancy < PTR_BITS'(QUEUE_DEPTH));
     assign cfg_fire      = req_valid && req_ready;
     assign cfg_is_arm    = cfg_fire && (req_data.req_total_bytes != 32'd0);
     assign cfg_is_entry  = cfg_fire && (req_data.req_total_bytes == 32'd0);
@@ -193,9 +217,6 @@ module handler_stream #(
     logic [31:0] read_body_remaining;
     logic        read_timeout_w, rx_fifo_stall_w;
 
-    logic        stream_busy, stream_refused;
-    logic [29:0] stream_space;
-    logic [3:0]  stream_state_debug;
 
     localparam logic ST_STAGE_IDLE = 1'b0;
     localparam logic ST_STAGE_RUN  = 1'b1;
@@ -480,6 +501,8 @@ module handler_stream #(
                         8'd0, reconn_cnt_q,
                         status_bad_q, fatal_q, resp_err_q, stream_err_q, init_err_q,
                         read_stall_q, 1'b0, conn_stall_q};
+
+    assign queueDepthWord     = 32'(QUEUE_DEPTH);
 
     assign respWord           = {5'd0, read_error_dirty, read_resp_error, read_status_ok,
                                  read_status_ascii};

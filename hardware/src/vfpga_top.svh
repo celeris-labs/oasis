@@ -133,7 +133,7 @@ ColumnChunkDecoderConfig #(
 // INFLIGHT register, and software/oasis mirrors this number.
 // Responses that may be outstanding. One BIT each in handler_stream (body_last), not a 1160-bit
 // descriptor, so this is no longer a resource decision -- 512 entries cost 512 bits.
-localparam int HTTP_QUEUE_DEPTH = 512;
+localparam int HTTP_QUEUE_DEPTH = 8192;
 
 // HttpConfig latches params; a START write emits one http_config_t beat, which the handler accepts
 // straight into a free slot. The slot ring IS the request queue, so there is no separate FIFO and
@@ -144,6 +144,7 @@ ready_valid_i #(http_config_t) http_start();
 logic [3:0]                    http_client_state;
 logic [31:0]                   http_total_word;
 logic [31:0]                   http_inflight_word;
+logic [31:0]                   http_queue_depth_word;
 logic [31:0]                   http_stall_word;
 logic [31:0]                   http_resp_word;
 logic [31:0]                   http_content_length_word;
@@ -166,6 +167,7 @@ HttpConfig #(
     .client_state (http_client_state),
     .total_word   (http_total_word),
     .inflight_word(http_inflight_word),
+    .queue_depth_word(http_queue_depth_word),
     .stall_word   (http_stall_word),
     .resp_word           (http_resp_word),
     .content_length_word (http_content_length_word),
@@ -376,6 +378,7 @@ handler_stream #(
 
     .totalWord                     (http_total_word),
     .inflightWord                  (http_inflight_word),
+    .queueDepthWord                (http_queue_depth_word),
     .stallWord                     (http_stall_word),
     .respWord                      (http_resp_word),
     .contentLengthWord             (http_content_length_word),
