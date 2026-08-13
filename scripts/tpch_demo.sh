@@ -343,7 +343,10 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
         if [ "$SKIP" -eq 0 ]; then
             echo "         full error kept: /tmp/oasis-q$n-cpu-error.txt"
             sed -n '/rror\|xception\|xtension/p' "$CPU_RAW" | head -6 | sed 's/^/         | /'
-            [ "$CPU_BASELINE" = httpfs ] && cat <<'HINT'
+            # Only when the failure IS about the extension. This hint once fired on "Couldn't
+            # connect to server" -- MinIO being down -- and sent the reader off to rebuild an
+            # extension that was working perfectly.
+            if [ "$CPU_BASELINE" = httpfs ] && grep -qi 'extension' "$CPU_RAW"; then cat <<'HINT'
          The baseline needs stock httpfs, and INSTALL httpfs CANNOT provide it here. This duckdb
          is one commit past v1.5.2, so it looks for .duckdb/extensions/<commit>/... and the
          repository has no build for that commit. Do NOT substitute the v1.5.2 binary: the extra
@@ -351,6 +354,7 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
          fails. httpfs is declared in extension/extension_config.cmake -- rebuild the extension.
          Until then, --cpu-baseline fallback runs, but its ratio is not quotable.
 HINT
+            fi
         fi
         SKIP=$((SKIP+1)); continue
     fi
