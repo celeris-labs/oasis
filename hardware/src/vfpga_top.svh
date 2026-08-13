@@ -11,9 +11,13 @@ import libstf::*;
 always_comb sq_rd.tie_off_m();
 always_comb cq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
-// handler.sv opens/closes TCP itself (legacy Coyote-http style).
-// The ColumnChunkDecoder is now fed by the HTTP stack (not host DMA), so the host-recv streams are unused.
-for (genvar I = 0; I < N_STRM_AXI; I++) begin
+// handler_stream.sv opens/closes TCP itself (legacy Coyote-http style).
+//
+// The ColumnChunkDecoder is fed by the HTTP stack rather than by host DMA, so the host-recv streams
+// used to be unused. Stream 0 now carries the REQUEST TEXT: the host builds every GET of a query
+// itself and DMAs the lot in, instead of writing a descriptor per request for the FPGA to rebuild
+// the text from. That is what removes the queue-depth limit -- see handler_stream.sv.
+for (genvar I = 1; I < N_STRM_AXI; I++) begin
     always_comb axis_host_recv[I].tie_off_s();
 end
 `elsif EN_RDMA
@@ -127,7 +131,9 @@ ColumnChunkDecoderConfig #(
 // TOE whose receive path does not demultiplex sessions (see handler.sv). The host must not enqueue
 // more than this many outstanding requests; it reads the ring occupancy back through HttpConfig's
 // INFLIGHT register, and software/oasis mirrors this number.
-localparam int HTTP_NUM_SLOTS = 4;
+// Responses that may be outstanding. One BIT each in handler_stream (body_last), not a 1160-bit
+// descriptor, so this is no longer a resource decision -- 512 entries cost 512 bits.
+localparam int HTTP_QUEUE_DEPTH = 512;
 
 // HttpConfig latches params; a START write emits one http_config_t beat, which the handler accepts
 // straight into a free slot. The slot ring IS the request queue, so there is no separate FIFO and
@@ -289,14 +295,31 @@ logic [3:0]   dbg_builder_state;
 logic [AXI_DATA_BITS-1:0] dbg_req_lo, dbg_req_hi;
 logic [7:0]   dbg_req_cnt;
 
+// The streamed handler has no request BUILDER, so the probes that watched it building a GET have
+// nothing to watch. Tied off rather than deleted: they are ILA probe indices, and renumbering an
+// ILA invalidates every saved waveform layout and every note that refers to a probe by number.
+always_comb begin
+    dbg_rx_ptr        = '0;
+    dbg_rx_buf_0      = '0;
+    dbg_rx_buf_1      = '0;
+    dbg_tx_acc        = '0;
+    dbg_tx_acc_cnt    = '0;
+    dbg_tx_acc_last   = 1'b0;
+    dbg_http_len      = '0;
+    dbg_builder_state = '0;
+    dbg_req_lo        = '0;
+    dbg_req_hi        = '0;
+    dbg_req_cnt       = '0;
+end
+
 // Stripped HTTP body (unaligned keep) → DataNormalizer → OutputWriter bypass.
 // ENABLE_COMPACTOR(0): barrel-shift + beat merge only (lighter than COMPACTOR=1).
 AXI4S axi_http_body (.aclk(clk), .aresetn(rst_n));
 ndata_i #(data8_t, DATABEAT_SIZE) http_body_ndata();
 ndata_i #(data8_t, DATABEAT_SIZE) http_body_norm();
 
-handler #(
-    .NUM_SLOTS(HTTP_NUM_SLOTS)
+handler_stream #(
+    .QUEUE_DEPTH(HTTP_QUEUE_DEPTH)
 ) inst_handler (
     .ap_clk  (clk),
     .ap_rst_n(rst_n),
@@ -340,6 +363,13 @@ handler #(
     .s_axis_tx_status_TDATA        (tcp_tx_stat.data),
 
     // One beat per ranged GET, straight from the START write into a free slot.
+    // Pre-built request text from the host. Every GET of the query, concatenated.
+    .s_axis_req_TVALID             (axis_host_recv[0].tvalid),
+    .s_axis_req_TREADY             (axis_host_recv[0].tready),
+    .s_axis_req_TDATA              (axis_host_recv[0].tdata),
+    .s_axis_req_TKEEP              (axis_host_recv[0].tkeep),
+    .s_axis_req_TLAST              (axis_host_recv[0].tlast),
+
     .req_valid                     (http_start.valid),
     .req_ready                     (http_start.ready),
     .req_data                      (http_start.data),
@@ -356,19 +386,7 @@ handler #(
     .m_axis_body_tready  (axi_http_body.tready),
     .m_axis_body_tdata   (axi_http_body.tdata),
     .m_axis_body_tkeep   (axi_http_body.tkeep),
-    .m_axis_body_tlast   (axi_http_body.tlast),
-
-    .debug_rx_write_ptr  (dbg_rx_ptr),
-    .debug_rx_buffer_w0  (dbg_rx_buf_0),
-    .debug_rx_buffer_w1  (dbg_rx_buf_1),
-    .debug_tx_acc        (dbg_tx_acc),
-    .debug_tx_acc_cnt    (dbg_tx_acc_cnt),
-    .debug_tx_acc_last   (dbg_tx_acc_last),
-    .debug_http_len      (dbg_http_len),
-    .debug_builder_state (dbg_builder_state),
-    .debug_req_lo        (dbg_req_lo),
-    .debug_req_hi        (dbg_req_hi),
-    .debug_req_cnt       (dbg_req_cnt)
+    .m_axis_body_tlast   (axi_http_body.tlast)
 );
 
 AXIToNData #(data8_t, DATABEAT_SIZE) inst_http_axi_to_ndata (
