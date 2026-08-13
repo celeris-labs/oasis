@@ -48,6 +48,12 @@ import http_types::*;
 //   37 RANGE_END_W2     ([31:0])
 //   38 RANGE_END_W3     ([31:0])
 //   39 START            (ConfigWriteReadyRegister)  -- value ignored, write triggers
+//   40 REQ_TOTAL_BYTES  ([31:0])     -- bytes of pre-built request text about to be streamed in
+//                                       over axis_host_recv. NON-ZERO selects the streamed request
+//                                       path and every per-request field above is ignored. Sits
+//                                       ABOVE START because 0..38 was full and moving START would
+//                                       shift the whole map; write it BEFORE START, which snapshots
+//                                       the live cfg.
 //
 // The 16 FILE_W words carry a 64-character GET path. Widening from 8 words pushed the map past
 // 32 registers, so HTTP_CONFIG_ADDR_SPACE in vfpga_top.svh is 64 and every address after FILE_W7
@@ -90,7 +96,7 @@ import http_types::*;
 // this register and treats (NUM_SLOTS - occupied) as its credit.
 // =================================================================================================
 module HttpConfig #(
-    parameter integer NUM_PARAM_REGS = 39,
+    parameter integer NUM_PARAM_REGS = 41,
     parameter integer START_ADDR     = 39
 ) (
     input  logic clk,
@@ -130,9 +136,15 @@ localparam logic [AXIL_DATA_BITS - 1:0] HTTP_CONFIG_ID = 64'h0000_0000_0048_5454
 // echo, which reads the LIVE cfg rather than the snapshot the handler took, still shows the correct
 // values. build-88 shipped exactly that (START_ADDR=31, i.e. RANGE_BEGIN_W1). Catch it at elaboration
 // rather than on the wire.
-localparam int LAST_PARAM_ADDR = 38;
+// Parameters occupy 0..38 and 40. START sits at 39, in the gap between them, because 0..38 was
+// already full and moving START would shift every address after it -- exactly the failure described
+// above. The guard therefore can no longer be "START is above every parameter"; what actually has to
+// hold is that START ALIASES no parameter, and that the address space covers the highest one.
+localparam int LAST_PARAM_ADDR   = 38;   // highest contiguous parameter, below START
+localparam int STREAM_PARAM_ADDR = 40;   // req_total_bytes, above START
 `ASSERT_ELAB(START_ADDR > LAST_PARAM_ADDR)
-`ASSERT_ELAB(NUM_PARAM_REGS > LAST_PARAM_ADDR)
+`ASSERT_ELAB(START_ADDR < STREAM_PARAM_ADDR)
+`ASSERT_ELAB(NUM_PARAM_REGS > STREAM_PARAM_ADDR)
 
 // -------------------------------------------------------------------------------------------------
 // Per-field write registers. Each ConfigWriteRegister latches the AXI-Lite
@@ -173,6 +185,7 @@ data64_t reg_range_begin_w1;
 data64_t reg_range_begin_w2;
 data64_t reg_range_begin_w3;
 data64_t reg_range_end_len;
+data64_t reg_req_total_bytes;
 data64_t reg_range_end_w0;
 data64_t reg_range_end_w1;
 data64_t reg_range_end_w2;
@@ -207,6 +220,11 @@ ConfigWriteRegister #(25, data64_t) inst_reg_req_flags        (clk, write_config
 ConfigWriteRegister #(26, data64_t) inst_reg_pkg_word_count   (clk, write_config, reg_pkg_word_count);
 ConfigWriteRegister #(27, data64_t) inst_reg_user_frequency   (clk, write_config, reg_user_frequency);
 ConfigWriteRegister #(28, data64_t) inst_reg_time_in_seconds  (clk, write_config, reg_time_in_seconds);
+// 40, ABOVE the START trigger at 39. Everything below 39 was taken, and moving START would shift
+// the whole map -- the one change this file exists to warn against. Writing a parameter above the
+// trigger is safe here only because the trigger reads the LIVE cfg: the host writes 40, then 39,
+// and the snapshot includes it.
+ConfigWriteRegister #(40, data64_t) inst_reg_req_total_bytes (clk, write_config, reg_req_total_bytes);
 ConfigWriteRegister #(29, data64_t) inst_reg_range_begin_len    (clk, write_config, reg_range_begin_len);
 ConfigWriteRegister #(30, data64_t) inst_reg_range_begin_w0     (clk, write_config, reg_range_begin_w0);
 ConfigWriteRegister #(31, data64_t) inst_reg_range_begin_w1     (clk, write_config, reg_range_begin_w1);
@@ -251,6 +269,7 @@ always_comb begin
     cfg.pkg_word_count  = reg_pkg_word_count [31:0];
     cfg.user_frequency  = reg_user_frequency [31:0];
     cfg.time_in_seconds = reg_time_in_seconds[31:0];
+    cfg.req_total_bytes = reg_req_total_bytes[31:0];
     cfg.range_begin_len = reg_range_begin_len[7:0];
     cfg.range_begin_w0  = reg_range_begin_w0 [31:0];
     cfg.range_begin_w1  = reg_range_begin_w1 [31:0];

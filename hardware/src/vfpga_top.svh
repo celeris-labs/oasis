@@ -148,7 +148,7 @@ logic [31:0]                   http_body_remaining_word;
 // mid-configuration, so registers 32..38 -- the rest of the Range begin and all of the Range end --
 // never reached the snapshot and the FPGA sent "Range: bytes=<truncated>-" with no end at all.
 HttpConfig #(
-    .NUM_PARAM_REGS(39),
+    .NUM_PARAM_REGS(41),
     .START_ADDR    (39)
 ) inst_http_config (
     .clk         (clk),

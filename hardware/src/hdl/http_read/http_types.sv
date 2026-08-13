@@ -59,6 +59,20 @@ typedef struct packed {
     logic [31:0] pkg_word_count;
     logic [31:0] user_frequency;
     logic [31:0] time_in_seconds;
+    // Total bytes of pre-built request text the host is about to stream in over axis_host_recv.
+    //
+    // NON-ZERO SELECTS THE STREAMED REQUEST PATH. The fields above describe ONE request and are
+    // rebuilt into GET text on the FPGA by http_req_builder, which is what caps the queue at the
+    // number of descriptors the ring can hold. When this is non-zero the host has already built the
+    // text for EVERY request of the query and is handing it over as one byte stream instead, so no
+    // per-request field above is read at all -- only server_ip and server_port, to open the
+    // connection.
+    //
+    // Zero on every write that does not set it, so a host that predates this field gets exactly the
+    // old behaviour. That is deliberate: the CSR map is the one place where being clever costs a
+    // silent corruption rather than an error, so the new path is opt-in by a value rather than by a
+    // shifted address.
+    logic [31:0] req_total_bytes;
 } http_config_t;
 
 endpackage
