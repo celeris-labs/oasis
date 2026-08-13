@@ -462,10 +462,19 @@ module handler_stream #(
                         1'b0, (read_state_q == ST_STAGE_RUN) || stream_busy, 6'd0,
                         req_ready, 3'd0, read_state_debug, init_state_debug};
 
-    // occupied/slots are 16 bits each here, not 8: the queue is 512 deep and the old byte-wide
-    // fields were the actual reason handler.sv could not go past 8 slots.
-    assign inflightWord = {conn_valid_q, tbl_dbg_closed, tbl_dbg_has_pending, 13'(QUEUE_DEPTH),
-                           16'(occupancy)};
+    // SAME LAYOUT AS handler.sv, deliberately, including the byte-wide fields that used to cap the
+    // ring at 8. Widening them here would have been tidier and would have silently broken every
+    // host reading a build-98 board: the software cannot tell which bitstream it is talking to, and
+    // num_slots() -- which max_inflight() is derived from -- comes straight out of these bits.
+    //
+    // So both fields SATURATE instead. 255 means "at least 255", which is all the host needs: it
+    // sizes its batches from this, and 255 is safely below the real 512.
+    logic [7:0] occ_sat, depth_sat;
+    assign occ_sat   = (occupancy > PTR_BITS'(255)) ? 8'd255 : 8'(occupancy);
+    assign depth_sat = (QUEUE_DEPTH > 255) ? 8'd255 : 8'(QUEUE_DEPTH);
+
+    assign inflightWord = {13'd0, conn_valid_q, tbl_dbg_closed, tbl_dbg_has_pending,
+                           depth_sat, occ_sat};
 
     assign stallWord = {5'd0, read_timeout_w, rx_fifo_stall_w, tbl_dbg_overflow,
                         8'd0, reconn_cnt_q,

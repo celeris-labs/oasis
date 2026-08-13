@@ -81,50 +81,95 @@ void HTTPSourceOperator::print(std::ostream &os) const {
 void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     auto config = ctx.config<HTTPReadConfig>();
 
-    // 1. Build the text for every chunk. The ranges live only here now -- there is no descriptor
-    //    for the FPGA to rebuild them from.
-    HTTPReadConfig::RequestBatch batch;
-    for (const auto &c : chunks_) {
-        // Ranges are inclusive on both ends and the chunk extent is [offset, offset + size). A
-        // zero-length chunk would underflow into a range ending at 2^64-1, i.e. a request for the
-        // rest of the object.
-        if (c.size == 0) {
-            throw std::runtime_error("HTTPBatchSourceOperator: zero-length column chunk at offset " +
-                                     std::to_string(c.offset) + " in '" + path_ + "'");
+    // Split so no batch is larger than the hardware queue. The queue holds one entry per expected
+    // response and every entry is pushed BEFORE the transfer is armed, so an oversized batch does
+    // not back-pressure, it deadlocks: the host waits on a free entry, and entries are only freed
+    // by responses, which cannot arrive until the arm that comes after them.
+    //
+    // A wide scale-30 row group at a 768 KiB chunk is thousands of GETs, so this is the normal path
+    // rather than a guard against an exotic case. Successive sub-batches self-pace: the next one
+    // blocks on entries the previous one is already draining.
+    const size_t max_per_batch = config->max_batch_requests();
+    size_t       chunk_lo      = 0;
+    while (chunk_lo < chunks_.size()) {
+        HTTPReadConfig::RequestBatch batch;
+        size_t                       chunk_hi = chunk_lo;
+        while (chunk_hi < chunks_.size()) {
+            HTTPReadConfig::RequestBatch probe;
+            build_chunk(*config, chunks_[chunk_hi], probe);
+            if (!batch.body_last.empty() &&
+                batch.body_last.size() + probe.body_last.size() > max_per_batch) {
+                break;
+            }
+            batch.text += probe.text;
+            batch.body_last.insert(batch.body_last.end(), probe.body_last.begin(),
+                                   probe.body_last.end());
+            chunk_hi++;
         }
-        config->read_streamed(server_ip_, server_port_, path_, c.offset, c.offset + c.size - 1,
-                              batch);
+        // A single column chunk that alone exceeds the queue would loop forever otherwise.
+        if (batch.body_last.size() > max_per_batch) {
+            throw std::runtime_error(
+                "HTTPBatchSourceOperator: column chunk at offset " +
+                std::to_string(chunks_[chunk_lo].offset) + " needs " +
+                std::to_string(batch.body_last.size()) +
+                " GETs, more than the hardware queue holds (" + std::to_string(max_per_batch) +
+                "). Raise OASIS_HTTP_CHUNK_BYTES or the queue depth.");
+        }
+        emit_batch(stream, ctx, batch);
+        chunk_lo = chunk_hi;
     }
+}
+
+void HTTPBatchSourceOperator::build_chunk(HTTPReadConfig &config, const Chunk &c,
+                                          HTTPReadConfig::RequestBatch &batch) {
+    // Ranges are inclusive on both ends and the chunk extent is [offset, offset + size). A
+    // zero-length chunk would underflow into a range ending at 2^64-1, i.e. a request for the
+    // rest of the object.
+    if (c.size == 0) {
+        throw std::runtime_error("HTTPBatchSourceOperator: zero-length column chunk at offset " +
+                                 std::to_string(c.offset) + " in '" + path_ + "'");
+    }
+    config.read_streamed(server_ip_, server_port_, path_, c.offset, c.offset + c.size - 1, batch);
+}
+
+void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &ctx,
+                                         const HTTPReadConfig::RequestBatch &batch) {
     if (batch.body_last.empty()) {
         return;
     }
+    auto config = ctx.config<HTTPReadConfig>();
 
-    // 2. Into a Coyote-visible buffer. LOCAL_READ needs a 64 B-aligned source or it emits databeats
-    //    with a broken keep signal, which the memory pool guarantees.
+    // Into a Coyote-visible buffer. LOCAL_READ needs a 64 B-aligned source or it emits databeats
+    // with a broken keep signal, which the memory pool guarantees.
+    //
+    // Kept in a vector, not a single member: the DMA is asynchronous, so a sub-batch's buffer must
+    // stay alive until its transfer completes. Overwriting one member per sub-batch would free the
+    // bytes the hardware is still reading.
     libstf::Status status;
-    text_buffer_ = libstf::make_buffer(ctx.memory_pool(), batch.text.size(), status);
-    if (!text_buffer_) {
+    auto           buf = libstf::make_buffer(ctx.memory_pool(), batch.text.size(), status);
+    if (!buf) {
         throw std::runtime_error("HTTPBatchSourceOperator: could not allocate " +
                                  std::to_string(batch.text.size()) + " bytes for request text");
     }
-    std::memcpy(text_buffer_->ptr, batch.text.data(), batch.text.size());
-    text_buffer_->size = batch.text.size();
-    ctx.tlb_manager()->ensure_tlb_mapping(text_buffer_->ptr, text_buffer_->capacity);
+    std::memcpy(buf->ptr, batch.text.data(), batch.text.size());
+    buf->size = batch.text.size();
+    ctx.tlb_manager()->ensure_tlb_mapping(buf->ptr, buf->capacity);
+    text_buffers_.push_back(buf);
 
-    // 3. Tell the hardware what is coming: one bit per expected response, then the arm. This must
-    //    precede the DMA -- the arm is what opens the connection, and the queue entries have to be
-    //    in place before any response can arrive.
+    // Tell the hardware what is coming: one bit per expected response, then the arm. This must
+    // precede the DMA -- the arm is what opens the connection, and the queue entries have to be in
+    // place before any response can arrive.
     config->submit_batch(server_ip_, server_port_, batch);
 
-    // 4. The text itself.
-    auto  *byte_ptr = static_cast<std::byte *>(text_buffer_->ptr);
-    for (size_t off = 0; off < text_buffer_->size; off += coyote::MAX_TRANSFER_SIZE) {
+    // Then the text itself.
+    auto *byte_ptr = static_cast<std::byte *>(buf->ptr);
+    for (size_t off = 0; off < buf->size; off += coyote::MAX_TRANSFER_SIZE) {
         coyote::localSg sg;
         sg.addr   = reinterpret_cast<void *>(byte_ptr + off);
-        sg.len    = std::min(text_buffer_->size - off, coyote::MAX_TRANSFER_SIZE);
+        sg.len    = std::min(buf->size - off, coyote::MAX_TRANSFER_SIZE);
         sg.stream = coyote::STRM_HOST;
         sg.dest   = stream;
-        const bool last = off + coyote::MAX_TRANSFER_SIZE >= text_buffer_->size;
+        const bool last = off + coyote::MAX_TRANSFER_SIZE >= buf->size;
         ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last);
     }
 }

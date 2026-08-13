@@ -376,6 +376,13 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
 // The text must match what http_req_builder used to assemble byte for byte, because strip_http
 // frames responses by Content-Length and the server is the same one either way.
 // -------------------------------------------------------------------------------------------------
+// Requests one batch may carry. The queue holds one entry per expected response and the host pushes
+// every entry BEFORE arming the transfer, so a batch larger than the queue can never drain.
+size_t HTTPReadConfig::max_batch_requests() {
+    const auto slots = num_slots();
+    return (slots == 0) ? 1u : static_cast<size_t>(slots);
+}
+
 std::string HTTPReadConfig::BuildGet(const std::string &host, uint16_t port, const std::string &path,
                                      uint64_t range_begin, uint64_t range_end) {
     std::ostringstream oss;
@@ -411,6 +418,16 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
                                   const RequestBatch &batch) {
     if (batch.body_last.empty()) {
         return;
+    }
+    // The caller must have split to the queue depth already -- see max_batch_requests(). Pushing
+    // more entries than the queue holds deadlocks rather than back-pressuring: the host blocks on
+    // req_ready waiting for the queue to drain, and it cannot drain because the arm that starts the
+    // transfer comes AFTER the entries.
+    if (batch.body_last.size() > max_batch_requests()) {
+        std::ostringstream msg;
+        msg << "HTTP batch of " << batch.body_last.size() << " requests exceeds the hardware queue ("
+            << max_batch_requests() << "); it must be split, or the entries deadlock against the arm";
+        throw std::runtime_error(msg.str());
     }
     // 1. One queue entry per expected response, carrying only its body_last bit. req_total_bytes
     //    stays 0 on these beats, which is what tells the hardware they are entries and not an arm.

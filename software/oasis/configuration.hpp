@@ -111,6 +111,10 @@ class HTTPReadConfig : public libstf::Config {
     void read_streamed(uint32_t server_ip, uint16_t server_port, const std::string &path,
                        uint64_t range_begin, uint64_t range_end, RequestBatch &batch);
 
+    /// Requests a single batch may carry, from the hardware queue depth. Larger batches must be
+    /// split: the host pushes every entry before arming, so one that does not fit cannot drain.
+    size_t max_batch_requests();
+
     /// Push the batch's body_last bits, then arm the transfer. The caller DMAs `batch.text` into
     /// the request stream afterwards -- this only tells the hardware what is coming.
     void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch);

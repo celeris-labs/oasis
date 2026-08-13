@@ -3,6 +3,7 @@
 #include <libstf/buffer.hpp>
 #include <libstf/common.hpp>
 #include <libstf/output_handle.hpp>
+#include <oasis/configuration.hpp>
 #include <parcore/metadata/metadata.hpp>
 
 #include <memory>
@@ -122,8 +123,14 @@ class HTTPBatchSourceOperator final : public SourceOperator {
     uint32_t           server_ip_;
     uint16_t           server_port_;
     std::vector<Chunk> chunks_;
-    /// The request text, alive until the DMA that reads it has completed.
-    std::shared_ptr<libstf::Buffer> text_buffer_;
+    /// One per sub-batch. The DMA is asynchronous, so each must outlive its own transfer -- a
+    /// single member would free the bytes the hardware is still reading when the next batch
+    /// overwrote it.
+    std::vector<std::shared_ptr<libstf::Buffer>> text_buffers_;
+
+    void build_chunk(HTTPReadConfig &config, const Chunk &c, HTTPReadConfig::RequestBatch &batch);
+    void emit_batch(libstf::stream_t stream, OasisContext &ctx,
+                    const HTTPReadConfig::RequestBatch &batch);
 };
 
 /**
