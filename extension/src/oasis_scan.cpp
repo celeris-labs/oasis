@@ -294,7 +294,29 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 			// decoder config would still win a race with arriving bytes. Enqueue it first.
 			// Scheduler::dispatch_to applies non-sink operators in flow order, so this ordering holds.
 			flow.push_back(std::move(decode));
-			flow.push_back(MakeHTTPSource(*http, cc));
+
+			// ONE batch for the whole row group, carried by the LAST flow.
+			//
+			// Every GET of the group is built as text on the host and handed over in a single
+			// transfer, so there is no per-request slot to wait for. That means the batch may only
+			// fire once EVERY column's decoder config is enqueued, because the responses come back
+			// in request order and the decoder consumes its configs in the order they were queued.
+			// The dispatcher runs flows in submission order on one thread, so putting the batch in
+			// the last flow puts it strictly after every earlier decode; and within this flow,
+			// dispatch_to applies sinks first and then non-sink operators in order, so this
+			// flow's own decode is enqueued before the batch fires too.
+			//
+			// It cannot be a flow of its own: dispatch_to asserts every flow has a sink, and a
+			// sinkless flow would never retire its pipeline slot.
+			if (k + 1 == hw_slot.size()) {
+				std::vector<oasis::HTTPBatchSourceOperator::Chunk> batch_chunks;
+				batch_chunks.reserve(hw_chunks.size());
+				for (const auto *bc : hw_chunks) {
+					batch_chunks.push_back({bc->offset, bc->total_compressed_size});
+				}
+				flow.push_back(std::make_unique<oasis::HTTPBatchSourceOperator>(
+				    http->path, http->server_ip, http->server_port, std::move(batch_chunks)));
+			}
 		} else {
 			if (rdma) {
 				flow.push_back(MakeRDMASource(*rdma, cc));
