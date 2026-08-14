@@ -39,17 +39,27 @@ cmake_args+=(-DN_DECODERS="$decoders")
 
 pushd hardware
 
-# Finds the build directory with the highest number and starts the synthesis in a new directory with that number + 1
+# Next build directory: highest existing number + 1.
+#
+# The glob matches TWO OR MORE digits. It used to be `build-[0-9][0-9]`, exactly two, so once
+# build-100 existed it was invisible: the scan found build-99, computed 100, failed to mkdir a
+# directory that already existed -- and then carried on regardless, reconfiguring and REBUILDING the
+# existing build-100 in place. Six hours of synthesis landed on top of an artifact someone might
+# still have been testing, under a name that no longer described it.
 n=0
-for d in build-[0-9][0-9]; do
+for d in build-[0-9][0-9]*; do
     [ -d "$d" ] || continue
     num="${d#build-}"
+    case "$num" in
+        ''|*[!0-9]*) continue ;;   # skip build-tmp and friends
+    esac
     [ "$((10#$num))" -gt "$n" ] && n=$((10#$num))
 done
-build_dir="$PWD/build-$(printf '%02d' $((n + 1)))"
+build_dir="$PWD/build-$((n + 1))"
 echo Building bitstream in hardware/$build_dir...
 
-mkdir "$build_dir"
+# Fatal, not a warning. Continuing past a collision is what overwrote build-100.
+mkdir "$build_dir" || { echo "refusing to build into an existing directory: $build_dir" >&2; exit 1; }
 cmake -S . -B "$build_dir" "${cmake_args[@]}"
 
 util_dir="$script_dir/util"
