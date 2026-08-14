@@ -75,6 +75,9 @@ constexpr const uint32_t HTTP_START           = 39;
 // 40, above START. See the map comment in http_config.sv for why it is above rather than below:
 // 0..38 was full, and moving START would shift every parameter after it.
 constexpr const uint32_t HTTP_REQ_TOTAL_BYTES = 40;
+// Bytes in one decoder stream, i.e. a column chunk. Queued ahead of the data; the hardware counts
+// them down and marks tlast. One per CHUNK, not per request.
+constexpr const uint32_t HTTP_REQ_CHUNK_BYTES = 41;
 
 // Bitstreams up to and including build-88 instantiate HttpConfig with START_ADDR=31: the override in
 // vfpga_top.svh was not moved when the GET path widened from 8 to 16 words. On those, a write to 31
@@ -381,7 +384,7 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
 // -------------------------------------------------------------------------------------------------
 // Requests one batch may carry. The queue holds one entry per expected response and the host pushes
 // every entry BEFORE arming the transfer, so a batch larger than the queue can never drain.
-size_t HTTPReadConfig::max_batch_requests() {
+size_t HTTPReadConfig::max_batch_chunks() {
     static const size_t cached = [this] {
         // Prefer the dedicated register: inflightWord's fields saturate at 255, and splitting a row
         // group at 255 when the hardware holds 8192 reintroduces exactly the batching this design
@@ -415,37 +418,40 @@ void HTTPReadConfig::read_streamed(uint32_t server_ip, uint16_t server_port,
     // Same split as read(): only the LAST GET of the chunk ends the decoder stream, because the
     // DataNormalizer resets its running byte offset on tlast and an extra one mid-chunk would
     // desynchronise every column after it.
+    // ONE entry for the whole chunk, whatever it splits into. The hardware marks the stream end by
+    // counting these bytes, so the split is invisible to it.
+    batch.chunk_bytes.push_back(static_cast<uint32_t>(range_end - range_begin + 1));
+
     if (chunk == 0 || (range_end - range_begin + 1) <= chunk) {
         batch.text += BuildGet(host, server_port, path, range_begin, range_end);
-        batch.body_last.push_back(true);
         return;
     }
     for (uint64_t begin = range_begin; begin <= range_end; begin += chunk) {
         const uint64_t end = std::min(begin + chunk - 1, range_end);
         batch.text += BuildGet(host, server_port, path, begin, end);
-        batch.body_last.push_back(end == range_end);
     }
 }
 
 void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
                                   const RequestBatch &batch) {
-    if (batch.body_last.empty()) {
+    if (batch.chunk_bytes.empty()) {
         return;
     }
-    // The caller must have split to the queue depth already -- see max_batch_requests(). Pushing
-    // more entries than the queue holds deadlocks rather than back-pressuring: the host blocks on
+    // The caller must have split to the queue depth already -- see max_batch_chunks(). Pushing more
+    // entries than the queue holds deadlocks rather than back-pressuring: the host blocks on
     // req_ready waiting for the queue to drain, and it cannot drain because the arm that starts the
     // transfer comes AFTER the entries.
-    if (batch.body_last.size() > max_batch_requests()) {
+    if (batch.chunk_bytes.size() > max_batch_chunks()) {
         std::ostringstream msg;
-        msg << "HTTP batch of " << batch.body_last.size() << " requests exceeds the hardware queue ("
-            << max_batch_requests() << "); it must be split, or the entries deadlock against the arm";
+        msg << "HTTP batch of " << batch.chunk_bytes.size() << " column chunks exceeds the hardware "
+            << "queue (" << max_batch_chunks() << "); it must be split, or the entries deadlock "
+            << "against the arm";
         throw std::runtime_error(msg.str());
     }
     // 1. One queue entry per expected response, carrying only its body_last bit. req_total_bytes
     //    stays 0 on these beats, which is what tells the hardware they are entries and not an arm.
-    for (const bool last : batch.body_last) {
-        write_register(libstf::ConfigRegister(HTTP_REQ_FLAGS, last ? 1u : 0u));
+    for (const uint32_t bytes : batch.chunk_bytes) {
+        write_register(libstf::ConfigRegister(HTTP_REQ_CHUNK_BYTES, bytes));
         write_register(libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, 0u));
         (void)read_register(HTTP_CLIENT_STATE);   // ordering barrier, see issue_range
         write_register(libstf::ConfigRegister(HTTP_START, 1));
@@ -460,8 +466,8 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
     write_register(libstf::ConfigRegister(HTTP_START, 1));
 
     if (http_debug_enabled()) {
-        std::fprintf(stderr, "[oasis-http] batch: %zu requests, %zu bytes of text\n",
-                     batch.body_last.size(), batch.text.size());
+        std::fprintf(stderr, "[oasis-http] batch: %zu column chunks, %zu bytes of request text\n",
+                     batch.chunk_bytes.size(), batch.text.size());
     }
 }
 
@@ -747,6 +753,7 @@ HTTPReadConfig::HTTPStall HTTPReadConfig::stall() {
     s.notify_overflow  = (word & (1u << 24)) != 0;
     s.rx_fifo_stall    = (word & (1u << 25)) != 0;
     s.read_timeout     = (word & (1u << 26)) != 0;
+    s.align_starved    = (word & (1u << 27)) != 0;
     return s;
 }
 
@@ -769,6 +776,7 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     if (notify_overflow)  oss << " notify_overflow";
     if (rx_fifo_stall)    oss << " rx_fifo_stall";
     if (read_timeout)     oss << " read_timeout";
+    if (align_starved)    oss << " align_starved";
     if (reconnects)       oss << " reconnects=" << static_cast<unsigned>(reconnects);
 
     // One explanation per line. These are sticky bits and several latch together over a long query,
@@ -789,6 +797,13 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
                "them, which only becomes possible once they are issued back to back. If this is set "
                "and throughput is fine, ignore it; if it is set and the run is slow, the request "
                "ring is deeper than the tx path can absorb.";
+    }
+    if (align_starved) {
+        oss << "\n    align_starved: body bytes arrived with no column-chunk length configured, so "
+               "the hardware could not tell where one decoder stream ends. The host queued fewer "
+               "chunk lengths than the responses it asked for. Two columns would be concatenated "
+               "into one stream, which corrupts silently rather than failing -- treat any result "
+               "from this run as suspect.";
     }
     if (rx_fifo_stall) {
         oss << "\n    rx_fifo_stall: the fifo between the TCP stack and the HTTP parser filled, so "

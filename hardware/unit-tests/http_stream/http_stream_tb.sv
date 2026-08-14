@@ -657,15 +657,33 @@ localparam int RECONNECT_AFTER = 999;
     // The text is built here exactly as the host would build it, and is the ONLY place the ranges
     // exist -- there is no descriptor for the FPGA to rebuild them from.
     // ---------------------------------------------------------------------------------------------
-    function automatic http_config_t make_entry(input int r);
+    // One entry per COLUMN CHUNK, carrying its total byte count -- not one per request. Requests 4
+    // and 5 belong to the same chunk (last_flag[4] == 0), so their bodies concatenate and the chunk
+    // is body_len[4] + body_len[5] bytes. That is exactly the case a byte count has to get right and
+    // the old per-response flag encoded by hand.
+    function automatic http_config_t make_chunk_entry(input int bytes);
         http_config_t c;
         begin
             c = '0;
-            c.req_flags       = {15'd0, last_flag[r]};
+            c.req_chunk_bytes = 32'(bytes);
             c.req_total_bytes = 32'd0;   // 0 => this beat is a queue entry, not an arm
             return c;
         end
     endfunction
+
+    // Walk the requests and emit one entry per chunk boundary.
+    task automatic push_chunk_entries(input int lo, input int hi);
+        int acc;
+        acc = 0;
+        for (int k = lo; k < hi; k++) begin
+            acc += body_len[k];
+            if (last_flag[k]) begin
+                push_cfg(make_chunk_entry(acc));
+                acc = 0;
+            end
+        end
+        if (acc != 0) push_cfg(make_chunk_entry(acc));
+    endtask
 
     function automatic http_config_t make_arm(input int total);
         http_config_t c;
@@ -747,8 +765,8 @@ localparam int RECONNECT_AFTER = 999;
             for (int k = sub_lo; k < sub_hi; k++) append_request(k);
             text_hi = req_text.size();
 
-            // entries, then the arm, then the text
-            for (int k = sub_lo; k < sub_hi; k++) push_cfg(make_entry(k));
+            // chunk lengths, then the arm, then the text
+            push_chunk_entries(sub_lo, sub_hi);
             push_cfg(make_arm(text_hi - text_lo));
             dma_text(text_lo, text_hi - text_lo);
 

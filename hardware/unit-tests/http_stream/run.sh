@@ -17,6 +17,7 @@ xvlog -sv ${TRACE:+-d TRACE} \
   "$HDL/tcp_init.sv" \
   "$HDL/http_req_stream.sv" \
   "$HDL/axis_fifo.sv" \
+  "$HDL/axis_rewrite_last.sv" \
   "$HDL/strip_http.sv" \
   "$HDL/tcp_read.sv" \
   "$HDL/handler_stream.sv" \

@@ -46,13 +46,14 @@ import http_types::*;
 // entry sufficient: the k-th response belongs to the k-th entry, by construction.
 // =================================================================================================
 module handler_stream #(
-    // Entries, i.e. responses that may be outstanding. ONE BIT EACH, so this is not a resource
-    // decision -- 8192 entries cost 1 KB. It is sized so that a whole row group always fits in one
-    // batch: the host pushes every entry before arming the transfer, so a row group that does not
-    // fit has to be split into several batches that each wait on the previous to drain, which is
-    // the only place left where anything is chunked for a reason that is not TCP's own interface.
-    // A wide scale-30 row group at a 768 KiB chunk is a few thousand GETs.
-    parameter int QUEUE_DEPTH = 8192,
+    // Column chunks that may be queued ahead of the data -- NOT requests.
+    //
+    // This used to be one bit per outstanding RESPONSE (body_last), which made it scale with the
+    // number of requests: thousands, once requests are pushed in bulk, and the only arbitrary limit
+    // left in the design. Tracking the boundary as a byte count per COLUMN CHUNK instead means a
+    // row group needs a handful of entries however finely each chunk is split into ranged GETs, so
+    // 64 is generous rather than a bound anyone can reach.
+    parameter int QUEUE_DEPTH = 64,
     // Cycles a stage may make no progress before its stall bit latches. See handler.sv.
     parameter int STALL_CYCLES = 268435456,
     // Bytes announced to the TOE per transmit reservation.
@@ -138,26 +139,27 @@ module handler_stream #(
 );
 
     localparam int PTR_BITS = $clog2(QUEUE_DEPTH) + 1; // one extra bit so full and empty differ
-    localparam int IDX_BITS = $clog2(QUEUE_DEPTH);
 
     initial begin
         if (QUEUE_DEPTH < 2 || (QUEUE_DEPTH & (QUEUE_DEPTH - 1)))
             $error("handler_stream: QUEUE_DEPTH must be a power of two >= 2 (pointers wrap on it)");
     end
 
-    // -- the response queue: one bit per expected response ----------------------------------------
-    logic                body_last_q [QUEUE_DEPTH];
-    logic [PTR_BITS-1:0] fill_ptr_q, read_ptr_q;
-    logic [IDX_BITS-1:0] fill_idx, read_idx;
-    assign fill_idx = fill_ptr_q[IDX_BITS-1:0];
-    assign read_idx = read_ptr_q[IDX_BITS-1:0];
-
+    // The chunk-length queue lives inside axis_rewrite_last. The handler keeps only a count of
+    // chunks configured but not yet completed, for the readback and for the arm/idle logic.
+    logic [PTR_BITS-1:0] occupancy_q;
     logic [PTR_BITS-1:0] occupancy;
-    assign occupancy = fill_ptr_q - read_ptr_q;
+    assign occupancy = occupancy_q;
 
     // -- the latched query context ------------------------------------------------------------
     logic [31:0] server_ip_q, server_port_q;
     logic        armed_q;          // a request-text transfer has been armed
+
+    logic                       raw_body_tvalid, raw_body_tready;
+    logic [AXI_DATA_BITS-1:0]   raw_body_tdata;
+    logic [AXI_DATA_BITS/8-1:0] raw_body_tkeep;
+    logic                       rwl_busy, rwl_starved;
+    logic [31:0]                rwl_remaining;
 
     logic        stream_busy, stream_refused;
     logic [29:0] stream_space;
@@ -176,9 +178,10 @@ module handler_stream #(
     //
     // An arm instead waits for the PREVIOUS transfer's text to have gone out, so successive batches
     // self-pace without overwriting a transfer in progress.
+    logic rwl_cfg_ready;
     assign req_ready     = (req_data.req_total_bytes != 32'd0)
                              ? !stream_busy
-                             : (occupancy < PTR_BITS'(QUEUE_DEPTH));
+                             : (rwl_cfg_ready && (occupancy < PTR_BITS'(QUEUE_DEPTH)));
     assign cfg_fire      = req_valid && req_ready;
     assign cfg_is_arm    = cfg_fire && (req_data.req_total_bytes != 32'd0);
     assign cfg_is_entry  = cfg_fire && (req_data.req_total_bytes == 32'd0);
@@ -222,8 +225,14 @@ module handler_stream #(
     localparam logic ST_STAGE_RUN  = 1'b1;
     logic read_state_q, read_state_d;
 
+    // More responses are coming exactly while a configured chunk is still incomplete. The old test
+    // counted queue entries, which worked when an entry meant a response; entries are now column
+    // chunks, so counting them would under-run the read stage by the split factor.
     logic read_has_work;
-    assign read_has_work = (read_ptr_q != fill_ptr_q);
+    assign read_has_work = rwl_busy;
+
+    logic chunk_done;
+    assign chunk_done = m_axis_body_tvalid && m_axis_body_tready && m_axis_body_tlast;
 
     // -- session table (notifications) ------------------------------------------------------------
     logic [TCP_LEN_BITS-1:0] tbl_req_len;
@@ -299,7 +308,7 @@ module handler_stream #(
         .clk(ap_clk), .rst_n(ap_rst_n),
         .start(read_state_q == ST_STAGE_RUN),
         .session_id(conn_sid_q),
-        .body_last(body_last_q[read_idx]),
+        .body_last(1'b0),   // tlast comes from axis_rewrite_last, by byte count
         .clear_framing(clear_framing),
         .rx_req_len(tbl_req_len), .rx_closed(tbl_closed), .rx_take_en(tbl_take_en),
         .m_axis_read_package_TVALID(m_axis_read_package_TVALID),
@@ -313,11 +322,11 @@ module handler_stream #(
         .s_axis_rx_data_TDATA(s_axis_rx_data_TDATA),
         .s_axis_rx_data_TKEEP(s_axis_rx_data_TKEEP),
         .s_axis_rx_data_TLAST(s_axis_rx_data_TLAST),
-        .m_axis_body_tvalid(m_axis_body_tvalid),
-        .m_axis_body_tready(m_axis_body_tready),
-        .m_axis_body_tdata(m_axis_body_tdata),
-        .m_axis_body_tkeep(m_axis_body_tkeep),
-        .m_axis_body_tlast(m_axis_body_tlast),
+        .m_axis_body_tvalid(raw_body_tvalid),
+        .m_axis_body_tready(raw_body_tready),
+        .m_axis_body_tdata(raw_body_tdata),
+        .m_axis_body_tkeep(raw_body_tkeep),
+        .m_axis_body_tlast(),   // always low now; the boundary is a byte count, not a flag
         .done(read_done), .error(read_error), .error_dirty(read_error_dirty),
         .resp_error(read_resp_error), .status_ascii(read_status_ascii),
         .status_ok(read_status_ok), .content_length(read_content_length),
@@ -326,15 +335,28 @@ module handler_stream #(
         .state_debug(read_state_debug)
     );
 
+    // -- alignment: mark the end of each column chunk by counting its bytes ------------------------
+
+    axis_rewrite_last #(.CFG_DEPTH(QUEUE_DEPTH)) inst_rewrite_last (
+        .clk(ap_clk), .rst_n(ap_rst_n),
+        .cfg_valid(cfg_is_entry), .cfg_ready(rwl_cfg_ready),
+        .cfg_len(req_data.req_chunk_bytes),
+        .s_tvalid(raw_body_tvalid), .s_tready(raw_body_tready),
+        .s_tdata(raw_body_tdata),   .s_tkeep(raw_body_tkeep),
+        .m_tvalid(m_axis_body_tvalid), .m_tready(m_axis_body_tready),
+        .m_tdata(m_axis_body_tdata),   .m_tkeep(m_axis_body_tkeep),
+        .m_tlast(m_axis_body_tlast),
+        .busy(rwl_busy), .starved(rwl_starved), .remaining_dbg(rwl_remaining)
+    );
+
     // -- sequencing -------------------------------------------------------------------------------
-    logic read_advance, conn_bind;
+    logic conn_bind;
 
     always_comb begin
         cs_d         = cs_q;
         read_state_d = read_state_q;
         reconn_d     = reconn_q;
         fatal_d      = fatal_q;
-        read_advance = 1'b0;
         conn_bind    = 1'b0;
         bind_en      = 1'b0;
         release_en   = 1'b0;
@@ -382,12 +404,11 @@ module handler_stream #(
             ST_STAGE_RUN: begin
                 if (read_done) begin
                     read_state_d = ST_STAGE_IDLE;
+                    // Nothing to advance any more: how far through a column chunk we are lives in
+                    // axis_rewrite_last's byte counter, not in a pointer here.
                     if (read_error) begin
-                        // Do not advance: this request has not been answered.
                         if (read_error_dirty) fatal_d  = 1'b1;
                         else                  reconn_d = 1'b1;
-                    end else begin
-                        read_advance = 1'b1;
                     end
                 end
             end
@@ -402,8 +423,7 @@ module handler_stream #(
 
     always_ff @(posedge ap_clk) begin
         if (!ap_rst_n) begin
-            fill_ptr_q   <= '0;
-            read_ptr_q   <= '0;
+            occupancy_q  <= '0;
             cs_q         <= CS_DOWN;
             read_state_q <= ST_STAGE_IDLE;
             conn_valid_q <= 1'b0;
@@ -429,10 +449,12 @@ module handler_stream #(
             reconn_q     <= reconn_d;
             fatal_q      <= fatal_d;
 
-            if (cfg_is_entry) begin
-                body_last_q[fill_idx] <= req_data.req_flags[0];
-                fill_ptr_q            <= fill_ptr_q + 1'b1;
-            end
+            // The length went straight into axis_rewrite_last; this only counts chunks outstanding.
+            case ({cfg_is_entry, chunk_done})
+                2'b10:   occupancy_q <= occupancy_q + 1'b1;
+                2'b01:   occupancy_q <= (occupancy_q == '0) ? '0 : occupancy_q - 1'b1;
+                default: occupancy_q <= occupancy_q;
+            endcase
             if (cfg_is_arm) begin
                 server_ip_q   <= req_data.server_ip;
                 server_port_q <= req_data.server_port;
@@ -441,7 +463,6 @@ module handler_stream #(
             // The transfer is done once the forwarder has drained it and every response was read.
             if (armed_q && !stream_busy && (occupancy == '0)) armed_q <= 1'b0;
 
-            if (read_advance) read_ptr_q <= read_ptr_q + 1'b1;
 
             if (retry_wait_q != '0) retry_wait_q <= retry_wait_q - 1'b1;
             if ((cs_q == CS_OPEN) && init_done && init_error) retry_wait_q <= '1;
@@ -497,7 +518,10 @@ module handler_stream #(
     assign inflightWord = {13'd0, conn_valid_q, tbl_dbg_closed, tbl_dbg_has_pending,
                            depth_sat, occ_sat};
 
-    assign stallWord = {5'd0, read_timeout_w, rx_fifo_stall_w, tbl_dbg_overflow,
+    // Bit 27 is align_starved: body bytes arrived with no chunk length configured, which means the
+    // host queued fewer lengths than responses and two columns would be concatenated into one
+    // stream. Silent corruption otherwise, so it gets a bit rather than a comment.
+    assign stallWord = {4'd0, rwl_starved, read_timeout_w, rx_fifo_stall_w, tbl_dbg_overflow,
                         8'd0, reconn_cnt_q,
                         status_bad_q, fatal_q, resp_err_q, stream_err_q, init_err_q,
                         read_stall_q, 1'b0, conn_stall_q};

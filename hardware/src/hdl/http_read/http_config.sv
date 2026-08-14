@@ -48,6 +48,9 @@ import http_types::*;
 //   37 RANGE_END_W2     ([31:0])
 //   38 RANGE_END_W3     ([31:0])
 //   39 START            (ConfigWriteReadyRegister)  -- value ignored, write triggers
+//   41 REQ_CHUNK_BYTES  ([31:0])     -- bytes in ONE decoder stream (a column chunk). Queued ahead
+//                                       of the data; axis_rewrite_last counts them down and marks
+//                                       tlast. One per COLUMN CHUNK, not per request.
 //   40 REQ_TOTAL_BYTES  ([31:0])     -- bytes of pre-built request text about to be streamed in
 //                                       over axis_host_recv. NON-ZERO selects the streamed request
 //                                       path and every per-request field above is ignored. Sits
@@ -97,7 +100,7 @@ import http_types::*;
 // this register and treats (NUM_SLOTS - occupied) as its credit.
 // =================================================================================================
 module HttpConfig #(
-    parameter integer NUM_PARAM_REGS = 41,
+    parameter integer NUM_PARAM_REGS = 42,
     parameter integer START_ADDR     = 39
 ) (
     input  logic clk,
@@ -143,7 +146,7 @@ localparam logic [AXIL_DATA_BITS - 1:0] HTTP_CONFIG_ID = 64'h0000_0000_0048_5454
 // above. The guard therefore can no longer be "START is above every parameter"; what actually has to
 // hold is that START ALIASES no parameter, and that the address space covers the highest one.
 localparam int LAST_PARAM_ADDR   = 38;   // highest contiguous parameter, below START
-localparam int STREAM_PARAM_ADDR = 40;   // req_total_bytes, above START
+localparam int STREAM_PARAM_ADDR = 41;   // req_total_bytes at 40, req_chunk_bytes at 41
 `ASSERT_ELAB(START_ADDR > LAST_PARAM_ADDR)
 `ASSERT_ELAB(START_ADDR < STREAM_PARAM_ADDR)
 `ASSERT_ELAB(NUM_PARAM_REGS > STREAM_PARAM_ADDR)
@@ -188,6 +191,7 @@ data64_t reg_range_begin_w2;
 data64_t reg_range_begin_w3;
 data64_t reg_range_end_len;
 data64_t reg_req_total_bytes;
+data64_t reg_req_chunk_bytes;
 data64_t reg_range_end_w0;
 data64_t reg_range_end_w1;
 data64_t reg_range_end_w2;
@@ -227,6 +231,7 @@ ConfigWriteRegister #(28, data64_t) inst_reg_time_in_seconds  (clk, write_config
 // trigger is safe here only because the trigger reads the LIVE cfg: the host writes 40, then 39,
 // and the snapshot includes it.
 ConfigWriteRegister #(40, data64_t) inst_reg_req_total_bytes (clk, write_config, reg_req_total_bytes);
+ConfigWriteRegister #(41, data64_t) inst_reg_req_chunk_bytes (clk, write_config, reg_req_chunk_bytes);
 ConfigWriteRegister #(29, data64_t) inst_reg_range_begin_len    (clk, write_config, reg_range_begin_len);
 ConfigWriteRegister #(30, data64_t) inst_reg_range_begin_w0     (clk, write_config, reg_range_begin_w0);
 ConfigWriteRegister #(31, data64_t) inst_reg_range_begin_w1     (clk, write_config, reg_range_begin_w1);
@@ -272,6 +277,7 @@ always_comb begin
     cfg.user_frequency  = reg_user_frequency [31:0];
     cfg.time_in_seconds = reg_time_in_seconds[31:0];
     cfg.req_total_bytes = reg_req_total_bytes[31:0];
+    cfg.req_chunk_bytes = reg_req_chunk_bytes[31:0];
     cfg.range_begin_len = reg_range_begin_len[7:0];
     cfg.range_begin_w0  = reg_range_begin_w0 [31:0];
     cfg.range_begin_w1  = reg_range_begin_w1 [31:0];

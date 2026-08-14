@@ -73,6 +73,15 @@ typedef struct packed {
     // silent corruption rather than an error, so the new path is opt-in by a value rather than by a
     // shifted address.
     logic [31:0] req_total_bytes;
+    // Bytes in one decoder stream, i.e. one column chunk's compressed extent.
+    //
+    // This replaced a per-RESPONSE body_last flag. The flag worked, but it made the hardware's
+    // bookkeeping scale with the number of REQUESTS -- one bit held per outstanding response, and
+    // thousands are outstanding once requests are pushed in bulk. A byte count scales with the
+    // number of COLUMN CHUNKS instead, of which a row group has a handful however finely each is
+    // split into ranged GETs. axis_rewrite_last counts the bytes down and asserts tlast on the beat
+    // that completes the chunk, so how many GETs it took is invisible downstream.
+    logic [31:0] req_chunk_bytes;
 } http_config_t;
 
 endpackage

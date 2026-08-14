@@ -89,7 +89,7 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
     // A wide scale-30 row group at a 768 KiB chunk is thousands of GETs, so this is the normal path
     // rather than a guard against an exotic case. Successive sub-batches self-pace: the next one
     // blocks on entries the previous one is already draining.
-    const size_t max_per_batch = config->max_batch_requests();
+    const size_t max_per_batch = config->max_batch_chunks();
     size_t       chunk_lo      = 0;
     while (chunk_lo < chunks_.size()) {
         HTTPReadConfig::RequestBatch batch;
@@ -97,23 +97,23 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
         while (chunk_hi < chunks_.size()) {
             HTTPReadConfig::RequestBatch probe;
             build_chunk(*config, chunks_[chunk_hi], probe);
-            if (!batch.body_last.empty() &&
-                batch.body_last.size() + probe.body_last.size() > max_per_batch) {
+            if (!batch.chunk_bytes.empty() &&
+                batch.chunk_bytes.size() + probe.chunk_bytes.size() > max_per_batch) {
                 break;
             }
             batch.text += probe.text;
-            batch.body_last.insert(batch.body_last.end(), probe.body_last.begin(),
-                                   probe.body_last.end());
+            batch.chunk_bytes.insert(batch.chunk_bytes.end(), probe.chunk_bytes.begin(),
+                                     probe.chunk_bytes.end());
             chunk_hi++;
         }
         // A single column chunk that alone exceeds the queue would loop forever otherwise.
-        if (batch.body_last.size() > max_per_batch) {
+        if (batch.chunk_bytes.size() > max_per_batch) {
             throw std::runtime_error(
                 "HTTPBatchSourceOperator: column chunk at offset " +
                 std::to_string(chunks_[chunk_lo].offset) + " needs " +
-                std::to_string(batch.body_last.size()) +
-                " GETs, more than the hardware queue holds (" + std::to_string(max_per_batch) +
-                "). Raise OASIS_HTTP_CHUNK_BYTES or the queue depth.");
+                std::to_string(batch.chunk_bytes.size()) +
+                " queue entries, more than the hardware holds (" + std::to_string(max_per_batch) +
+                ").");
         }
         emit_batch(stream, ctx, batch);
         chunk_lo = chunk_hi;
@@ -134,7 +134,7 @@ void HTTPBatchSourceOperator::build_chunk(HTTPReadConfig &config, const Chunk &c
 
 void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &ctx,
                                          const HTTPReadConfig::RequestBatch &batch) {
-    if (batch.body_last.empty()) {
+    if (batch.chunk_bytes.empty()) {
         return;
     }
     auto config = ctx.config<HTTPReadConfig>();

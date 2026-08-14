@@ -101,19 +101,25 @@ class HTTPReadConfig : public libstf::Config {
     struct RequestBatch {
         /// Every GET, concatenated, in the order the responses will come back.
         std::string text;
-        /// One entry per request: does this response end a decoder stream? A column chunk split
-        /// across several ranged GETs sets it only on the last, because the DataNormalizer resets
-        /// its running byte offset on tlast.
-        std::vector<bool> body_last;
+        /// One entry per COLUMN CHUNK: its total compressed size in bytes. The hardware counts
+        /// those bytes down and marks tlast on the beat that completes them, so how many ranged
+        /// GETs the chunk was split into is invisible downstream.
+        ///
+        /// This used to be one bool per REQUEST. The flag worked but made the hardware's queue
+        /// scale with request count -- thousands, once requests are pushed in bulk -- which was the
+        /// last arbitrary limit in the design. A row group has a handful of chunks however finely
+        /// each is split.
+        std::vector<uint32_t> chunk_bytes;
     };
 
     /// Append one column chunk's GETs to `batch`, splitting at chunk_bytes() exactly as read() does.
     void read_streamed(uint32_t server_ip, uint16_t server_port, const std::string &path,
                        uint64_t range_begin, uint64_t range_end, RequestBatch &batch);
 
-    /// Requests a single batch may carry, from the hardware queue depth. Larger batches must be
-    /// split: the host pushes every entry before arming, so one that does not fit cannot drain.
-    size_t max_batch_requests();
+    /// COLUMN CHUNKS a single batch may carry, from the hardware queue depth. Larger batches must
+    /// be split: the host pushes every entry before arming, so one that does not fit cannot drain.
+    /// Note this bounds chunks, not requests -- the request text is one DMA of any size.
+    size_t max_batch_chunks();
 
     /// Push the batch's body_last bits, then arm the transfer. The caller DMAs `batch.text` into
     /// the request stream afterwards -- this only tells the hardware what is coming.
@@ -207,6 +213,10 @@ class HTTPReadConfig : public libstf::Config {
         /// said no", which the other bits cannot -- and it is the condition that used to hang the
         /// board until it was reprogrammed.
         bool read_timeout = false;
+        /// Body bytes arrived with no column-chunk length configured. Sticky. Means the host queued
+        /// fewer chunk lengths than responses, so two columns merge into one decoder stream -- a
+        /// silent corruption, not a failure. Any result from such a run is suspect.
+        bool align_starved = false;
         /// The stallWord exactly as read, so a caller can tell a condition it has already reported
         /// from a new one. The named bools above are for reading; this is for comparing.
         uint32_t raw = 0;
@@ -214,7 +224,7 @@ class HTTPReadConfig : public libstf::Config {
         bool any() const {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
                    || resp_unframeable || dirty_abort || status_bad || notify_overflow
-                   || rx_fifo_stall || read_timeout;
+                   || rx_fifo_stall || read_timeout || align_starved;
         }
         std::string describe() const;
     };

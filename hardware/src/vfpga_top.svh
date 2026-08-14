@@ -133,7 +133,10 @@ ColumnChunkDecoderConfig #(
 // INFLIGHT register, and software/oasis mirrors this number.
 // Responses that may be outstanding. One BIT each in handler_stream (body_last), not a 1160-bit
 // descriptor, so this is no longer a resource decision -- 512 entries cost 512 bits.
-localparam int HTTP_QUEUE_DEPTH = 8192;
+// Column chunks queued ahead of the data, NOT requests. Alignment is a byte count per chunk
+// (axis_rewrite_last), so this scales with columns in a row group -- a handful -- rather than with
+// how finely each chunk is split into ranged GETs.
+localparam int HTTP_QUEUE_DEPTH = 64;
 
 // HttpConfig latches params; a START write emits one http_config_t beat, which the handler accepts
 // straight into a free slot. The slot ring IS the request queue, so there is no separate FIFO and
@@ -155,7 +158,7 @@ logic [31:0]                   http_body_remaining_word;
 // mid-configuration, so registers 32..38 -- the rest of the Range begin and all of the Range end --
 // never reached the snapshot and the FPGA sent "Range: bytes=<truncated>-" with no end at all.
 HttpConfig #(
-    .NUM_PARAM_REGS(41),
+    .NUM_PARAM_REGS(42),
     .START_ADDR    (39)
 ) inst_http_config (
     .clk         (clk),
