@@ -106,7 +106,7 @@ module tcp_session_table #(
 
     // Query port for the read stage.
     input  logic [IDX_BITS-1:0]    q_slot,
-    output logic [31:0]            q_pending,   // bytes announced and not yet requested (debug)
+    output logic [31:0]            q_pending,   // announcements queued and not yet requested (debug)
     output logic [TCP_LEN_BITS-1:0] q_req_len,  // length of the OLDEST unread announcement, 0 if none
     output logic                   q_closed,
     output logic                   q_bound,
@@ -135,11 +135,20 @@ module tcp_session_table #(
     logic [TCP_SESSION_BITS-1:0] sid_q     [NUM_SLOTS];
     logic                        closed_q  [NUM_SLOTS];
     logic                        ovf_q     [NUM_SLOTS];
-    logic [31:0]                 pending_q [NUM_SLOTS]; // debug only: bytes still queued
+    // Debug only: announcements still queued. Deliberately NOT a byte total -- see the assignment
+    // below for why reading a popped entry's length is expensive.
+    logic [31:0]                 pending_q [NUM_SLOTS];
 
     // The announcement queue itself: one circular buffer of segment lengths per slot. The head is
     // read combinationally (the reader needs q_req_len in the same cycle it decides to take), which
     // is the classic distributed-RAM access pattern.
+    // EXPLICIT, because getting this wrong is expensive and silent. One write port and one async
+    // read port is a distributed-RAM pattern, and at NOTIFY_DEPTH=512 the difference between
+    // inferring it and not is ~8000 flip-flops plus a 512:1 read mux -- which is exactly what
+    // happened when a second read port crept in for a debug counter. If a future change adds
+    // another read of this array, Vivado will fail on the attribute rather than quietly spending
+    // the flops and the timing.
+    (* ram_style = "distributed" *)
     logic [TCP_LEN_BITS-1:0] len_mem [NUM_SLOTS][NOTIFY_DEPTH];
     logic [PTR_BITS-1:0]     wr_ptr_q [NUM_SLOTS];
     logic [PTR_BITS-1:0]     rd_ptr_q [NUM_SLOTS];
@@ -237,9 +246,16 @@ module tcp_session_table #(
                     default: cnt_q[i] <= cnt_q[i];
                 endcase
 
-                pending_q[i] <= pending_q[i]
-                              + (push_en[i] ? {16'b0, notify_len} : 32'd0)
-                              - (pop_en[i]  ? {16'b0, len_mem[i][rd_ptr_q[i]]} : 32'd0);
+                // pending_q used to be a running BYTE total, which meant subtracting the popped
+                // entry's length -- a second read of len_mem, at a different index from the one
+                // q_req_len reads. Two combinational read ports stopped Vivado inferring
+                // distributed RAM, so a 512-entry queue became 8192 FLIP-FLOPS with a 512:1 mux in
+                // front of them, and that mux was the worst timing cluster in build-101 at -1.754
+                // ns. The value was debug-only and never read by anything.
+                //
+                // Counting ANNOUNCEMENTS instead needs no read at all, and is the more useful
+                // number anyway: it is the queue occupancy the depth has to cover.
+                pending_q[i] <= {{(32-CNT_BITS){1'b0}}, cnt_q[i]};
 
                 // Bind wins over everything: it starts a fresh connection's accounting from zero. It
                 // cannot collide with a notification for the same slot, because the session id only
