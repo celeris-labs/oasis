@@ -115,6 +115,7 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
                 " queue entries, more than the hardware holds (" + std::to_string(max_per_batch) +
                 ").");
         }
+        oasis::PadRequestTextToBeat(batch.text);
         emit_batch(stream, ctx, batch);
         chunk_lo = chunk_hi;
     }
@@ -156,6 +157,8 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     // Zeroing does not fix that; the drain does. It makes the next occurrence obvious instead of
     // plausible: NUL bytes are visibly wrong on the wire, whereas fragments of real HTTP look like
     // a protocol bug and cost days.
+    // The text was already padded to a whole beat when the batch was assembled, so this is a
+    // no-op in the normal case; it stays as a backstop for any path that skips that.
     const size_t beat    = 64;
     const size_t padded  = ((batch.text.size() + beat - 1) / beat) * beat;
     libstf::Status status;

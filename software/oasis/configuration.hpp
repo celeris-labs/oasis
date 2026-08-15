@@ -88,6 +88,10 @@ struct HTTPRequestEcho {
  * Dirty bring-up of hardware HttpConfig + handler (HW TCP open).
  * Writes the full CSR map and pulses START. No body return path yet.
  */
+/// Pads request text to a whole 64-byte DMA beat with a header the server ignores, so the transfer
+/// has no tail to round up and nothing can be left in the stream for the next batch to pick up.
+void PadRequestTextToBeat(std::string &text);
+
 class HTTPReadConfig : public libstf::Config {
   public:
     HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset, uint32_t num_regs);

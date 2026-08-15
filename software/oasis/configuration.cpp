@@ -432,6 +432,41 @@ void HTTPReadConfig::read_streamed(uint32_t server_ip, uint16_t server_port,
     }
 }
 
+// Pad the batch's request text to a whole 64-byte beat, using a header the server ignores.
+//
+// Coyote's DMA moves whole beats, so a 2069-byte batch is transferred as 2112. The hardware
+// discards the 43-byte tail (ST_DRAIN), but on a bitstream without that fix the tail stays at the
+// head of the stream and becomes the NEXT batch's opening bytes -- the server then sees a request
+// line prefixed with junk and answers 400. That is what makes build-101 unable to run any query
+// touching more than one row group.
+//
+// Making the text itself a whole number of beats removes the tail entirely, so there is nothing to
+// discard or to leak, on any bitstream. Unknown headers are ignored by definition, and MinIO was
+// checked: padded requests of 128, 129, 165 and 328 bytes all answer 206.
+//
+// This is not a substitute for ST_DRAIN -- a short DMA or a resized buffer would reintroduce a tail
+// and only the hardware can be sure of consuming it. It is the cheaper half of the same guarantee,
+// and it is what lets a bitstream without the drain work at all.
+void PadRequestTextToBeat(std::string &text) {
+    constexpr size_t BEAT = 64;
+    const size_t     rem  = text.size() % BEAT;
+    if (rem == 0 || text.size() < 4) {
+        return;
+    }
+    size_t needed = BEAT - rem;
+    // "X-Pad: " + value + CRLF is 9 bytes of overhead, so anything under that has to round up to
+    // the next beat rather than squeeze in.
+    while (needed < 9) {
+        needed += BEAT;
+    }
+    // Insert before the blank line that terminates the LAST request, so it stays a valid header.
+    const size_t tail = text.rfind("\r\n\r\n");
+    if (tail == std::string::npos) {
+        return;
+    }
+    text.insert(tail + 2, "X-Pad: " + std::string(needed - 9, 'a') + "\r\n");
+}
+
 void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
                                   const RequestBatch &batch) {
     if (batch.chunk_bytes.empty()) {
@@ -458,6 +493,7 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
     }
 
     // 2. The arm: server address plus the byte count, which is what opens the connection.
+    //    The length announced here is the PADDED one -- see PadRequestTextToBeat.
     write_register(libstf::ConfigRegister(HTTP_SERVER_IP, server_ip));
     write_register(libstf::ConfigRegister(HTTP_SERVER_PORT, server_port));
     write_register(
