@@ -145,14 +145,31 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     // Kept in a vector, not a single member: the DMA is asynchronous, so a sub-batch's buffer must
     // stay alive until its transfer completes. Overwriting one member per sub-batch would free the
     // bytes the hardware is still reading.
+    // Round the allocation up to a whole 64-byte beat and ZERO the tail.
+    //
+    // Coyote moves whole beats, so a 132-byte buffer is transferred as 192. The hardware discards
+    // what follows the announced length (ST_DRAIN in http_req_stream), but the pool recycles
+    // buffers, so those trailing bytes hold the PREVIOUS batch's request text. Before the drain
+    // existed they became the next request's prefix and the server saw "osGET ..." -- "os" out of
+    // an older "Host:" -- and answered 400.
+    //
+    // Zeroing does not fix that; the drain does. It makes the next occurrence obvious instead of
+    // plausible: NUL bytes are visibly wrong on the wire, whereas fragments of real HTTP look like
+    // a protocol bug and cost days.
+    const size_t beat    = 64;
+    const size_t padded  = ((batch.text.size() + beat - 1) / beat) * beat;
     libstf::Status status;
-    auto           buf = libstf::make_buffer(ctx.memory_pool(), batch.text.size(), status);
+    auto           buf = libstf::make_buffer(ctx.memory_pool(), padded, status);
     if (!buf) {
         throw std::runtime_error("HTTPBatchSourceOperator: could not allocate " +
-                                 std::to_string(batch.text.size()) + " bytes for request text");
+                                 std::to_string(padded) + " bytes for request text");
     }
     std::memcpy(buf->ptr, batch.text.data(), batch.text.size());
-    buf->size = batch.text.size();
+    std::memset(static_cast<std::byte *>(buf->ptr) + batch.text.size(), 0,
+                padded - batch.text.size());
+    // The hardware is told the REAL length; the padding exists only to make the DMA's beat count
+    // exact, and never reaches the wire.
+    buf->size = padded;
     ctx.tlb_manager()->ensure_tlb_mapping(buf->ptr, buf->capacity);
     text_buffers_.push_back(buf);
 
