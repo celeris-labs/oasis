@@ -29,6 +29,11 @@ module http_req_stream_tb;
     // 9000 bytes = two full chunks plus 808 -- so three chunks, the last partial, and the last beat
     // of it carrying 40 of 64 lanes.
     localparam int TOTAL_BYTES = 9000;
+    // What the DMA actually moves: whole 64-byte beats, so 9000 arrives as 9024. The 24 bytes past
+    // the announced length must NOT reach the wire and must NOT be left in the stream, where they
+    // would prefix the next transfer's first request line. That is a real observed failure -- an
+    // intermittent 400 Bad Request on an otherwise healthy connection.
+    localparam int DMA_BYTES = ((TOTAL_BYTES + LANES - 1) / LANES) * LANES;
     localparam int REFUSE_ON   = 2;   // refuse the 2nd reservation
 
     logic clk = 0, rst_n = 0;
@@ -87,14 +92,17 @@ module http_req_stream_tb;
         int off;
         @(posedge rst_n);
         off = 0;
-        while (off < TOTAL_BYTES) begin
-            automatic int n = (TOTAL_BYTES - off >= LANES) ? LANES : (TOTAL_BYTES - off);
+        while (off < DMA_BYTES) begin
+            automatic int n = (DMA_BYTES - off >= LANES) ? LANES : (DMA_BYTES - off);
             rq_data = '0; rq_keep = '0;
             for (int l = 0; l < n; l++) begin
-                rq_data[l*8 +: 8] = src[off + l];
+                // Past TOTAL_BYTES this is padding -- deliberately non-zero and distinctive, so if
+                // any of it reaches the wire the byte comparison names it rather than passing on a
+                // lucky zero.
+                rq_data[l*8 +: 8] = (off + l < TOTAL_BYTES) ? src[off + l] : 8'hEE;
                 rq_keep[l]        = 1'b1;
             end
-            rq_last  = (off + n >= TOTAL_BYTES);
+            rq_last  = (off + n >= DMA_BYTES);
             rq_valid = 1'b1;
             @(posedge clk);
             while (!rq_ready) @(posedge clk);

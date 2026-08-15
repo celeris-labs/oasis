@@ -95,6 +95,7 @@ module http_req_stream #(
     localparam logic [3:0] ST_SEND_META = 4'd1;
     localparam logic [3:0] ST_WAIT_STAT = 4'd2;
     localparam logic [3:0] ST_SEND_DATA = 4'd3;
+    localparam logic [3:0] ST_DRAIN     = 4'd4;
 
     logic [3:0]  state_q, state_d;
     logic [31:0] remaining_q, remaining_d;   // bytes of the whole transfer still to send
@@ -177,8 +178,29 @@ module http_req_stream #(
                 if (s_axis_req_TVALID && m_axis_tx_data_TREADY) begin
                     chunk_left_d = chunk_left_q - 17'(beat_bytes);
                     remaining_d  = remaining_q  - 32'(beat_bytes);
-                    if (beat_is_last) state_d = ST_IDLE;
+                    if (beat_is_last) begin
+                        // Done with this chunk. If that was also the end of the whole transfer but
+                        // the DMA has not signalled TLAST yet, there are padding beats behind it --
+                        // see ST_DRAIN.
+                        state_d = ((remaining_q - 32'(beat_bytes)) == 32'd0 && !s_axis_req_TLAST)
+                                    ? ST_DRAIN : ST_IDLE;
+                    end
                 end
+            end
+
+            // Swallow whatever the DMA appends past the byte count we were given.
+            //
+            // Coyote moves whole 64-byte beats, so a request-text buffer of, say, 132 bytes arrives
+            // as 192: 132 real bytes and 60 of tail. Consuming only the 132 leaves those 60 at the
+            // head of the stream, where they become the prefix of the NEXT batch's request line --
+            // a malformed GET, which the server answers 400 and which then desynchronises
+            // everything after it. Observed as intermittent "400 Bad Request" on an otherwise
+            // healthy connection.
+            //
+            // Nothing here reaches the wire; TLAST from the DMA is the real end of the transfer.
+            ST_DRAIN: begin
+                s_axis_req_TREADY = 1'b1;
+                if (s_axis_req_TVALID && s_axis_req_TLAST) state_d = ST_IDLE;
             end
 
             default: state_d = ST_IDLE;
