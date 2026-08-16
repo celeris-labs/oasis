@@ -243,7 +243,14 @@ run_fpga() {
     # the profiler line is the last "hw_mib = N" the shell printed
     hw_mib=$(grep -oE 'hw_mib *= *[0-9.]+' "$FPGA_RAW" | tail -1 | grep -oE '[0-9.]+$')
     extract_rows < "$FPGA_RAW" > "$FPGA_ROWS"
-    grep -qF "$END_MARK" "$FPGA_RAW" || fpga_rc=1
+    # Only DOWNGRADE a success. timeout(1) returns 124 and the shell's own signals 130/143, and
+    # every one of those was being overwritten with 1 here, because a killed query never reaches
+    # the end marker either. That made every timeout look like an ordinary error: the TIMEOUT
+    # branch could not fire, the two-consecutive-timeouts stop never triggered, and the trace kept
+    # on timeout was never kept -- in exactly the case it exists for.
+    if [ "$fpga_rc" = 0 ] && ! grep -qF "$END_MARK" "$FPGA_RAW"; then
+        fpga_rc=1
+    fi
 
 }
 
@@ -266,7 +273,9 @@ run_cpu() {
     rm -f "$cpu_file"
     cpu_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
     extract_rows < "$CPU_RAW" > "$CPU_ROWS"
-    grep -qF "$END_MARK" "$CPU_RAW" || cpu_rc=1
+    if [ "$cpu_rc" = 0 ] && ! grep -qF "$END_MARK" "$CPU_RAW"; then
+        cpu_rc=1
+    fi
 
 }
 
