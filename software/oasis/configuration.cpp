@@ -481,6 +481,19 @@ void PadRequestTextToBeat(std::string &text) {
 // simply absent from the byte stream. The query then waited forever for column bytes nobody had
 // asked for.
 //
+// THE ORDER OF THE WRITES AROUND THIS CALL IS PART OF THE PROTOCOL.
+//
+// req_ready is combinational on the LIVE req_total_bytes register, because that field is what tells
+// the hardware whether the pending beat is a chunk-length entry (zero) or a transfer arm (non-zero)
+// -- and the two have different admission rules: an entry needs queue room, an arm needs the
+// previous transfer to have finished sending. So the caller must write every parameter INCLUDING
+// req_total_bytes, then poll, then pulse START. Polling first asks whether the PREVIOUS beat would
+// be accepted, which is a different question and frequently the opposite answer: an arm polled
+// while the registers still held an entry sees the entry's condition, passes, and is then refused
+// and overwritten. That produced exactly the failures this check was added to prevent -- hangs when
+// an arm was lost, and wrong ANSWERS when a chunk-length entry was, because a missing length merges
+// two columns into one decoder stream and every value after the seam is shifted.
+//
 // An arm waits on the previous transfer draining, so this can legitimately block for as long as a
 // batch takes to send. The timeout is the same 30 s used for the request ring: reaching it means
 // the pipeline stopped, which is a diagnosis rather than a tuning knob.
@@ -518,21 +531,24 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
     // 1. One queue entry per expected response, carrying only its body_last bit. req_total_bytes
     //    stays 0 on these beats, which is what tells the hardware they are entries and not an arm.
     for (const uint32_t bytes : batch.chunk_bytes) {
-        await_cfg_ready("chunk-length entry");
+        // PARAMETERS FIRST, THEN POLL, THEN TRIGGER. req_ready is combinational on the LIVE value
+        // of req_total_bytes, so polling before writing it asks whether the PREVIOUS beat would be
+        // accepted. See await_cfg_ready.
         write_register(libstf::ConfigRegister(HTTP_REQ_CHUNK_BYTES, bytes));
         write_register(libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, 0u));
-        (void)read_register(HTTP_CLIENT_STATE);   // ordering barrier, see issue_range
+        await_cfg_ready("chunk-length entry");
         write_register(libstf::ConfigRegister(HTTP_START, 1));
     }
 
     // 2. The arm: server address plus the byte count, which is what opens the connection.
     //    The length announced here is the PADDED one -- see PadRequestTextToBeat.
-    await_cfg_ready("transfer arm");
     write_register(libstf::ConfigRegister(HTTP_SERVER_IP, server_ip));
     write_register(libstf::ConfigRegister(HTTP_SERVER_PORT, server_port));
     write_register(
         libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, static_cast<uint64_t>(batch.text.size())));
-    (void)read_register(HTTP_CLIENT_STATE);
+    // Only now does req_ready describe an ARM. Before this write it still described whatever the
+    // last beat was, and an arm polled against an entry's condition gets written into a refusal.
+    await_cfg_ready("transfer arm");
     write_register(libstf::ConfigRegister(HTTP_START, 1));
 
     if (http_debug_enabled()) {
