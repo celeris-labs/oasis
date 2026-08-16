@@ -295,6 +295,16 @@ if [ "$PHASES" = 1 ]; then
         cp "$FPGA_RAW"  "$PHASE_CACHE/q$n.raw"
         printf '  q%-3s %8ss  rc=%s\n' "$n" "$fpga_s" "$fpga_rc"
         if [ "$fpga_rc" = 124 ]; then
+            # KEEP THE OUTPUT. A timeout is the case where the trace matters most and it was the one
+            # case that threw it away: the raw file is a mktemp that the next query overwrites, so
+            # by the time anyone looked, the last state before the hang was gone. With
+            # OASIS_HTTP_DEBUG=1 this file holds the per-batch ring occupancy and stall word right
+            # up to the moment it stopped, which is otherwise unreadable -- the wedged process still
+            # owns the vFPGA, so nothing else can attach to ask.
+            cp "$FPGA_RAW" "/tmp/oasis-q$n-timeout.txt"
+            echo "  timed out -- trace kept: /tmp/oasis-q$n-timeout.txt"
+            echo "  last lines:"
+            grep -E 'oasis-http|stalled|batch' "$FPGA_RAW" | tail -6 | sed 's/^/    /'
             ct=$((ct+1))
             [ "$ct" -ge 2 ] && { echo "  two consecutive timeouts -- stopping the FPGA phase."; break; }
         else
