@@ -467,6 +467,38 @@ void PadRequestTextToBeat(std::string &text) {
     text.insert(tail + 2, "X-Pad: " + std::string(needed - 9, 'a') + "\r\n");
 }
 
+// Wait until the hardware can accept another config beat.
+//
+// THIS IS NOT OPTIONAL, and leaving it out is what made every multi-batch query fail.
+// ConfigWriteReadyRegister does not back-pressure: a START written while the previous beat is still
+// unconsumed OVERWRITES it, and that beat disappears with no error raised anywhere. The old
+// descriptor path called await_credit() before every START for exactly this reason; the streamed
+// path was written without an equivalent.
+//
+// The cost was invisible in the obvious places and glaring on the wire. An arm dropped this way
+// means a whole batch's request text is never transmitted: a scale-30 supplier scan submitted three
+// batches, sent two, and MinIO saw 46 requests where 69 were meant -- the missing batch's bytes
+// simply absent from the byte stream. The query then waited forever for column bytes nobody had
+// asked for.
+//
+// An arm waits on the previous transfer draining, so this can legitimately block for as long as a
+// batch takes to send. The timeout is the same 30 s used for the request ring: reaching it means
+// the pipeline stopped, which is a diagnosis rather than a tuning knob.
+void HTTPReadConfig::await_cfg_ready(const char *what) {
+    const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
+    while (!inflight().req_ready) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            std::ostringstream msg;
+            msg << "FPGA HTTP config port has refused a " << what << " for "
+                << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
+                << "s [" << inflight().describe() << "; " << stall().describe()
+                << "]. The pipeline has stopped draining.";
+            throw std::runtime_error(msg.str());
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
 void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
                                   const RequestBatch &batch) {
     if (batch.chunk_bytes.empty()) {
@@ -486,6 +518,7 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
     // 1. One queue entry per expected response, carrying only its body_last bit. req_total_bytes
     //    stays 0 on these beats, which is what tells the hardware they are entries and not an arm.
     for (const uint32_t bytes : batch.chunk_bytes) {
+        await_cfg_ready("chunk-length entry");
         write_register(libstf::ConfigRegister(HTTP_REQ_CHUNK_BYTES, bytes));
         write_register(libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, 0u));
         (void)read_register(HTTP_CLIENT_STATE);   // ordering barrier, see issue_range
@@ -494,6 +527,7 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
 
     // 2. The arm: server address plus the byte count, which is what opens the connection.
     //    The length announced here is the PADDED one -- see PadRequestTextToBeat.
+    await_cfg_ready("transfer arm");
     write_register(libstf::ConfigRegister(HTTP_SERVER_IP, server_ip));
     write_register(libstf::ConfigRegister(HTTP_SERVER_PORT, server_port));
     write_register(
@@ -769,6 +803,7 @@ HTTPReadConfig::HTTPInflight HTTPReadConfig::inflight() {
     f.has_pending = (word & (1u << 16)) != 0;
     f.peer_closed = (word & (1u << 17)) != 0;
     f.conn_up     = (word & (1u << 18)) != 0;
+    f.req_ready   = (word & (1u << 19)) != 0;
     return f;
 }
 

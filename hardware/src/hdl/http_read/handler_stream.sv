@@ -514,10 +514,18 @@ module handler_stream #(
     end
 
     // -- readback ---------------------------------------------------------------------------------
-    assign totalWord = {8'd0, tbl_dbg_overflow, stream_refused, fatal_q, reconn_q,
-                        (cs_q == CS_UP), 3'd0,
-                        1'b0, (read_state_q == ST_STAGE_RUN) || stream_busy, 6'd0,
-                        req_ready, 3'd0, read_state_debug, init_state_debug};
+    // Exactly 32 bits. The previous version packed 36 and SystemVerilog truncated it silently,
+    // dropping the top four and shifting every field below them -- so every bit the host decoded
+    // out of this register was the wrong one.
+    //   [31:24] zero      [23] overflow  [22] busy      [21] refused
+    //   [20] fatal        [19] reconn    [18] conn up   [17:12] zero
+    //   [11:8] read state [7:4] init state            [3:0] zero
+    assign totalWord = {8'd0,
+                        tbl_dbg_overflow[0],
+                        (read_state_q == ST_STAGE_RUN) || stream_busy,
+                        stream_refused, fatal_q, reconn_q, (cs_q == CS_UP),
+                        6'd0,
+                        read_state_debug, init_state_debug, 4'd0};
 
     // SAME LAYOUT AS handler.sv, deliberately, including the byte-wide fields that used to cap the
     // ring at 8. Widening them here would have been tidier and would have silently broken every
@@ -530,7 +538,12 @@ module handler_stream #(
     assign occ_sat   = (occupancy > PTR_BITS'(255)) ? 8'd255 : 8'(occupancy);
     assign depth_sat = (QUEUE_DEPTH > 255) ? 8'd255 : 8'(QUEUE_DEPTH);
 
-    assign inflightWord = {13'd0, conn_valid_q, tbl_dbg_closed, tbl_dbg_has_pending,
+    // Bit 19 is req_ready, and it is not decoration: ConfigWriteReadyRegister does NOT
+    // back-pressure, so a START written while the previous beat is unconsumed OVERWRITES it and
+    // that request vanishes with no error anywhere. The host has to poll this before every START.
+    // Losing an arm this way sends a whole batch's requests nowhere -- observed as 46 requests on
+    // the wire when 69 were submitted, with the missing batch's bytes simply absent.
+    assign inflightWord = {12'd0, req_ready, conn_valid_q, tbl_dbg_closed, tbl_dbg_has_pending,
                            depth_sat, occ_sat};
 
     // Bit 27 is align_starved: body bytes arrived with no chunk length configured, which means the

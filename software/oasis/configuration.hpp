@@ -129,6 +129,10 @@ class HTTPReadConfig : public libstf::Config {
     /// the request stream afterwards -- this only tells the hardware what is coming.
     void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch);
 
+    /// Block until the config port can take another beat. See the definition for why skipping this
+    /// loses whole batches without raising anything.
+    void await_cfg_ready(const char *what);
+
     /// The exact bytes http_req_builder used to assemble in hardware.
     static std::string BuildGet(const std::string &host, uint16_t port, const std::string &path,
                                 uint64_t range_begin, uint64_t range_end);
@@ -158,6 +162,10 @@ class HTTPReadConfig : public libstf::Config {
         bool    has_pending   = false; // an announced segment is waiting to be read
         bool    peer_closed   = false; // the peer has FINed
         bool    conn_up       = false; // the persistent connection is established
+        /// The config port can accept another beat. MUST be polled before every START: the write
+        /// register does not back-pressure, so a START landing on an unconsumed beat overwrites it
+        /// and the request is lost silently.
+        bool    req_ready     = false;
 
         bool legacy() const { return slots == 0; }
         uint8_t free_slots() const { return slots > occupied ? uint8_t(slots - occupied) : uint8_t(0); }
