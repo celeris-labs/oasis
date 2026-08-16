@@ -303,6 +303,16 @@ if [ "$PHASES" = 1 ]; then
         cp "$FPGA_ROWS" "$PHASE_CACHE/q$n.rows"
         cp "$FPGA_RAW"  "$PHASE_CACHE/q$n.raw"
         printf '  q%-3s %8ss  rc=%s\n' "$n" "$fpga_s" "$fpga_rc"
+        # Keep the raw output for ANY failure, not just a timeout, and keep it OUTSIDE the phase
+        # cache. That cache is a mktemp -d removed on exit, and the verdict that copies failures to
+        # /tmp runs in phase 2 -- so a phase-1 failure lost its trace entirely unless the whole run
+        # completed, which by definition it had not. A q5 timeout left nothing to look at while
+        # phase 1 carried on spending 300 s per remaining query.
+        if [ "$fpga_rc" != 0 ]; then
+            cp "$FPGA_RAW" "/tmp/oasis-q$n-fpga-raw.txt"
+            echo "    rc=$fpga_rc -- trace kept: /tmp/oasis-q$n-fpga-raw.txt"
+            grep -E 'oasis-http|stalled|Error|rror' "$FPGA_RAW" | tail -6 | sed 's/^/      /'
+        fi
         if [ "$fpga_rc" = 124 ]; then
             # KEEP THE OUTPUT. A timeout is the case where the trace matters most and it was the one
             # case that threw it away: the raw file is a mktemp that the next query overwrites, so
