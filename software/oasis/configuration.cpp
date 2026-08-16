@@ -502,8 +502,19 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
     write_register(libstf::ConfigRegister(HTTP_START, 1));
 
     if (http_debug_enabled()) {
-        std::fprintf(stderr, "[oasis-http] batch: %zu column chunks, %zu bytes of request text\n",
-                     batch.chunk_bytes.size(), batch.text.size());
+        // Print the handler's state with EVERY batch, not just the sizes.
+        //
+        // The state registers cannot be read while a query is stuck: that query holds vfid 0, so a
+        // second process cannot attach, and a process blocked in the driver often cannot be killed
+        // to release it. scripts/util/http_state.sh therefore returns nothing in exactly the case
+        // it exists for. Printing here means the LAST line before a hang carries the state going
+        // into the batch that hung, which is the reading that was otherwise unobtainable.
+        const auto f = inflight();
+        const auto st = stall();
+        std::fprintf(stderr,
+                     "[oasis-http] batch: %zu column chunks, %zu bytes of request text | %s | %s\n",
+                     batch.chunk_bytes.size(), batch.text.size(), f.describe().c_str(),
+                     st.any() ? st.describe().c_str() : "no stalls");
     }
 }
 
