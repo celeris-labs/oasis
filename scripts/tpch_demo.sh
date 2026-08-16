@@ -30,6 +30,7 @@
 #   ./scripts/tpch_demo.sh --threads 1        # pin BOTH sides to one DuckDB thread
 #   ./scripts/tpch_demo.sh --phases           # all FPGA queries, THEN all CPU ones
 #   ./scripts/tpch_demo.sh --cpu-baseline fallback   # time our own CPU path instead of stock DuckDB
+#   ./scripts/tpch_demo.sh --groups 4         # row groups in flight per scan (default 16)
 #
 # The CPU baseline is STOCK DuckDB by default -- its httpfs filesystem and its parquet reader,
 # reading the same objects from the same MinIO. One-time setup, with the proxy still set:
@@ -94,6 +95,16 @@ PHASES=0
 # prefetches in parallel. That is the point. If the ratio moves against us, that was always the real
 # number.
 CPU_BASELINE=httpfs
+# Row groups a scan keeps in flight. Empty means DuckDB's default (16).
+#
+# This bounds how many COLUMN CHUNKS are outstanding on the FPGA at once: chunks =
+# groups_in_flight x projected columns, summed over the tables a query scans. A six-way join at the
+# default fills the handler's 64-entry chunk queue, and once it is full the decoder is behind, the
+# read stage stalls, and the query stops -- reported as "config port refused a chunk-length entry".
+#
+# It is a HOST-side concurrency knob, not a wire one: the requests for each batch still go out in a
+# single TCP write however low this is set.
+GROUPS_IN_FLIGHT=
 # DuckDB worker threads, applied to BOTH sides. Empty means DuckDB's default (one per core).
 #
 # --threads 1 is the honest like-for-like comparison. By default DuckDB decodes Parquet across every
@@ -110,6 +121,7 @@ while [ $# -gt 0 ]; do
         --cpu-first) CPU_FIRST=1 ;;
         --phases)  PHASES=1 ;;
         --cpu-baseline) CPU_BASELINE="$2"; shift ;;
+        --groups)  GROUPS_IN_FLIGHT="$2"; shift ;;
         --threads) THREADS="$2"; shift ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
@@ -167,6 +179,7 @@ views_cpu() {
 
 SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=false;"
 [ -n "$THREADS" ] && SETUP="$SETUP SET threads=$THREADS;"
+[ -n "$GROUPS_IN_FLIGHT" ] && SETUP="$SETUP SET oasis_scan_groups_in_flight=$GROUPS_IN_FLIGHT;"
 
 # The FPGA script has to arm the profiler before the query and read it back after, and both of those
 # print rows of their own. Rather than trying to filter them out by shape -- which silently broke
@@ -203,7 +216,7 @@ echo " TPC-H conformance   scale=$SCALE  server=$SERVER:$PORT"
 # threads goes in the banner, not only in the summary. Two runs at different chunk sizes were once
 # compared as if only the chunk had moved, when one of them had also been left on every core -- and
 # the pasted output gave no hint of it until 40 lines later.
-echo " inflight=${OASIS_HTTP_MAX_INFLIGHT:-default}  chunk=${OASIS_HTTP_CHUNK_BYTES:-default}  threads=${THREADS:-ALL CORES}"
+echo " inflight=${OASIS_HTTP_MAX_INFLIGHT:-default}  chunk=${OASIS_HTTP_CHUNK_BYTES:-default}  threads=${THREADS:-ALL CORES}  groups=${GROUPS_IN_FLIGHT:-default(16)}"
 echo " cpu baseline: $([ "$CPU_BASELINE" = httpfs ] \
         && echo 'stock DuckDB httpfs + read_parquet over plain HTTP' \
         || echo 'OUR httpfpga:// cpu fallback -- not a neutral baseline')"
