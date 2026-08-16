@@ -56,13 +56,23 @@ echo
 case "$rc" in
     0)   echo "the board answered -- it is NOT wedged. If a suite is stuck, the fault is upstream"
          echo "of the handler (host side, or the query that is running, not the FPGA)." ;;
-    124) echo "the probe itself timed out: the handler is not answering at all." ;;
+    124) echo "the probe itself timed out: the handler is not answering at all."
+         echo
+         echo "Nothing was printed above, which is itself the finding: the state registers are read"
+         echo "on the way to issuing a request, so a run that reaches them prints them even when the"
+         echo "request then hangs. Getting nothing means it hung EARLIER -- in cThread setup or the"
+         echo "HEAD probe -- so the fault is below the HTTP handler, not in it."
+         echo "Check first:  hdev set hugepages -s 1G -p 16   and   lsmod | grep coyote" ;;
     *)   echo "probe failed (rc=$rc). The state above is from the moment of failure, which is the"
          echo "reading you want -- it disappears on reprogram." ;;
 esac
 echo
+# Resolve the newest bitstream rather than naming one. This used to say build-97, which by the time
+# anyone read it was five bitstreams stale -- and following it silently reprograms the board with an
+# old design, so the next run tests something other than what is being debugged.
+BIT=$(ls -dt "$ROOT"/hardware/build-*/bitstreams/cyt_top.bit 2>/dev/null | head -1)
 echo "reprogram before the next run:"
 echo "  hdev set hugepages -s 1G -p 16"
 echo "  cd $ROOT/parcore/libstf/coyote/util && ./program_hacc_local.sh \\"
-echo "      $ROOT/hardware/build-97/bitstreams/cyt_top.bit \\"
+echo "      ${BIT:-$ROOT/hardware/build-<newest>/bitstreams/cyt_top.bit} \\"
 echo "      $ROOT/parcore/libstf/coyote/driver/build/coyote_driver.ko"
