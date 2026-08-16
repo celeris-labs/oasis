@@ -43,11 +43,33 @@ size_t default_pipeline_depth(OasisContext &ctx) {
     // A pre-pipelining bitstream reports 0 slots. There, one request at a time is the only safe
     // depth: that handler sampled its start trigger as a one-cycle pulse in ST_IDLE, so a second
     // request issued mid-transfer is dropped and never retried.
+    // TWO DIFFERENT RESOURCES, and conflating them deadlocks the pipeline.
+    //
+    // max_inflight() is how many chunk LENGTHS the HTTP handler can hold -- 64, and cheap, because
+    // an entry is a byte count. maximum_num_enqueued_configs() is how many column chunks the
+    // DECODER will accept, and every flow the scheduler dispatches also acquires an output buffer.
+    // The depth has to respect both.
+    //
+    // This returned max_inflight() alone. That was harmless while it evaluated to 1 (the old
+    // bytes-in-flight cap) or 4 (the old ring), and became a deadlock the moment it started
+    // reporting the chunk-queue depth: 64 flows in flight, 64 decoder configs enqueued and 64
+    // output buffers claimed, against a decoder that takes far fewer. The decoder then stops
+    // accepting, chunks never reach tlast so they never retire, and back-pressure runs all the way
+    // out to the TOE -- observed as inflight=46/64 with rx_fifo_stall set and the receive window
+    // collapsing to below the drop threshold.
+    //
+    // It failed at a different query each run because what matters is how many column chunks have
+    // accumulated, not which query asked for them.
+    const auto decoder_depth =
+        ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
     if (ctx.isHTTPEnabled()) {
-        const auto depth = ctx.config<HTTPReadConfig>()->max_inflight();
-        return depth == 0 ? 1 : static_cast<size_t>(depth);
+        const auto http_depth = ctx.config<HTTPReadConfig>()->max_inflight();
+        if (http_depth == 0) {
+            return 1;   // pre-pipelining bitstream: one request at a time is the only safe depth
+        }
+        return std::min<size_t>(static_cast<size_t>(http_depth), decoder_depth);
     }
-    return ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
+    return decoder_depth;
 }
 
 } // namespace
