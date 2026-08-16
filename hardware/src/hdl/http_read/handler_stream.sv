@@ -406,9 +406,24 @@ module handler_stream #(
                     read_state_d = ST_STAGE_IDLE;
                     // Nothing to advance any more: how far through a column chunk we are lives in
                     // axis_rewrite_last's byte counter, not in a pointer here.
+                    // A RECONNECT CANNOT RECOVER ANYTHING HERE, so it is only ever correct when
+                    // there is nothing left to recover.
+                    //
+                    // handler.sv re-sent unanswered requests after a reconnect by rolling send_ptr
+                    // back to read_ptr -- the descriptors were still in their slots, so re-sending
+                    // was free. Streamed request text is consumed as it goes and cannot be
+                    // reproduced by the hardware, so after a reconnect the outstanding requests are
+                    // simply gone: no response can arrive, the read stage errors again, and it
+                    // reconnects again. Observed on the wire as SYN/FIN on 32769, 32770, 32771 ...
+                    // with no data on any of them, burning one of the TOE's 512 ephemeral ports per
+                    // iteration until they run out.
+                    //
+                    // So: reconnect only when the alignment counter says nothing is owed. Otherwise
+                    // this is fatal, and the host is told -- it still has the request text and can
+                    // reissue the batch, which is the only place a retry can come from now.
                     if (read_error) begin
-                        if (read_error_dirty) fatal_d  = 1'b1;
-                        else                  reconn_d = 1'b1;
+                        if (read_error_dirty || rwl_busy) fatal_d  = 1'b1;
+                        else                              reconn_d = 1'b1;
                     end
                 end
             end

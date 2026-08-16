@@ -860,9 +860,14 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
                "answered with Transfer-Encoding: chunked, or whether the reply was an error page";
     }
     if (dirty_abort) {
-        oss << ". The connection died in the middle of a body whose bytes had already reached the "
-               "decoder. Those cannot be unsent, so the request was NOT replayed -- replaying would "
-               "duplicate them in the column. Reprogram to clear";
+        oss << ". The connection died with work outstanding and the hardware could not recover it. "
+               "Either body bytes had already reached the decoder -- those cannot be unsent, so "
+               "replaying would duplicate them in a column -- or a column chunk was still owed "
+               "bytes, and the requests that would have supplied them were STREAMED, so the "
+               "hardware has no copy to re-send. Reconnecting in that state answers nothing and "
+               "used to spin, opening and closing a connection per attempt until the TOE's 512 "
+               "ephemeral ports ran out; it now stops here instead. The host still holds the "
+               "request text, so a retry has to come from there. Reprogram to clear";
     }
     if (status_bad) {
         oss << ". The server answered something other than 200/206, so whatever reached the decoder "
