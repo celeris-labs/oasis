@@ -13,7 +13,9 @@ SCALE=${SCALE:-30}
 export NO_PROXY="${SERVER},127.0.0.1,localhost"; export no_proxy="$NO_PROXY"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null || true
 
-for g in ${GROUPS:-2 4 8 16}; do
+# NOT "GROUPS": that is a bash built-in holding the caller's group IDs, so ${GROUPS:-...} silently
+# used those instead of the default and ran the sweep at groups_in_flight=264587.
+for g in ${SWEEP_GROUPS:-2 4 8 16}; do
     echo "=============== oasis_scan_groups_in_flight=$g  (expect inflight ~ 3x) ==============="
     OASIS_HTTP_DEBUG=1 OASIS_HTTP_CHUNK_BYTES=${OASIS_HTTP_CHUNK_BYTES:-786432} \
     timeout "${TIMEOUT:-120}" "$ROOT/extension/build/release/duckdb" -c "
@@ -29,7 +31,8 @@ for g in ${GROUPS:-2 4 8 16}; do
         echo "  -> this is where the receive path stops keeping up"
         break
     elif [ "$rc" != 0 ]; then
-        echo "  ERROR rc=$rc  $(grep -iE 'error' /tmp/q4-g$g.txt | head -2)"
+        echo "  ERROR rc=$rc"
+        grep -iE 'error|Error|exception|stalled' /tmp/q4-g$g.txt | tail -4 | sed 's/^/    /'
         break
     else
         echo "  OK          peak inflight=${peak:-?}"
