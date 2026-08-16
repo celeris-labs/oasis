@@ -383,6 +383,20 @@ module handler_stream #(
                 end
             end
             CS_UP: begin
+                // The peer closed and NOTHING is in flight: reconnect now, while it costs nothing.
+                //
+                // An object store closes an idle connection -- MinIO after about 30 s -- and the
+                // handler holds one connection across duckdb processes, so the gap between two
+                // queries is enough. The old behaviour was to notice only when a send failed, by
+                // which point a batch was outstanding; streamed request text cannot be re-sent, so
+                // that is unrecoverable and latches fatal, and fatal needs a reprogram.
+                //
+                // With an empty queue, an idle forwarder and no chunk owed bytes, there is nothing
+                // to replay, so tearing down and reopening loses nothing at all. Doing it here
+                // turns an idle close from a query-killing fault into a reconnect nobody notices.
+                if (tbl_dbg_closed[0] && (occupancy == '0) && !stream_busy && !rwl_busy) begin
+                    reconn_d = 1'b1;
+                end
                 if (reconn_q && (read_state_q == ST_STAGE_IDLE) && !stream_busy) cs_d = CS_CLOSE;
             end
             CS_CLOSE: begin
