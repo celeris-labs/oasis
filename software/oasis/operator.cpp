@@ -192,6 +192,24 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
         const bool last = off + coyote::MAX_TRANSFER_SIZE >= buf->size;
         ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last);
     }
+
+    // WAIT FOR THE TRANSFER TO DRAIN BEFORE RETURNING.
+    //
+    // The DMA is asynchronous and this buffer belongs to the operator, so it is freed when the
+    // query's operator is destroyed. If the query ends first, the hardware is left mid-transfer:
+    // http_req_stream sits in ST_SEND_DATA waiting for bytes that will never come, stream_busy
+    // never clears, and since an arm is only admitted when !stream_busy, EVERY LATER QUERY blocks
+    // forever waiting for a config beat.
+    //
+    // It is not subtle on the wire once you see it: a q4 run was still transmitting q2's request
+    // text -- GETs for supplier and region, two queries after the query that built them -- onto a
+    // connection the server had already reset.
+    //
+    // req_total_bytes still holds this batch's length, so req_ready currently reports the ARM
+    // condition, which is exactly !stream_busy. Waiting on it here is therefore a wait for this
+    // transfer to finish sending. It costs only as long as a few KB of request text takes to go
+    // out, and it guarantees the buffer outlives the DMA reading it.
+    config->await_cfg_ready("request text to finish sending");
 }
 
 void HTTPBatchSourceOperator::print(std::ostream &os) const {
