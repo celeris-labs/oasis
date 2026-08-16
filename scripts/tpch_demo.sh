@@ -175,7 +175,23 @@ SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=f
 # reading a script does not always exit non-zero on a failed statement.
 BEGIN_MARK='<<<OASIS-BEGIN>>>'
 END_MARK='<<<OASIS-END>>>'
-extract_rows() { awk -v b="$BEGIN_MARK" -v e="$END_MARK" '$0==b{f=1;next} $0==e{f=0} f' | sed '/^$/d'; }
+# Rows between the markers, MINUS anything the library wrote to stderr.
+#
+# The capture is `> file 2>&1`, because a hardware fault's only trace is on stderr and losing it
+# costs a debugging session. That also means OASIS_HTTP_DEBUG's per-batch trace lands between the
+# markers and is counted as result rows: a scale-30 q8 reported "3849 fpga rows vs 2 cpu rows" when
+# the answer was the correct two rows and the other 3847 lines were debug output. A MISMATCH that is
+# really a logging artifact is worse than no check at all -- it sent two rounds of debugging after
+# data corruption that had not happened.
+#
+# Dropped: anything tagged [oasis-http], and continuation lines, which the stall descriptions indent.
+# duckdb -noheader -list never indents a value, so leading whitespace is a safe discriminator.
+extract_rows() {
+    awk -v b="$BEGIN_MARK" -v e="$END_MARK" '$0==b{f=1;next} $0==e{f=0} f' \
+        | grep -v '\[oasis-http\]' \
+        | grep -v '^[[:space:]]' \
+        | sed '/^$/d'
+}
 
 # Result sets go through files, not shell variables. At scale 30 a single query can return several
 # hundred thousand rows and the old string comparison would have held two copies of it in memory.
