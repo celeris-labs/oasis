@@ -76,10 +76,6 @@ uint32_t ParseIpBE(const string &host) {
 	return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
 }
 
-uint32_t IpForArpLookup(uint32_t ip_be) {
-	return __builtin_bswap32(ip_be);
-}
-
 // Extra microseconds to wait after the ARP request. ZERO by default -- see EnsureInitialized.
 useconds_t ArpSettleMicros() {
 	static const useconds_t configured = [] {
@@ -288,7 +284,7 @@ void OasisHTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	if (HttpFpgaDebugEnabled()) {
 		std::fprintf(stderr,
 		             "[httpfpga] init http_server=%s parseIpBE=0x%08x arp=0x%08x port=%u\n",
-		             server_host_.c_str(), server_ip_, IpForArpLookup(server_ip_),
+		             server_host_.c_str(), server_ip_, server_ip_,
 		             static_cast<unsigned>(server_port_));
 	}
 	// Resolve the server MAC into the TOE ARP table, then let it settle. Without this the handler
@@ -308,7 +304,20 @@ void OasisHTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	// The knob stays, defaulting to zero, ONLY because the failure it was once believed to guard
 	// against is a wedge that outlives the process. If a connect ever stalls with no init_error, try
 	// OASIS_ARP_SETTLE_US=1000000 and say so -- do not re-add this blindly.
-	ctx.cthread()->doArpLookup(IpForArpLookup(server_ip_));
+	//
+	// REMOVED. This asked the TOE to resolve IpForArpLookup(server_ip_), which byte-swaps: for a
+	// server at 10.253.74.74 it broadcast "Who has 74.74.253.10?" -- an address that exists nowhere,
+	// so nothing ever answered and no mapping was ever learned. The warm-up did resolve something,
+	// but only as a side effect: the request goes out as a BROADCAST carrying the FPGA's own IP and
+	// MAC in the sender fields, so the segment learns the FPGA's mapping regardless of what was
+	// asked for. That is what made it look load-bearing.
+	//
+	// It also put a bogus ARP into every capture, next to real traffic, where it reads like a
+	// symptom of whatever is being debugged. The TOE resolves the server itself when it opens the
+	// connection; the correct target does not need asking for twice, and the wrong one never helped.
+	//
+	// If a connect ever stalls with no init_error after this, the honest fix is to resolve the
+	// RIGHT address -- doArpLookup(server_ip_), no swap -- not to restore the swapped one.
 	if (const useconds_t settle = ArpSettleMicros()) {
 		usleep(settle);
 	}
