@@ -289,21 +289,30 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 		oasis::OperatorFlow flow;
 		auto decode = std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type);
 
-		// OASIS_HTTP_BATCH=0 falls back to one request per column chunk, which makes the flow
-		// structurally IDENTICAL to the RDMA path: [source, decode, sink] per chunk, one source per
-		// flow. The batch path instead puts decode first and hangs a whole row group's requests off
-		// the last flow, and it is the only place the HTTP path diverges in shape from RDMA. If the
-		// per-chunk path is reliable and the batch path is not, the fault is in the batching layer
-		// rather than in the hardware underneath it.
+		// OASIS_HTTP_BATCH=0 gives every column chunk its own request, one source per flow, which
+		// is the RDMA path's shape: no cross-flow coupling, no row-group-wide batch riding the last
+		// flow, and exactly one queue entry per request.
+		//
+		// It cannot use HTTPSourceOperator to do it. That operator drives http_req_builder's
+		// registers -- path words, range ASCII, ip hex -- and the builder no longer exists: the
+		// streamed handler takes its request text from host DMA instead, so those writes land in
+		// registers nothing reads and not one byte is transmitted. So this still goes through
+		// HTTPBatchSourceOperator and the DMA text path; the batch is simply one chunk long.
+		//
+		// Ordering stays decode-then-source, unlike RDMA's source-then-decode: the GET fires a real
+		// request whose body streams in on the server's schedule, so the decoder config has to be
+		// enqueued before the trigger rather than after it.
 		static const bool http_batch = [] {
 			const char *e = std::getenv("OASIS_HTTP_BATCH");
 			return !(e && e[0] == '0');
 		}();
 
 		if (http && !http_batch) {
-			flow.push_back(std::make_unique<oasis::HTTPSourceOperator>(
-			    http->path, http->server_ip, http->server_port, cc.offset, cc.total_compressed_size));
 			flow.push_back(std::move(decode));
+			std::vector<oasis::HTTPBatchSourceOperator::Chunk> one_chunk;
+			one_chunk.push_back({cc.offset, cc.total_compressed_size});
+			flow.push_back(std::make_unique<oasis::HTTPBatchSourceOperator>(
+			    http->path, http->server_ip, http->server_port, std::move(one_chunk)));
 		} else if (http) {
 			// Config strictly before trigger. The HTTP source fires a real GET and the response body
 			// streams into the decoder on its own schedule, so unlike the RDMA/local sources — which
