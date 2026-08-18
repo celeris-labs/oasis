@@ -1,5 +1,7 @@
 #include "oasis_scan.hpp"
 
+#include <cstdlib>
+
 #include "coalesced_fetcher.hpp"
 #include "column_reader.hpp"
 #include "duckdb/common/exception.hpp"
@@ -287,7 +289,22 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 		oasis::OperatorFlow flow;
 		auto decode = std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type);
 
-		if (http) {
+		// OASIS_HTTP_BATCH=0 falls back to one request per column chunk, which makes the flow
+		// structurally IDENTICAL to the RDMA path: [source, decode, sink] per chunk, one source per
+		// flow. The batch path instead puts decode first and hangs a whole row group's requests off
+		// the last flow, and it is the only place the HTTP path diverges in shape from RDMA. If the
+		// per-chunk path is reliable and the batch path is not, the fault is in the batching layer
+		// rather than in the hardware underneath it.
+		static const bool http_batch = [] {
+			const char *e = std::getenv("OASIS_HTTP_BATCH");
+			return !(e && e[0] == '0');
+		}();
+
+		if (http && !http_batch) {
+			flow.push_back(std::make_unique<oasis::HTTPSourceOperator>(
+			    http->path, http->server_ip, http->server_port, cc.offset, cc.total_compressed_size));
+			flow.push_back(std::move(decode));
+		} else if (http) {
 			// Config strictly before trigger. The HTTP source fires a real GET and the response body
 			// streams into the decoder on its own schedule, so unlike the RDMA/local sources — which
 			// the host or the RDMA stack meters — there is no point at which we can be sure the
