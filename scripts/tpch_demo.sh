@@ -303,7 +303,12 @@ run_cpu() {
       # serially and pays the object store's latency on each. The FPGA path keeps 64 requests in
       # flight from a single thread. Comparing at threads=1 therefore handicaps the CPU on I/O
       # while equalising decode -- run it both ways and report both numbers.
-      [ -n "${CPU_THREADS:-}" ] && echo "SET threads=$CPU_THREADS;"
+      # 0 means "leave DuckDB's own default", i.e. every core -- SET threads=0 is not valid.
+      if [ -n "${CPU_THREADS:-}" ] && [ "${CPU_THREADS}" != 0 ]; then
+          echo "SET threads=$CPU_THREADS;"
+      elif [ "${CPU_THREADS:-}" = 0 ]; then
+          echo "RESET threads;"
+      fi
       if [ "$CPU_BASELINE" = httpfs ]; then
           # Give stock DuckDB its best shot rather than its default one. The metadata cache is OFF
           # by default, so without this the parquet reader re-fetches each file's footer over HTTP
