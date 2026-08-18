@@ -117,6 +117,27 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
         }
         oasis::PadRequestTextToBeat(batch.text);
         emit_batch(stream, ctx, batch);
+
+        // The decoder's handshake counters alongside every batch line. Without them a trace shows
+        // the queue filling but not WHY nothing retires, because a chunk only retires when it
+        // reaches tlast, and that needs the decoder to be accepting. The equivalent sampling in
+        // HTTPSourceOperator never runs on this path -- the batch operator replaced it.
+        //
+        //   in stalled climbing   -> the decoder refuses input; nothing can retire
+        //   in starved climbing   -> the decoder is idle waiting; the stall is upstream
+        //   out handshakes flat   -> the decoder is not producing, so it is waiting, not busy
+        if (http_debug_enabled()) {
+            const auto prof = ctx.config<parcore::ColumnChunkDecoderConfig>()->read_profile(stream);
+            std::fprintf(stderr,
+                         "[oasis-http]   decoder in: hs=%llu starved=%llu stalled=%llu | "
+                         "out: hs=%llu starved=%llu stalled=%llu\n",
+                         static_cast<unsigned long long>(prof.in.handshakes_cycles),
+                         static_cast<unsigned long long>(prof.in.starved_cycles),
+                         static_cast<unsigned long long>(prof.in.stalled_cycles),
+                         static_cast<unsigned long long>(prof.out.handshakes_cycles),
+                         static_cast<unsigned long long>(prof.out.starved_cycles),
+                         static_cast<unsigned long long>(prof.out.stalled_cycles));
+        }
         chunk_lo = chunk_hi;
     }
 }
