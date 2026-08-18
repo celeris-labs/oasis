@@ -31,6 +31,9 @@
 #   ./scripts/tpch_demo.sh --phases           # all FPGA queries, THEN all CPU ones
 #   ./scripts/tpch_demo.sh --cpu-baseline fallback   # time our own CPU path instead of stock DuckDB
 #   ./scripts/tpch_demo.sh --groups 4         # row groups in flight per scan (default 16)
+#   ./scripts/tpch_demo.sh --sched-depth 16   # splinters in flight per stream (0 = hardware depth,
+#                                             # which is 64 -- exactly filling BOTH the decoder
+#                                             # config FIFO and the HTTP chunk queue, no slack)
 #
 # The CPU baseline is STOCK DuckDB by default -- its httpfs filesystem and its parquet reader,
 # reading the same objects from the same MinIO. One-time setup, with the proxy still set:
@@ -122,6 +125,7 @@ while [ $# -gt 0 ]; do
         --phases)  PHASES=1 ;;
         --cpu-baseline) CPU_BASELINE="$2"; shift ;;
         --groups)  GROUPS_IN_FLIGHT="$2"; shift ;;
+        --sched-depth) SCHED_DEPTH="$2"; shift ;;
         --threads) THREADS="$2"; shift ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
@@ -180,6 +184,7 @@ views_cpu() {
 SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=false;"
 [ -n "$THREADS" ] && SETUP="$SETUP SET threads=$THREADS;"
 [ -n "$GROUPS_IN_FLIGHT" ] && SETUP="$SETUP SET oasis_scan_groups_in_flight=$GROUPS_IN_FLIGHT;"
+[ -n "${SCHED_DEPTH:-}" ] && SETUP="$SETUP SET oasis_scheduler_queue_depth=$SCHED_DEPTH;"
 
 # The FPGA script has to arm the profiler before the query and read it back after, and both of those
 # print rows of their own. Rather than trying to filter them out by shape -- which silently broke
