@@ -192,6 +192,18 @@ SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=f
 TRACE_DIR=${TRACE_DIR:-$ROOT/.traces}
 mkdir -p "$TRACE_DIR"
 
+# Ctrl-C used to leave the duckdb child running: the shell interrupts the script, but the query
+# under `timeout` keeps going and keeps the vFPGA open, so the next run cannot attach and the board
+# looks wedged when it is only occupied. Signal the whole process group instead.
+on_interrupt() {
+    trap - INT TERM
+    echo
+    echo "  interrupted -- killing the query so it releases the vFPGA"
+    kill -TERM 0 2>/dev/null
+    exit 130
+}
+trap on_interrupt INT TERM
+
 # The FPGA script has to arm the profiler before the query and read it back after, and both of those
 # print rows of their own. Rather than trying to filter them out by shape -- which silently broke
 # every comparison by exactly one row -- bracket the real query with sentinels and take only what
