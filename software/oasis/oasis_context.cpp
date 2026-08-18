@@ -1,5 +1,7 @@
 #include "oasis/oasis_context.hpp"
 
+#include <cstdlib>
+
 #include "oasis/configuration.hpp"
 #include "parcore/configuration.hpp"
 
@@ -48,6 +50,37 @@ static libstf::stream_mask_t computeManagedStreams(libstf::GlobalConfig &global_
     return managed;
 }
 
+
+// How many output buffers to keep enqueued per stream.
+//
+// This was a hardcoded 2 while the scheduler dispatches up to 64 flows, and every flow's sink needs
+// a buffer for the decoder to write its results into. Flows past the second had nowhere to put
+// their output, so the decoder stalled on its OUTPUT side -- observed directly as
+// out_stalled=1632080 against out_starved=150185, with the counters frozen.
+//
+// It deadlocks rather than throttling. The two buffers are released only when the scan collects
+// them, the scan collects its HEAD row group, and if the head's columns are among the flows that
+// never got a buffer, nothing is ever released. Everything downstream follows: the decoder stops
+// accepting input, the reader stops draining, the rx fifo fills, the advertised window crosses
+// rx_engine's 24000-byte floor and the connection dies in go-back-N.
+//
+// At 8 MiB a buffer, 64 of them is 512 MiB against 32 GiB of huge pages -- the 2 was never a
+// memory decision. Clamped to what the bitstream reports it can hold.
+static size_t computeObmBuffers(libstf::GlobalConfig &global_config) {
+    size_t desired = 64;
+    if (const char *e = std::getenv("OASIS_OBM_BUFFERS")) {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v > 0) {
+            desired = static_cast<size_t>(v);
+        }
+    }
+    const size_t hw_max = global_config.get_config<libstf::MemConfig>()->maximum_num_enqueued_buffers();
+    if (hw_max > 0 && desired > hw_max) {
+        desired = hw_max;
+    }
+    return desired < 2 ? 2 : desired;
+}
+
 OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
                            size_t obm_buffer_capacity)
     : device_id_(DEFAULT_DEVICE_ID)
@@ -59,7 +92,8 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
     , output_buffer_manager_(std::make_shared<libstf::OutputBufferManager>(cthread(),
                              global_config_.get_config<libstf::MemConfig>(),
                              memory_pool_, tlb_manager_,
-                             computeManagedStreams(global_config_), 2, obm_buffer_capacity)) {
+                             computeManagedStreams(global_config_),
+                             computeObmBuffers(global_config_), obm_buffer_capacity)) {
     // Verify the bitstream loaded on the device is actually an Oasis system.
     if (global_config_.system_id() != OASIS_SYSTEM_ID) {
         std::ostringstream msg;
