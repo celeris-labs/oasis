@@ -31,6 +31,7 @@
 #   ./scripts/tpch_demo.sh --phases           # all FPGA queries, THEN all CPU ones
 #   ./scripts/tpch_demo.sh --cpu-baseline fallback   # time our own CPU path instead of stock DuckDB
 #   ./scripts/tpch_demo.sh --groups 4         # row groups in flight per scan (default 16)
+#   ./scripts/tpch_demo.sh --threads 1 --cpu-threads 0   # FPGA on 1 thread, CPU on every core
 #   ./scripts/tpch_demo.sh --sched-depth 16   # splinters in flight per stream (0 = hardware depth,
 #                                             # which is 64 -- exactly filling BOTH the decoder
 #                                             # config FIFO and the HTTP chunk queue, no slack)
@@ -127,6 +128,7 @@ while [ $# -gt 0 ]; do
         --groups)  GROUPS_IN_FLIGHT="$2"; shift ;;
         --sched-depth) SCHED_DEPTH="$2"; shift ;;
         --threads) THREADS="$2"; shift ;;
+        --cpu-threads) CPU_THREADS="$2"; shift ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
         -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
@@ -294,8 +296,21 @@ run_fpga() {
 run_cpu() {
     cpu_file=$(mktemp)
     { echo "$SETUP"
+      # --cpu-threads overrides --threads for the CPU side only.
+      #
+      # threads=1 equalises DECODE parallelism, but it also throttles DuckDB's I/O: it gets HTTP
+      # concurrency from threads, so at one thread its parquet reader issues range reads nearly
+      # serially and pays the object store's latency on each. The FPGA path keeps 64 requests in
+      # flight from a single thread. Comparing at threads=1 therefore handicaps the CPU on I/O
+      # while equalising decode -- run it both ways and report both numbers.
+      [ -n "${CPU_THREADS:-}" ] && echo "SET threads=$CPU_THREADS;"
       if [ "$CPU_BASELINE" = httpfs ]; then
-          echo "LOAD httpfs;"; views_cpu
+          # Give stock DuckDB its best shot rather than its default one. The metadata cache is OFF
+          # by default, so without this the parquet reader re-fetches each file's footer over HTTP
+          # on every query -- a cost the FPGA side does not pay, because the extension parses the
+          # footer once per scan. This makes the baseline faster, which is the point: a baseline we
+          # can be accused of handicapping is worth nothing.
+          echo "LOAD httpfs; SET enable_http_metadata_cache=true;"; views_cpu
       else
           echo "SET httpfpga_cpu_fallback=true;"; views read_parquet
       fi
