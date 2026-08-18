@@ -8,6 +8,9 @@
 #   peerclose  MinIO hung up      -> tcp_notify.valid & tcp_notify.data[closed]
 #   weclose    our RTL hung up    -> tcp_close_req.valid
 #   txerr      TOE refused a send -> tcp_tx_stat.valid & tcp_tx_stat.data[error] != 0
+#   now        no trigger at all: arm, wait SECS, then force a capture. The buffer is circular
+#              while armed, so a forced trigger hands back the ~900 qualified TCP events that
+#              came BEFORE the force. Use this when the run wedges without anyone closing.
 #
 # peerclose vs weclose is the measurement that splits the bug in half. Run peerclose first.
 # -------------------------------------------------------------------------------------------------
@@ -132,17 +135,33 @@ switch -- $mode {
         set_property TRIGGER_COMPARE_VALUE eq1'b1  [need $probes *tcp_tx_stat*valid*]
         set_property TRIGGER_COMPARE_VALUE neq2'b00 [need $probes {*tcp_tx_stat*error*}]
     }
+    now {
+        # Nothing to trigger on -- the force below is the trigger. Every probe stays don't-care.
+        puts "    (none -- capture is forced after the delay)"
+    }
     default { puts "unknown mode '$mode'"; exit 1 }
 }
 
 run_hw_ila $ila
 puts ""
-puts "ARMED. Start the query run now -- it stays armed through the queries that pass."
-puts "Waiting up to 60 minutes for the trigger."
-if {[catch {wait_on_hw_ila -timeout 60 $ila} err]} {
-    puts "NO TRIGGER within the timeout: $err"
-    puts "For peerclose that is itself the answer -- nobody sent a close notification."
-    exit 2
+if {$mode eq "now"} {
+    set secs 120
+    if {[info exists ::env(SECS)] && $::env(SECS) ne ""} { set secs $::env(SECS) }
+    puts "ARMED and capturing. Start the query run now."
+    puts "Forcing a capture in $secs seconds -- let it wedge before that fires."
+    after [expr {$secs * 1000}]
+    puts "forcing trigger"
+    run_hw_ila -trigger_now $ila
+    wait_on_hw_ila -timeout 2 $ila
+} else {
+    puts "ARMED. Start the query run now -- it stays armed through the queries that pass."
+    puts "Waiting up to 60 minutes for the trigger."
+    if {[catch {wait_on_hw_ila -timeout 60 $ila} err]} {
+        puts "NO TRIGGER within the timeout: $err"
+        puts "For peerclose that is itself the answer -- nobody sent a close notification,"
+        puts "so the peer-closed the handler reports is not coming from a real close."
+        exit 2
+    }
 }
 set data [upload_hw_ila_data $ila]
 write_hw_ila_data -force -csv_file ${out}.csv $data
