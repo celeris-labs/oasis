@@ -28,7 +28,7 @@ export NO_PROXY="${SERVER},127.0.0.1,localhost"; export no_proxy="$NO_PROXY"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null || true
 
 sample() {
-    "$DUCKDB" -csv -noheader -c "
+    timeout 30 "$DUCKDB" -csv -noheader -c "
         SET http_server='$SERVER'; SET http_port=$PORT;
         SELECT decoder, in_handshakes_cycles, in_starved_cycles, in_stalled_cycles, in_idle_cycles,
                out_handshakes_cycles, out_starved_cycles, out_stalled_cycles, out_idle_cycles
