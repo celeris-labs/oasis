@@ -28,3 +28,4 @@ jemalloc-5.3.0/
 
 # transient debug logs from scripts/util/repeat_query.sh
 .repeat-logs/
+.ila/
