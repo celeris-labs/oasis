@@ -79,6 +79,19 @@ proc need {probes pat} {
     return $p
 }
 
+# Not every CONTROL property is writable: they depend on how the IP was generated. TRIGGER_MODE is
+# read-only unless C_ADV_TRIGGER was set, and DATA_DEPTH is fixed at build time. Setting one of
+# those is not an error worth aborting on -- the value it is stuck at is the value we wanted.
+proc try_set {obj prop val} {
+    if {[catch {set_property $prop $val $obj} err]} {
+        set cur "?"
+        catch {set cur [get_property $prop $obj]}
+        puts "  note: $prop not writable (stuck at $cur) -- continuing"
+        return 0
+    }
+    return 1
+}
+
 # Reset every probe to don't-care in both the trigger and the storage qualifier. Vivado otherwise
 # keeps whatever a previous session left set, which silently changes what you are measuring.
 foreach p $probes {
@@ -88,11 +101,11 @@ foreach p $probes {
     set_property CAPTURE_COMPARE_VALUE $x $p
 }
 
-set_property CONTROL.TRIGGER_MODE BASIC_ONLY $ila
-set_property CONTROL.CAPTURE_MODE BASIC      $ila
-set_property CONTROL.CAPTURE_CONDITION OR    $ila
+try_set $ila CONTROL.TRIGGER_MODE BASIC_ONLY
+try_set $ila CONTROL.CAPTURE_MODE BASIC
+try_set $ila CONTROL.CAPTURE_CONDITION OR
 # Keep most of the buffer as history: we want what led UP to the event, not what followed it.
-set_property CONTROL.TRIGGER_POSITION [expr {$depth * 9 / 10}] $ila
+try_set $ila CONTROL.TRIGGER_POSITION [expr {$depth * 9 / 10}]
 
 # The storage qualifier is what makes a 1024-sample buffer usable. Storing only cycles on which a
 # TCP event is actually valid stretches the window from ~4 us of wall clock to seconds of run time.
@@ -106,16 +119,16 @@ foreach pat {*tcp_open_req*valid* *tcp_open_rsp*valid* *tcp_close_req*valid*
 puts "trigger:"
 switch -- $mode {
     peerclose {
-        set_property CONTROL.TRIGGER_CONDITION AND $ila
+        try_set $ila CONTROL.TRIGGER_CONDITION AND
         set_property TRIGGER_COMPARE_VALUE eq1'b1 [need $probes *tcp_notify*valid*]
         set_property TRIGGER_COMPARE_VALUE eq1'b1 [need $probes {*tcp_notify*closed*}]
     }
     weclose {
-        set_property CONTROL.TRIGGER_CONDITION AND $ila
+        try_set $ila CONTROL.TRIGGER_CONDITION AND
         set_property TRIGGER_COMPARE_VALUE eq1'b1 [need $probes *tcp_close_req*valid*]
     }
     txerr {
-        set_property CONTROL.TRIGGER_CONDITION AND $ila
+        try_set $ila CONTROL.TRIGGER_CONDITION AND
         set_property TRIGGER_COMPARE_VALUE eq1'b1  [need $probes *tcp_tx_stat*valid*]
         set_property TRIGGER_COMPARE_VALUE neq2'b00 [need $probes {*tcp_tx_stat*error*}]
     }
