@@ -138,6 +138,10 @@ class HTTPReadConfig : public libstf::Config {
     /// so a batch that fills the queue part way through deadlocks against its own arm.
     void await_queue_space(size_t needed, const char *what);
 
+    /// The three HTTP status digits from the last response strip_http parsed, as text ("206",
+    /// "416", ...), or "unparsed". Reads CSR 12. Meaningful mainly when stall().status_bad is set.
+    std::string last_http_status();
+
     /// The exact bytes http_req_builder used to assemble in hardware.
     static std::string BuildGet(const std::string &host, uint16_t port, const std::string &path,
                                 uint64_t range_begin, uint64_t range_end);

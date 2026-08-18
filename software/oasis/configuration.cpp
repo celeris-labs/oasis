@@ -546,6 +546,22 @@ void HTTPReadConfig::await_queue_space(size_t needed, const char *what) {
     }
 }
 
+// The three status digits strip_http captured, as text. CSR 12 (respWord) carries them as ASCII
+// in bits [23:0]; the handler only kept a bad/good bit, so a failure said "not 200/206" without
+// ever naming the code -- and 416 (range past EOF), 400 (malformed request) and 503 (server out of
+// resources) each mean something completely different about who is at fault.
+std::string HTTPReadConfig::last_http_status() {
+    const uint32_t w = static_cast<uint32_t>(read_register(HTTP_RESP).value());
+    const char d[3] = {static_cast<char>((w >> 16) & 0xFF), static_cast<char>((w >> 8) & 0xFF),
+                       static_cast<char>(w & 0xFF)};
+    for (const char c : d) {
+        if (c < '0' || c > '9') {
+            return "unparsed";
+        }
+    }
+    return std::string(d, 3);
+}
+
 void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
                                   const RequestBatch &batch) {
     if (batch.chunk_bytes.empty()) {
@@ -603,6 +619,12 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
                      "[oasis-http] batch: %zu column chunks, %zu bytes of request text | %s | %s\n",
                      batch.chunk_bytes.size(), batch.text.size(), f.describe().c_str(),
                      st.any() ? st.describe().c_str() : "no stalls");
+        // Name the status the moment it goes bad. It is a live register, so it must be read while
+        // the failure is on the board -- by the time the run ends it may have been overwritten.
+        if (st.status_bad) {
+            std::fprintf(stderr, "[oasis-http]   HTTP status from the server: %s\n",
+                         last_http_status().c_str());
+        }
     }
 }
 
@@ -971,7 +993,10 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     }
     if (status_bad) {
         oss << ". The server answered something other than 200/206, so whatever reached the decoder "
-               "is an error document, not column data";
+               "is an error document, not column data. The three digits are in CSR 12 bits [23:0] "
+               "as ASCII -- HTTPReadConfig::last_http_status() decodes them. 416 means a range past "
+               "end of file (a metadata/offset bug on our side), 400 a malformed request (request "
+               "text corruption), 5xx the server itself";
     }
     if (notify_overflow) {
         oss << ". The announcement queue overflowed, so segments the TOE announced were dropped and "
