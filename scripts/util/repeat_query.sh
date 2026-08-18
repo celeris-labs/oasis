@@ -26,31 +26,39 @@ SCALE=${SCALE:-30}
 N=${N:-8}
 TABLE=${TABLE:-lineitem}
 COL=${COL:-l_quantity}
-GROUPS=${GROUPS_IN_FLIGHT:-4}
+GRPS=${GROUPS_IN_FLIGHT:-4}   # NOT 'GROUPS' -- bash owns that name and silently keeps your gid
+
+LOG=${LOG:-$ROOT/.repeat-logs}; rm -rf "$LOG"; mkdir -p "$LOG"
 
 export NO_PROXY="${SERVER},127.0.0.1,localhost"; export no_proxy="$NO_PROXY"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null || true
 
-echo "$N x  sum($COL) from $TABLE  (scale $SCALE, groups=$GROUPS, chunk=${OASIS_HTTP_CHUNK_BYTES:-default})"
+echo "$N x  sum($COL) from $TABLE  (scale $SCALE, groups=$GRPS, chunk=${OASIS_HTTP_CHUNK_BYTES:-default})"
 echo "each iteration is its own duckdb process, as tpch_demo runs them"
 echo "----------------------------------------------------------------------"
 first_fail=0
 for i in $(seq "$N"); do
     t0=$(date +%s.%N)
-    OASIS_HTTP_DEBUG=1 timeout "${TIMEOUT:-60}" "$DUCKDB" -c "
+    OASIS_HTTP_DEBUG=1 timeout "${TIMEOUT:-60}" "$DUCKDB" -csv -c "
         SET http_server='$SERVER'; SET http_port=$PORT; SET threads=1;
-        SET oasis_scan_groups_in_flight=$GROUPS;
-        SELECT sum($COL) FROM read_oasis('httpfpga:///throughput/tpch-$SCALE/$TABLE.parquet');" \
-        > "/tmp/repeat-$i.txt" 2>&1
+        SET oasis_scan_groups_in_flight=$GRPS;
+        SELECT sum($COL) AS s, count(*) AS n FROM read_oasis('httpfpga:///throughput/tpch-$SCALE/$TABLE.parquet');" \
+        > "$LOG/repeat-$i.txt" 2>&1
     rc=$?
     t1=$(date +%s.%N)
     secs=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
-    val=$(grep -oE '^\| *[0-9]+ *\|' "/tmp/repeat-$i.txt" | tr -dc '0-9' | head -1)
-    if [ "$rc" = 0 ]; then
-        printf '  %2d  OK       %8ss   sum=%s\n' "$i" "$secs" "${val:-?}"
+    val=$(grep -oE '^[0-9]+\.?[0-9]*,[0-9]+$' "$LOG/repeat-$i.txt" | head -1)
+    gets=$(grep -c 'GET /' "$LOG/repeat-$i.txt")
+    if [ "$i" = 1 ]; then ref=$val; fi
+    if [ "$rc" = 0 ] && [ -n "$val" ] && [ "$val" = "$ref" ]; then
+        printf '  %2d  OK       %8ss   sum,rows=%-28s gets=%s\n' "$i" "$secs" "$val" "$gets"
+    elif [ "$rc" = 0 ]; then
+        printf '  %2d  WRONG    %8ss   sum,rows=%-28s gets=%s  (want %s)\n' "$i" "$secs" "${val:-<none>}" "$gets" "$ref"
+        [ "$first_fail" = 0 ] && first_fail=$i
+        break
     else
-        printf '  %2d  FAIL     %8ss   rc=%s\n' "$i" "$secs" "$rc"
-        grep -oE 'inflight=[0-9]+/[0-9]+[^|]*\| stalled:[^\\]*' "/tmp/repeat-$i.txt" | tail -1 | sed 's/^/        /'
+        printf '  %2d  FAIL     %8ss   rc=%s  gets=%s\n' "$i" "$secs" "$rc" "$gets"
+        grep -oE 'inflight=[0-9]+/[0-9]+[^|]*\| stalled:[^\\]*' "$LOG/repeat-$i.txt" | tail -1 | sed 's/^/        /'
         [ "$first_fail" = 0 ] && first_fail=$i
         break
     fi
@@ -60,5 +68,5 @@ if [ "$first_fail" = 0 ]; then
     echo "all $N passed -- repeating ONE query does not break it, so variety matters, not count"
 else
     echo "first failure on iteration $first_fail -- purely cumulative, query content is irrelevant"
-    echo "state kept: /tmp/repeat-$first_fail.txt"
+    echo "state kept: $LOG/repeat-$first_fail.txt  (readable from the build server too)"
 fi
