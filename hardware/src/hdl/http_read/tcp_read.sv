@@ -54,7 +54,17 @@ module tcp_read #(
     // smaller than what the stack promises the sender.
     //
     // Cost is 64 RAMB36 instead of 16, out of 2016 on the U55C -- the design uses 25.8%.
-    parameter int RX_FIFO_DEPTH = 4096,
+    //
+    // 4096 -> 8192 (256 KiB -> 512 KiB), build-105. This is slack, not a fix. The decoder ingests
+    // Snappy at ~615 MB/s measured (one vhsnunzip unbuffered core, ~5.5 B/cycle by its own README)
+    // while the server delivers faster, so the imbalance is permanent and no fifo size makes it go
+    // away. What the extra depth buys is TIME: tcp_read can keep issuing readPkg, which advances
+    // rxSar.appd, which keeps the advertised window above rx_engine's 24000-byte accept floor for
+    // roughly twice as long. Doubling absorbs ~1.3 ms of the imbalance instead of ~0.64 ms.
+    //
+    // The actual fix is the window clamp in rx_sar_table.cpp, which stops a dip below that floor
+    // being catastrophic. This only makes the dips rarer. Cost: 128 RAMB36, +3.2% of the device.
+    parameter int RX_FIFO_DEPTH = 8192,
 
     // Cycles to wait for ANY progress before giving up on a response. At 250 MHz, 2^29 is ~2.1 s.
     //
