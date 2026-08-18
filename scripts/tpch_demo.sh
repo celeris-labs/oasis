@@ -186,6 +186,12 @@ SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=f
 [ -n "$GROUPS_IN_FLIGHT" ] && SETUP="$SETUP SET oasis_scan_groups_in_flight=$GROUPS_IN_FLIGHT;"
 [ -n "${SCHED_DEPTH:-}" ] && SETUP="$SETUP SET oasis_scheduler_queue_depth=$SCHED_DEPTH;"
 
+# Traces go inside the repo, not /tmp. /tmp is per-host, so a trace written on the FPGA node is
+# invisible from the build node where the analysis happens -- and the interesting files are exactly
+# the ones someone else needs to read.
+TRACE_DIR=${TRACE_DIR:-$ROOT/.traces}
+mkdir -p "$TRACE_DIR"
+
 # The FPGA script has to arm the profiler before the query and read it back after, and both of those
 # print rows of their own. Rather than trying to filter them out by shape -- which silently broke
 # every comparison by exactly one row -- bracket the real query with sentinels and take only what
@@ -327,8 +333,8 @@ if [ "$PHASES" = 1 ]; then
         # completed, which by definition it had not. A q5 timeout left nothing to look at while
         # phase 1 carried on spending 300 s per remaining query.
         if [ "$fpga_rc" != 0 ]; then
-            cp "$FPGA_RAW" "/tmp/oasis-q$n-fpga-raw.txt"
-            echo "    rc=$fpga_rc -- trace kept: /tmp/oasis-q$n-fpga-raw.txt"
+            cp "$FPGA_RAW" "$TRACE_DIR/oasis-q$n-fpga-raw.txt"
+            echo "    rc=$fpga_rc -- trace kept: $TRACE_DIR/oasis-q$n-fpga-raw.txt"
             grep -E 'oasis-http|stalled|Error|rror' "$FPGA_RAW" | tail -6 | sed 's/^/      /'
         fi
         if [ "$fpga_rc" = 124 ]; then
@@ -338,8 +344,8 @@ if [ "$PHASES" = 1 ]; then
             # OASIS_HTTP_DEBUG=1 this file holds the per-batch ring occupancy and stall word right
             # up to the moment it stopped, which is otherwise unreadable -- the wedged process still
             # owns the vFPGA, so nothing else can attach to ask.
-            cp "$FPGA_RAW" "/tmp/oasis-q$n-timeout.txt"
-            echo "  timed out -- trace kept: /tmp/oasis-q$n-timeout.txt"
+            cp "$FPGA_RAW" "$TRACE_DIR/oasis-q$n-timeout.txt"
+            echo "  timed out -- trace kept: $TRACE_DIR/oasis-q$n-timeout.txt"
             echo "  last lines:"
             grep -E 'oasis-http|stalled|batch' "$FPGA_RAW" | tail -6 | sed 's/^/    /'
             ct=$((ct+1))
@@ -402,9 +408,9 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
         # Keep the whole thing, and print it ONCE. The FPGA side learned this the hard way and the
         # CPU side did not: 60 characters of "IO Error: Extension /home/.../extensions/f1b9c" names
         # neither the extension nor why it was refused, and both are the only things worth knowing.
-        cp "$CPU_RAW" "/tmp/oasis-q$n-cpu-error.txt"
+        cp "$CPU_RAW" "$TRACE_DIR/oasis-q$n-cpu-error.txt"
         if [ "$SKIP" -eq 0 ]; then
-            echo "         full error kept: /tmp/oasis-q$n-cpu-error.txt"
+            echo "         full error kept: $TRACE_DIR/oasis-q$n-cpu-error.txt"
             sed -n '/rror\|xception\|xtension/p' "$CPU_RAW" | head -6 | sed 's/^/         | /'
             # Only when the failure IS about the extension. This hint once fired on "Couldn't
             # connect to server" -- MinIO being down -- and sent the reader off to rebuild an
@@ -437,8 +443,8 @@ HINT
         # "terminate called after throwing an instance of 'st" -- which names neither the exception
         # nor the stage, and those are the only two things worth knowing. The tail is where the
         # handler state and the stall word are.
-        cp "$FPGA_RAW" "/tmp/oasis-q$n-error.txt"
-        echo "         full error kept: /tmp/oasis-q$n-error.txt"
+        cp "$FPGA_RAW" "$TRACE_DIR/oasis-q$n-error.txt"
+        echo "         full error kept: $TRACE_DIR/oasis-q$n-error.txt"
         sed -n '$p;/rror\|xception\|terminate\|httpfpga\|oasis-http/p' "$FPGA_RAW" \
             | tail -12 | sed 's/^/         | /'
         FAIL=$((FAIL+1)); FAILED+=("q$n"); continue
@@ -463,8 +469,8 @@ HINT
         fi
         printf '%-5s %-8s %9s %9s %10s  %s\n' "q$n" "MISMATCH" "$fpga_s" "$cpu_s" "${hw_mib:--}" "$detail"
         FAIL=$((FAIL+1)); FAILED+=("q$n"); accumulate
-        cp "$FPGA_ROWS" "/tmp/oasis-q$n-fpga.txt"; cp "$CPU_ROWS" "/tmp/oasis-q$n-cpu.txt"
-        echo "         full outputs kept: /tmp/oasis-q$n-{fpga,cpu}.txt"
+        cp "$FPGA_ROWS" "$TRACE_DIR/oasis-q$n-fpga.txt"; cp "$CPU_ROWS" "$TRACE_DIR/oasis-q$n-cpu.txt"
+        echo "         full outputs kept: $TRACE_DIR/oasis-q$n-{fpga,cpu}.txt"
     fi
 done
 
