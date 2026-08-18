@@ -133,6 +133,11 @@ class HTTPReadConfig : public libstf::Config {
     /// loses whole batches without raising anything.
     void await_cfg_ready(const char *what);
 
+    /// Block until the hardware queue has room for `needed` entries. Batches must reserve space for
+    /// all of their entries up front: the arm that starts a transfer is written after the entries,
+    /// so a batch that fills the queue part way through deadlocks against its own arm.
+    void await_queue_space(size_t needed, const char *what);
+
     /// The exact bytes http_req_builder used to assemble in hardware.
     static std::string BuildGet(const std::string &host, uint16_t port, const std::string &path,
                                 uint64_t range_begin, uint64_t range_end);

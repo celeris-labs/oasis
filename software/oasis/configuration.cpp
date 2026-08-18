@@ -230,8 +230,10 @@ constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 196608;
 // both 0 and any value >= the ring size mean "use the whole ring". No longer clamped by a
 // bytes-in-flight product -- see HttpMaxInflight for why that cap was removed.
 // The TCP window the stack advertises: 1 << WINDOW_BITS with WINDOW_BITS = 16 + WINDOW_SCALE_BITS
-// and WINDOW_SCALE_BITS = 2 (toe_config.hpp.in). Since build-95 the receive fifo is the same size,
-// so this one number is both what the peer is invited to send and what can actually be held.
+// and WINDOW_SCALE_BITS = 4 (toe_config.hpp.in), i.e. 1 MiB -- NOT the 256 KiB that a WINDOW_SCALE_BITS
+// of 2 would give, which is what this comment said until 2026-08-18. Since build-95 the receive fifo
+// (axis_data_fifo_512_d16384 in tcp_stack.sv, 16384 x 64 B) is the same size, so this one number is
+// both what the peer is invited to send and what can actually be held. If either moves, move both.
 //
 // MEASURED, against MinIO on 10.253.74.74, one keep-alive connection, 48 MB per point. The budget
 // is chunk x depth and every row inside it spends the same 256 KiB:
@@ -512,6 +514,38 @@ void HTTPReadConfig::await_cfg_ready(const char *what) {
     }
 }
 
+// Wait until the queue has room for a WHOLE batch, before any of it is pushed.
+//
+// await_cfg_ready only answers "can one more beat be accepted", which is not the question a batch
+// needs to ask. Entries are pushed one at a time and the arm that starts the transfer comes after
+// the last of them, so a batch that runs out of room half way through can never finish: the
+// remaining entries wait for space, space is freed only by responses, and responses need the arm.
+//
+// That is reachable whenever the host's own ceiling -- oasis_scan_groups_in_flight x projected
+// columns -- meets the hardware queue. At 16 groups it is 32 for a two-column scan and 48 for
+// three, both with headroom; a FOUR-column scan makes it exactly 64, the queue depth, and the
+// deadlock is then certain rather than unlucky. TPC-H q5 is the first query that scans four
+// hardware columns, which is why q1-q4 pass and q5 hangs at inflight=64/64.
+void HTTPReadConfig::await_queue_space(size_t needed, const char *what) {
+    const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
+    while (true) {
+        const auto f = inflight();
+        // A pre-pipelining bitstream reports slots == 0 and has no queue to reserve in.
+        if (f.legacy() || static_cast<size_t>(f.free_slots()) >= needed) {
+            return;
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            std::ostringstream msg;
+            msg << "FPGA HTTP queue never freed " << needed << " slots for " << what << " within "
+                << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
+                << "s [" << f.describe() << "; " << stall().describe()
+                << "]. The pipeline has stopped draining.";
+            throw std::runtime_error(msg.str());
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
 void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
                                   const RequestBatch &batch) {
     if (batch.chunk_bytes.empty()) {
@@ -528,6 +562,10 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
             << "against the arm";
         throw std::runtime_error(msg.str());
     }
+    // Reserve room for the whole batch BEFORE pushing any of it. Without this the loop below can
+    // fill the queue mid-batch and hang with the arm never issued -- see await_queue_space.
+    await_queue_space(batch.chunk_bytes.size(), "a batch of chunk-length entries");
+
     // 1. One queue entry per expected response, carrying only its body_last bit. req_total_bytes
     //    stays 0 on these beats, which is what tells the hardware they are entries and not an arm.
     for (const uint32_t bytes : batch.chunk_bytes) {
