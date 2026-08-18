@@ -21,19 +21,41 @@ open_hw_manager
 connect_hw_server -allow_non_jtag
 open_hw_target
 
+puts "targets:  [get_hw_targets]"
+puts "devices:  [get_hw_devices]"
+
 set dev [lindex [get_hw_devices *xcu55c*] 0]
 if {$dev eq ""} { set dev [lindex [get_hw_devices] 0] }
+if {$dev eq ""} { puts "ERROR: no device on the target at all -- is the board visible to the hw_server?"; exit 1 }
 current_hw_device $dev
-puts "device: $dev"
+puts "using:    $dev"
 
 set_property PROBES.FILE      $ltx $dev
 set_property FULL_PROBES.FILE $ltx $dev
-refresh_hw_device -update_hw_probes false $dev
+# NO -update_hw_probes false here. That flag skips probe enumeration, and then get_hw_ilas finds
+# nothing however correct the ltx is. Probe discovery is the entire reason we are refreshing.
+refresh_hw_device $dev
 
 set ila [lindex [get_hw_ilas -of_objects $dev -filter {CELL_NAME =~ *ila_perf_tcp*}] 0]
+if {$ila eq ""} { set ila [lindex [get_hw_ilas -filter {CELL_NAME =~ *ila_perf_tcp*}] 0] }
 if {$ila eq ""} {
-    puts "ila_perf_tcp not found. ILAs on this device:"
-    foreach i [get_hw_ilas -of_objects $dev] { puts "  [get_property CELL_NAME $i]" }
+    puts "----------------------------------------------------------------"
+    puts "ila_perf_tcp not found."
+    puts "PROBES.FILE      = [get_property PROBES.FILE $dev]"
+    puts "FULL_PROBES.FILE = [get_property FULL_PROBES.FILE $dev]"
+    set all [get_hw_ilas]
+    if {[llength $all] == 0} {
+        puts "NO ILAs of any kind were enumerated."
+        puts "That means the debug hub was not reached, not that the probe map is wrong."
+        puts "Most likely the bitstream on the board is not the one this ltx describes --"
+        puts "check that build-\$BUILD matches what program_hacc_local.sh actually loaded."
+    } else {
+        puts "ILAs that WERE found:"
+        foreach i $all { puts "  [get_property CELL_NAME $i]" }
+    }
+    puts "debug cores:"
+    foreach c [get_hw_devices] { puts "  device $c" }
+    puts "----------------------------------------------------------------"
     exit 1
 }
 set depth [get_property CONTROL.DATA_DEPTH $ila]
