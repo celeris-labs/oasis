@@ -4,8 +4,9 @@
 # Does not reprogram anything.
 #
 #   ./scripts/util/ila_tcp.sh list           # what the probes are actually called
-#   ./scripts/util/ila_tcp.sh close          # trigger when the connection is opened or closed
-#   ./scripts/util/ila_tcp.sh txerr          # trigger when the TOE refuses a send
+#   ./scripts/util/ila_tcp.sh peerclose    # MinIO hung up
+#   ./scripts/util/ila_tcp.sh weclose      # our RTL hung up
+#   ./scripts/util/ila_tcp.sh txerr        # the TOE refused a send
 #
 # Arm it FIRST, then start the query run in another shell. It sits armed through the queries that
 # pass and fires on the one that does not.
