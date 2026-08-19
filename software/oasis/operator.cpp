@@ -128,15 +128,23 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
         //   out handshakes flat   -> the decoder is not producing, so it is waiting, not busy
         if (http_debug_enabled()) {
             const auto prof = ctx.config<parcore::ColumnChunkDecoderConfig>()->read_profile(stream);
+            // idle is the counter that was missing, and it is the one that matters. handshake /
+            // starved / stalled only describe cycles WHILE a column chunk is streaming; the
+            // profiler sits in IDLE between chunks and counts none of them. So a decoder that
+            // looks 80% stalled in-chunk can still be idle most of the wall clock, waiting for the
+            // host to configure the next chunk -- with the receive buffer already full of data it
+            // has not been told about yet. Without this field the two cannot be told apart.
             std::fprintf(stderr,
-                         "[oasis-http]   decoder in: hs=%llu starved=%llu stalled=%llu | "
-                         "out: hs=%llu starved=%llu stalled=%llu\n",
+                         "[oasis-http]   decoder in: hs=%llu starved=%llu stalled=%llu idle=%llu | "
+                         "out: hs=%llu starved=%llu stalled=%llu idle=%llu\n",
                          static_cast<unsigned long long>(prof.in.handshakes_cycles),
                          static_cast<unsigned long long>(prof.in.starved_cycles),
                          static_cast<unsigned long long>(prof.in.stalled_cycles),
+                         static_cast<unsigned long long>(prof.in.idle_cycles),
                          static_cast<unsigned long long>(prof.out.handshakes_cycles),
                          static_cast<unsigned long long>(prof.out.starved_cycles),
-                         static_cast<unsigned long long>(prof.out.stalled_cycles));
+                         static_cast<unsigned long long>(prof.out.stalled_cycles),
+                         static_cast<unsigned long long>(prof.out.idle_cycles));
         }
         chunk_lo = chunk_hi;
     }
