@@ -23,47 +23,58 @@ N=${N:-400}
 export NO_PROXY="${SERVER},127.0.0.1,localhost"; export no_proxy="$NO_PROXY"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null || true
 
-python3 - "$SERVER" "$PORT" "$OBJ" "$CHUNK" "$N" <<'PYEOF'
-import http.client, sys, time
+python3 - "$SERVER" "$PORT" "$OBJ" "$CHUNK" "$N" <<'PYEOF2'
+import socket, sys, time
 server, port, obj, chunk, n = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
 
-def run(label, pipeline):
-    c = http.client.HTTPConnection(server, port)
-    c.connect()
-    total = 0
+# http.client refuses to pipeline -- it raises CannotSendRequest if a reply is outstanding. HTTP/1.1
+# pipelining is legal and MinIO answers in order, so this speaks it directly over a socket.
+def req(i):
+    off = i * chunk
+    return (f"GET {obj} HTTP/1.1\r\nHost: {server}:{port}\r\n"
+            f"Range: bytes={off}-{off+chunk-1}\r\nConnection: keep-alive\r\n\r\n").encode()
+
+class Reader:
+    def __init__(self, sock): self.s = sock; self.buf = b""
+    def fill(self):
+        d = self.s.recv(1 << 20)
+        if not d: raise RuntimeError("server closed")
+        self.buf += d
+    def one_response(self):
+        while b"\r\n\r\n" not in self.buf: self.fill()
+        head, _, rest = self.buf.partition(b"\r\n\r\n")
+        length = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":")[1])
+        self.buf = rest
+        while len(self.buf) < length: self.fill()
+        body, self.buf = self.buf[:length], self.buf[length:]
+        return len(body)
+
+def run(label, depth):
+    s = socket.create_connection((server, port))
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    r = Reader(s)
+    total = 0; sent = 0; pend = 0
     t0 = time.perf_counter()
-    if pipeline:
-        # send several requests before reading any reply -- what the FPGA does
-        depth = 8
-        pend = 0
-        i = 0
-        while i < n or pend:
-            while pend < depth and i < n:
-                off = i * chunk
-                c.putrequest("GET", obj, skip_host=True, skip_accept_encoding=True)
-                c.putheader("Host", f"{server}:{port}")
-                c.putheader("Range", f"bytes={off}-{off+chunk-1}")
-                c.endheaders()
-                pend += 1; i += 1
-            r = c.getresponse(); total += len(r.read()); pend -= 1
-    else:
-        for i in range(n):
-            off = i * chunk
-            c.request("GET", obj, headers={"Range": f"bytes={off}-{off+chunk-1}"})
-            r = c.getresponse(); total += len(r.read())
+    while sent < n or pend:
+        while pend < depth and sent < n:
+            s.sendall(req(sent)); sent += 1; pend += 1
+        total += r.one_response(); pend -= 1
     el = time.perf_counter() - t0
-    c.close()
-    print(f"  {label:<34} {total/1e6:8.0f} MB  {el:6.2f} s  {total/el/1e9:6.3f} GB/s")
+    s.close()
+    print(f"  {label:<36} {total/1e6:7.0f} MB {el:6.2f} s {total/el/1e9:7.3f} GB/s")
 
 print(f"one TCP connection, {chunk//1024} KiB ranged GETs, {n} of them")
 print()
-run("sequential (request, wait, repeat)", False)
-run("pipelined depth 8 (as the FPGA)", True)
+for d in (1, 2, 4, 8, 16, 32):
+    run(f"pipeline depth {d}", d)
 print()
-print("  FPGA measured on the same pattern:  ~0.33 GB/s wall, ~0.75 GB/s in-stream")
+print("  FPGA on the same pattern, measured:  ~0.33 GB/s")
 print()
-print("  pipelined number >> FPGA  -> the connection has headroom; the fault is ours")
-print("  pipelined number ~ FPGA   -> we are AT the single-connection ceiling, and no decoder")
-print("                               or parser work will move it. Per-session buffering is the")
-print("                               only way past, and that is a shell-level change.")
-PYEOF
+print("  depth 8+ much higher -> the connection has headroom and the FPGA is not exploiting")
+print("                          pipelining. The fault is in our request/response path.")
+print("  depth 8+ ~ 0.35 GB/s -> we are AT the single-connection ceiling. Only more sessions")
+print("                          would help, and RX_DDR_BYPASS forbids them.")
+PYEOF2
