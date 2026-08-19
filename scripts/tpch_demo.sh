@@ -610,8 +610,13 @@ HINT
         note="$(wc -l < "$FPGA_ROWS" | tr -d ' ') rows"
         # A query whose columns are all strings never reaches the decoder. Say so rather than
         # letting a 0.00 look like a failure.
-        awk -v m="${hw_mib:-0}" 'BEGIN{exit !(m+0 < 0.01)}' &&
-            note="$note, all-CPU query (no fixed-width column fetched)"
+        # Only meaningful when a per-query hw_MiB exists. In --single-session there is ONE profiler
+        # window for all 22 queries, so hw_mib is deliberately blank -- and treating blank as zero
+        # labelled every query "all-CPU query", which is simply false.
+        if [ -n "${hw_mib:-}" ]; then
+            awk -v m="$hw_mib" 'BEGIN{exit !(m+0 < 0.01)}' &&
+                note="$note, all-CPU query (no fixed-width column fetched)"
+        fi
         printf '%-5s %-8s %9s %9s %10s  %s\n' "q$n" "PASS" "$fpga_s" "$cpu_s" "${hw_mib:--}" "$note"
         PASS=$((PASS+1)); accumulate
     else
