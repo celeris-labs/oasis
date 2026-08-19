@@ -500,6 +500,57 @@ timestamp_t OasisHTTPFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	return timestamp_t(0);
 }
 
+// Serve a read from the handle's read-ahead cache, refilling it when the range is not resident.
+//
+// Without this, DuckDB's Parquet ColumnReader turned every page-header peek into a separate HTTP
+// request over a separate TCP connection -- measured on the wire as a whole handshake to move 256
+// bytes. Refilling 1 MiB at a time collapses thousands of those into a handful.
+//
+// Reads at or above the buffer size skip the cache: they are already efficient, and copying them
+// through a 1 MiB window would only add a memcpy and evict useful data.
+void OasisHTTPFileSystem::ReadBuffered(OasisHTTPFileHandle &h, void *dst, size_t size,
+                                       uint64_t location) {
+	if (size >= OasisHTTPFileHandle::READ_BUFFER_LEN) {
+		HTTPReadRange(h.path, location, size, dst);
+		return;
+	}
+	const bool resident = h.buffer_end > h.buffer_start && location >= h.buffer_start &&
+	                      location + size <= h.buffer_end;
+	if (!resident) {
+		if (!h.read_buffer) {
+			h.read_buffer = duckdb::unique_ptr<data_t[]>(new data_t[OasisHTTPFileHandle::READ_BUFFER_LEN]);
+		}
+		// READ AHEAD ONLY WHEN THE ACCESS IS ACTUALLY SEQUENTIAL.
+		//
+		// Reading a whole buffer for every small request is a trap, not a win. Parquet page headers
+		// can sit ~1 MB apart, so a scattered 256-byte header walk would pull a fresh 1 MiB per
+		// header, use 256 bytes of it and throw the rest away -- thousands of times the bytes the
+		// unbuffered path moved. Sequential page walking is the case that benefits, and it is
+		// recognisable: the next read starts where the last buffer ended.
+		//
+		// So: read ahead when this read continues the previous window, fetch exactly what was
+		// asked for when it does not. A single seek costs one small request, as before; a scan
+		// pays one 1 MiB fetch per MiB and gets every later header for free.
+		const bool sequential = h.buffer_end > h.buffer_start && location >= h.buffer_end &&
+		                        location - h.buffer_end <= OasisHTTPFileHandle::READ_BUFFER_LEN / 4;
+		const bool first_touch = h.buffer_end == h.buffer_start;
+		uint64_t fetch = (sequential || first_touch) ? OasisHTTPFileHandle::READ_BUFFER_LEN : size;
+		// Never read past EOF: the server answers short and the drain would wait for bytes that
+		// are not coming. Read() above rejects that for the caller's range; the READ-AHEAD has to
+		// clamp itself.
+		if (h.known_file_size != 0 && location + fetch > h.known_file_size) {
+			fetch = h.known_file_size - location;
+		}
+		if (fetch < size) {
+			fetch = size; // caller's range is authoritative and already bounds-checked
+		}
+		HTTPReadRange(h.path, location, static_cast<size_t>(fetch), h.read_buffer.get());
+		h.buffer_start = location;
+		h.buffer_end = location + fetch;
+	}
+	std::memcpy(dst, h.read_buffer.get() + (location - h.buffer_start), size);
+}
+
 void OasisHTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &h = handle.Cast<OasisHTTPFileHandle>();
 	if (nr_bytes < 0) {
@@ -510,7 +561,7 @@ void OasisHTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_byte
 	if (h.known_file_size != 0 && location + static_cast<uint64_t>(nr_bytes) > h.known_file_size) {
 		throw IOException("Read past end of file %s", handle.path);
 	}
-	HTTPReadRange(h.path, location, static_cast<size_t>(nr_bytes), buffer);
+	ReadBuffered(h, buffer, static_cast<size_t>(nr_bytes), location);
 }
 
 int64_t OasisHTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
@@ -525,7 +576,7 @@ int64_t OasisHTTPFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_b
 	if (h.known_file_size != 0) {
 		to_read = std::min(to_read, static_cast<size_t>(h.known_file_size - h.cursor));
 	}
-	HTTPReadRange(h.path, h.cursor, to_read, buffer);
+	ReadBuffered(h, buffer, to_read, h.cursor);
 	h.cursor += to_read;
 	return static_cast<int64_t>(to_read);
 }
