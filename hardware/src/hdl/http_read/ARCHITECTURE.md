@@ -11,11 +11,16 @@ four times from memory, each time costing a day.
 **Date:** 2026-08-06 · **Status:** superseded by ADR-3
 
 The Coyote TOE is built with `TCP_STACK_RX_DDR_BYPASS_EN=1`, so there is no per-session receive
-buffer: every session shares one `axis_data_fifo_512_d1024` (`tcp_stack.sv:681`, 1024 × 64 B =
-64 KB). `rxAppMemDataRead()` pops the **head** of that fifo regardless of which session asked, so
-the real contract is:
+buffer: every session shares one packet fifo (`rx_buffer_fifo` in `tcp_stack.sv:681`).
+`rxAppMemDataRead()` pops the **head** of that fifo regardless of which session asked, so the real
+contract is:
 
 > `readPkg` must be issued in global **arrival** order across all sessions.
+
+**Size note (2026-08-18).** This ADR was written when that fifo was `axis_data_fifo_512_d1024`,
+1024 × 64 B = 64 KB. It is now `axis_data_fifo_512_d16384` = **1 MiB**, matched to a 1 MiB advertised
+window (`WINDOW_SCALE_BITS = 4`). The contract above is unchanged — it is about ordering, not
+capacity — but every capacity number in the original text was four to sixteen times too small.
 
 Builds 90/91/92 violated it — `handler.sv` drained slots in *request* order — and wedged. The fix
 taken at the time was to allow only one connection (keep-alive, `00c1c09`), which made everything
@@ -64,8 +69,17 @@ The cliff is at the same *chunk size* at every depth — bytes in flight at the 
 bytes in flight, and it lands exactly where a response stops fitting alongside the parser's backlog.
 
 **Decision.** `axis_fifo.sv` between the TOE and the parser. `TREADY` now comes from fifo space.
-`rx_fifo_stall` is sticky and reaches the host as `stallWord` bit 25 — if it ever sets, the fifo is
-undersized and this decision has been silently undone.
+`rx_fifo_stall` is sticky and reaches the host as `stallWord` bit 25.
+
+> **2026-08-18 — `rx_fifo_stall` now sets routinely, and the original reading of it is wrong.**
+> The bit was documented as meaning "the fifo is undersized and this decision has been silently
+> undone". It has a second and far more common cause: the fifo fills because the **decoder** stopped
+> consuming, not because the fifo is too small. When the host deadlocks its own dispatcher the
+> decoder runs out of output buffers, `strip_http` back-pressures, and this bit sets as a *symptom*
+> several links down the chain. See *The dispatcher deadlock* in the top-level `README.md`.
+>
+> Read it as "the drain stopped" and then ask **why**. Only conclude the fifo is undersized after
+> ruling out the host side — `inflight=64/64` alongside it points at the deadlock, not at RTL.
 
 **Rejected:** a faster (parallel CRLF line-skipping) header parser. Measured at 0.3 % of per-request
 cost — right measurement, wrong quantity. The parser's cost was never cycles, it was holding
@@ -159,6 +173,34 @@ Related: [[toe-rx-no-demux]] records "bigger row groups are slower". That was me
 cliff, where a larger column chunk meant a larger response falling off it. With the cliff gone the
 sign may well have flipped, and bigger row groups mean fewer GETs. Re-test before relying on it.
 
+### 2026-08-18: re-read the numbers in this ADR before acting on them
+
+Three of the quantities this ADR reasons from have moved, and one conclusion should be re-derived
+rather than inherited.
+
+- **`N × 32 KiB / 800 µs = N × 40 MB/s` assumed a 32 KiB chunk.** The default is now 192 KiB
+  (`HTTP_DEFAULT_CHUNK_BYTES`), and the window that made that legal is 1 MiB. The same arithmetic at
+  the current chunk gives ~240 MB/s on **one** connection, and the measured single-connection points
+  are 192 KiB → 148 MB/s, 256 KiB → 179, 512 KiB → 294, 1 MiB → 423. Most of what this ADR wanted
+  from N connections has since been bought by a bigger window on one — which was step 1 of the
+  "two things to settle" above, and the answer turned out to be yes.
+
+- **`--groups`, and every "the receive path gives out at depth N" result, are contaminated by a
+  host-side deadlock** (see *The dispatcher deadlock* in the top-level `README.md`). The scheduler
+  dispatches 64 flows against a 64-entry hardware queue while only 2 FPGA output buffers exist, and
+  the single dispatcher thread that replenishes those buffers is the same thread that blocks on
+  hardware credit. Sweeps that found a depth where things "give out" were partly finding that
+  deadlock, not a property of the receive path. **Re-run the depth sweeps after that is fixed**;
+  until then no conclusion about optimal depth from those runs is safe.
+
+- **The decoder's timing has degraded and that is not accounted for anywhere in this file.**
+  build-103 closes at WNS **-0.949 ns** on the 250 MHz user clock with 30,719 failing endpoints, and
+  689 of the 1000 worst paths sit inside `inst_http_column_chunk_decoder` (524 in
+  `hybrid_page_decoder`, 113 in the Snappy `vhsnunzip`). build-102 was -0.436 ns with 200. A design
+  that does not close timing can corrupt or hang data-dependently, so **any** intermittent,
+  query-dependent failure must be reproduced on a timing-clean bitstream before it is attributed to
+  the network or to the host. Check `reports/shell_timing_summary.rpt` before trusting a run.
+
 ### What would overturn this
 
 - **The decoder stops being idle.** If duty rises above ~50 % after the connection count goes up,
@@ -168,8 +210,11 @@ sign may well have flipped, and bigger row groups mean fewer GETs. Re-test befor
   connections buy nothing and the bottleneck is the server, not us. This is the cheapest thing to
   falsify: the throughput should scale close to linearly with N up to some N, and if it does not,
   stop building.
-- **`rx_fifo_stall` sets.** Then the per-connection fifos are undersized and back-pressure is
-  reaching the TOE again, which breaks the arrival-order contract for every other session at once.
+- **`rx_fifo_stall` sets *with the decoder still consuming*.** Then the per-connection fifos are
+  undersized and back-pressure is reaching the TOE again, which breaks the arrival-order contract for
+  every other session at once. The qualifier matters: as of 2026-08-18 the usual cause of this bit is
+  a host-side deadlock starving the decoder of output buffers, which says nothing about fifo sizing.
+  Check `inflight` first.
 
 ### Explicitly not doing
 
@@ -177,11 +222,13 @@ sign may well have flipped, and bigger row groups mean fewer GETs. Re-test befor
   — but the non-bypass path in `tcp_stack.sv` drives a memory channel (`m_tcp_mem_wr_cmd[
   ddrPortNetworkRx]`) and the U55C has HBM, not DDR. Whether Coyote wires that channel on this card
   is an open question for the Coyote authors.
-- **`WINDOW_SCALING_EN=0`.** Would make `BUFFER_SIZE` 65,536 — exactly the fifo — instead of the
-  262,144 the stack currently advertises against 64 KB of real buffer. Prepared as
-  `scripts/synthesize.sh --no-window-scaling`, deliberately not built: once the fifo is drained
-  continuously the over-advertisement matters much less, and this would confound the measurement.
-  (Note the CMake guard bug that made the flag a no-op was real and is fixed in the Coyote checkout.)
+- **`WINDOW_SCALING_EN=0`.** ~~Would make `BUFFER_SIZE` 65,536 — exactly the fifo — instead of the
+  262,144 the stack currently advertises against 64 KB of real buffer.~~ **Obsolete: the mismatch
+  this was meant to paper over no longer exists.** `WINDOW_SCALE_BITS` is now 4, so the stack
+  advertises 1 MiB, and `rx_buffer_fifo` was resized to `d16384` = 1 MiB to match. Turning scaling
+  off would now *cost* throughput (256 KiB → 179 MB/s vs 1 MiB → 423 MB/s measured) for nothing.
+  The flag still exists as `scripts/synthesize.sh --no-window-scaling`. (The CMake guard bug that
+  made it a no-op was real and is fixed in the Coyote checkout.)
 - **`NUM_SLOTS = 8`.** Deeper pipelining on *one* connection cannot help, for the reason above.
 
 ### Implementation plan

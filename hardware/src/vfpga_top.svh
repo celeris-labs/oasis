@@ -320,11 +320,12 @@ end
 // Stripped HTTP body (unaligned keep) → DataNormalizer → OutputWriter bypass.
 // ENABLE_COMPACTOR(0): barrel-shift + beat merge only (lighter than COMPACTOR=1).
 AXI4S axi_http_body (.aclk(clk), .aresetn(rst_n));
-ndata_i #(data8_t, DATABEAT_SIZE) http_body_ndata();
-ndata_i #(data8_t, DATABEAT_SIZE) http_body_norm();
+localparam int HTTP_DEST_BITS = (NUM_DECODERS > 1) ? $clog2(NUM_DECODERS) : 1;
+logic [HTTP_DEST_BITS-1:0] http_body_dest;
 
 handler_stream #(
-    .QUEUE_DEPTH(HTTP_QUEUE_DEPTH)
+    .QUEUE_DEPTH(HTTP_QUEUE_DEPTH),
+    .NUM_DEST(NUM_DECODERS)
 ) inst_handler (
     .ap_clk  (clk),
     .ap_rst_n(rst_n),
@@ -392,57 +393,67 @@ handler_stream #(
     .m_axis_body_tready  (axi_http_body.tready),
     .m_axis_body_tdata   (axi_http_body.tdata),
     .m_axis_body_tkeep   (axi_http_body.tkeep),
-    .m_axis_body_tlast   (axi_http_body.tlast)
+    .m_axis_body_tlast   (axi_http_body.tlast),
+    .m_axis_body_tdest   (http_body_dest)
 );
 
-AXIToNData #(data8_t, DATABEAT_SIZE) inst_http_axi_to_ndata (
-    .clk(clk),
-    .rst_n(rst_n),
+// One decode lane per decoder, fed by a chunk-granular demux.
+//
+// The demux switches only between chunks -- axis_rewrite_last holds tdest constant from a chunk's
+// first beat to its tlast -- so a chunk is never split across lanes. The lane is chosen by the
+// HOST, in the spare upper bits of the chunk-length register, and is the same stream index it
+// enqueued that chunk's decoder configuration on. Hardware round-robin would have been simpler and
+// wrong: one retried or dropped chunk would desynchronise host and hardware permanently.
+//
+// Back-pressure is per lane, so a lane busy on a large chunk stalls the shared body stream. That is
+// the same head-of-line behaviour the single-lane design had; it does not get worse, and the gain
+// is that two chunks decode concurrently rather than in sequence.
+AXI4S axi_http_lane [NUM_DECODERS] (.aclk(clk), .aresetn(rst_n));
 
-    .in(axi_http_body),
-    .out(http_body_ndata)
-);
+for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_http_lane_sel
+    assign axi_http_lane[L].tvalid = axi_http_body.tvalid &&
+                                     (http_body_dest == HTTP_DEST_BITS'(L));
+    assign axi_http_lane[L].tdata  = axi_http_body.tdata;
+    assign axi_http_lane[L].tkeep  = axi_http_body.tkeep;
+    assign axi_http_lane[L].tlast  = axi_http_body.tlast;
+end
+always_comb begin
+    axi_http_body.tready = axi_http_lane[0].tready;
+    for (int L = 1; L < NUM_DECODERS; L++) begin
+        if (http_body_dest == HTTP_DEST_BITS'(L)) axi_http_body.tready = axi_http_lane[L].tready;
+    end
+end
 
-DataNormalizer #(
-    .data_t(data8_t),
-    .NUM_ELEMENTS(DATABEAT_SIZE),
-    .ENABLE_COMPACTOR(0)
-) inst_http_body_normalizer (
-    .clk(clk),
-    .rst_n(rst_n),
+for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_http_decoders
+    ndata_i       #(data8_t, DATABEAT_SIZE) lane_ndata();
+    ndata_i       #(data8_t, DATABEAT_SIZE) lane_norm();
+    typed_ndata_i #(DATABEAT_SIZE)          lane_typed();
+    ndata_i       #(data8_t, DATABEAT_SIZE) lane_decoded();
 
-    .in(http_body_ndata),
-    .out(http_body_norm)
-);
+    AXIToNData #(data8_t, DATABEAT_SIZE) inst_axi_to_ndata (
+        .clk(clk), .rst_n(rst_n), .in(axi_http_lane[L]), .out(lane_ndata)
+    );
 
-// Mirror the RDMA decoder path: HTTP-fetched raw column-chunk bytes → ColumnChunkDecoder → axi_out[0].
-// The raw bypass is replaced entirely; the host reads DECODED output from stream 0 (like the RDMA
-// oasis_scan flow). column_chunk_conf[0]/profile[0] are the same config slots the RDMA decoder used.
-typed_ndata_i #(DATABEAT_SIZE)          http_typed_out();
-ndata_i       #(data8_t, DATABEAT_SIZE) http_decoded();
+    DataNormalizer #(
+        .data_t(data8_t), .NUM_ELEMENTS(DATABEAT_SIZE), .ENABLE_COMPACTOR(0)
+    ) inst_normalizer (
+        .clk(clk), .rst_n(rst_n), .in(lane_ndata), .out(lane_norm)
+    );
 
-ColumnChunkDecoder #(
-    .DATABEAT_SIZE(DATABEAT_SIZE)
-) inst_http_column_chunk_decoder (
-    .clk(clk),
-    .rst_n(rst_n),
+    ColumnChunkDecoder #(
+        .DATABEAT_SIZE(DATABEAT_SIZE)
+    ) inst_decoder (
+        .clk(clk), .rst_n(rst_n),
+        .conf(column_chunk_conf[L]), .profile(profile[L]),
+        .in(lane_norm), .out(lane_typed)
+    );
 
-    .conf(column_chunk_conf[0]),
-    .profile(profile[0]),
+    `DATA_ASSIGN(lane_typed, lane_decoded);
 
-    .in(http_body_norm),
-    .out(http_typed_out)
-);
-
-`DATA_ASSIGN(http_typed_out, http_decoded);
-
-NDataToAXI #(data8_t, DATABEAT_SIZE) inst_http_ndata_to_axi (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .in(http_decoded),
-    .out(axi_out[0])
-);
+    NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi (
+        .clk(clk), .rst_n(rst_n), .in(lane_decoded), .out(axi_out[L])
+    );
+end
 
 // Raw bypass removed — nothing flows to the bypass output slot now.
 always_comb axi_out[BYPASS_ID].tie_off_m();

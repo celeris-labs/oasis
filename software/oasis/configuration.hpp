@@ -127,7 +127,8 @@ class HTTPReadConfig : public libstf::Config {
 
     /// Push the batch's body_last bits, then arm the transfer. The caller DMAs `batch.text` into
     /// the request stream afterwards -- this only tells the hardware what is coming.
-    void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch);
+    void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch,
+                      libstf::stream_t stream);
 
     /// Block until the config port can take another beat. See the definition for why skipping this
     /// loses whole batches without raising anything.

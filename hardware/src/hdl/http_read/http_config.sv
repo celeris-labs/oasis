@@ -278,6 +278,7 @@ always_comb begin
     cfg.time_in_seconds = reg_time_in_seconds[31:0];
     cfg.req_total_bytes = reg_req_total_bytes[31:0];
     cfg.req_chunk_bytes = reg_req_chunk_bytes[31:0];
+    cfg.req_chunk_dest  = reg_req_chunk_bytes[35:32];
     cfg.range_begin_len = reg_range_begin_len[7:0];
     cfg.range_begin_w0  = reg_range_begin_w0 [31:0];
     cfg.range_begin_w1  = reg_range_begin_w1 [31:0];

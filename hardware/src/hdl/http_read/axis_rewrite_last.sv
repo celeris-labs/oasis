@@ -25,7 +25,12 @@ import lynxTypes::*;
 module axis_rewrite_last #(
     // Column chunks that may be configured ahead of the data. A row group's worth is a handful, so
     // this exists to decouple the host from the wire, not to bound anything.
-    parameter int CFG_DEPTH = 64
+    parameter int CFG_DEPTH = 64,
+    // Decoder lanes the body stream can be routed to. 1 keeps the original single-lane behaviour
+    // and costs nothing.
+    parameter int NUM_DEST  = 1,
+    // Derived, but a parameter so the ports can use it.
+    parameter int DEST_BITS = (NUM_DEST > 1) ? $clog2(NUM_DEST) : 1
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -34,6 +39,11 @@ module axis_rewrite_last #(
     input  logic        cfg_valid,
     output logic        cfg_ready,
     input  logic [31:0] cfg_len,
+    // Which decoder lane this chunk belongs to. The HOST decides -- it is the same stream index it
+    // enqueued the chunk's decoder configuration on -- and the hardware must not second-guess it.
+    // Round-robin in hardware would work only while host and hardware never disagree, and a single
+    // dropped or retried chunk would desynchronise them permanently.
+    input  logic [DEST_BITS-1:0] cfg_dest,
 
     input  logic                       s_tvalid,
     output logic                       s_tready,
@@ -45,6 +55,9 @@ module axis_rewrite_last #(
     output logic [AXI_DATA_BITS-1:0]   m_tdata,
     output logic [AXI_DATA_BITS/8-1:0] m_tkeep,
     output logic                       m_tlast,
+    // Lane of the chunk currently streaming. Valid whenever m_tvalid is high, and constant for a
+    // whole chunk, so a demux downstream can hold its selection until tlast.
+    output logic [DEST_BITS-1:0]       m_tdest,
 
     // High while any configured chunk is still incomplete. This is what tells the handler that more
     // responses are coming: the module knows exactly how many bytes are still owed, so nothing else
@@ -66,8 +79,9 @@ module axis_rewrite_last #(
             $error("axis_rewrite_last: CFG_DEPTH must be a power of two >= 2");
     end
 
-    // Length queue.
-    logic [31:0]          len_mem [CFG_DEPTH];
+    // Length queue, and the lane each length belongs to.
+    logic [31:0]          len_mem  [CFG_DEPTH];
+    logic [DEST_BITS-1:0] dest_mem [CFG_DEPTH];
     logic [PTR_BITS-1:0]  wr_ptr_q, rd_ptr_q;
     logic [CNT_BITS-1:0]  cnt_q;
     logic                 q_empty, q_full;
@@ -77,6 +91,7 @@ module axis_rewrite_last #(
 
     // Bytes still owed on the stream currently being counted. Loaded from the queue head.
     logic [31:0] remaining_q;
+    logic [DEST_BITS-1:0] dest_q;
     logic        active_q;
     logic        starved_q;
 
@@ -98,6 +113,7 @@ module axis_rewrite_last #(
     assign m_tdata = s_tdata;
     assign m_tkeep = s_tkeep;
     assign m_tlast = is_last;
+    assign m_tdest = dest_q;
 
     assign busy          = active_q || !q_empty;
     assign starved       = starved_q;
@@ -109,17 +125,22 @@ module axis_rewrite_last #(
             rd_ptr_q    <= '0;
             cnt_q       <= '0;
             remaining_q <= '0;
+            dest_q      <= '0;
             active_q    <= 1'b0;
             starved_q   <= 1'b0;
         end else begin
             // Push and pop can happen in the same cycle, so the count is adjusted ONCE from both
             // rather than by two assignments where the later silently wins.
             if (do_push) begin
-                len_mem[wr_ptr_q] <= cfg_len;
-                wr_ptr_q          <= wr_ptr_q + 1'b1;
+                len_mem [wr_ptr_q] <= cfg_len;
+                dest_mem[wr_ptr_q] <= cfg_dest;
+                wr_ptr_q           <= wr_ptr_q + 1'b1;
             end
             if (do_pop) begin
-                remaining_q <= len_mem[rd_ptr_q];
+                remaining_q <= len_mem [rd_ptr_q];
+                // dest_q holds for the whole chunk, so a demux can latch it on the first beat and
+                // keep it until tlast without re-deciding mid-stream.
+                dest_q      <= dest_mem[rd_ptr_q];
                 active_q    <= 1'b1;
                 rd_ptr_q    <= rd_ptr_q + 1'b1;
             end

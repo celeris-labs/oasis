@@ -208,7 +208,26 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     // Tell the hardware what is coming: one bit per expected response, then the arm. This must
     // precede the DMA -- the arm is what opens the connection, and the queue entries have to be in
     // place before any response can arrive.
-    config->submit_batch(server_ip_, server_port_, batch);
+    // A batch carries ONE lane for all its chunks, so every chunk in it must belong to the stream
+    // this operator runs on. That holds when each flow submits its own chunk (OASIS_HTTP_BATCH=0):
+    // the decode config and the request are applied on the same stream by construction.
+    //
+    // It does NOT hold for a row-group batch, whose chunks come from sibling flows the scheduler
+    // may have placed on other streams. With one decoder that was harmless -- every stream was 0.
+    // With more than one it would route a column's bytes to a decoder configured for a different
+    // column, which corrupts silently. Refuse rather than corrupt.
+    if (batch.chunk_bytes.size() > 1) {
+        const auto decoders = ctx.config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
+        if (decoders > 1) {
+            throw std::runtime_error(
+                "HTTPBatchSourceOperator: a multi-chunk batch cannot target " +
+                std::to_string(decoders) +
+                " decoders -- its chunks may belong to different streams. Run with "
+                "OASIS_HTTP_BATCH=0 (one request per column chunk), or give the batch a per-chunk "
+                "lane before enabling multi-decoder batching.");
+        }
+    }
+    config->submit_batch(server_ip_, server_port_, batch, stream);
 
     // Then the text itself.
     auto *byte_ptr = static_cast<std::byte *>(buf->ptr);

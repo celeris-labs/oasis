@@ -54,6 +54,9 @@ module handler_stream #(
     // row group needs a handful of entries however finely each chunk is split into ranged GETs, so
     // 64 is generous rather than a bound anyone can reach.
     parameter int QUEUE_DEPTH = 64,
+    // Decoder lanes downstream. 1 reproduces the original single-decoder behaviour exactly.
+    parameter int NUM_DEST    = 1,
+    parameter int DEST_BITS   = (NUM_DEST > 1) ? $clog2(NUM_DEST) : 1,
     // Cycles a stage may make no progress before its stall bit latches. See handler.sv.
     parameter int STALL_CYCLES = 268435456,
     // Bytes announced to the TOE per transmit reservation.
@@ -125,6 +128,8 @@ module handler_stream #(
     output logic [AXI_DATA_BITS-1:0]   m_axis_body_tdata,
     output logic [AXI_DATA_BITS/8-1:0] m_axis_body_tkeep,
     output logic                       m_axis_body_tlast,
+    // Lane for the chunk currently streaming, constant until tlast.
+    output logic [DEST_BITS-1:0]       m_axis_body_tdest,
 
     output logic [31:0]                               totalWord,
     output logic [31:0]                               inflightWord,
@@ -337,15 +342,19 @@ module handler_stream #(
 
     // -- alignment: mark the end of each column chunk by counting its bytes ------------------------
 
-    axis_rewrite_last #(.CFG_DEPTH(QUEUE_DEPTH)) inst_rewrite_last (
+    axis_rewrite_last #(
+        .CFG_DEPTH(QUEUE_DEPTH), .NUM_DEST(NUM_DEST), .DEST_BITS(DEST_BITS)
+    ) inst_rewrite_last (
         .clk(ap_clk), .rst_n(ap_rst_n),
         .cfg_valid(cfg_is_entry), .cfg_ready(rwl_cfg_ready),
         .cfg_len(req_data.req_chunk_bytes),
+        .cfg_dest(req_data.req_chunk_dest[DEST_BITS-1:0]),
         .s_tvalid(raw_body_tvalid), .s_tready(raw_body_tready),
         .s_tdata(raw_body_tdata),   .s_tkeep(raw_body_tkeep),
         .m_tvalid(m_axis_body_tvalid), .m_tready(m_axis_body_tready),
         .m_tdata(m_axis_body_tdata),   .m_tkeep(m_axis_body_tkeep),
         .m_tlast(m_axis_body_tlast),
+        .m_tdest(m_axis_body_tdest),
         .busy(rwl_busy), .starved(rwl_starved), .remaining_dbg(rwl_remaining)
     );
 

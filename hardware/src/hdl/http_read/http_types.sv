@@ -82,6 +82,11 @@ typedef struct packed {
     // split into ranged GETs. axis_rewrite_last counts the bytes down and asserts tlast on the beat
     // that completes the chunk, so how many GETs it took is invisible downstream.
     logic [31:0] req_chunk_bytes;
+    // Decoder lane this chunk belongs to. Carried in the SPARE UPPER BITS of the 64-bit
+    // req_chunk_bytes register rather than in a register of its own: the address map is full of
+    // traps (moving anything shifts every later parameter silently), and a chunk length has never
+    // needed more than 32 bits.
+    logic [3:0]  req_chunk_dest;
 } http_config_t;
 
 endpackage

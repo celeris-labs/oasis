@@ -563,7 +563,7 @@ std::string HTTPReadConfig::last_http_status() {
 }
 
 void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
-                                  const RequestBatch &batch) {
+                                  const RequestBatch &batch, libstf::stream_t stream) {
     if (batch.chunk_bytes.empty()) {
         return;
     }
@@ -588,7 +588,13 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
         // PARAMETERS FIRST, THEN POLL, THEN TRIGGER. req_ready is combinational on the LIVE value
         // of req_total_bytes, so polling before writing it asks whether the PREVIOUS beat would be
         // accepted. See await_cfg_ready.
-        write_register(libstf::ConfigRegister(HTTP_REQ_CHUNK_BYTES, bytes));
+        // The decoder lane rides in bits [35:32] of the 64-bit chunk-length register. It MUST be
+        // the same stream the chunk's decoder configuration was enqueued on, or the bytes reach a
+        // decoder expecting a different column. There is no register-map change here on purpose:
+        // moving anything in that map shifts every later parameter silently.
+        write_register(libstf::ConfigRegister(
+            HTTP_REQ_CHUNK_BYTES,
+            static_cast<uint64_t>(bytes) | (static_cast<uint64_t>(stream & 0xF) << 32)));
         write_register(libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, 0u));
         await_cfg_ready("chunk-length entry");
         write_register(libstf::ConfigRegister(HTTP_START, 1));
