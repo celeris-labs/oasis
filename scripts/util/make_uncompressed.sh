@@ -30,7 +30,7 @@ SCALE=${SCALE:-30}
 TABLE=${TABLE:-lineitem}
 COL=${COL:-l_quantity}
 MC=${MC:-$HOME/mc}
-ALIAS=${MC_ALIAS:-minio}
+ALIAS=${MC_ALIAS:-local}   # NOT "minio" -- no such alias exists; see the guard below
 BUCKET=${BUCKET:-throughput}
 NAME=${TABLE}_${COL}_raw.parquet
 STAGE=${STAGE:-$ROOT/.raw}
@@ -56,6 +56,17 @@ fi
 ls -la "$OUT" || exit 1
 
 echo "3/4  uploading to the MinIO the FPGA actually reads ($SERVER)"
+# mc does NOT error on an unknown alias -- it treats "foo/bucket/key" as a LOCAL PATH and happily
+# creates ./foo/bucket/ and copies into it, at NFS speed, reporting success. That cost us two
+# 130 MiB "uploads" into ./minio/throughput/tpch-30/ before anyone noticed. So check the alias is
+# real before using it.
+if ! "$MC" alias list "$ALIAS" >/dev/null 2>&1; then
+    echo "     no mc alias named '$ALIAS'. Available:"
+    "$MC" alias list 2>/dev/null | grep -E '^[a-zA-Z]' | sed 's/^/       /'
+    echo "     Re-run with MC_ALIAS=<one of those>. Without this check mc would have silently"
+    echo "     written a directory called '$ALIAS' into the current folder."
+    exit 1
+fi
 "$MC" cp "$OUT" "$ALIAS/$BUCKET/tpch-$SCALE/$NAME" 2>&1 | tail -1 || true
 
 echo "4/4  verifying over HTTP -- mc's exit code proves nothing about WHICH MinIO it wrote to"
