@@ -32,6 +32,17 @@
 #   ./scripts/tpch_demo.sh --cpu-baseline fallback   # time our own CPU path instead of stock DuckDB
 #   ./scripts/tpch_demo.sh --groups 4         # row groups in flight per scan (default 16)
 #   ./scripts/tpch_demo.sh --threads 1 --cpu-threads 0   # FPGA on 1 thread, CPU on every core
+#   ./scripts/tpch_demo.sh --single-session   # all 22 queries in ONE duckdb process per side
+#
+# --single-session is the standard TPC-H shape and the quotable one. By default this script starts a
+# FRESH duckdb per query -- 44 processes for a full run -- which throws away every in-process cache
+# between queries. DuckDB's parquet metadata cache and its external file cache both live in the
+# process, so per-query processes re-fetch every footer over HTTP (lineitem's alone is 2.37 MB) and
+# re-read every byte. It also re-attaches the vFPGA 22 times while the hardware's TCP connection
+# persists across them, which is how a killed query poisons the next.
+#
+# EXPECT THE RATIO TO DROP. The CPU side gains more from caching than the FPGA side does. That is
+# the point: it is the number that survives scrutiny.
 #   ./scripts/tpch_demo.sh --sched-depth 16   # splinters in flight per stream (0 = hardware depth,
 #                                             # which is 64 -- exactly filling BOTH the decoder
 #                                             # config FIFO and the HTTP chunk queue, no slack)
@@ -129,6 +140,7 @@ while [ $# -gt 0 ]; do
         --sched-depth) SCHED_DEPTH="$2"; shift ;;
         --threads) THREADS="$2"; shift ;;
         --cpu-threads) CPU_THREADS="$2"; shift ;;
+        --single-session) SINGLE_SESSION=1 ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
         -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
@@ -191,6 +203,10 @@ SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=f
 # Traces go inside the repo, not /tmp. /tmp is per-host, so a trace written on the FPGA node is
 # invisible from the build node where the analysis happens -- and the interesting files are exactly
 # the ones someone else needs to read.
+# One session per side means the FPGA side runs to completion before the CPU side starts,
+# which is exactly what --phases means. Force it rather than allow a contradiction.
+[ "${SINGLE_SESSION:-0}" = 1 ] && PHASES=1
+
 TRACE_DIR=${TRACE_DIR:-$ROOT/.traces}
 mkdir -p "$TRACE_DIR"
 
@@ -336,6 +352,83 @@ run_cpu() {
 }
 
 
+
+# ---------------------------------------------------------------------------------------------
+# --single-session: every query in ONE duckdb process per side.
+#
+# Per-query wall time comes from timestamps the session itself prints, not from the shell, so the
+# process startup that dominates short queries is excluded from all of them equally. Populates the
+# same P_S / P_RC / P_MIB arrays and PHASE_CACHE the per-query path fills, so the verdict, the
+# totals and every error path below are untouched.
+# ---------------------------------------------------------------------------------------------
+SESSION_MARK='@@MARK@'
+
+# Emit one query's block: a begin stamp, the body, an end stamp.
+session_block() {
+    local n=$1 body=$2
+    echo "SELECT '${SESSION_MARK}q${n}@begin@' || epoch_ms(get_current_timestamp());"
+    echo "$body"
+    echo "SELECT '${SESSION_MARK}q${n}@end@' || epoch_ms(get_current_timestamp());"
+}
+
+# $1 = fpga|cpu. Writes the raw output to $2.
+run_session() {
+    local side=$1 out=$2
+    local f; f=$(mktemp)
+    {
+        echo "$SETUP"
+        if [ "$side" = cpu ]; then
+            if [ -n "${CPU_THREADS:-}" ] && [ "${CPU_THREADS}" != 0 ]; then
+                echo "SET threads=$CPU_THREADS;"
+            elif [ "${CPU_THREADS:-}" = 0 ]; then
+                echo "RESET threads;"
+            fi
+            echo "LOAD httpfs; SET enable_http_metadata_cache=true;"
+            views_cpu
+        else
+            views read_oasis
+        fi
+        local q
+        for q in "$ROOT"/scripts/tpch/q*.sql; do
+            local n; n=$(basename "$q" .sql); n=${n#q}; n=$((10#$n))
+            if [ -n "$ONLY" ] && ! printf ',%s,' "$ONLY" | grep -q ",$n,"; then continue; fi
+            session_block "$n" "$(cat "$q")"
+        done
+    } > "$f"
+    # One timeout for the whole session rather than per query.
+    local budget=$(( TIMEOUT * 22 ))
+    timeout "${budget}s" "$DUCKDB" -noheader -list < "$f" > "$out" 2>&1
+    local rc=$?
+    rm -f "$f"
+    return $rc
+}
+
+# Split one session's output into per-query row files and durations.
+# $1 = raw output, $2 = destination dir, $3 = suffix (rows file extension)
+session_split() {
+    local raw=$1 dir=$2
+    awk -v mark="$SESSION_MARK" -v dir="$dir" '
+        index($0, mark) == 1 {
+            rest = substr($0, length(mark) + 1)
+            split(rest, a, "@")          # a[1]=qN a[2]=begin|end a[3]=epoch_ms
+            q = a[1]; what = a[2]; ms = a[3] + 0
+            if (what == "begin") { start[q] = ms; cur = q; next }
+            if (what == "end") {
+                if (q in start) printf "%s %.2f\n", q, (ms - start[q]) / 1000.0 >> (dir "/durations")
+                close(dir "/durations")
+                cur = ""; next
+            }
+            next
+        }
+        cur != "" {
+            if ($0 ~ /\[oasis-http\]/) next
+            if ($0 ~ /^[[:space:]]/) next
+            if ($0 == "") next
+            print >> (dir "/" cur ".rows")
+        }
+    ' "$raw"
+}
+
 # ---------------------------------------------------------------------------------------------
 # PHASE 1 (--phases only): every FPGA query, back to back, before any CPU baseline runs.
 #
@@ -343,11 +436,30 @@ run_cpu() {
 # every error path stay in exactly one place. A wedge still stops the pass -- carrying on past two
 # consecutive timeouts costs (remaining queries x TIMEOUT) of nothing.
 # ---------------------------------------------------------------------------------------------
-declare -A P_S P_RC P_MIB
+declare -A P_S P_RC P_MIB C_S C_RC
+CPU_CACHE=""
 PHASE_CACHE=""
 if [ "$PHASES" = 1 ]; then
     PHASE_CACHE=$(mktemp -d)
-    trap 'rm -f "$FPGA_RAW" "$FPGA_ROWS" "$CPU_RAW" "$CPU_ROWS"; rm -rf "$PHASE_CACHE"' EXIT
+    trap 'rm -f "$FPGA_RAW" "$FPGA_ROWS" "$CPU_RAW" "$CPU_ROWS"; rm -rf "$PHASE_CACHE" "$CPU_CACHE"' EXIT
+    if [ "${SINGLE_SESSION:-0}" = 1 ]; then
+        CPU_CACHE=$(mktemp -d)
+        echo "phase 1/2: FPGA, all queries in ONE duckdb session"
+        run_session fpga "$FPGA_RAW"; sess_rc=$?
+        cp "$FPGA_RAW" "$TRACE_DIR/oasis-session-fpga.txt"
+        session_split "$FPGA_RAW" "$PHASE_CACHE"
+        echo "phase 2/2: CPU baseline, ONE duckdb session"
+        run_session cpu "$CPU_RAW"; cpu_sess_rc=$?
+        cp "$CPU_RAW" "$TRACE_DIR/oasis-session-cpu.txt"
+        session_split "$CPU_RAW" "$CPU_CACHE"
+        # A query that printed an end stamp finished; one that did not was cut off by the session
+        # timeout or an error, and its rc has to say so or it would be scored as a pass.
+        while read -r q secs; do P_S[${q#q}]=$secs; P_RC[${q#q}]=0; done < "$PHASE_CACHE/durations" 2>/dev/null
+        while read -r q secs; do C_S[${q#q}]=$secs; C_RC[${q#q}]=0; done < "$CPU_CACHE/durations" 2>/dev/null
+        printf '  fpga session rc=%s   cpu session rc=%s\n' "$sess_rc" "$cpu_sess_rc"
+        [ "$sess_rc" = 0 ] || echo "  FPGA session did not complete -- trace: $TRACE_DIR/oasis-session-fpga.txt"
+        [ "$cpu_sess_rc" = 0 ] || echo "  CPU session did not complete -- trace: $TRACE_DIR/oasis-session-cpu.txt"
+    else
     echo "phase 1/2: FPGA, all queries back to back (keeps the connection from going idle)"
     ct=0
     for f in "$ROOT"/scripts/tpch/q*.sql; do
@@ -386,7 +498,8 @@ if [ "$PHASES" = 1 ]; then
             ct=0
         fi
     done
-    echo "phase 2/2: CPU baseline"
+    fi
+    [ "${SINGLE_SESSION:-0}" = 1 ] || echo "phase 2/2: CPU baseline"
     echo
     printf '%-5s %-8s %9s %9s %10s  %s\n' "query" "result" "fpga_s" "cpu_s" "hw_MiB" "note"
 fi
@@ -394,8 +507,17 @@ fi
 # Replays what phase 1 measured. Defined AFTER run_fpga so it wins the name.
 replay_fpga() {
     fpga_s=${P_S[$n]:-0}; fpga_rc=${P_RC[$n]:-1}; hw_mib=${P_MIB[$n]:-}
+    # One session = one profiler window for all 22 queries, so a per-query hw_MiB does not exist.
+    [ "${SINGLE_SESSION:-0}" = 1 ] && hw_mib=""
     cp "$PHASE_CACHE/q$n.rows" "$FPGA_ROWS" 2>/dev/null || : > "$FPGA_ROWS"
     cp "$PHASE_CACHE/q$n.raw"  "$FPGA_RAW"  2>/dev/null || : > "$FPGA_RAW"
+}
+
+# Replays what the single CPU session measured, mirroring replay_fpga.
+replay_cpu() {
+    cpu_s=${C_S[$n]:-0}; cpu_rc=${C_RC[$n]:-1}
+    cp "$CPU_CACHE/q$n.rows" "$CPU_ROWS" 2>/dev/null || : > "$CPU_ROWS"
+    : > "$CPU_RAW"
 }
 
 for f in "$ROOT"/scripts/tpch/q*.sql; do
@@ -405,7 +527,8 @@ for f in "$ROOT"/scripts/tpch/q*.sql; do
     sql_body=$(cat "$f")
 
     # Second reader gets MinIO's page cache warm, so the order is a measurement choice.
-    if   [ "$PHASES" = 1 ];    then replay_fpga; run_cpu
+    if   [ "${SINGLE_SESSION:-0}" = 1 ]; then replay_fpga; replay_cpu
+    elif [ "$PHASES" = 1 ];    then replay_fpga; run_cpu
     elif [ "$CPU_FIRST" = 1 ]; then run_cpu; run_fpga
     else                            run_fpga; run_cpu; fi
 
