@@ -10,6 +10,7 @@
 namespace duckdb {
 
 class DatabaseInstance;
+class OasisHTTPFileHandle; // defined below; ReadBuffered takes it by reference
 class FileOpener;
 
 // A reply read off a host socket. `raw` owns the bytes; the rest index into it.
@@ -59,6 +60,7 @@ public:
 private:
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst);
+	void ReadBuffered(OasisHTTPFileHandle &h, void *dst, size_t size, uint64_t location);
 	// CPU fallback: fetch the range over an ordinary host socket, bypassing the FPGA entirely.
 	// Enabled with `SET httpfpga_cpu_fallback = true;`. Reliable but does not exercise the FPGA
 	// data path — a scaffolding aid while the HW receive path is validated.
@@ -113,6 +115,18 @@ public:
 	uint64_t known_file_size;
 	uint32_t server_ip;
 	uint16_t server_port;
+
+	// Read-ahead cache. DuckDB's ColumnReader walks a Parquet file in very small steps -- a page
+	// header is ~256 bytes -- and without a buffer every one of those became its own HTTP request
+	// AND its own TCP connection (HTTPReadRangeCpu sends Connection: close). Observed on the wire:
+	// a full SYN / SYN-ACK / GET / 206 / FIN / FIN-ACK exchange to move 256 bytes, repeated for
+	// every page of every BYTE_ARRAY column. DuckDB's own HTTPFileHandle buffers for this reason.
+	//
+	// Reads larger than the buffer bypass it entirely and stream straight into the caller.
+	static constexpr uint64_t READ_BUFFER_LEN = 1ULL << 20; // 1 MiB
+	duckdb::unique_ptr<data_t[]> read_buffer;
+	uint64_t buffer_start = 0;
+	uint64_t buffer_end = 0; // exclusive; buffer_end == buffer_start means empty
 };
 
 } // namespace duckdb
