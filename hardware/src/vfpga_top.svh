@@ -410,17 +410,27 @@ handler_stream #(
 // is that two chunks decode concurrently rather than in sequence.
 AXI4S axi_http_lane [NUM_DECODERS] (.aclk(clk), .aresetn(rst_n));
 
+// An interface array may only be indexed by an elaboration-time constant, so the lanes' tready
+// cannot be selected inside always_comb -- Vivado rejects it with "'L' is not a constant". Mirror
+// each lane's tready into a packed vector from the generate loop, where the index IS constant, and
+// mux that instead.
+logic [NUM_DECODERS-1:0] lane_tready;
+
 for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_http_lane_sel
     assign axi_http_lane[L].tvalid = axi_http_body.tvalid &&
                                      (http_body_dest == HTTP_DEST_BITS'(L));
     assign axi_http_lane[L].tdata  = axi_http_body.tdata;
     assign axi_http_lane[L].tkeep  = axi_http_body.tkeep;
     assign axi_http_lane[L].tlast  = axi_http_body.tlast;
+    assign lane_tready[L]          = axi_http_lane[L].tready;
 end
+
+// Lane 0 is the default, so a dest wider than the lane count (HTTP_DEST_BITS rounds up) parks on a
+// real consumer rather than hanging the body stream.
 always_comb begin
-    axi_http_body.tready = axi_http_lane[0].tready;
+    axi_http_body.tready = lane_tready[0];
     for (int L = 1; L < NUM_DECODERS; L++) begin
-        if (http_body_dest == HTTP_DEST_BITS'(L)) axi_http_body.tready = axi_http_lane[L].tready;
+        if (http_body_dest == HTTP_DEST_BITS'(L)) axi_http_body.tready = lane_tready[L];
     end
 end
 
