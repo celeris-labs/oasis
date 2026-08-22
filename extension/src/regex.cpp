@@ -21,8 +21,20 @@
 
 namespace duckdb {
 
-static constexpr idx_t REGEX_HW_MAX_STATES = 12;
-static constexpr idx_t REGEX_HW_MAX_CHARS = 12;
+// These must equal the flashed bitstream's rem_top_ff STATE_COUNT / CHAR_COUNT:
+// NFA below emits the config blob, and a mismatch shifts every field after
+// state_pred, so the card decodes a valid-looking but wrong pattern.
+//
+// Taken from the compile definitions rather than restated, because restating is
+// how this drifted: these sat at 12/12 against a 24-state, 32-char bitstream
+// while regex_table.cpp had been updated, so the scalar regex_fpga() path
+// compiled blobs the card could not decode. OASIS_REGEX_MAX_STATES /
+// OASIS_REGEX_MAX_TOKENS in CMakeLists.txt is the single source for both paths.
+#if !defined(REGEX_MAX_STATES) || !defined(REGEX_MAX_TOKENS)
+#error "REGEX_MAX_STATES / REGEX_MAX_TOKENS must be set from CMake (see OASIS_REGEX_MAX_*)"
+#endif
+static constexpr idx_t REGEX_HW_MAX_STATES = REGEX_MAX_STATES;
+static constexpr idx_t REGEX_HW_MAX_CHARS = REGEX_MAX_TOKENS;
 
 static vector<uint8_t> CompileRegexBlob(const string &pattern) {
 	CALI_CXX_MARK_FUNCTION;

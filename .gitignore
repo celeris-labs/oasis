@@ -5,6 +5,12 @@ extension/CMakeCache.txt
 CMakeFiles/**
 CMakeCache.txt
 
+# scripts/regex_bench.py scratch output
+.regex_bench
+
+# scripts/regex_sweep.py scratch output
+.regex_sweep
+
 # Generated unit test files
 hardware/unit-tests/diff/**
 hardware/unit-tests/sim_dump.vcd

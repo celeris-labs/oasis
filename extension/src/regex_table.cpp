@@ -23,11 +23,66 @@
 
 namespace duckdb {
 
-static constexpr idx_t REGEX_HW_MAX_STATES = 12;
-static constexpr idx_t REGEX_HW_MAX_CHARS = 12;
+// Must track REGEX_MAX_STATES / REGEX_MAX_TOKENS in the celeris submodule
+// (software/celeris/operators/regex/CMakeLists.txt), which in turn must equal
+// rem_top_ff's STATE_COUNT / CHAR_COUNT in the flashed bitstream.
+//
+// CHAR_COUNT was widened 12 -> 32 in celeris a39225a (bitstream
+// build_hw_more_chars). Measured against that bitstream, the extra slots do
+// work -- a 26-slot alternation matches correctly -- but a *single unbroken
+// literal run* longer than 16 characters silently returns wrong results
+// instead of being rejected. Runs are what chain through rem_decoder's
+// config_conds; alternation branches and class/quantifier-separated literals
+// each start a fresh chain, so only the per-run length is capped.
+// REGEX_HW_MAX_RUN below is a host-side guard for that, since neither the NFA
+// compiler nor the hardware reports it.
+//
+// Taken from the compile definitions rather than restated: OASIS_REGEX_MAX_STATES
+// / OASIS_REGEX_MAX_TOKENS in CMakeLists.txt is the single source, and it already
+// feeds the fregex ExternalProject that instantiates the blob layout. Restating
+// them here is what let regex.cpp sit at 12 against a 24-state build.
+#if !defined(REGEX_MAX_STATES) || !defined(REGEX_MAX_TOKENS)
+#error "REGEX_MAX_STATES / REGEX_MAX_TOKENS must be set from CMake (see OASIS_REGEX_MAX_*)"
+#endif
+static constexpr idx_t REGEX_HW_MAX_STATES = REGEX_MAX_STATES;
+static constexpr idx_t REGEX_HW_MAX_CHARS = REGEX_MAX_TOKENS;
+// A literal run occupies one char slot per character, so the cap is CHAR_COUNT
+// (RegexConfig::kMaxLiteralRun in regex_config.hpp), not an independent number.
+static constexpr idx_t REGEX_HW_MAX_RUN = REGEX_MAX_TOKENS;
 
 idx_t RegexFpgaScanGlobalState::MaxThreads() const {
 	return max_threads;
+}
+
+// Rejects patterns whose longest unbroken literal run exceeds what rem_decoder's
+// chained comparators handle. Deliberately a conservative textual scan rather
+// than an NFA walk: anything that is not a plain literal character (a class, an
+// escape, a group or alternation delimiter, a quantifier) ends the current run,
+// which is exactly how the hardware chain breaks. Over-counting a run would
+// reject a working pattern, so escapes end the run rather than extending it.
+static void CheckRegexLiteralRunLength(const string &pattern) {
+	idx_t run = 0;
+	idx_t longest = 0;
+	for (idx_t i = 0; i < pattern.size(); i++) {
+		const char c = pattern[i];
+		const bool is_meta = c == '\\' || c == '[' || c == ']' || c == '(' || c == ')' || c == '|' || c == '*' ||
+		                     c == '+' || c == '?' || c == '{' || c == '}' || c == '.' || c == '^' || c == '$';
+		if (is_meta) {
+			if (c == '\\' && i + 1 < pattern.size()) {
+				i++; // consume the escaped character with the escape
+			}
+			run = 0;
+			continue;
+		}
+		run++;
+		longest = MaxValue(longest, run);
+	}
+	if (longest > REGEX_HW_MAX_RUN) {
+		throw BinderException(
+		    "regex_fpga_scan: pattern contains a literal run of %llu characters; the bitstream matches at most %llu "
+		    "consecutive literal characters correctly. Break the run with a class, quantifier or alternation.",
+		    static_cast<uint64_t>(longest), static_cast<uint64_t>(REGEX_HW_MAX_RUN));
+	}
 }
 
 static LogicalType GetScanColumnType(const DuckTableEntry &table, const ColumnIndex &column_index) {
@@ -138,8 +193,18 @@ unique_ptr<FunctionData> RegexFpgaScanBind(ClientContext &context, TableFunction
 		throw InternalException("Column type must be string: " + table_column);
 	}
 
-	auto bind_data = make_uniq<RegexFpgaScanBindData>(table_entry, table_column, pattern,
-	                                                  NFA(pattern, REGEX_HW_MAX_STATES, REGEX_HW_MAX_CHARS).dump_binary());
+	CheckRegexLiteralRunLength(pattern);
+
+	// dump_binary() returns only as many bytes as the compiled pattern occupies, but
+	// write_regex_blob_if_changed drives a fixed number of MMIO words: the card latches
+	// RegexConfig::kBlobBytes every time. Handing it a short vector leaves the tail words
+	// unwritten, so the engines match against whatever the previous pattern left behind --
+	// which shows up as every row matching or none, deterministically and regardless of
+	// the pattern. Pad to full width, exactly as examples/06_regex does.
+	std::vector<uint8_t> regex_blob = NFA(pattern, REGEX_HW_MAX_STATES, REGEX_HW_MAX_CHARS).dump_binary();
+	regex_blob.resize(REGEX_CONFIG_BLOB_BYTES, 0);
+
+	auto bind_data = make_uniq<RegexFpgaScanBindData>(table_entry, table_column, pattern, std::move(regex_blob));
 
 	const auto &columns = table_entry.GetColumns();
 	for (idx_t col_idx = 0; col_idx < columns.PhysicalColumnCount(); col_idx++) {
@@ -165,6 +230,11 @@ unique_ptr<GlobalTableFunctionState> RegexFpgaScanInitGlobal(ClientContext &cont
 	auto &storage = bind_data.table.GetStorage();
 	storage.InitializeParallelScan(context, gstate->parallel_scan, input.column_indexes);
 	gstate->max_threads = storage.MaxThreads(context);
+
+	Value dry_run_value;
+	if (context.TryGetCurrentSetting("oasis_regex_dry_run", dry_run_value) && !dry_run_value.IsNull()) {
+		gstate->dry_run = BooleanValue::Get(dry_run_value);
+	}
 	return std::move(gstate);
 }
 
@@ -185,31 +255,48 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 		lstate->output_types.push_back(lstate->scanned_types[scan_idx]);
 	}
 
+	// Batch geometry: 0 means "use the default". Rows are clamped to what the result FIFOs can
+	// hold (kRegexMaxStringsPerEngine per engine), which finalize() would otherwise reject.
+	Value setting_value;
+	if (context.client.TryGetCurrentSetting("oasis_regex_batch_rows", setting_value) && !setting_value.IsNull()) {
+		const auto rows = setting_value.GetValue<uint64_t>();
+		if (rows > 0) {
+			const uint64_t cap = uint64_t(celeris::kRegexMaxStringsPerEngine) * celeris::kRegexEngineCount;
+			lstate->max_accum_count = idx_t(MinValue<uint64_t>(rows, cap));
+		}
+	}
+	if (context.client.TryGetCurrentSetting("oasis_regex_wire_buffer_bytes", setting_value) &&
+	    !setting_value.IsNull()) {
+		const auto bytes = setting_value.GetValue<uint64_t>();
+		if (bytes > 0) {
+			lstate->wire_buffer_bytes = bytes;
+		}
+	}
+	if (context.client.TryGetCurrentSetting("oasis_regex_outlier_bytes", setting_value) && !setting_value.IsNull()) {
+		const auto bytes = setting_value.GetValue<uint64_t>();
+		if (bytes > 0) {
+			lstate->outlier_bytes = bytes;
+		}
+	}
+
 	auto &storage = bind_data.table.GetStorage();
 	// Push scan filters (e.g. c_nationkey = 7) into the storage scan so the FPGA only sees surviving rows.
 	lstate->scan_filter_set = BuildScanFilterSet(input, lstate->scanned_types);
 	lstate->scan_state.Initialize(scan_storage_ids, context.client,
 	                              lstate->scan_filter_set ? lstate->scan_filter_set.get() : input.filters.get());
-	lstate->output_cache.Initialize(context.client, lstate->output_types, REGEX_FPGA_MAX_ACCUM_COUNT);
-	lstate->batch_row_refs.reserve(REGEX_FPGA_MAX_ACCUM_COUNT);
+	lstate->output_cache.Initialize(context.client, lstate->output_types, lstate->max_accum_count);
+	lstate->batch_row_refs.reserve(lstate->max_accum_count);
 	lstate->match_sel_scratch.Initialize(STANDARD_VECTOR_SIZE);
 
 	lstate->rows_in_current_row_group = storage.NextParallelScan(context.client, gstate.parallel_scan, lstate->scan_state);
 
 	auto &ctx = gstate.ctx;
 	libstf::Status status;
-	const uint64_t raw_capacity = align_to_64_multiple(REGEX_FPGA_RAW_BATCH_LIMIT);
-	lstate->struct_buffer =
-	    libstf::make_buffer(ctx.get_memory_pool(), REGEX_FPGA_MAX_ACCUM_COUNT * sizeof(string_t), status);
+	lstate->wire_buffer = libstf::make_buffer(ctx.get_memory_pool(), lstate->wire_buffer_bytes, status);
 	if (!status.ok()) {
-		throw InternalException("Failed to allocate FPGA regex descriptor buffer for table scan");
+		throw InternalException("Failed to allocate FPGA regex wire buffer for table scan");
 	}
-	if (raw_capacity > 0) {
-		lstate->raw_buffer = libstf::make_buffer(ctx.get_memory_pool(), raw_capacity, status);
-		if (!status.ok()) {
-			throw InternalException("Failed to allocate FPGA regex payload buffer for table scan");
-		}
-	}
+	lstate->packer.reset(static_cast<uint8_t *>(lstate->wire_buffer->ptr), lstate->wire_buffer_bytes);
 
 	return std::move(lstate);
 }
@@ -331,7 +418,8 @@ static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindDa
 static void ResetFpgaAccumulation(RegexFpgaScanLocalState &lstate, bool keep_current_retained_chunk = false) {
 	lstate.accum_count = 0;
 	lstate.staged_rows = 0;
-	lstate.raw_used = 0;
+	lstate.batch_has_outlier = false;
+	lstate.packer.reset(static_cast<uint8_t *>(lstate.wire_buffer->ptr), lstate.wire_buffer_bytes);
 	lstate.batch_row_refs.clear();
 	// The slots those dictionary entries pointed at are gone with the batch.
 	lstate.dict_stamp++;
@@ -347,7 +435,7 @@ static void ResetFpgaAccumulation(RegexFpgaScanLocalState &lstate, bool keep_cur
 	}
 }
 
-static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const std::vector<bool> &matches) {
+static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const RegexMatchBitmap &matches) {
 	auto &matches_by_chunk = lstate.match_indices_scratch;
 	matches_by_chunk.resize(lstate.retained_chunks.size());
 	for (auto &row_indices : matches_by_chunk) {
@@ -356,7 +444,7 @@ static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const std::vector
 	// One entry per row the batch decides, which is more than the strings sent to the FPGA whenever
 	// rows shared a dictionary entry: several rows then read the same slot's match bit.
 	for (const auto &row_ref : lstate.batch_row_refs) {
-		if (!matches[row_ref.slot_idx]) {
+		if (!matches.test(row_ref.slot_idx)) {
 			continue;
 		}
 		matches_by_chunk[row_ref.chunk_idx].push_back(row_ref.row_idx);
@@ -395,9 +483,19 @@ static void FlushFpgaBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 	}
 
 	CALI_MARK_BEGIN("fpga_regex_batch");
-	auto matches = RunFpgaRegexPackedBatch(global_state.ctx, lstate.struct_buffer->ptr, lstate.accum_count,
-	                                     lstate.raw_buffer ? lstate.raw_buffer->ptr : nullptr, lstate.raw_used,
-	                                     bind_data.regex_blob);
+	// Squares off the rectangle: pads the short engines and fills the tails. Has to
+	// happen before the enqueue and after the last append, so it lives here rather
+	// than in the staging loop.
+	const celeris::RegexStreamPacker::Plan plan = lstate.packer.finalize();
+	// The batch is fully packed by this point either way, so a dry run leaves exactly the host-side
+	// scan-and-pack cost and drops the enqueue, the device wait and the result read-back.
+	RegexMatchBitmap matches;
+	if (global_state.dry_run) {
+		matches.assign_zero(lstate.accum_count);
+	} else {
+		matches = RunFpgaRegexPackedBatch(global_state.ctx, lstate.wire_buffer->ptr, plan, lstate.accum_count,
+		                                  bind_data.regex_blob);
+	}
 	CALI_MARK_END("fpga_regex_batch");
 
 	CALI_MARK_BEGIN("append_output_cache");
@@ -407,25 +505,28 @@ static void FlushFpgaBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 	ResetFpgaAccumulation(lstate, keep_current_retained_chunk);
 }
 
-// Whether staging one more *distinct* string would overrun the batch. `next_raw_cost` is 0 for a
-// row that reuses an already-staged dictionary entry, which costs no descriptor and no payload.
-static bool WouldExceedFpgaBatch(const RegexFpgaScanLocalState &lstate, uint64_t next_raw_cost, bool needs_slot) {
+// Whether staging one more *distinct* string would overrun the batch. `next_length` is the string's
+// length; it is ignored for a row that reuses an already-staged dictionary entry, which costs
+// nothing on the wire.
+static bool WouldExceedFpgaBatch(const RegexFpgaScanLocalState &lstate, uint64_t next_length, bool needs_slot) {
 	// Rows are capped independently of strings: when a dictionary column resolves millions of rows
 	// to a handful of distinct values the string budget would never fill, and the retained chunks
 	// backing those rows would grow without bound.
-	if (lstate.staged_rows >= REGEX_FPGA_MAX_ACCUM_COUNT) {
+	if (lstate.staged_rows >= lstate.max_accum_count) {
 		return true;
 	}
 	if (!needs_slot) {
 		return false;
 	}
-	if (lstate.accum_count >= REGEX_FPGA_MAX_ACCUM_COUNT) {
+	// Also the per-engine result-FIFO bound, since the count is dealt round-robin:
+	// REGEX_FPGA_MAX_ACCUM_COUNT / 64 = 1024 results per engine.
+	if (lstate.accum_count >= lstate.max_accum_count) {
 		return true;
 	}
-	if (next_raw_cost == 0) {
-		return false;
-	}
-	return lstate.raw_used + next_raw_cost > REGEX_FPGA_RAW_BATCH_LIMIT;
+	// The wire size is set by the longest engine stream once the rectangle is
+	// squared off, not by the sum of the strings, so ask the packer rather than
+	// tracking a running total.
+	return lstate.packer.wire_size_after(next_length) > lstate.wire_buffer_bytes;
 }
 
 static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScanGlobalState &global_state,
@@ -450,8 +551,6 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 		regex_vector.ToUnifiedFormat(regex_format);
 		const string_t *regex_data = UnifiedVectorFormat::GetData<string_t>(regex_format);
 
-		auto *descriptors = reinterpret_cast<string_t *>(lstate.struct_buffer->ptr);
-		auto *raw_base = static_cast<char *>(lstate.raw_buffer ? lstate.raw_buffer->ptr : nullptr);
 		if (dedup) {
 			// Dictionary indices only mean anything within the chunk that produced them.
 			lstate.dict_stamp++;
@@ -475,15 +574,45 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			const bool needs_slot = slot == DConstants::INVALID_INDEX;
 
 			const string_t &regex_value = regex_data[regex_idx];
-			const uint64_t raw_cost = needs_slot ? RegexFpgaNonInlinedRawCost(regex_value) : 0;
-			if (raw_cost > REGEX_FPGA_RAW_BATCH_LIMIT) {
+			const uint64_t next_length = regex_value.GetSize();
+			// A single value only has to fit one engine's stream, and the rectangle
+			// is 64 of those, so the bound is the buffer over the engine count.
+			if (needs_slot && (next_length + 1) * celeris::kRegexEngineCount > lstate.wire_buffer_bytes) {
 				throw InvalidInputException(
-				    "regex_fpga_scan: a %llu byte value in column %s does not fit the %llu byte FPGA payload buffer",
+				    "regex_fpga_scan: a %llu byte value in column %s does not fit the %llu byte FPGA wire buffer",
 				    (unsigned long long)regex_value.GetSize(), bind_data.regex_column.c_str(),
-				    (unsigned long long)REGEX_FPGA_RAW_BATCH_LIMIT);
+				    (unsigned long long)lstate.wire_buffer_bytes);
 			}
 
-			if (lstate.staged_rows > 0 && WouldExceedFpgaBatch(lstate, raw_cost, needs_slot)) {
+			// Outliers go in a batch of their own. The collector pops all 64 engines
+			// together, so one engine walking a multi-KB string holds the rest until
+			// their result FIFOs fill, which backs pressure all the way to the
+			// splitter and can wedge the array -- see kRegexOutlierBytes. Alone, every
+			// engine owes exactly one result and nobody can run ahead.
+			//
+			// Flush what is staged, then let the outlier be staged into the empty
+			// batch; the byte/row caps below close it again on the next row.
+			if (needs_slot && next_length >= lstate.outlier_bytes && lstate.staged_rows > 0) {
+				CALI_MARK_END("stage_rows_for_fpga_batch");
+				FlushFpgaBatch(bind_data, global_state, lstate, true);
+				if (lstate.output_cache.size() > 0) {
+					return;
+				}
+				CALI_MARK_BEGIN("stage_rows_for_fpga_batch");
+				continue;
+			}
+			// ...and close the batch again immediately after one, so it stays solo.
+			if (lstate.batch_has_outlier && lstate.staged_rows > 0) {
+				CALI_MARK_END("stage_rows_for_fpga_batch");
+				FlushFpgaBatch(bind_data, global_state, lstate, true);
+				if (lstate.output_cache.size() > 0) {
+					return;
+				}
+				CALI_MARK_BEGIN("stage_rows_for_fpga_batch");
+				continue;
+			}
+
+			if (lstate.staged_rows > 0 && WouldExceedFpgaBatch(lstate, next_length, needs_slot)) {
 				// Send what we have and retry this row against a fresh batch. chunk_offset is left
 				// pointing at the row, so it is staged exactly once. Keeping the current chunk is
 				// required even at offset 0: it still holds the rows we are about to stage.
@@ -497,10 +626,15 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			}
 
 			if (needs_slot) {
-				slot = lstate.accum_count;
-				RegexFpgaPackString(&descriptors[slot], raw_base, lstate.raw_used, regex_value);
-				lstate.raw_used += raw_cost;
+				// Straight into the wire layout, no descriptor and no second pass.
+				// The slot is the append order, which is what result_bit_index maps
+				// back from once the card returns its engine-major bitmap.
+				slot = lstate.packer.append(regex_value.GetData(), next_length);
+				D_ASSERT(slot == lstate.accum_count);
 				lstate.accum_count++;
+				if (next_length >= lstate.outlier_bytes) {
+					lstate.batch_has_outlier = true;
+				}
 				if (dedup) {
 					if (regex_idx >= lstate.dict_slot_stamp.size()) {
 						lstate.dict_slot_of.resize(regex_idx + 1, 0);

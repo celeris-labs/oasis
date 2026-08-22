@@ -1,6 +1,8 @@
 #pragma once
 
 #include "celeris/celeris_context.hpp"
+#include "celeris/operators/regex/regex_stream.hpp"
+#include "regex_fpga_batch.hpp" // batch-geometry defaults
 #include "syslog_undef.hpp" // must follow the celeris include, precede the duckdb ones
 
 #include "duckdb.hpp"
@@ -40,6 +42,9 @@ struct RegexFpgaScanGlobalState : public GlobalTableFunctionState {
 	celeris::CelerisContext &ctx;
 	ParallelTableScanState parallel_scan;
 	idx_t max_threads = 1;
+	// oasis_regex_dry_run: skip the device and report no matches, leaving only the host-side
+	// scan-and-pack cost. Benchmarking only -- see the option's description.
+	bool dry_run = false;
 
 	explicit RegexFpgaScanGlobalState(celeris::CelerisContext &ctx) : ctx(ctx) {
 	}
@@ -82,7 +87,9 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 
 	idx_t accum_count = 0; // distinct strings staged for the FPGA in this batch
 	idx_t staged_rows = 0; // rows this batch decides; >= accum_count once rows share a slot
-	uint64_t raw_used = 0;
+	// A multi-KB value is staged alone: the collector pops all 64 engines together,
+	// so one engine on a long string can wedge the array (see kRegexOutlierBytes).
+	bool batch_has_outlier = false;
 	bool finished = false;
 
 	// Dictionary fast path. When the regex column arrives dictionary-encoded, every row with the
@@ -95,8 +102,21 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	vector<uint64_t> dict_slot_stamp;
 	uint64_t dict_stamp = 0;
 
-	std::shared_ptr<libstf::Buffer> struct_buffer;
-	std::shared_ptr<libstf::Buffer> raw_buffer;
+	// Rows are packed straight into the wire layout as they are scanned, so there
+	// is no separate descriptor buffer and no second pass. The packer holds the
+	// per-engine write cursors; the batch geometry only becomes known at flush.
+	std::shared_ptr<libstf::Buffer> wire_buffer;
+	celeris::RegexStreamPacker packer;
+
+	// Batch geometry, resolved once per scan from oasis_regex_batch_rows /
+	// oasis_regex_wire_buffer_bytes so a sweep does not need a rebuild. A batch ends
+	// when either cap is hit: rows bind for short strings, bytes for long ones.
+	idx_t max_accum_count = REGEX_FPGA_MAX_ACCUM_COUNT;
+	uint64_t wire_buffer_bytes = REGEX_FPGA_WIRE_BUFFER_BYTES;
+	// Solo-batch threshold, from oasis_regex_outlier_bytes. Defaults to the celeris
+	// constant; raising it is only safe when lengths are uniform, since the deadlock it
+	// guards against needs a long laggard beside short neighbours.
+	uint64_t outlier_bytes = celeris::kRegexOutlierBytes;
 };
 
 unique_ptr<FunctionData> RegexFpgaScanBind(ClientContext &context, TableFunctionBindInput &input,

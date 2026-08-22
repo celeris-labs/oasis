@@ -5,6 +5,7 @@
 #include "oasis_scan.hpp"
 #include "regex.hpp"
 #include "regex_table.hpp"
+#include "regex_profile.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_settings.hpp"
 #include "oasis_log_sink.hpp"
@@ -42,6 +43,38 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "ceil(value / threads) groups in flight but at least 1).",
 	    LogicalType::UBIGINT, Value::UBIGINT(16));
 
+	// Benchmarking knob: run regex_fpga_scan's whole host pipeline -- storage scan, string
+	// decompression and packing into the FPGA wire format -- but skip the device round trip and
+	// treat every row as non-matching. Timing this against the real scan separates the cost of
+	// *preparing* bytes for the FPGA from the cost of moving and matching them, which is what
+	// decides whether the host can keep a faster decoder fed. Results are wrong by construction.
+	config.AddExtensionOption("oasis_regex_dry_run",
+	                          "Benchmarking only: skip the FPGA round trip in regex_fpga_scan and "
+	                          "return no matches, leaving just the host-side scan and packing",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
+	// Batch geometry for regex_fpga_scan. A batch ends when either cap is hit: rows bind for
+	// short strings, bytes for long ones. Exposed as settings so the batch-size/string-length
+	// trade-off can be swept without a rebuild. Rows are clamped to the result-FIFO depth
+	// (kRegexMaxStringsPerEngine * 64); the wire buffer is per scan thread and comes out of the
+	// huge-page pool, so large values times many threads will exhaust it.
+	config.AddExtensionOption("oasis_regex_batch_rows",
+	                          "regex_fpga_scan: max rows per FPGA batch (0 = default 65536)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+	config.AddExtensionOption("oasis_regex_wire_buffer_bytes",
+	                          "regex_fpga_scan: per-thread wire buffer in bytes (0 = default 4 MiB)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+	// Strings at or above this get a solo batch. The default (kRegexOutlierBytes, 2 KiB) is a
+	// deadlock budget derived for *adversarial length skew* -- one multi-KB laggard among 1-byte
+	// neighbours, where the neighbours fill their result FIFOs and wedge the splitter. On data of
+	// uniform length no engine can run ahead of another, so the hazard does not arise and the
+	// threshold is pure cost: solo batching means one device round trip per string. Exposed so that
+	// regime can be measured. Raising it on skewed data risks wedging the array -- see
+	// kRegexOutlierBytes in celeris regex_stream.hpp.
+	config.AddExtensionOption("oasis_regex_outlier_bytes",
+	                          "regex_fpga_scan: solo-batch threshold in bytes (0 = default 2048)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
 
@@ -68,6 +101,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(regex_function);
 
 	RegisterRegexFpgaScanFunction(loader);
+
+	// Stream-profiler readout for the regex datapath (see regex_profile.cpp).
+	RegisterRegexProfileFunction(loader);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {
