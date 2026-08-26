@@ -48,7 +48,7 @@ WORKLOAD=all
 # dead_us_per_get) was computed from a split that was not in force. At the 192 KiB default that made
 # the GET count wrong by 24x. Exporting it means the number printed is the number used.
 # Keep in step with HTTP_DEFAULT_CHUNK_BYTES in software/oasis/configuration.cpp.
-export OASIS_HTTP_CHUNK_BYTES=${OASIS_HTTP_CHUNK_BYTES:-196608}
+export OASIS_HTTP_CHUNK_BYTES=${OASIS_HTTP_CHUNK_BYTES:-0}
 
 while [ $# -gt 0 ]; do
     case "$1" in

@@ -95,7 +95,7 @@ involved at all.
 >
 > It also makes pipelining safe again. Depth > 1 used to wedge the receive path, and the reason was
 > never the depth — it was concurrent **sessions**. With `TCP_STACK_RX_DDR_BYPASS_EN=1` there is one
-> shared packet fifo for the whole stack (`axis_data_fifo_512_d1024 rx_buffer_fifo` in
+> shared packet fifo for the whole stack (`axis_data_fifo_512_d16384 rx_buffer_fifo` in
 > `tcp_stack.sv`), `rx_app_stream_if` answers a `readPkg` by echoing back the session id **the
 > application asked for** plus a bare one-bit token, and `rxAppMemDataRead` pops one packet from the
 > **head** of that fifo without ever looking at the session. The real contract is *"readPkg must be
@@ -111,13 +111,29 @@ each of those was a full connect / GET / body / teardown cycle with nothing over
 per-request round trips dominated: the decoder consumes 64 B/cycle at 250 MHz (16 GB/s, more than
 the 100 GbE link can deliver) and spent the overwhelming majority of a query idle between requests.
 
-`handler.sv` is a ring of `HTTP_NUM_SLOTS` (4) request slots pipelined over that one connection:
+**`handler_stream.sv` is what is built today, and it is not a descriptor ring.** `handler.sv` (a
+ring of `HTTP_NUM_SLOTS` = 4 slots, each holding a full 1160-bit `http_config_t`) still exists in the
+tree and in bitstreams up to build-95, but the depth was an amount of FPGA registers rather than a
+design choice: measured on a scale-30 `lineitem` scan that ring was full for 1462 of 1465 requests,
+so the host spent essentially the whole query blocked on a slot.
+
+Every byte range is known once the Parquet footer is parsed, so the host now builds all of the GET
+text up front and DMAs it in. A request is only text; nothing about it has to be stored on the FPGA.
+What still needs a queue is the *column-chunk boundary*, because the host may split one chunk across
+several ranged GETs and the `DataNormalizer` resets its byte offset on `tlast`. That is a byte count
+per column chunk, so `HTTP_QUEUE_DEPTH` (64, `vfpga_top.svh:139`) scales with columns per row group
+rather than with requests.
+
+The host drives it in three steps (`HTTPReadConfig::submit_batch`):
 
 ```
-fill_ptr   host START write lands in a free slot          (one cycle, no handshake)
-send_ptr   SEND:  tcp_send_http builds and transmits the GET on the shared session
-read_ptr   READ:  tcp_read streams exactly one response body out; the connection stays open
+1.  one cfg beat per column chunk, req_total_bytes == 0   -> pushes a queue entry
+2.  one cfg beat with req_total_bytes != 0                -> latches the server, ARMS the transfer
+                                                             (this is what opens the connection)
+3.  the request text itself, DMA'd over s_axis_req (Coyote LOCAL_READ)
 ```
+
+The order is part of the protocol and is not optional — see the comment on `await_cfg_ready`.
 
 There is no `conn_ptr` any more — the connection is a property of the client, not of a request, and
 a small FSM beside the ring opens it, holds it, and reopens it if it dies. Slots advance strictly in
@@ -192,36 +208,64 @@ Two consequences worth knowing:
 - **The status code is captured.** A 404 or 416 used to flow into the decoder as if its XML body
   were column data. `HttpConfig` read register 12 now carries the three status digits.
 
-### Splitting a column chunk across several GETs
+### Splitting a column chunk across several GETs — off by default
 
-`HTTPReadConfig::read` splits a byte range into GETs of at most `OASIS_HTTP_CHUNK_BYTES` (default
-8 KiB) and marks only the last one `body_last`, so the whole chunk still arrives as **one** decoder
-stream with exactly one `tlast` — the `DataNormalizer` resets its running byte offset on `tlast`, so
-an extra one mid-chunk would desynchronise everything after it. The flag rides in `REQ_FLAGS`
-(register 25, formerly a dead `num_sessions` field, so the address map did not move).
+**`HTTP_DEFAULT_CHUNK_BYTES` is now `0`: one GET per column chunk, no split.** The split still
+exists as a knob (`OASIS_HTTP_CHUNK_BYTES=<bytes>`, no rebuild needed) and 192 KiB is the
+known-good fallback, but it is not the default any more.
 
-This is host-side flow control against the TOE's receive buffer. A ranged GET's response is bounded
-by the range, so `max_inflight() × chunk_bytes()` bounds how many bytes the server can have in
-flight — 4 × 8 KiB = 32 KiB, safely under the ~41.5 KB at which `rx_engine` starts dropping segments
-(see *Receive window* below). Splitting is nearly free only because the connection is persistent:
-each extra request costs a ~150-byte GET and a ~200-byte response header, pipelined, with no
-handshake and no teardown. `OASIS_HTTP_CHUNK_BYTES=0` disables splitting.
+When splitting is on, `HTTPReadConfig::read` cuts a byte range into GETs of at most that size and
+marks only the last one `body_last`, so the whole chunk still arrives as **one** decoder stream with
+exactly one `tlast` — the `DataNormalizer` resets its running byte offset on `tlast`, so an extra one
+mid-chunk would desynchronise everything after it. The flag rides in `REQ_FLAGS` (register 25,
+formerly a dead `num_sessions` field, so the address map did not move). On the streamed path the
+boundary is a byte count rather than a flag, so the split is invisible to the hardware either way.
 
-### Receive window (unfixed)
+**Why it was turned off.** The split was never a throughput optimisation — it was a host-side cap
+against a receive fifo four times smaller than the advertised window, and that mismatch is fixed in
+hardware (see *Receive window* below). What remains is cost: a ranged GET takes the object store
+roughly the same time whatever its size, and HTTP/1.1 serialises that time — ADR-3 measured per-GET
+cost falling only 1020 → 848 → 822 µs across pipeline depth 1 → 2 → 4, because MinIO answers request
+1 fully before reading request 2. Splitting a 2 MB column chunk eleven ways pays that fixed cost
+eleven times for the same bytes.
 
-`rx_sar_table.cpp:71` computes the advertised window from the application read pointer alone, with
-`WINDOW_BITS = 18`, so it can advertise up to **256 KB** — against a **64 KB** shared fifo. Grep
-`rx_sar_table` for `data_count` and you get nothing: the window has no knowledge of the buffer it
-describes. `rx_engine` drops a segment and answers `ACK_NODELAY` (a duplicate ACK) once free space
-falls below 375 beats, i.e. once occupancy passes ~41.5 KB, and out-of-order buffering is disabled
-on this path so one drop forces go-back-N.
+**What this has not been measured against yet.** The published size curve (192 KiB → 148 MB/s,
+256 KiB → 179, 512 KiB → 294, 1 MiB → 423) is `one_conn_ceiling.sh` — a host raw socket measuring
+what MinIO delivers on one keep-alive connection. It is the right shape and the right ceiling, but
+it is *not* the FPGA path, which sits at ~0.33 GB/s. The equivalent sweep through the FPGA has not
+been run at these sizes, and unsplit column chunks at scale 30 exceed every size on that curve.
+Re-run `scripts/sweep.sh` and `scripts/throughput.sh` before quoting a speedup.
 
-The proper fix is in the TOE — plumb `rxbuffer_data_count` into `rx_sar_table` and advertise
-`min(appd − recvd − 1, free_fifo_bytes)` — or, cheaply, `FIFO_DEPTH {1024}` → `{4096}` in
-`scripts/ip_inst/network_infrastructure.tcl:356` plus the two `16'd1024` literals in
-`tcp_stack.sv`. Neither is done. The range split above is the host-side stand-in: it refuses to ask
-for more than the buffer can hold, which makes the over-advertised window unreachable rather than
-correct.
+**What reports trouble.** `rx_fifo_stall` (the drain stopping, `stallWord` bit 25) with the reconnect
+count beside it. There is also a Coyote-side hazard that larger responses make more likely:
+`rx_engine` accepts a segment only with >375 beats (24000 B) free while `rx_sar_table` advertises
+`(appd − recvd) − 1` and knows nothing about that floor, so an advertised window landing in 1..24000
+deadlocks rather than back-pressures. The clamp shipped in build-105 and lives in the `parcore`
+submodule — it does **not** survive a `git submodule update`.
+
+### Receive window (fixed in hardware since build-95 — the old text here was wrong for months)
+
+`rx_sar_table.cpp:71` still computes the advertised window from the application read pointer alone
+and still has no knowledge of the fifo behind it — grep `rx_sar_table` for `data_count` and you get
+nothing. **That stopped mattering when the two numbers were made equal.**
+
+| | value | where |
+|---|---|---|
+| `WINDOW_SCALE_BITS` | 4 | `toe/toe_config.hpp.in` |
+| `WINDOW_BITS` | `16 + 4` = 20 → **1 MiB** advertised | same file, scaling is enabled |
+| `rx_buffer_fifo` | `axis_data_fifo_512_d16384` = 16384 × 64 B = **1 MiB** | `tcp_stack.sv:681` |
+| `axis_max_data_count` | `16'd16384` | `tcp_stack.sv:544`, `:671` |
+
+So the stack advertises exactly what it can hold. **Anything in this repo still quoting "256 KB
+against a 64 KB fifo", `WINDOW_BITS = 18`, `d1024`, or a "~41.5 KB drop threshold" is describing
+hardware that has not been built since build-94** — that arithmetic came from `WINDOW_SCALE_BITS = 2`
+and a 1024-deep fifo, and both moved.
+
+Raising the window is why chunk size buys throughput at all: 256 KiB → 179 MB/s, 512 KiB → 294,
+1 MiB → 423, measured against MinIO. If the window is ever raised again, `rx_buffer_fifo` and both
+`axis_max_data_count` literals **must** move with it; the stack advertises `BUFFER_SIZE` regardless
+of real free space, so a window larger than the fifo invites exactly the drops it used to cause, and
+recovery is go-back-N with out-of-order buffering disabled.
 
 ### Row group size
 
@@ -238,12 +282,17 @@ need ~8x fewer requests for the same bytes.
 
 **This no longer buys what it used to, and it was never free.** Larger row groups were the mitigation
 for port exhaustion, which keep-alive removes outright — a whole query now costs one connection
-whatever the row group size. And measured on build-92 they were *slower*: going from 49 to 7 row
-groups took the `latency` workload from 3.068 s to 6.0–9.1 s, because short transfers finished before
-slow-start ramped the congestion window past the ~41.5 KB drop threshold and 1.3 MB chunks lived
-permanently in go-back-N. With the range split above, the GET size is decoupled from the row group
-size entirely, so pick row groups for decode efficiency and leave the wire to
-`OASIS_HTTP_CHUNK_BYTES`.
+whatever the row group size.
+
+The "bigger row groups are slower" measurement (build-92: 49 → 7 row groups took the `latency`
+workload from 3.068 s to 6.0–9.1 s) **was taken under the drop cliff and should not be relied on
+now.** It was caused by 1.3 MB chunks living permanently in go-back-N against a 64 KB fifo, and that
+fifo is now 1 MiB. Re-measure before quoting it. In either case the GET size is decoupled from the
+row group size by the range split above, so pick row groups for decode efficiency and leave the wire
+to `OASIS_HTTP_CHUNK_BYTES`.
+
+**The real cap on row groups in flight is host-side and is a deadlock, not a slowdown** — see
+*The dispatcher deadlock* below.
 
 ### The CSR map must match the bitstream
 
@@ -273,11 +322,103 @@ than six hours later on the wire.
 | GET path budget | 64 characters (16 CSR words). Was 32 up to `build-88`; longer paths throw rather than truncate |
 | Decoded column chunk | must fit one output buffer (8 MiB), i.e. ~1M rows of an 8-byte type |
 | Compression | SNAPPY and uncompressed only — other codecs throw `codec N not supported by ParCore` |
-| Requests in flight | **4** (`HTTP_NUM_SLOTS`), pipelined over one persistent connection. Safe because there is only ever one TCP session; `max_inflight() × OASIS_HTTP_CHUNK_BYTES` is what bounds the bytes in flight against the shared receive fifo |
-| Receive window | the TOE advertises up to 256 KB against a 64 KB shared fifo and drops past ~41.5 KB. Worked around host-side by splitting ranges, not fixed |
+| Requests in flight | bounded by `HTTP_QUEUE_DEPTH` = **64** column-chunk entries (`handler_stream.sv`), pipelined over one persistent connection. Safe because there is only ever one TCP session. The old 4-slot `handler.sv` ring and the `max_inflight() × OASIS_HTTP_CHUNK_BYTES` bytes-in-flight cap are both gone |
+| Receive window | 1 MiB advertised against a 1 MiB fifo — matched, see *Receive window* above. Raising one without the other reintroduces the drops |
+| Column chunks in flight | **the binding limit in practice.** 64 hardware queue entries against a scheduler that dispatches 64 flows, and only 2 FPGA output buffers. See *The dispatcher deadlock* |
 | Response framing | `Content-Length` only. A response without one (e.g. `Transfer-Encoding: chunked`) latches `resp_error` and stalls rather than misparsing |
 | NULLs | **not supported.** The decoder is configured from `num_values`, which counts NULLs, but the page only holds the non-null values, so the read hangs waiting for values that do not exist. TPC-H is unaffected (no NULLs) |
 | Trailing page bytes | a data page carrying padding past the last declared value hangs the decoder. `fastparquet` emits exactly 8 such bytes per page; DuckDB-written files are fine |
+
+### The dispatcher deadlock (HYPOTHESIS — not yet confirmed on hardware)
+
+**Status 2026-08-18: this is a candidate explanation for "`tpch_demo` dies half way through",
+derived by reading the code plus one wedged-board reading. It has NOT been reproduced or confirmed,
+and at least two other mechanisms produce the same symptom** — see *Competing explanations* at the
+end of this section. Do not treat it as diagnosed.
+
+What is directly observed, from `scripts/util/http_state.sh` on a board left wedged by a failed run:
+`conn=up`, `reconnects=0`, no `dirty_abort`, no `read_timeout`, no `notify_overflow`. What you see is:
+
+```
+Invalid Error: FPGA HTTP config port has refused a chunk-length entry for 30s
+  [inflight=64/64 conn=up pending; stalled: CONNECT READ(slot 0) rx_fifo_stall]
+```
+
+Read `inflight=64/64` as *the 64-entry column-chunk queue is full*, and remember the stall bits are
+**sticky** — `CONNECT` latching does not mean the connection is stalled now, it means it stalled once
+during the run. The two live readings are the queue occupancy and `rx_fifo_stall`.
+
+Three resources are involved, and they are badly matched:
+
+| resource | depth | set in |
+|---|---|---|
+| scheduler flows in flight | `min(max_inflight(), maximum_num_enqueued_configs())` = `min(64, 64)` = **64** | `scheduler.cpp`, `default_pipeline_depth` |
+| HTTP column-chunk queue | **64** entries | `HTTP_QUEUE_DEPTH`, `vfpga_top.svh:139` |
+| FPGA output buffers | **2** | `NUM_BUFFERS_TO_ENQUEUE`, passed as `2` in `oasis_context.cpp:62` |
+
+The `min()` in `default_pipeline_depth` was added to stop the scheduler over-committing the decoder,
+but on this hardware `MAX_NUM_ENQUEUED_BUFFERS` is also 64 (`column_chunk_decoder_config.sv:38`), so
+**the `min()` is a no-op** and the scheduler still dispatches 64 flows. A flow is one *batch* of
+column chunks, not one chunk, so 64 flows routinely need far more than 64 queue entries.
+
+The deadlock is a circular wait on a single thread:
+
+```
+dispatch_loop (ONE thread)
+  └─ dispatch_to
+       ├─ sink->apply()      -> acquire_output_handle() -> ensure_stream_has_buffers()
+       │                        ...the ONLY code path that tops FPGA output buffers back up to 2
+       └─ source->apply()    -> submit_batch() -> await_cfg_ready()   <-- BLOCKS up to 30 s
+```
+
+1. The queue fills, so `await_cfg_ready` blocks the dispatcher.
+2. Blocked, the dispatcher cannot acquire another output handle, so **no output buffers are added**.
+   `ensure_stream_has_buffers` is called from exactly one site — inside `acquire_output_handle`
+   (`output_buffer_manager.cpp:135`). The completion path pops a buffer (`:238`) and never replaces it.
+3. The decoder drains its remaining ≤ 2 buffers and then has nowhere to write.
+4. It stops consuming → `strip_http` back-pressures → the rx fifo fills (**`rx_fifo_stall`**) → the
+   TOE back-pressures → responses stop arriving.
+5. Responses are what free queue entries, so step 1 never clears. 30 s later the host throws.
+
+That is why it "fails at a different query each run": what matters is how many column chunks have
+accumulated, not which query asked for them. It is also why `--groups` helps — fewer row groups in
+flight means fewer chunks, so the queue is less likely to fill while the dispatcher is the only thing
+holding the buffer supply open. **`--groups` is a workaround for this bug, not a tuning knob.**
+
+Fixes, in order of how much they address the actual cause:
+
+1. **Replenish output buffers off the dispatcher.** Call `ensure_stream_has_buffers` when a buffer is
+   popped in `move_current_buffer_to_handle`, so the FPGA's buffer supply no longer depends on a
+   thread that can block on FPGA credit. This breaks the cycle outright and is the fix worth making.
+2. **Raise `NUM_BUFFERS_TO_ENQUEUE` above 2.** Widens the window but does not remove the cycle; at
+   8 MiB per buffer it also costs real memory. Mitigation, not a fix.
+3. **Make the two depths genuinely different.** Bound the scheduler to something well under
+   `HTTP_QUEUE_DEPTH` so the dispatcher never blocks in `submit_batch` in the normal case.
+
+### Competing explanations for the same symptom
+
+Every hypothesis below ends in *the decoder stops consuming*, and from there the downstream signature
+(`rx_fifo_stall`, back-pressure to the TOE, queue never drains, `64/64`) is **identical**. The stall
+bits cannot tell them apart. Do not close this out on the signature alone.
+
+1. **The dispatcher deadlock above.** Predicts: the hung process has its `dispatch_loop` thread
+   parked inside `await_cfg_ready`, and the failure tracks the number of column chunks in flight
+   (so `--groups` moves it) rather than the query text.
+2. **build-103 does not close timing.** WNS **-0.949 ns** on the 250 MHz user clock, 30,719 failing
+   endpoints, and 689 of the 1000 worst paths are inside `inst_http_column_chunk_decoder`
+   (524 `hybrid_page_decoder`, 113 Snappy `vhsnunzip`). build-102 was -0.436 ns with 200. A decoder
+   that violates setup can hang or corrupt data-dependently. Predicts: build-102 survives runs that
+   build-103 fails.
+3. **A decoder input it cannot handle.** The NULL and trailing-page-bytes limits in *Limits and known
+   gaps* both hang the decoder by construction. Predicts: deterministic — the *same* query fails
+   every time on the same data.
+
+**Discriminating test, cheapest first:** run the failing suite under `gdb` and look at the thread
+backtraces at the hang (1 is confirmed or refuted outright); then repeat the same run on build-102
+(separates 2); then check whether the failure is query-deterministic (separates 3). Note
+`ptrace_scope` is 2 on `alveo-u55c-04`, so `gdb` must **launch** duckdb rather than attach to it.
+
+Until this is settled, `--groups 4` is a mitigation of unknown mechanism, not a fix.
 
 ### Ephemeral port exhaustion (fixed by keep-alive; the mechanism is worth keeping in mind)
 
