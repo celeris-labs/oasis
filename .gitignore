@@ -31,4 +31,7 @@ jemalloc-5.3.0/
 .ila/
 .traces/
 .raw/
+# A/B results from scripts/util/decoder_ab.sh
+.decoder-ab/
 minio/
+hardware/src/oasis_defines.svh

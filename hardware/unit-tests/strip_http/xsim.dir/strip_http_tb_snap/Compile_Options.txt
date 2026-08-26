@@ -1,1 +1,0 @@
--debug "typical" -top "strip_http_tb" -snapshot "strip_http_tb_snap" 
