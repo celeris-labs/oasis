@@ -79,7 +79,21 @@ module tcp_read #(
     // was ~8 ms. Two seconds is three orders of magnitude of headroom, so this fires only when
     // something is genuinely never going to arrive -- and then it aborts, which the handler already
     // knows how to turn into a reconnect and replay.
-    parameter int WATCHDOG_BITS = 29
+    parameter int WATCHDOG_BITS = 29,
+
+    // 0 (default): this module owns the receive path -- it consumes tcp_session_table's
+    //    announcements, issues its own readPkg, and consumes one rx_metadata beat per packet.
+    //    Correct for exactly ONE session, which is what the single-connection handler holds.
+    //
+    // 1: rx_dispatch owns all of that, for N sessions at once. Data arrives here PRE-ROUTED on
+    //    s_axis_rx_data_* -- already selected for this lane and already in global arrival order --
+    //    so ST_WAIT_NOTIFY and ST_REQ_PKG have nothing to do and are skipped. The notification and
+    //    readPkg ports are tied off; rx_space_ok is what this lane offers back to the dispatcher.
+    //
+    //    The framer, the decoupling fifo and the response state machine are IDENTICAL in both
+    //    modes: each lane still sees one ordered single-session HTTP byte stream, which is the
+    //    whole reason a per-lane strip_http needs no new logic.
+    parameter bit EXTERNAL_DISPATCH = 0
 ) (
     input  logic                                      clk,
     input  logic                                      rst_n,
@@ -135,6 +149,13 @@ module tcp_read #(
     // TOE -- exactly what this whole change exists to prevent, so it is worth a CSR bit.
     output logic [$clog2(RX_FIFO_DEPTH+1)-1:0]        rx_fifo_level,
     output logic                                      rx_fifo_stall,
+
+    // EXTERNAL_DISPATCH only: room for a WHOLE MSS, not for one beat. rx_dispatch gates its
+    // readPkg on this, and once it issues, every beat of that packet is accepted unconditionally --
+    // so a lane that says "ok" with room for less than a full segment forces the dispatcher to
+    // stall the shared stream, which stalls every other lane too. That is the one failure this
+    // whole arrangement exists to avoid, so the margin is deliberate.
+    output logic                                      rx_space_ok,
 
     output logic [3:0]                                debug_rx_write_ptr,
     output logic [AXI_DATA_BITS-1:0]                  debug_rx_buffer_w0,
@@ -204,6 +225,12 @@ module tcp_read #(
     assign fifo_s_tvalid         = (state_q == ST_RECV_DATA) && s_axis_rx_data_TVALID;
     assign s_axis_rx_data_TREADY = (state_q == ST_RECV_DATA) && fifo_s_tready;
     assign in_fire               = s_axis_rx_data_TVALID && s_axis_rx_data_TREADY;
+
+    // Space for one maximum segment, in beats. MSS is 4096 on this stack (see the TOE's
+    // MSS/mss_table); at 512 bit that is 64 beats. The +2 covers the fifo's own registered
+    // output stage, which is occupied but not counted in rx_fifo_level.
+    localparam int MSS_BEATS = (4096 / (AXI_DATA_BITS/8)) + 2;
+    assign rx_space_ok = (RX_FIFO_DEPTH - rx_fifo_level) > MSS_BEATS;
 
     axis_fifo #(
         .DATA_BITS(AXI_DATA_BITS),
@@ -302,7 +329,11 @@ module tcp_read #(
 
             // resp_ack is asserted for this whole cycle; the framer clears resp_done on the edge.
             ST_ARM: begin
-                state_d = pkg_active_q ? ST_RECV_DATA : ST_WAIT_NOTIFY;
+                // Under external dispatch there is no notification to wait for and no readPkg to
+                // issue -- rx_dispatch has already done both, and bytes for this lane may already
+                // be arriving. Go straight to accepting them.
+                if (EXTERNAL_DISPATCH) state_d = ST_RECV_DATA;
+                else                   state_d = pkg_active_q ? ST_RECV_DATA : ST_WAIT_NOTIFY;
             end
 
             ST_WAIT_NOTIFY: begin
@@ -351,7 +382,9 @@ module tcp_read #(
             end
 
             ST_REQ_PKG: begin
-                m_axis_read_package_TVALID = 1'b1;
+                // Unreachable under EXTERNAL_DISPATCH (ST_ARM never routes here); the guard keeps
+                // the readPkg port provably quiet rather than relying on that argument.
+                m_axis_read_package_TVALID = !EXTERNAL_DISPATCH;
                 if (m_axis_read_package_TREADY) begin
                     rx_meta_received_d = 1'b0;
                     pkg_active_d       = 1'b1;
@@ -360,8 +393,10 @@ module tcp_read #(
             end
 
             ST_RECV_DATA: begin
-                // One rx metadata beat per readPkg.
-                if (!rx_meta_received_q) begin
+                // One rx metadata beat per readPkg -- but only when this module issued the readPkg.
+                // Under external dispatch rx_dispatch consumes the metadata (it is what names the
+                // lane), so touching it here would steal a beat and mis-route the next packet.
+                if (!EXTERNAL_DISPATCH && !rx_meta_received_q) begin
                     s_axis_rx_metadata_TREADY = 1'b1;
                     if (s_axis_rx_metadata_TVALID) rx_meta_received_d = 1'b1;
                 end
@@ -369,6 +404,17 @@ module tcp_read #(
                 if (sh_resp_error) begin
                     abort_dirty_d = sh_resp_dirty;
                     state_d       = ST_ABORT;
+                end else if (EXTERNAL_DISPATCH) begin
+                    // Stay here for the whole response. There is no per-packet round trip to make:
+                    // packets for this lane simply arrive, and the framer decides when the response
+                    // is complete. tlast here is a PACKET boundary, not a response boundary.
+                    if (sh_resp_done)   state_d = ST_DONE;
+                    else if (rx_closed) state_d = ST_DRAIN;
+                    else if (wdog_expired) begin
+                        wdog_timeout_d = 1'b1;
+                        abort_dirty_d  = sh_resp_dirty;
+                        state_d        = ST_ABORT;
+                    end
                 end else if (in_fire && s_axis_rx_data_TLAST) begin
                     // The packet is fully handed over TO THE FIFO. Whether it completed the
                     // response is decided back in ST_WAIT_NOTIFY, once the framer has drained it.

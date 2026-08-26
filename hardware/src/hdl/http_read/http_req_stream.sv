@@ -81,6 +81,19 @@ module http_req_stream #(
     output logic                        s_axis_tx_status_TREADY,
     input  logic [TCP_TX_STAT_BITS-1:0] s_axis_tx_status_TDATA,
 
+    // Transmit-path arbitration. N lanes share ONE TOE transmit interface, and the
+    // meta -> status -> data sequence cannot interleave: tx_status is a single ordered response
+    // stream, so a second announcement made before the first lane's data is pushed takes the other
+    // lane's reservation. bus_req is high from the arm until the whole transfer is sent; the lane
+    // only leaves ST_IDLE while it holds the grant.
+    //
+    // Granting for a whole TRANSFER rather than per chunk is deliberate. Request text is a few
+    // hundred bytes per GET against a ~1 ms server round trip, so serialising transmit costs
+    // nothing measurable and removes every interleaving hazard. Tie bus_grant high for single-lane
+    // use and this module behaves exactly as before.
+    output logic        bus_req,
+    input  logic        bus_grant,
+
     // Status.
     output logic        busy,          // a transfer is armed and not yet fully sent
     output logic        refused_sticky,// the TOE refused at least one reservation (informational)
@@ -141,7 +154,7 @@ module http_req_stream #(
                 if (req_start) begin
                     // Arm. Nothing is sent until the connection is up.
                     remaining_d = req_total_bytes;
-                end else if ((remaining_q != 32'd0) && conn_up) begin
+                end else if ((remaining_q != 32'd0) && conn_up && bus_grant) begin
                     chunk_d      = (remaining_q >= 32'(CHUNK_BYTES)) ? 17'(CHUNK_BYTES)
                                                                      : remaining_q[16:0];
                     chunk_left_d = (remaining_q >= 32'(CHUNK_BYTES)) ? 17'(CHUNK_BYTES)
@@ -226,6 +239,7 @@ module http_req_stream #(
     end
 
     assign busy           = (state_q != ST_IDLE) || (remaining_q != 32'd0);
+    assign bus_req = (remaining_q != 32'd0);
     assign refused_sticky = refused_q;
     assign tx_space       = space_q;
     assign state_debug    = state_q;

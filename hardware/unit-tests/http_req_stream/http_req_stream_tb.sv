@@ -74,6 +74,7 @@ module http_req_stream_tb;
         .m_axis_tx_data_TLAST(txd_last),
         .s_axis_tx_status_TVALID(txs_valid), .s_axis_tx_status_TREADY(txs_ready),
         .s_axis_tx_status_TDATA(txs_data),
+        .bus_req(), .bus_grant(1'b1),
         .busy(busy), .refused_sticky(refused_sticky), .tx_space(tx_space),
         .state_debug(state_debug)
     );

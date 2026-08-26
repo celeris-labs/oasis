@@ -188,43 +188,55 @@ constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 // depth back without a rebuild if a run misbehaves.
 constexpr const uint8_t  HTTP_DEFAULT_MAX_INFLIGHT = 0;
 
-// Largest byte range asked for in one GET. 0 disables splitting entirely (one GET per column chunk).
+// Largest byte range asked for in one GET. 0 disables splitting entirely: ONE GET PER COLUMN CHUNK,
+// which is the default.
 //
-// RAISED 8192 -> 131072 ON build-94. The 8 KiB default existed to keep `depth x chunk` under the
-// ~41.5 KB drop threshold described above. That bound was real, but it was a symptom: the parser
-// held s_axis_rx_data_TREADY low for the ~550 cycles of a header walk, so the shared FIFO backed up
-// behind it and small requests were the only way to stay under the edge. b238c4e put a FIFO between
-// the TOE and the parser, and the edge went with it.
+// WHY THE SPLIT IS OFF
+// A GET costs the object store roughly a fixed amount whatever its size, and HTTP/1.1 serialises
+// that cost -- ADR-3 measured per-GET time falling only 1020 -> 848 -> 822 us across pipeline depth
+// 1 -> 2 -> 4, because MinIO answers request 1 fully before it reads request 2. Splitting a 2 MB
+// column chunk into eleven 192 KiB GETs therefore pays that fixed cost eleven times to move the same
+// bytes. The split never bought throughput; it bought a bound on response size, and that bound is no
+// longer needed (below). Fewer, larger requests is the whole optimisation.
 //
-// Measured on build-94, scripts/sweep.sh, lineitem sf1, per-GET marginal cost in microseconds:
+// THE BOUND IT USED TO PROVIDE IS GONE
+// The 8 KiB original existed to keep `depth x chunk` under the ~41.5 KB threshold at which rx_engine
+// began dropping, back when the stack advertised 256 KB against a 64 KB fifo. Two changes retired
+// it, in order: b238c4e put a fifo between the TOE and the HTTP parser (the backlog was the parser
+// holding TREADY low through a header walk, not the network outrunning the decoder, which drains at
+// ~16 GB/s); then the window and the fifo were made equal. Verified in the submodule, not from
+// memory:
 //
-//            4K->8K   8K->16K  16K->32K  32K->64K  64K->128K
-//   depth 1    1019       988      1116       936        720
-//   depth 2     927       705       786       508        801
-//   depth 4     888       779       719       764        600
+//   WINDOW_SCALE_BITS = 4  ->  WINDOW_BITS = 20  ->  BUFFER_SIZE = 1 MiB
+//                                          parcore/libstf/coyote/hw/services/network/hls/toe/
+//                                          toe_config.hpp.in:36
+//   rx_buffer_fifo    = axis_data_fifo_512_d16384 = 16384 x 64 B = 1 MiB
+//   axis_max_data_count = 16'd16384 at both sites  tcp_stack.sv:544, :671, :681
 //
-// Flat, at every depth. On build-93 the same sweep showed +10.4 ms/GET at 32K->64K -- a response
-// that no longer fit alongside the parser's backlog. That cliff is gone, so the cost of a GET is now
-// latency and nothing else, and the only thing that matters is issuing fewer of them.
+// So the stack advertises exactly what it can hold, and a response larger than the window is
+// ordinary TCP flow control rather than an overrun: the window closes as the decoder falls behind
+// and reopens as it drains.
 //
-// 131072 is the largest size actually measured, not a limit. Bigger is very likely still better;
-// sweep further before raising it again, because past here nothing has been observed. Note the
-// bytes-in-flight product is now 4 x 128 KiB = 512 KiB, eight times what the old rule permitted --
-// that is deliberate and is what the sweep above tested, but it means rx_fifo_stall (stallWord bit
-// 25) is the thing to watch: if it ever sets, back-pressure has reached the TOE again and this
-// number is why.
+// AN EARLIER VERSION OF THIS COMMENT SAID "DELIBERATELY NOT 262144", on the grounds that 2^18 was
+// BUFFER_SIZE and every sweep that hung had hung at or above it. That was true of WINDOW_SCALE_BITS
+// = 2 and is not true of the hardware built since; the boundary it named moved to 1 MiB. It is kept
+// here because the observation behind it -- sweeps hang AT the window, not at some fraction of it --
+// is the thing to re-test if this default misbehaves.
 //
-// Splitting is nearly free only because the connection is persistent: the extra requests cost a
-// ~150-byte GET and a ~200-byte response header each, pipelined, with no handshake and no teardown.
-// 196608 = 192 KiB. Raised from 131072 on build-95, where the rx fifo went 64 KiB -> 256 KiB on both
-// sides (ours and the TOE's). rx_fifo_stall no longer sets at any size up to here, which it did at
-// 131072 on build-94 -- so the decoupling now actually holds at the size we ask for.
+// WHAT TO WATCH, AND HOW TO BACK OUT
+// rx_fifo_stall (stallWord bit 25) is the failure mode now: it means the drain stopped, so
+// back-pressure reached the TOE. Read it with the reconnect count next to it -- a climbing reconnect
+// count is the peer giving up, a stall bit alone is local. Neither is a correctness problem by
+// itself; both mean this number is implicated. There is also a Coyote-side hazard that big responses
+// make more likely: rx_engine accepts a segment only with >375 beats (24000 B) free while
+// rx_sar_table advertises (appd - recvd) - 1 and knows nothing about that floor, so an advertised
+// window landing in 1..24000 deadlocks rather than back-pressures. The clamp for it shipped in
+// build-105 and lives in the parcore submodule, which means it does NOT survive a
+// `git submodule update` -- check that before blaming this constant.
 //
-// Deliberately NOT 262144. That is 2^18 = BUFFER_SIZE = 1 << WINDOW_BITS, exactly the window the TOE
-// advertises, and every sweep that has hung has hung at or above it. The buffer got bigger in
-// build-95 but WINDOW_BITS did not, so that boundary is untouched and is not worth walking into for
-// a few percent.
-constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 196608;
+// OASIS_HTTP_CHUNK_BYTES=<bytes> restores splitting at any size without a rebuild. 196608 (192 KiB)
+// was the previous default and is the known-good fallback; scripts/sweep.sh walks the range.
+constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 0;
 
 // Effective request-ring depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override), and
 // both 0 and any value >= the ring size mean "use the whole ring". No longer clamped by a
@@ -886,7 +898,19 @@ HTTPReadConfig::HTTPInflight HTTPReadConfig::inflight() {
     f.peer_closed = (word & (1u << 17)) != 0;
     f.conn_up     = (word & (1u << 18)) != 0;
     f.req_ready   = (word & (1u << 19)) != 0;
+    // [23:20] is the lane count on handler_multi. A single-session bitstream leaves it zero, and
+    // zero lanes is not a thing -- it means one shared connection.
+    const uint8_t lanes = static_cast<uint8_t>((word >> 20) & 0xFu);
+    f.lanes       = (lanes == 0) ? uint8_t(1) : lanes;
     return f;
+}
+
+uint8_t HTTPReadConfig::lane_count() {
+    // Cached: it cannot change without reprogramming, and this is read on the per-chunk path.
+    if (lane_count_cached_ == 0) {
+        lane_count_cached_ = inflight().lanes;
+    }
+    return lane_count_cached_;
 }
 
 std::string HTTPReadConfig::HTTPInflight::describe() const {

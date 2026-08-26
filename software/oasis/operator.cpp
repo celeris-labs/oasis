@@ -224,19 +224,51 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
                 std::to_string(decoders) +
                 " decoders -- its chunks may belong to different streams. Run with "
                 "OASIS_HTTP_BATCH=0 (one request per column chunk), or give the batch a per-chunk "
-                "lane before enabling multi-decoder batching.");
+                "lane before enabling multi-decoder batching. This is also the required mode on a "
+                "multi-session bitstream (--multi): there each lane owns its own TCP connection and "
+                "its own request-text stream, so a batch spanning lanes has no single destination "
+                "to be DMA'd to.");
         }
     }
     config->submit_batch(server_ip_, server_port_, batch, stream);
 
     // Then the text itself.
+    //
+    // TWO DIFFERENT THINGS ARE CALLED A "STREAM" HERE, and sending the text to the wrong one
+    // deadlocks the handler:
+    //
+    //   - the DECODE LANE, which is `stream`. It travels in bits [35:32] of the chunk-length
+    //     register, set by submit_batch above, and never through the DMA descriptor.
+    //   - the HOST-DMA SINK, which is this `dest`, the axis_host_recv index the FPGA reads the
+    //     request text from.
+    //
+    // Which sink is correct depends on the bitstream, so ask it rather than assume:
+    //
+    //   - ONE session (handler_stream, lane_count()==1): only axis_host_recv[0] is wired -- the
+    //     handler's s_axis_req connects to it and vfpga_top.svh ties off [1..N_STRM_AXI-1]. All
+    //     text goes to 0 whatever decode lane the chunk is bound for.
+    //   - N sessions (handler_multi, lane_count()>1): each lane owns a session AND its own request
+    //     stream, so lane L's text must go to axis_host_recv[L]. Sending it to 0 would hand every
+    //     lane's GETs to lane 0's connection.
+    //
+    // Getting this wrong is silent. A tied-off stream holds tready high and discards, so the DMA
+    // reports success while the text vanishes; the handler has already been armed by submit_batch,
+    // so it waits for bytes that no longer exist -- await_cfg_ready times out at 30 s, the read
+    // watchdog fires a dirty_abort, the body stream stops draining, and the receive window
+    // collapses to zero with the TOE retransmitting into a dead peer. One wrong descriptor field.
+    //
+    // It stayed invisible until the second decoder existed, because every flow was on stream 0.
+    const uint8_t          lanes    = config->lane_count();
+    const libstf::stream_t req_dest = (lanes > 1)
+                                        ? static_cast<libstf::stream_t>(stream % lanes)
+                                        : static_cast<libstf::stream_t>(0);
     auto *byte_ptr = static_cast<std::byte *>(buf->ptr);
     for (size_t off = 0; off < buf->size; off += coyote::MAX_TRANSFER_SIZE) {
         coyote::localSg sg;
         sg.addr   = reinterpret_cast<void *>(byte_ptr + off);
         sg.len    = std::min(buf->size - off, coyote::MAX_TRANSFER_SIZE);
         sg.stream = coyote::STRM_HOST;
-        sg.dest   = stream;
+        sg.dest   = req_dest;
         const bool last = off + coyote::MAX_TRANSFER_SIZE >= buf->size;
         ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last);
     }

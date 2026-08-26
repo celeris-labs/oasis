@@ -304,6 +304,8 @@ module handler_stream #(
         .s_axis_tx_status_TVALID(s_axis_tx_status_TVALID),
         .s_axis_tx_status_TREADY(s_axis_tx_status_TREADY),
         .s_axis_tx_status_TDATA(s_axis_tx_status_TDATA),
+        // Single lane: the transmit path has no other claimant, so the grant is unconditional.
+        .bus_req(), .bus_grant(1'b1),
         .busy(stream_busy), .refused_sticky(stream_refused),
         .tx_space(stream_space), .state_debug(stream_state_debug)
     );

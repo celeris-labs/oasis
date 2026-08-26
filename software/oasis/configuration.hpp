@@ -176,12 +176,26 @@ class HTTPReadConfig : public libstf::Config {
         /// register does not back-pressure, so a START landing on an unconsumed beat overwrites it
         /// and the request is lost silently.
         bool    req_ready     = false;
+        /// TCP sessions this bitstream has, one per decoder lane (handler_multi). 1 on a
+        /// single-session bitstream, where the field reads 0 and is normalised here -- an older
+        /// bitstream has one shared connection, not zero.
+        uint8_t lanes         = 1;
 
+        bool multi_session() const { return lanes > 1; }
         bool legacy() const { return slots == 0; }
         uint8_t free_slots() const { return slots > occupied ? uint8_t(slots - occupied) : uint8_t(0); }
         std::string describe() const;
     };
     HTTPInflight inflight();
+
+    /// TCP sessions the bitstream provides, cached after the first read. 1 means the single-session
+    /// handler_stream; >1 means handler_multi, where every request beat must name a lane and each
+    /// lane's request text goes to its OWN host-recv stream.
+    ///
+    /// Read from hardware rather than compiled in: the CSR map and the bitstream must agree, and a
+    /// host that assumes a lane count the board does not have sends text to a tied-off stream,
+    /// which discards it while reporting success. See the note on req_dest in operator.cpp.
+    uint8_t lane_count();
 
     /**
      * Read CSR 11: which pipeline stage stopped making progress (`stallWord` in handler.sv).
@@ -320,6 +334,10 @@ class HTTPReadConfig : public libstf::Config {
     static constexpr uint64_t ID = HTTP_READ_CONFIG_ID;
 
   private:
+    /// Lanes reported by the bitstream, cached on first read. 0 means "not read yet"; lane_count()
+    /// normalises a single-session bitstream's 0 to 1.
+    uint8_t lane_count_cached_ {0};
+
     /// Bytes asked for in the most recent ranged GET, so response() can compare what the server
     /// said against what was requested.
     std::atomic<uint32_t> last_request_bytes_ {0};

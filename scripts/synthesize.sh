@@ -4,11 +4,13 @@ script_dir="$(cd "$(dirname "$0")" && pwd)"
 
 cmake_args=()
 decoders=1
+enable_http_multi=0
 enable_http=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --http) enable_http=1 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
+        --multi) enable_http_multi=1 ;;
         --decoders) decoders="$2"; shift ;;
         --decoders=*) decoders="${1#*=}" ;;
         # Make the advertised TCP receive window match the buffer that actually exists.
@@ -36,6 +38,8 @@ if [ "$enable_http" -eq 1 ]; then
     cmake_args+=(-DENABLE_HTTP=ON -DENABLE_RDMA=OFF)
 fi
 cmake_args+=(-DN_DECODERS="$decoders")
+# One TCP session per decoder lane. Needs --http; the build fails loudly otherwise.
+cmake_args+=(-DENABLE_HTTP_MULTI="$([ "$enable_http_multi" = 1 ] && echo ON || echo OFF)")
 
 pushd hardware
 

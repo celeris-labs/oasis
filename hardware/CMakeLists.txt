@@ -14,10 +14,32 @@ set(N_DECODERS 1 CACHE STRING "Number of ColumnChunkDecoders (default=1)")
 option(ENABLE_RDMA "Enable RDMA stack" ON)
 # FPGA HTTP ranged-GET client on the bypass stream (mutually exclusive with RDMA)
 option(ENABLE_HTTP "Enable HTTP stack" OFF)
+# One TCP session PER DECODER LANE instead of one shared session (handler_multi). Requires
+# ENABLE_HTTP. The ceiling being escaped is the single connection: measured against MinIO, one TCP
+# session delivers ~0.46 GB/s however deeply pipelined and sixteen deliver 4.60, with the FPGA at
+# 0.33 -- so the session count is worth more than anything inside the decoder.
+option(ENABLE_HTTP_MULTI "One TCP session per decoder lane" OFF)
 
 if(ENABLE_HTTP AND ENABLE_RDMA)
     message(FATAL_ERROR "ENABLE_HTTP and ENABLE_RDMA are mutually exclusive")
 endif()
+
+if(ENABLE_HTTP_MULTI AND NOT ENABLE_HTTP)
+    message(FATAL_ERROR "ENABLE_HTTP_MULTI needs ENABLE_HTTP -- there is no HTTP client to give sessions to")
+endif()
+
+# Coyote generates lynx_pkg.sv from its own template, so oasis cannot add a `define there without
+# editing the submodule. This generated header is oasis's own, included by vfpga_top.svh.
+if(ENABLE_HTTP_MULTI)
+    set(OASIS_DEF_EN_TCP_MULTI "`define EN_TCP_MULTI")
+else()
+    set(OASIS_DEF_EN_TCP_MULTI "// EN_TCP_MULTI off: one shared TCP session for all decoder lanes")
+endif()
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/oasis_defines.svh.in
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/oasis_defines.svh
+    @ONLY
+)
 
 # Number of vFPGAs (user applications)
 set(N_REGIONS 1)
