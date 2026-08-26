@@ -504,6 +504,19 @@ if [ "$PHASES" = 1 ]; then
     printf '%-5s %-8s %9s %9s %10s  %s\n' "query" "result" "fpga_s" "cpu_s" "hw_MiB" "note"
 fi
 
+# An end stamp means the query STOPPED, not that it succeeded. A query that raised prints its error
+# between its own begin and end markers and stamps the end regardless, so scoring on the stamp alone
+# treats a failed session as 22 completed queries -- and because both sides then hold the SAME error
+# text, `cmp` matches and every query is reported PASS at 0.00 s. A whole run of 404s once printed
+# "pass 22  fail 0", which is the most dangerous output this script can produce.
+#
+# Detected per query rather than by gating on the session rc: at scale 30 a session that dies on q22
+# still measured q1..q21 correctly, and throwing those away would be its own kind of wrong.
+query_errored() {   # $1 = captured rows file
+    [ -s "$1" ] || return 1
+    grep -qE '^[A-Za-z][A-Za-z ]*Error: ' "$1"
+}
+
 # Replays what phase 1 measured. Defined AFTER run_fpga so it wins the name.
 replay_fpga() {
     fpga_s=${P_S[$n]:-0}; fpga_rc=${P_RC[$n]:-1}; hw_mib=${P_MIB[$n]:-}
@@ -511,6 +524,7 @@ replay_fpga() {
     [ "${SINGLE_SESSION:-0}" = 1 ] && hw_mib=""
     cp "$PHASE_CACHE/q$n.rows" "$FPGA_ROWS" 2>/dev/null || : > "$FPGA_ROWS"
     cp "$PHASE_CACHE/q$n.raw"  "$FPGA_RAW"  2>/dev/null || : > "$FPGA_RAW"
+    query_errored "$FPGA_ROWS" && fpga_rc=1
 }
 
 # Replays what the single CPU session measured, mirroring replay_fpga.
@@ -518,6 +532,7 @@ replay_cpu() {
     cpu_s=${C_S[$n]:-0}; cpu_rc=${C_RC[$n]:-1}
     cp "$CPU_CACHE/q$n.rows" "$CPU_ROWS" 2>/dev/null || : > "$CPU_ROWS"
     : > "$CPU_RAW"
+    query_errored "$CPU_ROWS" && cpu_rc=1
 }
 
 for f in "$ROOT"/scripts/tpch/q*.sql; do
