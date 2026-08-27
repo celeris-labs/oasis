@@ -41,20 +41,35 @@ its own `run.sh` and no dependency on the Coyote build:
 
 | | |
 |---|---|
-| `http_pipeline/` | the whole client — handler + session table + init/send/read — against a TOE model serving several concurrent sessions. Checks bodies byte-exact and in order, one `tlast` each, and that request k+1's GET goes out before body k finishes. Runs at 4 slots and at 1 |
+| `http_pipeline/` | the whole *descriptor-ring* client — handler + session table + init/send/read — against a TOE model serving several concurrent sessions. Checks bodies byte-exact and in order, one `tlast` each, and that request k+1's GET goes out before body k finishes. Runs at 4 slots and at 1. **Mixes live and archived sources** (`handler`, `tcp_send_http`, `http_req_builder` come from `hardware/archive/http_read/`) — a frozen design, not what is built today |
 | `tcp_read/` | receive path against realistic MinIO responses: multi-segment, back-pressured, unaligned. `case_burst_notifications` announces every segment (and the FIN) before a single `readPkg` is served, which is what pins the one-readPkg-per-announcement contract |
-| `http_req_builder/` | the assembled GET, byte for byte, including 64-character paths and multi-beat sends |
-| `strip_http/` | header strip in isolation. **4 of its 6 cases currently fail** — the bench drives `strip_http` directly, without the `tcp_read` concatenator that masks per-`readPkg` `tlast`, so its expectations no longer match how the module is used. `tcp_read/` is the authoritative coverage for this module |
+| `http_req_builder/` | the assembled GET, byte for byte, including 64-character paths and multi-beat sends. **Archived module** — the GET text is built on the host now |
+| `strip_http/` | header strip in isolation: two responses back to back with the boundary mid-beat, a chunk split across 3 GETs producing exactly one `tlast`, 7-byte ragged beats, back-pressure across a response boundary, `Content-Length: 0`, lowercase header names, a missing `Content-Length` → `resp_error`, 404 capture, `resp_dirty` |
+| `rx_dispatch/` | the arrival-order receive dispatcher: it owns the notification and `readPkg` handshake for all lanes and hands each one pre-routed bytes |
+| `tx_arbiter/` | round-robin grant for N lanes sharing the TOE's single transmit interface, where `meta → status → data` may not interleave |
+| `handler_multi/` | N TCP sessions, one per decode lane, end to end through the handler |
+| `http_multilane/` | `rx_dispatch` + N × `tcp_read`: N responses interleaved **at packet granularity** on one shared receive stream come out correctly framed on their own lanes, and a lane whose consumer stalls does not stall the others |
+
+`hardware/archive/http_read/README.md` says which of these drive retired modules and why they are
+kept. Last run 2026-08-23, all green: `http_pipeline` PASS, `tcp_read` 11/11, `strip_http` 20/20,
+`rx_dispatch` 10/10, `tx_arbiter` 6/6, `handler_multi` 15/15, `http_multilane` 16/16. Each bench
+prints its own tally, so re-run `run.sh` rather than trusting this line.
 
 ### Synthesis
 For synthesis, execute the following command:
 
 ```bash
-./scripts/synthesize.sh [--http] [--no-rdma] [--decoders <number-of-decoders>]
+./scripts/synthesize.sh [--http] [--multi] [--no-rdma] [--decoders <number-of-decoders>]
 ```
 
 `--http` builds the FPGA HTTP client (`ENABLE_HTTP=ON`, and implies `ENABLE_RDMA=OFF`) — see
 [HTTP read path](#http-read-path) below.
+
+`--multi` (`ENABLE_HTTP_MULTI=ON`) gives **each decode lane its own TCP session** instead of sharing
+one session across all of them. Pair it with `--decoders N`; the host reads the lane count off the
+bitstream, so nothing needs recompiling to match. First such build is build-110 (4 lanes,
+2026-08-26) and it has **not** been measured on hardware yet — see
+`hardware/src/hdl/http_read/ARCHITECTURE.md`, ADR-4.
 
 The script spins off the synthesis in the background in a way that the user can disconnect from 
 the server without the synthesis stopping. You can check the progress in `hardware/build-**/bitgen.log`. 
@@ -83,8 +98,9 @@ involved at all.
 
 ### Keep-alive and request pipelining
 
-> **One TCP connection carries every request.** It is opened lazily on the first ranged GET and then
-> held open across every request and every query; `strip_http` delimits each response by
+> **One TCP connection carries every request** (on a default build; with `--multi` it is one per
+> decode lane, and everything below holds per lane). It is opened lazily on the first ranged GET and
+> then held open across every request and every query; `strip_http` delimits each response by
 > `Content-Length` instead of by the server's FIN, which is what makes that possible.
 >
 > This is not a latency optimisation, it is what makes the client usable at all. The TOE hands out
@@ -108,13 +124,16 @@ involved at all.
 The unit of work is one `(row group, column)` column chunk, so a query fetches hundreds of them —
 TPC-H Q6 over `lineitem` at sf1 is 4 columns x 49 row groups = 196 ranged GETs to move 48 MB. When
 each of those was a full connect / GET / body / teardown cycle with nothing overlapping it, the
-per-request round trips dominated: the decoder consumes 64 B/cycle at 250 MHz (16 GB/s, more than
-the 100 GbE link can deliver) and spent the overwhelming majority of a query idle between requests.
+per-request round trips dominated: the decoder's input port carries 64 B/cycle at 250 MHz (16 GB/s
+of line rate, more than the 100 GbE link delivers) and it spent the overwhelming majority of a query
+idle between requests. **That port rate is not the decode rate** — on a real query the decoder
+ingests ~1.0 GB/s while a chunk is streaming and is idle 68 % of the wall clock (2026-08-19), which
+is still twice what one TCP session supplies (0.46 GB/s) but is a factor of two, not of sixteen.
 
-**`handler_stream.sv` is what is built today, and it is not a descriptor ring.** `handler.sv` (a
-ring of `HTTP_NUM_SLOTS` = 4 slots, each holding a full 1160-bit `http_config_t`) still exists in the
-tree and in bitstreams up to build-95, but the depth was an amount of FPGA registers rather than a
-design choice: measured on a scale-30 `lineitem` scan that ring was full for 1462 of 1465 requests,
+**`handler_stream.sv` is what is built today (`handler_multi.sv` with `--multi`), and neither is a
+descriptor ring.** `handler.sv` (a ring of `HTTP_NUM_SLOTS` = 4 slots, each holding a full 1160-bit
+`http_config_t`) shipped in bitstreams up to build-95 and now lives in `hardware/archive/http_read/`,
+out of the synthesis path. Its depth was an amount of FPGA registers rather than a design choice: measured on a scale-30 `lineitem` scan that ring was full for 1462 of 1465 requests,
 so the host spent essentially the whole query blocked on a slot.
 
 Every byte range is known once the Parquet footer is parsed, so the host now builds all of the GET
@@ -230,8 +249,10 @@ cost falling only 1020 → 848 → 822 µs across pipeline depth 1 → 2 → 4, 
 eleven times for the same bytes.
 
 **What this has not been measured against yet.** The published size curve (192 KiB → 148 MB/s,
-256 KiB → 179, 512 KiB → 294, 1 MiB → 423) is `one_conn_ceiling.sh` — a host raw socket measuring
-what MinIO delivers on one keep-alive connection. It is the right shape and the right ceiling, but
+256 KiB → 179, 512 KiB → 294, 1 MiB → 423) was taken 2026-08-12 with a host raw socket on one
+keep-alive connection, 48 MB per point — what MinIO delivers, not what the FPGA does.
+(`scripts/util/conn_scaling.sh MODE=chunk` reproduces and extends it; `one_conn_ceiling.sh` is the
+other axis, pipeline depth at a fixed 768 KiB.) It is the right shape and the right ceiling, but
 it is *not* the FPGA path, which sits at ~0.33 GB/s. The equivalent sweep through the FPGA has not
 been run at these sizes, and unsplit column chunks at scale 30 exceed every size on that curve.
 Re-run `scripts/sweep.sh` and `scripts/throughput.sh` before quoting a speedup.
@@ -322,21 +343,47 @@ than six hours later on the wire.
 | GET path budget | 64 characters (16 CSR words). Was 32 up to `build-88`; longer paths throw rather than truncate |
 | Decoded column chunk | must fit one output buffer (8 MiB), i.e. ~1M rows of an 8-byte type |
 | Compression | SNAPPY and uncompressed only — other codecs throw `codec N not supported by ParCore` |
-| Requests in flight | bounded by `HTTP_QUEUE_DEPTH` = **64** column-chunk entries (`handler_stream.sv`), pipelined over one persistent connection. Safe because there is only ever one TCP session. The old 4-slot `handler.sv` ring and the `max_inflight() × OASIS_HTTP_CHUNK_BYTES` bytes-in-flight cap are both gone |
+| Requests in flight | bounded by `HTTP_QUEUE_DEPTH` = **64** column-chunk entries (`handler_stream.sv`), pipelined over one persistent connection — or over one per lane with `--multi`, where `rx_dispatch` keeps the arrival-order contract that a single session gets for free. The old 4-slot `handler.sv` ring and the `max_inflight() × OASIS_HTTP_CHUNK_BYTES` bytes-in-flight cap are both gone |
 | Receive window | 1 MiB advertised against a 1 MiB fifo — matched, see *Receive window* above. Raising one without the other reintroduces the drops |
 | Column chunks in flight | **the binding limit in practice.** 64 hardware queue entries against a scheduler that dispatches 64 flows, and only 2 FPGA output buffers. See *The dispatcher deadlock* |
 | Response framing | `Content-Length` only. A response without one (e.g. `Transfer-Encoding: chunked`) latches `resp_error` and stalls rather than misparsing |
 | NULLs | **not supported.** The decoder is configured from `num_values`, which counts NULLs, but the page only holds the non-null values, so the read hangs waiting for values that do not exist. TPC-H is unaffected (no NULLs) |
 | Trailing page bytes | a data page carrying padding past the last declared value hangs the decoder. `fastparquet` emits exactly 8 such bytes per page; DuckDB-written files are fine |
 
-### The dispatcher deadlock (HYPOTHESIS — not yet confirmed on hardware)
+### The dispatcher deadlock — RESOLVED 2026-08-19
 
-**Status 2026-08-18: this is a candidate explanation for "`tpch_demo` dies half way through",
-derived by reading the code plus one wedged-board reading. It has NOT been reproduced or confirmed,
-and at least two other mechanisms produce the same symptom** — see *Competing explanations* at the
-end of this section. Do not treat it as diagnosed.
+**Fixed in software, and confirmed by measurement rather than by reading.** `oasis_stream_profile()`
+sampled twice while the board was wedged showed `out_stalled = 1,632,080` against
+`out_starved = 150,185`, counters otherwise frozen: the decoder had finished results that **nobody
+was collecting**. One reading told the candidate mechanisms apart — a decoder starved of input looks
+nothing like a decoder whose output is not drained.
 
-What is directly observed, from `scripts/util/http_state.sh` on a board left wedged by a failed run:
+The hypothesis below was right in shape (a host-side circular wait) and wrong in detail. Two
+independent host-side bugs, both fixed; 22/22 at scale 30 has passed on builds 104 and 105 since:
+
+1. **`oasis_context.cpp` built `OutputBufferManager` with a hardcoded `2`** while the scheduler
+   dispatches up to 64 flows, each of whose sinks needs a buffer. Flows 3..64 had nowhere to put
+   decoder output, and those 2 buffers free only when the scan collects them — so if the head row
+   group's columns were among the starved flows, nothing was ever freed. Fixed in **`c1afd00`**: the
+   count is now derived (64, clamped to the bitstream's `maximum_num_enqueued_buffers`, override
+   `OASIS_OBM_BUFFERS`). At 8 MiB a buffer that is 512 MiB against 32 GiB of huge pages — the `2`
+   was never a memory decision.
+2. **`submit_batch` checked that a batch fits an EMPTY queue, never that there was room NOW.** At
+   `groups_in_flight(16) × 4 columns = 64 = QUEUE_DEPTH` exactly, a 4-entry batch could push one
+   entry, hit 64/64 and block forever — the arm that would drain it comes after all its entries.
+   That is why q1–q4 passed and q5, the first four-hardware-column query, hung. Fixed in
+   **`df2067d`** (reserve room for the whole batch before pushing any of it).
+
+Everything seen on the wire — the rx fifo filling, the advertised window walking down, dup-ACK
+storms, RST — was downstream of these two.
+
+**Dead ends, recorded so nobody retries them:** `align_starved`; `oasis_scheduler_queue_depth`;
+LIMIT pruning; `oasis_scan_groups_in_flight` (it does not throttle the FPGA at all —
+`Scheduler::submit` never blocks); "the timeout kills it" (q5 hung at 600 s too).
+
+The rest of this section is the original derivation, kept because the mechanism is the useful part.
+
+What was directly observed, from `scripts/util/http_state.sh` on a board left wedged by a failed run:
 `conn=up`, `reconnects=0`, no `dirty_abort`, no `read_timeout`, no `notify_overflow`. What you see is:
 
 ```
@@ -354,7 +401,7 @@ Three resources are involved, and they are badly matched:
 |---|---|---|
 | scheduler flows in flight | `min(max_inflight(), maximum_num_enqueued_configs())` = `min(64, 64)` = **64** | `scheduler.cpp`, `default_pipeline_depth` |
 | HTTP column-chunk queue | **64** entries | `HTTP_QUEUE_DEPTH`, `vfpga_top.svh:139` |
-| FPGA output buffers | **2** | `NUM_BUFFERS_TO_ENQUEUE`, passed as `2` in `oasis_context.cpp:62` |
+| FPGA output buffers | **2** at the time; **64** since `c1afd00` | `computeObmBuffers()` in `oasis_context.cpp`, override `OASIS_OBM_BUFFERS` |
 
 The `min()` in `default_pipeline_depth` was added to stop the scheduler over-committing the decoder,
 but on this hardware `MAX_NUM_ENQUEUED_BUFFERS` is also 64 (`column_chunk_decoder_config.sv:38`), so
@@ -385,30 +432,39 @@ accumulated, not which query asked for them. It is also why `--groups` helps —
 flight means fewer chunks, so the queue is less likely to fill while the dispatcher is the only thing
 holding the buffer supply open. **`--groups` is a workaround for this bug, not a tuning knob.**
 
-Fixes, in order of how much they address the actual cause:
+Fixes considered, and what actually shipped:
 
-1. **Replenish output buffers off the dispatcher.** Call `ensure_stream_has_buffers` when a buffer is
-   popped in `move_current_buffer_to_handle`, so the FPGA's buffer supply no longer depends on a
-   thread that can block on FPGA credit. This breaks the cycle outright and is the fix worth making.
-2. **Raise `NUM_BUFFERS_TO_ENQUEUE` above 2.** Widens the window but does not remove the cycle; at
-   8 MiB per buffer it also costs real memory. Mitigation, not a fix.
-3. **Make the two depths genuinely different.** Bound the scheduler to something well under
-   `HTTP_QUEUE_DEPTH` so the dispatcher never blocks in `submit_batch` in the normal case.
+1. **Replenish output buffers off the dispatcher** — call `ensure_stream_has_buffers` when a buffer
+   is popped in `move_current_buffer_to_handle`, so the buffer supply stops depending on a thread
+   that can block on FPGA credit. Still the structurally cleanest fix. **Not done:** raising the
+   count to 64 made the window wide enough that the cycle has not been reachable since, and the
+   second bug (`df2067d`) turned out to be the one that fired in practice.
+2. **Raise the buffer count above 2** — **shipped** in `c1afd00`, derived rather than hardcoded.
+3. **Make the two depths genuinely different** — **shipped** in `df2067d`, from the other end:
+   `submit_batch` now reserves room for a whole batch, so a full queue throttles instead of wedging.
 
-### Competing explanations for the same symptom
+### Competing explanations for the same symptom — settled 2026-08-19
 
 Every hypothesis below ends in *the decoder stops consuming*, and from there the downstream signature
 (`rx_fifo_stall`, back-pressure to the TOE, queue never drains, `64/64`) is **identical**. The stall
-bits cannot tell them apart. Do not close this out on the signature alone.
+bits cannot tell them apart, which is why this list existed.
+
+**How it was settled:** not by the signature but by the `out_stalled` / `out_starved` delta above —
+(1) predicts output stalled, (2) and (3) predict output starved. It read stalled by an order of
+magnitude, and fixing the two host-side bugs made 22/22 pass. The list is kept because the
+discriminating tests are the reusable part.
 
 1. **The dispatcher deadlock above.** Predicts: the hung process has its `dispatch_loop` thread
    parked inside `await_cfg_ready`, and the failure tracks the number of column chunks in flight
    (so `--groups` moves it) rather than the query text.
 2. **build-103 does not close timing.** WNS **-0.949 ns** on the 250 MHz user clock, 30,719 failing
-   endpoints, and 689 of the 1000 worst paths are inside `inst_http_column_chunk_decoder`
+   endpoints, and 689 of the 1000 worst paths inside `inst_http_column_chunk_decoder`
    (524 `hybrid_page_decoder`, 113 Snappy `vhsnunzip`). build-102 was -0.436 ns with 200. A decoder
    that violates setup can hang or corrupt data-dependently. Predicts: build-102 survives runs that
-   build-103 fails.
+   build-103 fails. **Not the cause here** — but note that no bitstream since closes timing either
+   (build-105 **-0.383 ns**, build-108 **-0.620 ns**), so this stays on the list for any *new*
+   intermittent, query-dependent fault. In build-105 the largest failing cluster is
+   `inst_handler/inst_tbl`, not the decoder; check `analysis.txt` before assuming otherwise.
 3. **A decoder input it cannot handle.** The NULL and trailing-page-bytes limits in *Limits and known
    gaps* both hang the decoder by construction. Predicts: deterministic — the *same* query fails
    every time on the same data.
@@ -418,7 +474,8 @@ backtraces at the hang (1 is confirmed or refuted outright); then repeat the sam
 (separates 2); then check whether the failure is query-deterministic (separates 3). Note
 `ptrace_scope` is 2 on `alveo-u55c-04`, so `gdb` must **launch** duckdb rather than attach to it.
 
-Until this is settled, `--groups 4` is a mitigation of unknown mechanism, not a fix.
+`--groups 4` was a mitigation of an unknown mechanism and is no longer needed: with both fixes in,
+the default `groups_in_flight` of 16 passes 22/22 at scale 30.
 
 ### Ephemeral port exhaustion (fixed by keep-alive; the mechanism is worth keeping in mind)
 
