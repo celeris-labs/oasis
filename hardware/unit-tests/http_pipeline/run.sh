@@ -8,6 +8,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 HDL="$ROOT/../../src/hdl/http_read"
+ARCHIVE="$ROOT/../../archive/http_read"   # modules retired from the design; see archive README
 OUT="$ROOT/xsim.dir"
 
 if ! command -v xvlog >/dev/null 2>&1; then
@@ -23,12 +24,12 @@ xvlog -sv ${TRACE:+-d TRACE} \
   "$HDL/http_types.sv" \
   "$HDL/tcp_session_table.sv" \
   "$HDL/tcp_init.sv" \
-  "$HDL/http_req_builder.sv" \
-  "$HDL/tcp_send_http.sv" \
+  "$ARCHIVE/http_req_builder.sv" \
+  "$ARCHIVE/tcp_send_http.sv" \
   "$HDL/axis_fifo.sv" \
   "$HDL/strip_http.sv" \
   "$HDL/tcp_read.sv" \
-  "$HDL/handler.sv" \
+  "$ARCHIVE/handler.sv" \
   http_pipeline_tb.sv
 
 # http_req_builder.sv carries no timescale directive, so one has to be supplied here.

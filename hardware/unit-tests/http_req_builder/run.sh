@@ -2,7 +2,7 @@
 # Standalone xsim (Vivado) for http_req_builder. No package dependencies, so the DUT compiles alone.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-HDL="$ROOT/../../src/hdl/http_read"
+HDL="$ROOT/../../archive/http_read"   # retired from the design; see archive README
 OUT="$ROOT/xsim.dir"
 
 if ! command -v xvlog >/dev/null 2>&1; then
