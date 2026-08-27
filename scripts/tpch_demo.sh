@@ -33,6 +33,8 @@
 #   ./scripts/tpch_demo.sh --groups 4         # row groups in flight per scan (default 16)
 #   ./scripts/tpch_demo.sh --threads 1 --cpu-threads 0   # FPGA on 1 thread, CPU on every core
 #   ./scripts/tpch_demo.sh --single-session   # all 22 queries in ONE duckdb process per side
+#   ./scripts/tpch_demo.sh --cache off        # DEFAULT: neither side caches file data in RAM
+#   ./scripts/tpch_demo.sh --cache full       # DuckDB's own cache defaults, i.e. the CPU at its best
 #
 # --single-session is the standard TPC-H shape and the quotable one. By default this script starts a
 # FRESH duckdb per query -- 44 processes for a full run -- which throws away every in-process cache
@@ -128,6 +130,37 @@ GROUPS_IN_FLIGHT=
 # same amount of parallelism, is decoding in hardware faster?
 THREADS=""
 
+# Caching posture, applied to BOTH sides. A FAIRNESS knob, not a tuning one.
+#
+# Three caches are in play and only two of them are ours to set:
+#
+#   enable_external_file_cache -- DuckDB's in-memory cache of file DATA, and it DEFAULTS TO TRUE
+#       (duckdb v1.5.2, src/include/duckdb/main/settings.hpp:710). It caches everything the CPU
+#       baseline's parquet reader touches, footers AND column bytes, so in --single-session the CPU
+#       can answer the second query that reads lineitem out of RAM with no HTTP at all. The FPGA
+#       side cannot use it the same way: ParquetReader opens through CachingFileSystem
+#       (extension/parquet/parquet_reader.cpp:862) so our FOOTER reads are cached, but the column
+#       bytes never pass through it -- the scheduler streams them into the decoder. Leaving this at
+#       its default hands the CPU a cache the FPGA path structurally cannot have, and that is
+#       exactly what makes a --single-session ratio unquotable.
+#   enable_http_metadata_cache -- httpfs's cache of HTTP metadata (HEAD results). CPU side only:
+#       our filesystem never consults it, it keeps its own one-HEAD-per-path size cache
+#       (http_file_system.cpp:374). Defaults to false.
+#   MinIO's own page cache -- shared by both sides and NOT settable from here. It is why every
+#       configuration is run twice and the second run reported.
+#
+#   off       (default) both DuckDB caches OFF on both sides. Every query re-fetches from the
+#             server, which is what the FPGA path does today, so both sides do the same work.
+#             This is the parity number.
+#   metadata  HEAD results cached on the CPU side; no file DATA cached anywhere. Removes the footer
+#             round trip without letting either side re-read column bytes from RAM.
+#   full      DuckDB's own defaults: the CPU baseline at its best, with a warm RAM cache against an
+#             FPGA that has none. Worth quoting TOO -- a baseline that can be accused of being
+#             handicapped is worth nothing -- but quote it as what it is.
+#
+# Whichever it is, it belongs next to the number. "FPGA 273 s vs CPU 249 s" says nothing alone.
+CACHE=off
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --scale)   SCALE="$2"; shift ;;
@@ -141,9 +174,10 @@ while [ $# -gt 0 ]; do
         --threads) THREADS="$2"; shift ;;
         --cpu-threads) CPU_THREADS="$2"; shift ;;
         --single-session) SINGLE_SESSION=1 ;;
+        --cache)   CACHE="$2"; shift ;;
         --server)  SERVER="$2"; shift ;;
         --port)    PORT="$2"; shift ;;
-        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -153,6 +187,11 @@ case "$CPU_BASELINE" in
     httpfs|fallback) ;;
     *) echo "--cpu-baseline must be 'httpfs' (stock DuckDB) or 'fallback' (ours): got '$CPU_BASELINE'" >&2
        exit 2 ;;
+esac
+
+case "$CACHE" in
+    off|metadata|full) ;;
+    *) echo "--cache must be 'off', 'metadata' or 'full': got '$CACHE'" >&2; exit 2 ;;
 esac
 
 if [ "$PHASES" = 1 ] && [ "$CPU_FIRST" = 1 ]; then
@@ -196,6 +235,16 @@ views_cpu() {
 }
 
 SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=false;"
+# enable_external_file_cache is a GLOBAL setting and it is on by DEFAULT, so it has to be turned off
+# explicitly, on every process, FPGA side included -- otherwise the FPGA side caches its footers in
+# RAM while the CPU side caches whole columns, and neither of them is doing what the run claims.
+if [ "$CACHE" = full ]; then
+    SETUP="$SETUP SET enable_external_file_cache=true;"
+else
+    SETUP="$SETUP SET enable_external_file_cache=false;"
+fi
+# httpfs-only, so it is emitted with the CPU baseline rather than here.
+if [ "$CACHE" = off ]; then CPU_META_CACHE=false; else CPU_META_CACHE=true; fi
 [ -n "$THREADS" ] && SETUP="$SETUP SET threads=$THREADS;"
 [ -n "$GROUPS_IN_FLIGHT" ] && SETUP="$SETUP SET oasis_scan_groups_in_flight=$GROUPS_IN_FLIGHT;"
 [ -n "${SCHED_DEPTH:-}" ] && SETUP="$SETUP SET oasis_scheduler_queue_depth=$SCHED_DEPTH;"
@@ -262,6 +311,15 @@ echo " cpu baseline: $([ "$CPU_BASELINE" = httpfs ] \
         && echo 'stock DuckDB httpfs + read_parquet over plain HTTP' \
         || echo 'OUR httpfpga:// cpu fallback -- not a neutral baseline')"
 echo " read_oasis() decodes fixed-width columns on the FPGA; strings are decoded on the host."
+# The two things that make a timing comparable, printed with every run because both have silently
+# differed between the sides before: what is cached, and whether anything is encrypted.
+echo " cache=$CACHE  ($(case "$CACHE" in
+        off)      echo 'no file-data cache and no HTTP metadata cache on either side' ;;
+        metadata) echo 'HTTP metadata cached on the CPU side; no file data cached on either' ;;
+        full)     echo "DuckDB's own defaults -- the CPU side caches file data in RAM, the FPGA cannot" ;;
+    esac))"
+echo " transport: plain HTTP/1.1, no TLS on either side (FPGA: TCP+HTTP in hardware, no TLS exists"
+echo "            in the datapath; CPU: http:// URLs to the same port, proxies unset)."
 echo "=============================================================================="
 [ "$PHASES" = 1 ] || \
     printf '%-5s %-8s %9s %9s %10s  %s\n' "query" "result" "fpga_s" "cpu_s" "hw_MiB" "note"
@@ -326,12 +384,10 @@ run_cpu() {
           echo "RESET threads;"
       fi
       if [ "$CPU_BASELINE" = httpfs ]; then
-          # Give stock DuckDB its best shot rather than its default one. The metadata cache is OFF
-          # by default, so without this the parquet reader re-fetches each file's footer over HTTP
-          # on every query -- a cost the FPGA side does not pay, because the extension parses the
-          # footer once per scan. This makes the baseline faster, which is the point: a baseline we
-          # can be accused of handicapping is worth nothing.
-          echo "LOAD httpfs; SET enable_http_metadata_cache=true;"; views_cpu
+          # The metadata cache is httpfs's and applies to this side only; --cache decides it. It
+          # used to be hardcoded true, which gave the baseline its best shot but made the two sides
+          # cache differently without saying so.
+          echo "LOAD httpfs; SET enable_http_metadata_cache=$CPU_META_CACHE;"; views_cpu
       else
           echo "SET httpfpga_cpu_fallback=true;"; views read_parquet
       fi
@@ -383,7 +439,7 @@ run_session() {
             elif [ "${CPU_THREADS:-}" = 0 ]; then
                 echo "RESET threads;"
             fi
-            echo "LOAD httpfs; SET enable_http_metadata_cache=true;"
+            echo "LOAD httpfs; SET enable_http_metadata_cache=$CPU_META_CACHE;"
             views_cpu
         else
             views read_oasis
@@ -676,6 +732,14 @@ if [ "$TIMED" -gt 0 ]; then
         echo "            with Connection: close. Measured ~1.35x slower than keep-alive against this"
         echo "            server, so this ratio flatters the FPGA. Do not quote it -- use the default."
     fi
+    # The cache posture belongs with the total, not only in the banner 40 lines up: it changes what
+    # the ratio MEANS, not just its value.
+    case "$CACHE" in
+        off)      echo "   CACHE: off on both sides -- every query re-fetched from MinIO. Parity." ;;
+        metadata) echo "   CACHE: HTTP metadata only on the CPU side; no file data cached anywhere." ;;
+        full)     echo "   CACHE: DuckDB defaults -- the CPU side served file data from RAM and the"
+                  echo "          FPGA side could not. Quote this next to a --cache off run, never alone." ;;
+    esac
     # Whichever side ran second read the same bytes out of MinIO's page cache. Say which that was,
     # because a ratio measured in one order is not the same claim as the other.
     if [ "$PHASES" = 1 ]; then
