@@ -12,6 +12,7 @@
 #include <iostream>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <output_handle.hpp>
@@ -59,7 +60,13 @@ namespace {
 std::atomic<uint64_t> g_batches {0};
 std::atomic<uint64_t> g_strings {0};
 std::atomic<uint64_t> g_mutex_wait_ns {0};
+std::atomic<uint64_t> g_arm_wait_ns {0};
 std::atomic<uint64_t> g_config_ns {0};
+std::atomic<uint64_t> g_acquire_ns {0};
+std::atomic<uint64_t> g_scan_ns {0};
+std::atomic<uint64_t> g_materialize_ns {0};
+std::atomic<uint64_t> g_stage_ns {0};
+std::atomic<uint64_t> g_emit_ns {0};
 std::atomic<uint64_t> g_enqueue_ns {0};
 std::atomic<uint64_t> g_drain_ns {0};
 std::atomic<uint64_t> g_read_ns {0};
@@ -71,14 +78,115 @@ uint64_t NanosSince(const PhaseClock::time_point &start) {
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(PhaseClock::now() - start).count());
 }
 
+// Hang diagnostics, enabled by OASIS_REGEX_DIAG. Deliberately unconditional counters
+// (relaxed atomics, a few ns) so the printout can name exact sequence numbers: the
+// question these answer is whether a stalled run is blocked waiting for a *credit*
+// (host-side starvation -- every credit held by a thread that is itself waiting for
+// one) or inside the drain (the card owes results it never delivered). Those have
+// opposite fixes, and from outside the process they look identical.
+std::atomic<uint64_t> g_seq {0};
+std::atomic<uint64_t> g_submitted {0};
+std::atomic<uint64_t> g_collect_enter {0};
+std::atomic<uint64_t> g_collect_exit {0};
+
+bool DiagOn() {
+	static const bool on = std::getenv("OASIS_REGEX_DIAG") != nullptr;
+	return on;
+}
+
+void Diag(const char *what, uint64_t seq) {
+	if (!DiagOn()) {
+		return;
+	}
+	std::fprintf(stderr, "[regexdiag] %-14s seq=%-6llu submitted=%llu collect_enter=%llu collect_exit=%llu\n",
+	             what, (unsigned long long)seq, (unsigned long long)g_submitted.load(std::memory_order_relaxed),
+	             (unsigned long long)g_collect_enter.load(std::memory_order_relaxed),
+	             (unsigned long long)g_collect_exit.load(std::memory_order_relaxed));
+}
+
+// Bounds the number of batches between submit and collect process-wide. See
+// kRegexMaxSubmissionsInFlight for why this is a correctness bound on the RTL's
+// single-entry arm mailbox and not a throughput knob.
+//
+// Hand-rolled rather than std::counting_semaphore: the extension is built at C++17.
+class ArmCredits {
+public:
+	// Returns nanoseconds spent waiting, so the caller can tell "queued behind the
+	// device" apart from "queued behind another host thread".
+	uint64_t acquire() {
+		std::unique_lock<std::mutex> lock(mutex_);
+		if (available_ > 0) {
+			available_--;
+			return 0;
+		}
+		const auto start = PhaseClock::now();
+		blocked_++;
+		if (DiagOn()) {
+			std::fprintf(stderr, "[regexdiag] %-14s blocked=%u available=0 submitted=%llu collect_enter=%llu collect_exit=%llu\n",
+			             "ARM_BLOCK", blocked_, (unsigned long long)g_submitted.load(std::memory_order_relaxed),
+			             (unsigned long long)g_collect_enter.load(std::memory_order_relaxed),
+			             (unsigned long long)g_collect_exit.load(std::memory_order_relaxed));
+		}
+		cv_.wait(lock, [this] { return available_ > 0; });
+		blocked_--;
+		available_--;
+		return NanosSince(start);
+	}
+
+	// Non-blocking. The caller uses this to discover that the pool is empty while it
+	// still has work of its own it could collect -- see AcquireRegexArmCredit.
+	bool try_acquire() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		if (available_ == 0) {
+			return false;
+		}
+		available_--;
+		return true;
+	}
+
+	void release() {
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			available_++;
+		}
+		cv_.notify_one();
+	}
+
+private:
+	std::mutex mutex_;
+	std::condition_variable cv_;
+	uint32_t available_ = kRegexMaxSubmissionsInFlight;
+	uint32_t blocked_ = 0;
+};
+
+ArmCredits g_arm_credits;
+
+// Serialises the arm + enqueue sequence. There is one cThread process-wide
+// (celeris_context.cpp) and one input stream, and postCmd writes shared config
+// registers with no internal lock, so config and enqueue cannot interleave across
+// threads. It also fixes submission order, which is what the OBM's positional
+// handle queue relies on -- hence the handle acquire is inside it too.
+std::mutex g_fpga_mutex;
+
 } // namespace
+
+void AddRegexScanNs(uint64_t ns) { g_scan_ns.fetch_add(ns, std::memory_order_relaxed); }
+void AddRegexMaterializeNs(uint64_t ns) { g_materialize_ns.fetch_add(ns, std::memory_order_relaxed); }
+void AddRegexStageNs(uint64_t ns) { g_stage_ns.fetch_add(ns, std::memory_order_relaxed); }
+void AddRegexEmitNs(uint64_t ns) { g_emit_ns.fetch_add(ns, std::memory_order_relaxed); }
 
 RegexBatchPhases GetRegexBatchPhases() {
 	RegexBatchPhases p;
 	p.batches = g_batches.load(std::memory_order_relaxed);
 	p.strings = g_strings.load(std::memory_order_relaxed);
 	p.mutex_wait_ns = g_mutex_wait_ns.load(std::memory_order_relaxed);
+	p.arm_wait_ns = g_arm_wait_ns.load(std::memory_order_relaxed);
 	p.config_ns = g_config_ns.load(std::memory_order_relaxed);
+	p.acquire_ns = g_acquire_ns.load(std::memory_order_relaxed);
+	p.scan_ns = g_scan_ns.load(std::memory_order_relaxed);
+	p.materialize_ns = g_materialize_ns.load(std::memory_order_relaxed);
+	p.stage_ns = g_stage_ns.load(std::memory_order_relaxed);
+	p.emit_ns = g_emit_ns.load(std::memory_order_relaxed);
 	p.enqueue_ns = g_enqueue_ns.load(std::memory_order_relaxed);
 	p.drain_ns = g_drain_ns.load(std::memory_order_relaxed);
 	p.read_ns = g_read_ns.load(std::memory_order_relaxed);
@@ -89,42 +197,107 @@ void ResetRegexBatchPhases() {
 	g_batches.store(0, std::memory_order_relaxed);
 	g_strings.store(0, std::memory_order_relaxed);
 	g_mutex_wait_ns.store(0, std::memory_order_relaxed);
+	g_arm_wait_ns.store(0, std::memory_order_relaxed);
 	g_config_ns.store(0, std::memory_order_relaxed);
+	g_acquire_ns.store(0, std::memory_order_relaxed);
+	g_scan_ns.store(0, std::memory_order_relaxed);
+	g_materialize_ns.store(0, std::memory_order_relaxed);
+	g_stage_ns.store(0, std::memory_order_relaxed);
+	g_emit_ns.store(0, std::memory_order_relaxed);
 	g_enqueue_ns.store(0, std::memory_order_relaxed);
 	g_drain_ns.store(0, std::memory_order_relaxed);
 	g_read_ns.store(0, std::memory_order_relaxed);
 }
 
-RegexMatchBitmap RunFpgaRegexPackedBatch(celeris::CelerisContext &ctx, void *wire_ptr,
-                                         const celeris::RegexStreamPacker::Plan &plan, idx_t count,
-                                         const std::vector<uint8_t> &regex_blob) {
-	CALI_CXX_MARK_FUNCTION;
-	static std::mutex fpga_mutex;
-	CALI_MARK_BEGIN("mutex_wait");
-	const auto t_wait = PhaseClock::now();
-	std::lock_guard<std::mutex> lock(fpga_mutex);
-	g_mutex_wait_ns.fetch_add(NanosSince(t_wait), std::memory_order_relaxed);
-	CALI_MARK_END("mutex_wait");
+bool TryAcquireRegexArmCredit() {
+	return g_arm_credits.try_acquire();
+}
 
+void AcquireRegexArmCredit() {
+	g_arm_wait_ns.fetch_add(g_arm_credits.acquire(), std::memory_order_relaxed);
+}
+
+RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
+                                 const celeris::RegexStreamPacker::Plan &plan, idx_t count,
+                                 const std::vector<uint8_t> &regex_blob) {
+	CALI_CXX_MARK_FUNCTION;
 	if (count == 0) {
 		return {};
 	}
+
+	// The caller must already hold exactly one arm credit for this submission; it is
+	// released by the matching CollectRegexBatch.
+	//
+	// Acquiring here instead was a deadlock. The credits are process-wide but each
+	// scan thread only collects once *its own* window is full, so N threads could take
+	// every credit while all of them were still short of their window -- every credit
+	// held by a thread blocked waiting for one more, and no thread ever reaching the
+	// call that would release one. Ownership sits with the caller precisely so it can
+	// collect its own oldest transfer instead of blocking. See AcquireRegexArmCredit.
+
+	// Allocate and TLB-map this transfer's output buffer BEFORE taking the lock.
+	//
+	// The handle registration has to stay ordered -- the OBM matches buffers to handles
+	// positionally -- but the allocation and the TLB ioctl behind it do not, and they are
+	// what the critical section was actually made of: 18.0 ms of a 18.9 ms section at 32
+	// threads, with threads queued 118 ms behind it. Split, the ordered part is a queue
+	// push and one descriptor write.
+	CALI_MARK_BEGIN("prepare_output");
+	const auto t_acquire = PhaseClock::now();
+	const size_t output_bytes = (static_cast<size_t>(plan.bat_count) + 7) / 8;
+	libstf::Buffer prepared = ctx.get_output_buffer_manager().prepare_output_buffer(0, output_bytes);
+	g_acquire_ns.fetch_add(NanosSince(t_acquire), std::memory_order_relaxed);
+	CALI_MARK_END("prepare_output");
+
+	CALI_MARK_BEGIN("mutex_wait");
+	const auto t_wait = PhaseClock::now();
+	std::unique_lock<std::mutex> lock(g_fpga_mutex);
+	g_mutex_wait_ns.fetch_add(NanosSince(t_wait), std::memory_order_relaxed);
+	CALI_MARK_END("mutex_wait");
+
+	RegexSubmission submission;
+	submission.count = count;
+	submission.bat_count = plan.bat_count;
 
 	CALI_MARK_BEGIN("config_setup");
 	const auto t_config = PhaseClock::now();
 	std::shared_ptr<celeris::RegexConfig> config = ctx.get_config<celeris::RegexConfig>();
 
-	libstf::stream_mask_t active_outputs(0);
-	active_outputs.set(0);
-	std::shared_ptr<libstf::OutputHandle> output_handle = ctx.get_output_buffer_manager().acquire_output_handle(active_outputs);
+	// Stream 0 is UNMANAGED (see celeris_context.cpp), so it must go through the
+	// size-based overload: the mask-based one is for managed streams only and trips an
+	// assert that release builds compile out, then hands back a full-capacity buffer
+	// instead of an exactly-sized one. The card writes one bit per padded result, so
+	// ceil(bat_count/8) bytes is exactly what this batch will produce -- and one
+	// correctly-sized buffer per handle is what lets several batches be outstanding.
+	//
+	// The registration has to stay inside this lock. OutputBufferManager matches arriving
+	// buffers to handles positionally, so acquire order must equal enqueue order; two
+	// threads registering outside the lock and enqueueing inside it would hand each
+	// other's results over with no error anywhere. Only the allocation moved out.
+	submission.handle = ctx.get_output_buffer_manager().acquire_output_handle(0, prepared);
 
-	// The pattern is constant for the whole query, so this is 8 MMIO writes on the
-	// first batch and none after. regex_top keeps the blob latched and re-arms the
-	// engines off batCount instead.
+	// The pattern is constant for the whole query, so this is 35 MMIO writes on the
+	// first submission and none after. regex_top latches the blob and arms the engines
+	// once; a transfer does not re-arm the pattern.
+	//
+	// Writing a *different* pattern with transfers outstanding is not safe, and this
+	// does not currently prevent it: RegexConfig's cached blob is process-wide, so two
+	// concurrent queries with different patterns would rewrite it on every submission.
+	// regex_top holds the write until the arm queue drains, so the card cannot be
+	// wedged by it, but the transfers submitted in between are matched against the
+	// pattern already loaded. The fix is to drain the in-flight window before writing a
+	// differing blob -- acquire every arm credit rather than one. Not done here because
+	// it needs a lock-free way to see the pending change before taking the lock, and
+	// concurrent multi-pattern queries were already wrong before this path existed.
 	config->write_regex_blob_if_changed(regex_blob);
-	// The padded result count, not the string count: it tells the collector how
-	// many bits to emit and, divided by the engine count, how long each engine's
-	// run is.
+	// The padded result count, not the string count: it tells the collector how many
+	// bits to emit before it flushes and marks this transfer's last output beat.
+	//
+	// This must precede the enqueue below and must not be skipped. rem_engines gates
+	// its input on the arm queue being non-empty, so a transfer whose DMA is delivered
+	// ahead of its arm -- which happens routinely, since AXI-Lite and DMA are
+	// independent paths -- back-pressures until the count lands rather than being
+	// walked under whatever the array was last doing.
 	config->write_bat_count(plan.bat_count);
 	g_config_ns.fetch_add(NanosSince(t_config), std::memory_order_relaxed);
 	CALI_MARK_END("config_setup");
@@ -134,8 +307,41 @@ RegexMatchBitmap RunFpgaRegexPackedBatch(celeris::CelerisContext &ctx, void *wir
 	// One stream now. The descriptor stream is gone: NUL terminators frame the
 	// strings and the chunk interleave assigns them to engines.
 	libstf::enqueue_stream_input(ctx.get_cthread(), ctx.get_tlb_manager(), wire_ptr, plan.wire_bytes, 0, true);
+	submission.seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+	g_submitted.fetch_add(1, std::memory_order_relaxed);
+	Diag("SUBMIT", submission.seq);
 	g_enqueue_ns.fetch_add(NanosSince(t_enqueue), std::memory_order_relaxed);
 	CALI_MARK_END("enqueue");
+
+	// Everything past this point is per-handle and needs no shared state, so the lock
+	// ends here and the next thread can arm while this batch is still on the card.
+	return submission;
+}
+
+RegexMatchBitmap CollectRegexBatch(RegexSubmission &submission) {
+	CALI_CXX_MARK_FUNCTION;
+	if (!submission.valid()) {
+		// Either a zero-row batch that was never armed, or a submission already
+		// collected. Both are no-ops, which is what lets a teardown loop drain a
+		// window without tracking what it has already taken.
+		RegexMatchBitmap empty;
+		empty.assign_zero(submission.count);
+		return empty;
+	}
+
+	// Taken by value and cleared immediately, so every exit path below -- including
+	// an exception out of the drain -- leaves the submission collected and releases
+	// the credit exactly once.
+	std::shared_ptr<libstf::OutputHandle> output_handle = std::move(submission.handle);
+	const idx_t count = submission.count;
+	submission.handle = nullptr;
+
+	struct CreditGuard {
+		~CreditGuard() { g_arm_credits.release(); }
+	} credit_guard;
+
+	g_collect_enter.fetch_add(1, std::memory_order_relaxed);
+	Diag("DRAIN_ENTER", submission.seq);
 
 	CALI_MARK_BEGIN("drain_output");
 	const auto t_drain = PhaseClock::now();
@@ -153,6 +359,8 @@ RegexMatchBitmap RunFpgaRegexPackedBatch(celeris::CelerisContext &ctx, void *wir
 		}
 	}
 	g_drain_ns.fetch_add(NanosSince(t_drain), std::memory_order_relaxed);
+	g_collect_exit.fetch_add(1, std::memory_order_relaxed);
+	Diag("DRAIN_EXIT", submission.seq);
 	g_batches.fetch_add(1, std::memory_order_relaxed);
 	g_strings.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
 	CALI_MARK_END("drain_output");
@@ -203,6 +411,21 @@ RegexMatchBitmap RunFpgaRegexPackedBatch(celeris::CelerisContext &ctx, void *wir
 	g_read_ns.fetch_add(NanosSince(t_read), std::memory_order_relaxed);
 	CALI_MARK_END("read_results");
 	return results;
+}
+
+RegexMatchBitmap RunFpgaRegexPackedBatch(celeris::CelerisContext &ctx, void *wire_ptr,
+                                         const celeris::RegexStreamPacker::Plan &plan, idx_t count,
+                                         const std::vector<uint8_t> &regex_blob) {
+	CALI_CXX_MARK_FUNCTION;
+	if (count == 0) {
+		return {};
+	}
+	// Nothing outstanding to collect, so blocking for a credit is safe here.
+	CALI_MARK_BEGIN("arm_wait");
+	AcquireRegexArmCredit();
+	CALI_MARK_END("arm_wait");
+	RegexSubmission submission = SubmitRegexBatch(ctx, wire_ptr, plan, count, regex_blob);
+	return CollectRegexBatch(submission);
 }
 
 std::vector<bool> RunFpgaRegexBatch(celeris::CelerisContext &ctx, const std::vector<string_t> &inputs,

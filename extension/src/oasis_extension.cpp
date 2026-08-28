@@ -75,6 +75,29 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "regex_fpga_scan: solo-batch threshold in bytes (0 = default 2048)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
+	// How many transfers one scan thread keeps on the card. Depth 1 is the old
+	// behaviour: pack a batch, submit it, block on its results, pack the next -- so the
+	// host and the card take turns and neither is ever busy while the other works.
+	// Depth 2 packs the next batch while the current one matches.
+	//
+	// Each extra transfer pins one more wire buffer per thread out of the huge-page
+	// pool (oasis_regex_wire_buffer_bytes, 4 MiB by default), and the *process-wide*
+	// ceiling is separate and lower -- kRegexMaxSubmissionsInFlight arm credits, which
+	// the RTL's single-entry arm mailbox fixes at 2 until Stage 2 lands. So on a
+	// many-thread scan the threads are already sharing those credits and a deeper
+	// per-thread window only costs pool; set it to 1 there if huge pages are tight.
+	config.AddExtensionOption("oasis_regex_max_in_flight",
+	                          "regex_fpga_scan: transfers outstanding per scan thread (0 = default 1)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+
+	// regex_fpga_scan saturates the card at ~12 scan threads (scripts/regex_report.py -s threads),
+	// so past that point extra threads buy the scan nothing while still occupying workers that the
+	// rest of the query -- joins, aggregation, other scans -- could be using. Capping the scan's
+	// own parallelism leaves those workers free without lowering DuckDB's global thread count.
+	config.AddExtensionOption("oasis_regex_max_threads",
+	                          "regex_fpga_scan: cap the scan's own parallelism (0 = no cap)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
 

@@ -122,29 +122,26 @@ set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/oasis_profi
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# celeris/generated carries regex_limits.h, the source of truth for the engine's
-# token/state budget. regex_table.cpp reads it rather than restating the numbers:
-# the limits changed with the bitstream (12 -> 32 tokens) and a local copy here
-# silently kept rejecting patterns the card could handle.
-set(CELERIS_GENERATED_DIR "${CELERIS_SOFTWARE_DIR}/../generated")
-
 # The pattern budget must match the flashed bitstream's rem_top_ff CHAR_COUNT /
 # STATE_COUNT, because nfa.cpp instantiates RegexConfig<REGEX_MAX_TOKENS,
 # REGEX_MAX_STATES> and that template *is* the config blob's bit layout -- a
 # mismatch silently shifts every field after state_pred, so the card decodes a
 # valid-looking but wrong pattern and matches nothing (or everything).
 #
-# celeris/generated/regex_limits.h is a stale fallback (still 12 states); the
-# celeris build sets these on the command line, so this target must too or it
-# quietly picks up the header instead. build_hw_24 is CHAR_COUNT=32/STATE_COUNT=24.
+# These come from the command line only. celeris/generated/regex_limits.h used to
+# be a fallback for them, but it was generated once and then went stale at 12
+# states while the RTL moved to 28, so a build that picked it up compiled a blob
+# layout the card could not decode. Both regex.cpp and regex_table.cpp now #error
+# if the definitions are absent, and the generated directory is gone.
+# build_hw_24 is CHAR_COUNT=32/STATE_COUNT=24.
 foreach(_t ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
     target_compile_definitions(${_t} PRIVATE
         REGEX_MAX_TOKENS=${OASIS_REGEX_MAX_TOKENS}
         REGEX_MAX_STATES=${OASIS_REGEX_MAX_STATES})
 endforeach()
 
-target_include_directories(${EXTENSION_NAME} BEFORE PRIVATE ${CELERIS_SOFTWARE_DIR} ${CELERIS_REGEX_DIR} ${CELERIS_RE2_PARSER_DIR} ${CELERIS_GENERATED_DIR} )
-target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE PRIVATE ${CELERIS_SOFTWARE_DIR} ${CELERIS_REGEX_DIR} ${CELERIS_RE2_PARSER_DIR} ${CELERIS_GENERATED_DIR} )
+target_include_directories(${EXTENSION_NAME} BEFORE PRIVATE ${CELERIS_SOFTWARE_DIR} ${CELERIS_REGEX_DIR} ${CELERIS_RE2_PARSER_DIR})
+target_include_directories(${LOADABLE_EXTENSION_NAME} BEFORE PRIVATE ${CELERIS_SOFTWARE_DIR} ${CELERIS_REGEX_DIR} ${CELERIS_RE2_PARSER_DIR})
 
 add_dependencies(${EXTENSION_NAME} oasis_fregex_ext)
 add_dependencies(${LOADABLE_EXTENSION_NAME} oasis_fregex_ext)

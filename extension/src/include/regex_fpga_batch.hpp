@@ -18,23 +18,23 @@ namespace duckdb {
 
 static constexpr uint64_t REGEX_FPGA_BEAT_BYTES = 64;
 
-// Rows per batch. The device round trip costs a fixed ~134 us per batch on top of a
-// per-string term, so fewer, larger batches amortise it -- measured at threads=1:
-// 16 B strings 4.48 -> 3.06 ns/string going from 65536 to 131072 (1.46x), 33 B 1.33x,
-// 72 B 1.16x, 256 B 1.07x. Short strings gain most because the *row* cap is what binds
-// for them; long ones hit the byte cap first and barely move.
+// Rows per batch.
 //
-// Kept at 65536 deliberately. 131072 is the absolute ceiling --
-// kRegexMaxStringsPerEngine (2048) x 64 engines -- so defaulting to it leaves the
-// parallel-pop result FIFOs *exactly* full, with none of the skew slack the deadlock
-// analysis relies on. Tried as a default and backed out: a 12-case sweep exhausted the
-// 1 GiB huge-page pool mid-run and five cases disagreed with software. End to end it was
-// only worth ~5% anyway (the device is ~48% of the wall clock at 32 threads, so device
-// savings convert at roughly 40%), which does not buy that risk.
+// 16384, lowered from 65536. The old value existed to amortise a fixed ~134 us device
+// round trip over as many strings as possible -- with one batch on the card at a time,
+// fewer and larger batches was strictly better. Continuous streaming removes that fixed
+// cost: the measured round trip is now ~7.6 us, so there is almost nothing left to
+// amortise, and smaller batches win instead by spreading work more evenly over the scan
+// threads and keeping more transfers in flight.
 //
-// Still worth raising for single-threaded device work, where it is a real 1.3-1.5x on
-// short strings: use oasis_regex_batch_rows per session rather than changing this.
-static constexpr idx_t REGEX_FPGA_MAX_ACCUM_COUNT = 1ULL << 16;
+// Measured at 32 threads over 608 MB, four runs each: 16384 gave 0.137-0.147 s
+// (~4.2 GB/s) against 0.156-0.157 s (~3.9 GB/s) at 65536. Below ~12288 it turns back
+// down as per-batch overhead starts to dominate again.
+//
+// Still bounded by the result FIFO: (kRegexMaxStringsPerEngine - 1) x 64 engines, one
+// slot per engine being reserved for the terminated filler run. Overridable per session
+// with oasis_regex_batch_rows.
+static constexpr idx_t REGEX_FPGA_MAX_ACCUM_COUNT = 1ULL << 14;
 
 // How much wire buffer one scan thread holds. This is a host-memory bound and
 // nothing more: the 1 MiB REGEX_FPGA_RAW_BATCH_LIMIT it replaces was the
@@ -61,15 +61,42 @@ celeris::CelerisContext &GetCelerisContext();
 //
 // mutex_wait is time queued behind another thread and is only meaningful above one
 // thread; the rest are the phases of one batch's round trip.
+//
+// The lock now covers config + enqueue only; drain happens outside it (see
+// SubmitRegexBatch). An earlier attempt at that hung within seconds at 32 threads,
+// because nothing bounded how many *unaccepted* arms could pile up -- see the
+// arm-credit note on kRegexMaxSubmissionsInFlight below, which is what makes it safe.
+//
+// mutex_wait is time queued behind another thread's submit; arm_wait is time queued
+// on the arm credit, i.e. genuine device backlog rather than host contention. Telling
+// those two apart is the whole point of pipelining, so they are counted separately.
 struct RegexBatchPhases {
 	uint64_t batches = 0;
 	uint64_t strings = 0;
 	uint64_t mutex_wait_ns = 0;
+	uint64_t arm_wait_ns = 0;
 	uint64_t config_ns = 0;
+	// Time inside acquire_output_handle, a subset of config_ns. Broken out because it
+	// allocates a huge page, TLB-maps it and pushes a descriptor, all under the submit
+	// lock -- the obvious suspect when many threads serialise there.
+	uint64_t acquire_ns = 0;
 	uint64_t enqueue_ns = 0;
 	uint64_t drain_ns = 0;
 	uint64_t read_ns = 0;
+	// Host scan-path phases, accumulated across threads. Timed per chunk rather than per
+	// row: a clock read is ~20 ns against a ~27 ns append, so per-row timing would cost
+	// more than the thing it measures.
+	uint64_t scan_ns = 0;        // storage.Scan
+	uint64_t materialize_ns = 0; // MaterializeRetainedColumns
+	uint64_t stage_ns = 0;       // the per-row staging loop, including packer.append
+	uint64_t emit_ns = 0;        // AppendMatchedRows, turning a bitmap into output rows
 };
+
+// Accumulators for the phases above, incremented from regex_table.cpp.
+void AddRegexScanNs(uint64_t ns);
+void AddRegexMaterializeNs(uint64_t ns);
+void AddRegexStageNs(uint64_t ns);
+void AddRegexEmitNs(uint64_t ns);
 
 RegexBatchPhases GetRegexBatchPhases();
 void ResetRegexBatchPhases();
@@ -116,9 +143,81 @@ struct RegexMatchBitmap {
 	}
 };
 
-// Runs a batch already packed into `wire_ptr` by a RegexStreamPacker. `count` is
-// the number of real strings; `plan` carries the padded result geometry the card
-// needs. Returns one verdict per slot, in slot order.
+// How many batches may sit between submit and collect, process-wide.
+//
+// This is a correctness bound, not a tuning knob, and what sets it is how the card
+// receives an arm. batCount used to be a libstf ConfigWriteReadyRegister: a
+// single-entry mailbox whose own header warns it "does not apply back pressure to the
+// GlobalConfig. So values may be lost." A second write arriving while regex_top had not
+// yet accepted the first silently overwrote it, and a lost arm is not a wrong answer
+// but a wedged array -- the collector waits on a count nobody sent. Two credits were the
+// most that could be allowed against that: one running batch, one pending arm.
+//
+// batCount is now a queue REGEX_BAT_COUNT_DEPTH (32) deep in regex_config.sv, so arms
+// are lossless and this bound moves to what the rest of the path allows, which is
+// REGEX_BAT_COUNT_DEPTH (32) -- the queue has no back-pressure, so overrunning it drops
+// an arm. This bound is exact, not approximate: a credit is held for exactly the window
+// between pushing an arm and collecting the results that pop it, so at most this many
+// entries can ever be in the queue. 32 therefore fills it without exceeding it.
+//
+// It must also be at least the number of scan threads, or threads block here instead of
+// packing: at 32 threads with 16 credits the scan spent 138 ms waiting on credits.
+// Raising it past the RTL queue depth needs the FIFO deepened first.
+//
+// A credit is released in CollectRegexBatch.
+static constexpr uint32_t kRegexMaxSubmissionsInFlight = 32;
+
+// A batch handed to the card and not yet collected. Submission order is global and
+// fixed at submit time: OutputBufferManager matches buffers to handles positionally
+// (enqueued_handles[stream].front()), so a handle acquired second receives the
+// second transfer's results whatever the threads do afterwards.
+//
+// Every submission holds one arm credit. It MUST be collected -- dropping one on the
+// floor both leaks the credit and, worse, strands its handle at the head of the
+// OBM's positional queue, where the next transfer's results are then delivered into
+// an object nobody is reading. Collecting is what releases both.
+struct RegexSubmission {
+	std::shared_ptr<libstf::OutputHandle> handle;
+	idx_t    count = 0;
+	uint32_t bat_count = 0;
+	// Global submission order, for diagnostics only.
+	uint64_t seq = 0;
+
+	bool valid() const { return handle != nullptr; }
+};
+
+// Takes one arm credit if the pool is not empty, without blocking.
+//
+// A caller that fails to get one and has transfers of its own outstanding MUST collect
+// one of them rather than wait: the pool is shared, so blocking here while holding
+// credits is what deadlocks the whole scan.
+bool TryAcquireRegexArmCredit();
+
+// Blocks until a credit is free. Only safe when the caller has nothing outstanding to
+// collect -- otherwise it can be waiting on credits that only it could release.
+void AcquireRegexArmCredit();
+
+// Arms the card for a batch already packed into `wire_ptr` by a RegexStreamPacker and
+// enqueues its DMA, then returns without waiting for results. `count` is the number
+// of real strings; `plan` carries the padded result geometry the card needs.
+//
+// `wire_ptr` must stay alive and unmodified until the matching CollectRegexBatch
+// returns: the DMA reads it asynchronously.
+//
+// The caller must already hold one arm credit (TryAcquireRegexArmCredit /
+// AcquireRegexArmCredit); CollectRegexBatch releases it.
+RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
+                                 const celeris::RegexStreamPacker::Plan &plan, idx_t count,
+                                 const std::vector<uint8_t> &regex_blob);
+
+// Blocks until `submission`'s results have landed and returns one verdict per slot,
+// in slot order. Releases the submission's arm credit. Idempotent on an already
+// collected (or default-constructed) submission, which is what lets a destructor
+// drain a window without tracking which entries it already took.
+RegexMatchBitmap CollectRegexBatch(RegexSubmission &submission);
+
+// Submit immediately followed by collect. The serial path, kept for callers with
+// nothing to overlap (RunFpgaRegexBatch, the SQL scalar function).
 RegexMatchBitmap RunFpgaRegexPackedBatch(celeris::CelerisContext &ctx, void *wire_ptr,
                                          const celeris::RegexStreamPacker::Plan &plan, idx_t count,
                                          const std::vector<uint8_t> &regex_blob);
