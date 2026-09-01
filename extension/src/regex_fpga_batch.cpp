@@ -59,23 +59,95 @@ namespace {
 // every increment already happens under fpga_mutex except mutex_wait itself.
 std::atomic<uint64_t> g_batches {0};
 std::atomic<uint64_t> g_strings {0};
+std::atomic<uint64_t> g_wire_bytes {0};
 std::atomic<uint64_t> g_mutex_wait_ns {0};
 std::atomic<uint64_t> g_arm_wait_ns {0};
 std::atomic<uint64_t> g_config_ns {0};
 std::atomic<uint64_t> g_acquire_ns {0};
+std::atomic<uint64_t> g_getconfig_ns {0};
+std::atomic<uint64_t> g_handle_ns {0};
+std::atomic<uint64_t> g_csr_ns {0};
 std::atomic<uint64_t> g_scan_ns {0};
 std::atomic<uint64_t> g_materialize_ns {0};
 std::atomic<uint64_t> g_stage_ns {0};
 std::atomic<uint64_t> g_emit_ns {0};
+std::atomic<uint64_t> g_initlocal_ns {0};
+std::atomic<uint64_t> g_wirealloc_ns {0};
 std::atomic<uint64_t> g_enqueue_ns {0};
 std::atomic<uint64_t> g_drain_ns {0};
 std::atomic<uint64_t> g_read_ns {0};
 
 using PhaseClock = std::chrono::steady_clock;
 
+// Link occupancy.
+//
+// The one question a stage decomposition cannot answer above one thread: was the card
+// ever left with nothing to read? Every submitted-but-uncollected transfer is one the
+// card either has not started, is reading, or has answered but nobody has picked up, so
+// the window being empty is the only state in which the input DMA is provably idle.
+//
+// Kept under its own mutex rather than as lock-free atomics: the update is a
+// compare-and-timestamp pair that has to be atomic *together*, and it happens twice per
+// batch against a batch measured in tens of microseconds.
+std::mutex g_depth_mutex;
+uint32_t g_depth = 0;
+uint32_t g_max_depth = 0;
+PhaseClock::time_point g_depth_mark;   // last time g_depth changed
+PhaseClock::time_point g_wall_start;
+uint64_t g_link_idle_ns_v = 0;
+uint64_t g_depth_ns_v = 0;              // integral of g_depth dt, for the mean depth
+uint64_t g_idle_events_v = 0;
+uint64_t g_max_idle_ns_v = 0;
+
+// Fill and drain shape, per scan thread.
+//
+// link_idle_ns says the card had nothing enqueued; it does not say why. The two ends of
+// a query are different problems: at the start every thread has to scan and pack a whole
+// batch before anything can be submitted, and at the end threads stop at different times
+// and the window empties one thread at a time. These record, relative to the first
+// RegexFpgaScanInitGlobal of the query, when each thread first submitted and when it
+// finished -- so "the pipeline fills slowly" can be told from "one thread starts late".
+std::mutex g_fill_mutex;
+PhaseClock::time_point g_query_start;
+uint64_t g_fill_min_ns = 0, g_fill_max_ns = 0, g_fill_sum_ns = 0, g_fill_n = 0;
+uint64_t g_done_min_ns = 0, g_done_max_ns = 0, g_done_sum_ns = 0, g_done_n = 0;
+
 uint64_t NanosSince(const PhaseClock::time_point &start) {
 	return static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(PhaseClock::now() - start).count());
+}
+
+// Advances the depth integral to `now` and applies `delta` to the window depth. Must be
+// called with g_depth_mutex held.
+void AccountDepth(const PhaseClock::time_point &now, int delta) {
+	const uint64_t dt = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_depth_mark).count());
+	if (g_depth == 0) {
+		g_link_idle_ns_v += dt;
+		// Only a gap that is actually ended by a submit is one idle event; the
+		// bring-up-to-date call from the reader passes delta == 0 and must not count.
+		if (delta > 0 && dt > 0) {
+			g_idle_events_v++;
+			if (dt > g_max_idle_ns_v) {
+				g_max_idle_ns_v = dt;
+			}
+			if (std::getenv("OASIS_REGEX_IDLE_TRACE") && dt > 50000) {
+				std::fprintf(stderr, "[regexidle] gap %8.3f ms after %llu submissions\n",
+				             double(dt) / 1e6,
+				             (unsigned long long)g_batches.load(std::memory_order_relaxed));
+			}
+		}
+	}
+	g_depth_ns_v += dt * uint64_t(g_depth);
+	g_depth_mark = now;
+	if (delta > 0) {
+		g_depth++;
+		if (g_depth > g_max_depth) {
+			g_max_depth = g_depth;
+		}
+	} else if (delta < 0 && g_depth > 0) {
+		g_depth--;
+	}
 }
 
 // Hang diagnostics, enabled by OASIS_REGEX_DIAG. Deliberately unconditional counters
@@ -174,39 +246,130 @@ void AddRegexScanNs(uint64_t ns) { g_scan_ns.fetch_add(ns, std::memory_order_rel
 void AddRegexMaterializeNs(uint64_t ns) { g_materialize_ns.fetch_add(ns, std::memory_order_relaxed); }
 void AddRegexStageNs(uint64_t ns) { g_stage_ns.fetch_add(ns, std::memory_order_relaxed); }
 void AddRegexEmitNs(uint64_t ns) { g_emit_ns.fetch_add(ns, std::memory_order_relaxed); }
+void AddRegexInitLocalNs(uint64_t ns) { g_initlocal_ns.fetch_add(ns, std::memory_order_relaxed); }
+void AddRegexWireAllocNs(uint64_t ns) { g_wirealloc_ns.fetch_add(ns, std::memory_order_relaxed); }
 
 RegexBatchPhases GetRegexBatchPhases() {
 	RegexBatchPhases p;
 	p.batches = g_batches.load(std::memory_order_relaxed);
 	p.strings = g_strings.load(std::memory_order_relaxed);
+	p.wire_bytes = g_wire_bytes.load(std::memory_order_relaxed);
 	p.mutex_wait_ns = g_mutex_wait_ns.load(std::memory_order_relaxed);
 	p.arm_wait_ns = g_arm_wait_ns.load(std::memory_order_relaxed);
 	p.config_ns = g_config_ns.load(std::memory_order_relaxed);
 	p.acquire_ns = g_acquire_ns.load(std::memory_order_relaxed);
+	p.getconfig_ns = g_getconfig_ns.load(std::memory_order_relaxed);
+	p.handle_ns = g_handle_ns.load(std::memory_order_relaxed);
+	p.csr_ns = g_csr_ns.load(std::memory_order_relaxed);
 	p.scan_ns = g_scan_ns.load(std::memory_order_relaxed);
 	p.materialize_ns = g_materialize_ns.load(std::memory_order_relaxed);
 	p.stage_ns = g_stage_ns.load(std::memory_order_relaxed);
 	p.emit_ns = g_emit_ns.load(std::memory_order_relaxed);
+	p.initlocal_ns = g_initlocal_ns.load(std::memory_order_relaxed);
+	p.wirealloc_ns = g_wirealloc_ns.load(std::memory_order_relaxed);
 	p.enqueue_ns = g_enqueue_ns.load(std::memory_order_relaxed);
 	p.drain_ns = g_drain_ns.load(std::memory_order_relaxed);
 	p.read_ns = g_read_ns.load(std::memory_order_relaxed);
+	{
+		// Bring the integrals up to date before reading them, or a window that has been
+		// empty since the last submit reports zero idle.
+		std::lock_guard<std::mutex> lock(g_depth_mutex);
+		AccountDepth(PhaseClock::now(), 0);
+		p.link_idle_ns = g_link_idle_ns_v;
+		p.depth_ns = g_depth_ns_v;
+		p.max_depth = g_max_depth;
+		p.idle_events = g_idle_events_v;
+		p.max_idle_ns = g_max_idle_ns_v;
+		p.wall_ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(g_depth_mark - g_wall_start).count());
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_fill_mutex);
+		p.fill_min_ns = g_fill_min_ns;
+		p.fill_max_ns = g_fill_max_ns;
+		p.fill_mean_ns = g_fill_n ? g_fill_sum_ns / g_fill_n : 0;
+		p.fill_threads = g_fill_n;
+		p.done_min_ns = g_done_min_ns;
+		p.done_max_ns = g_done_max_ns;
+		p.done_mean_ns = g_done_n ? g_done_sum_ns / g_done_n : 0;
+	}
 	return p;
 }
 
 void ResetRegexBatchPhases() {
 	g_batches.store(0, std::memory_order_relaxed);
 	g_strings.store(0, std::memory_order_relaxed);
+	g_wire_bytes.store(0, std::memory_order_relaxed);
 	g_mutex_wait_ns.store(0, std::memory_order_relaxed);
 	g_arm_wait_ns.store(0, std::memory_order_relaxed);
 	g_config_ns.store(0, std::memory_order_relaxed);
 	g_acquire_ns.store(0, std::memory_order_relaxed);
+	g_getconfig_ns.store(0, std::memory_order_relaxed);
+	g_handle_ns.store(0, std::memory_order_relaxed);
+	g_csr_ns.store(0, std::memory_order_relaxed);
 	g_scan_ns.store(0, std::memory_order_relaxed);
 	g_materialize_ns.store(0, std::memory_order_relaxed);
 	g_stage_ns.store(0, std::memory_order_relaxed);
 	g_emit_ns.store(0, std::memory_order_relaxed);
+	g_initlocal_ns.store(0, std::memory_order_relaxed);
+	g_wirealloc_ns.store(0, std::memory_order_relaxed);
 	g_enqueue_ns.store(0, std::memory_order_relaxed);
 	g_drain_ns.store(0, std::memory_order_relaxed);
 	g_read_ns.store(0, std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lock(g_depth_mutex);
+		const auto now = PhaseClock::now();
+		g_wall_start = now;
+		g_depth_mark = now;
+		g_link_idle_ns_v = 0;
+		g_depth_ns_v = 0;
+		g_max_depth = g_depth;
+		g_idle_events_v = 0;
+		g_max_idle_ns_v = 0;
+	}
+}
+
+void NoteRegexQueryStart() {
+	std::lock_guard<std::mutex> lock(g_fill_mutex);
+	g_query_start = PhaseClock::now();
+	g_fill_min_ns = g_fill_max_ns = g_fill_sum_ns = g_fill_n = 0;
+	g_done_min_ns = g_done_max_ns = g_done_sum_ns = g_done_n = 0;
+}
+
+void NoteRegexFirstSubmit() {
+	std::lock_guard<std::mutex> lock(g_fill_mutex);
+	const uint64_t ns = NanosSince(g_query_start);
+	if (g_fill_n == 0 || ns < g_fill_min_ns) {
+		g_fill_min_ns = ns;
+	}
+	if (ns > g_fill_max_ns) {
+		g_fill_max_ns = ns;
+	}
+	g_fill_sum_ns += ns;
+	g_fill_n++;
+}
+
+void NoteRegexThreadDone() {
+	std::lock_guard<std::mutex> lock(g_fill_mutex);
+	const uint64_t ns = NanosSince(g_query_start);
+	// OASIS_REGEX_FILL_TRACE: one line per thread as it retires, with the wire bytes
+	// submitted process-wide so far. The slope between consecutive lines is the link
+	// rate the remaining threads are sustaining, which is how a ragged tail shows up as
+	// throughput rather than as idle -- the window is never empty during it, so
+	// link_idle_ns cannot see it.
+	if (std::getenv("OASIS_REGEX_FILL_TRACE")) {
+		std::fprintf(stderr, "[regexfill] thread done %2llu at %8.3f ms  wire %7.1f MB\n",
+		             (unsigned long long)(g_done_n + 1), double(ns) / 1e6,
+		             double(g_wire_bytes.load(std::memory_order_relaxed)) / 1e6);
+	}
+	if (g_done_n == 0 || ns < g_done_min_ns) {
+		g_done_min_ns = ns;
+	}
+	if (ns > g_done_max_ns) {
+		g_done_max_ns = ns;
+	}
+	g_done_sum_ns += ns;
+	g_done_n++;
 }
 
 bool TryAcquireRegexArmCredit() {
@@ -244,7 +407,7 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// push and one descriptor write.
 	CALI_MARK_BEGIN("prepare_output");
 	const auto t_acquire = PhaseClock::now();
-	const size_t output_bytes = (static_cast<size_t>(plan.bat_count) + 7) / 8;
+	const size_t output_bytes = (static_cast<size_t>(plan.strings_in_batch) + 7) / 8;
 	libstf::Buffer prepared = ctx.get_output_buffer_manager().prepare_output_buffer(0, output_bytes);
 	g_acquire_ns.fetch_add(NanosSince(t_acquire), std::memory_order_relaxed);
 	CALI_MARK_END("prepare_output");
@@ -257,11 +420,15 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 
 	RegexSubmission submission;
 	submission.count = count;
-	submission.bat_count = plan.bat_count;
+	submission.bat_count = plan.strings_in_batch;
 
 	CALI_MARK_BEGIN("config_setup");
 	const auto t_config = PhaseClock::now();
 	std::shared_ptr<celeris::RegexConfig> config = ctx.get_config<celeris::RegexConfig>();
+	const auto t_getcfg = PhaseClock::now();
+	g_getconfig_ns.fetch_add(
+	    uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_getcfg - t_config).count()),
+	    std::memory_order_relaxed);
 
 	// Stream 0 is UNMANAGED (see celeris_context.cpp), so it must go through the
 	// size-based overload: the mask-based one is for managed streams only and trips an
@@ -275,6 +442,10 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// threads registering outside the lock and enqueueing inside it would hand each
 	// other's results over with no error anywhere. Only the allocation moved out.
 	submission.handle = ctx.get_output_buffer_manager().acquire_output_handle(0, prepared);
+	const auto t_handle = PhaseClock::now();
+	g_handle_ns.fetch_add(
+	    uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_handle - t_getcfg).count()),
+	    std::memory_order_relaxed);
 
 	// The pattern is constant for the whole query, so this is 35 MMIO writes on the
 	// first submission and none after. regex_top latches the blob and arms the engines
@@ -298,7 +469,8 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// ahead of its arm -- which happens routinely, since AXI-Lite and DMA are
 	// independent paths -- back-pressures until the count lands rather than being
 	// walked under whatever the array was last doing.
-	config->write_bat_count(plan.bat_count);
+	config->write_strings_in_batch(plan.strings_in_batch);
+	g_csr_ns.fetch_add(NanosSince(t_handle), std::memory_order_relaxed);
 	g_config_ns.fetch_add(NanosSince(t_config), std::memory_order_relaxed);
 	CALI_MARK_END("config_setup");
 
@@ -307,6 +479,11 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// One stream now. The descriptor stream is gone: NUL terminators frame the
 	// strings and the chunk interleave assigns them to engines.
 	libstf::enqueue_stream_input(ctx.get_cthread(), ctx.get_tlb_manager(), wire_ptr, plan.wire_bytes, 0, true);
+	g_wire_bytes.fetch_add(plan.wire_bytes, std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> depth_lock(g_depth_mutex);
+		AccountDepth(PhaseClock::now(), +1);
+	}
 	submission.seq = g_seq.fetch_add(1, std::memory_order_relaxed);
 	g_submitted.fetch_add(1, std::memory_order_relaxed);
 	Diag("SUBMIT", submission.seq);
@@ -359,6 +536,10 @@ RegexMatchBitmap CollectRegexBatch(RegexSubmission &submission) {
 		}
 	}
 	g_drain_ns.fetch_add(NanosSince(t_drain), std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> depth_lock(g_depth_mutex);
+		AccountDepth(PhaseClock::now(), -1);
+	}
 	g_collect_exit.fetch_add(1, std::memory_order_relaxed);
 	Diag("DRAIN_EXIT", submission.seq);
 	g_batches.fetch_add(1, std::memory_order_relaxed);

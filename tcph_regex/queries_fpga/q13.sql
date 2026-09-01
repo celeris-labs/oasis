@@ -13,7 +13,7 @@ FROM (
             o_orderkey
         FROM
             regex_fpga_scan('orders', regex_column := 'o_comment',
-                pattern := '[ -~]*spec[ -~]*requ[ -~]*') AS matched_orders)
+                pattern := '.*special.*requests.*') AS matched_orders)
 GROUP BY
     c_custkey) AS c_orders (c_custkey,
         c_count)

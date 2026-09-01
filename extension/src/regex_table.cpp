@@ -111,6 +111,12 @@ static inline uint64_t StageNanos(const StageClock::time_point &t) {
 }
 static bool CollectOldestTransfer(RegexFpgaScanLocalState &lstate);
 
+// How close to the row cap a batch has to be before it is allowed to close early on a
+// chunk boundary. One chunk of a 64 B string is 4 strings per engine, i.e. 256 rows; at
+// 512 the rule can fire for anything up to 128 B strings and still give up at most half
+// a percent of the batch.
+static constexpr idx_t kBoundaryCloseSlack = 512;
+
 static void BuildScanColumns(const RegexFpgaScanBindData &bind_data, const TableFunctionInitInput &input,
                              vector<ColumnIndex> &scan_column_indexes, vector<StorageIndex> &scan_storage_ids,
                              vector<LogicalType> &scan_types, idx_t &scanned_regex_column_idx) {
@@ -292,11 +298,48 @@ unique_ptr<GlobalTableFunctionState> RegexFpgaScanInitGlobal(ClientContext &cont
 	auto &bind_data = input.bind_data->Cast<RegexFpgaScanBindData>();
 	auto gstate = make_uniq<RegexFpgaScanGlobalState>(GetCelerisContext());
 	auto &storage = bind_data.table.GetStorage();
+	NoteRegexQueryStart();
 	storage.InitializeParallelScan(context, gstate->parallel_scan, input.column_indexes);
 	gstate->max_threads = storage.MaxThreads(context);
 
-	// The device saturates well below DuckDB's default scan parallelism, so let a query cap the
-	// scan's threads and leave the rest of the pool to the operators downstream of it.
+	// Scan threads are capped by the arm-credit pool, not by the machine.
+	//
+	// Every transfer on the card holds one arm credit, and there are exactly
+	// kRegexMaxSubmissionsInFlight (32) of them because that is the depth of the RTL's
+	// strings_in_batch queue, which does not back-pressure. A thread that cannot get a
+	// credit stops packing and collects instead, so T threads each keeping W transfers
+	// outstanding need T*W <= 32 or they spend the scan taking credits off each other.
+	//
+	// That fixes the shape of the operating point rather than leaving it to the machine's
+	// core count. W = 1 makes a thread wait out its own device round trip before it packs
+	// again -- the only overlap it gets is other threads' -- so the useful window is 2,
+	// and that puts the thread cap at 16. Measured at 32 threads over 283 MB, paired over
+	// 16 rounds of benchmark_runner:
+	//
+	//   32 threads, W=1  26.78 ms   (the previous default)
+	//   32 threads, W=2  27.2  ms   demand 64 > 32 credits, threads block on credits
+	//   16 threads, W=1  26.5  ms   half the packing power, still one round trip deep
+	//   16 threads, W=2  25.98 ms   won 16 of 16 rounds
+	//
+	// It is a cap, not a target: a smaller machine keeps its own thread count. The host
+	// can afford it -- with the device switched out (oasis_regex_dry_run) the scan-and-pack
+	// path runs at 17.7 GB/s on 16 threads against 15.8 on 32, because 32 workers on 16
+	// physical cores is already past the knee for this memory-bound work.
+	Value max_in_flight_value;
+	idx_t window = REGEX_FPGA_DEFAULT_IN_FLIGHT;
+	if (context.TryGetCurrentSetting("oasis_regex_max_in_flight", max_in_flight_value) &&
+	    !max_in_flight_value.IsNull()) {
+		const auto depth = UBigIntValue::Get(max_in_flight_value);
+		if (depth > 0) {
+			window = idx_t(depth);
+		}
+	}
+	const idx_t credit_cap = MaxValue<idx_t>(kRegexMaxSubmissionsInFlight / MaxValue<idx_t>(window, 1), 1);
+	if (credit_cap < gstate->max_threads) {
+		gstate->max_threads = credit_cap;
+	}
+
+	// An explicit setting still wins, in either direction.
 	Value max_threads_value;
 	if (context.TryGetCurrentSetting("oasis_regex_max_threads", max_threads_value) &&
 	    !max_threads_value.IsNull()) {
@@ -315,6 +358,7 @@ unique_ptr<GlobalTableFunctionState> RegexFpgaScanInitGlobal(ClientContext &cont
 
 unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                          GlobalTableFunctionState *global_state) {
+	const auto t_init = StageClock::now();
 	auto &bind_data = input.bind_data->Cast<RegexFpgaScanBindData>();
 	auto &gstate = global_state->Cast<RegexFpgaScanGlobalState>();
 	auto lstate = make_uniq<RegexFpgaScanLocalState>();
@@ -372,6 +416,23 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 		}
 	}
 
+	// Opening ramp: how many of this thread's first batches are shrunk. Defaults to
+	// REGEX_FPGA_FILL_RAMP_STEPS; OASIS_REGEX_FILL_RAMP overrides it (0 disables the
+	// ramp) so the two can be A/B'd in one build.
+	lstate->fill_ramp_steps = REGEX_FPGA_FILL_RAMP_STEPS;
+	if (const char *ramp_env = std::getenv("OASIS_REGEX_FILL_RAMP")) {
+		lstate->fill_ramp_steps = idx_t(std::strtoul(ramp_env, nullptr, 10));
+	}
+	// Wire-byte target per batch. OASIS_REGEX_TARGET_WIRE_BYTES overrides
+	// REGEX_FPGA_TARGET_WIRE_BYTES so the size can be swept without a rebuild; the row cap
+	// (oasis_regex_batch_rows) is a backstop and cannot raise it.
+	lstate->target_wire_bytes = REGEX_FPGA_TARGET_WIRE_BYTES;
+	if (const char *target_env = std::getenv("OASIS_REGEX_TARGET_WIRE_BYTES")) {
+		const auto bytes = std::strtoull(target_env, nullptr, 10);
+		if (bytes > 0) {
+			lstate->target_wire_bytes = bytes;
+		}
+	}
 	auto &storage = bind_data.table.GetStorage();
 	// Push scan filters (e.g. c_nationkey = 7) into the storage scan so the FPGA only sees surviving rows.
 	lstate->scan_filter_set = BuildScanFilterSet(input, lstate->scanned_types);
@@ -388,6 +449,7 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	// buffer, not max_in_flight of them.
 	StartNewStagedBatch(*lstate, gstate.ctx);
 
+	AddRegexInitLocalNs(StageNanos(t_init));
 	return std::move(lstate);
 }
 
@@ -530,6 +592,16 @@ static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindDa
 static void StartNewStagedBatch(RegexFpgaScanLocalState &lstate, celeris::CelerisContext &ctx) {
 	lstate.accum_count = 0;
 	lstate.staged_rows = 0;
+	lstate.accum_cap = lstate.max_accum_count;
+	lstate.batch_payload_bytes = 0;
+	// Opening ramp: the first few batches are deliberately small so the card has
+	// something to read while the rest of the first full batch is still being packed.
+	// See REGEX_FPGA_FILL_RAMP_STEPS.
+	lstate.batch_target_bytes = lstate.target_wire_bytes;
+	if (lstate.batches_started < lstate.fill_ramp_steps) {
+		lstate.batch_target_bytes >>= (lstate.fill_ramp_steps - lstate.batches_started);
+	}
+	lstate.batches_started++;
 	// Take a recycled ref vector if one is free -- clear() keeps its capacity, whereas a
 	// fresh vector would regrow and fault pages in on every batch.
 	if (!lstate.free_row_refs.empty()) {
@@ -544,12 +616,14 @@ static void StartNewStagedBatch(RegexFpgaScanLocalState &lstate, celeris::Celeri
 	lstate.dict_stamp++;
 
 	if (lstate.free_wire_buffers.empty()) {
+		const auto t_alloc = StageClock::now();
 		libstf::Status status;
 		auto buffer = libstf::make_buffer(ctx.get_memory_pool(), lstate.wire_buffer_bytes, status);
 		if (!status.ok()) {
 			throw InternalException("Failed to allocate FPGA regex wire buffer for table scan");
 		}
 		lstate.free_wire_buffers.push_back(std::move(buffer));
+		AddRegexWireAllocNs(StageNanos(t_alloc));
 	}
 	lstate.wire_buffer = std::move(lstate.free_wire_buffers.back());
 	lstate.free_wire_buffers.pop_back();
@@ -612,6 +686,10 @@ static void SubmitStagedBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaS
 	// with everything else.
 	if (lstate.staged_rows == 0) {
 		return;
+	}
+	if (!lstate.submitted_any) {
+		lstate.submitted_any = true;
+		NoteRegexFirstSubmit();
 	}
 
 	// Take this submission's arm credit before anything else, and never block on it
@@ -803,7 +881,7 @@ static bool WouldExceedFpgaBatch(const RegexFpgaScanLocalState &lstate, uint64_t
 	// Rows are capped independently of strings: when a dictionary column resolves millions of rows
 	// to a handful of distinct values the string budget would never fill, and the retained chunks
 	// backing those rows would grow without bound.
-	if (lstate.staged_rows >= lstate.max_accum_count) {
+	if (lstate.staged_rows >= lstate.accum_cap) {
 		return true;
 	}
 	if (!needs_slot) {
@@ -811,7 +889,22 @@ static bool WouldExceedFpgaBatch(const RegexFpgaScanLocalState &lstate, uint64_t
 	}
 	// Also the per-engine result-FIFO bound, since the count is dealt round-robin:
 	// REGEX_FPGA_MAX_ACCUM_COUNT / 64 = 1024 results per engine.
-	if (lstate.accum_count >= lstate.max_accum_count) {
+	if (lstate.accum_count >= lstate.accum_cap) {
+		return true;
+	}
+	// Close on the chunk boundary rather than one string past it, once the batch has
+	// either reached its byte target or come within a chunk of its row cap.
+	//
+	// The wire is a whole number of 256 B chunks per engine, so wherever a batch happens
+	// to end, the last chunk of all 64 engines is part filler -- and the card reads and
+	// the engines walk every byte of it. On the 72 B benchmark column a 16384-row batch
+	// landed one byte into a fresh chunk, so 74 chunks travelled to carry 73 chunks of
+	// strings: 1.4% of the wire, pure loss. Closing at the boundary instead took the
+	// scan's wire from 291.0 MB to 288.4 MB for 283.1 MB of text and was worth 1.7-2.0%
+	// end to end, paired over 18-20 rounds.
+	if ((lstate.batch_payload_bytes >= lstate.batch_target_bytes ||
+	     lstate.staged_rows + kBoundaryCloseSlack >= lstate.accum_cap) &&
+	    lstate.packer.rectangle_grows(next_length)) {
 		return true;
 	}
 	// The wire size is set by the longest engine stream once the rectangle is
@@ -854,6 +947,7 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			}
 			if (lstate.in_flight.empty()) {
 				lstate.finished = true;
+				NoteRegexThreadDone();
 			}
 			return;
 		}
@@ -946,7 +1040,12 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 					return;
 				}
 				CALI_MARK_BEGIN("stage_rows_for_fpga_batch");
-		auto t_stage = StageClock::now();
+				// Restart the timer, do not shadow it: `auto t_stage = ...` here declared a
+				// second variable that died at the `continue`, so the accumulator at the
+				// bottom of the loop measured from the top of the *chunk* and swallowed
+				// every submit and drain that happened in between. stage_ms then read as
+				// stage + drain and the decomposition did not add up.
+				t_stage = StageClock::now();
 				continue;
 			}
 
@@ -957,6 +1056,7 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 				slot = lstate.packer.append(regex_value.GetData(), next_length);
 				D_ASSERT(slot == lstate.accum_count);
 				lstate.accum_count++;
+				lstate.batch_payload_bytes += next_length + 1;
 				if (dedup) {
 					if (regex_idx >= lstate.dict_slot_stamp.size()) {
 						lstate.dict_slot_of.resize(regex_idx + 1, 0);

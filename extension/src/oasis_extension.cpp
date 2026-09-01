@@ -59,7 +59,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// (kRegexMaxStringsPerEngine * 64); the wire buffer is per scan thread and comes out of the
 	// huge-page pool, so large values times many threads will exhaust it.
 	config.AddExtensionOption("oasis_regex_batch_rows",
-	                          "regex_fpga_scan: max rows per FPGA batch (0 = default 65536)",
+	                          "regex_fpga_scan: max rows per FPGA batch, a backstop on the "
+	                          "REGEX_FPGA_TARGET_WIRE_BYTES byte target (0 = default 16384)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 	config.AddExtensionOption("oasis_regex_wire_buffer_bytes",
 	                          "regex_fpga_scan: per-thread wire buffer in bytes (0 = default 4 MiB)",
@@ -75,27 +76,35 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "regex_fpga_scan: solo-batch threshold in bytes (0 = default 2048)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
-	// How many transfers one scan thread keeps on the card. Depth 1 is the old
-	// behaviour: pack a batch, submit it, block on its results, pack the next -- so the
-	// host and the card take turns and neither is ever busy while the other works.
-	// Depth 2 packs the next batch while the current one matches.
+	// How many transfers one scan thread keeps on the card. Depth 1 makes the host and
+	// the card take turns: pack a batch, submit it, block on its results, pack the next,
+	// so a thread's only overlap is other threads'. Depth 2 packs the next batch while
+	// the current one matches, and is the default.
 	//
-	// Each extra transfer pins one more wire buffer per thread out of the huge-page
-	// pool (oasis_regex_wire_buffer_bytes, 4 MiB by default), and the *process-wide*
-	// ceiling is separate and lower -- kRegexMaxSubmissionsInFlight arm credits, which
-	// the RTL's single-entry arm mailbox fixes at 2 until Stage 2 lands. So on a
-	// many-thread scan the threads are already sharing those credits and a deeper
-	// per-thread window only costs pool; set it to 1 there if huge pages are tight.
+	// This is not independent of the scan's thread count. Every outstanding transfer
+	// holds one of kRegexMaxSubmissionsInFlight (32) arm credits -- the depth of the
+	// RTL's strings_in_batch queue, which does not back-pressure -- so T threads at depth
+	// W need T*W <= 32 or they spend the scan taking credits off each other.
+	// RegexFpgaScanInitGlobal therefore caps the scan's threads at 32/W, and the two
+	// numbers are one decision: 16 x 2 beat 32 x 1 by 3.3% and won 15 of 16 paired
+	// rounds, while 32 x 2 (demand 64, pool 32) lost.
+	//
+	// Each extra transfer also pins one more wire buffer per thread out of the huge-page
+	// pool (oasis_regex_wire_buffer_bytes, 4 MiB by default); 16 threads at depth 2 is
+	// the same 128 MiB the old 32-at-depth-1 default used. Set it to 1 if pages are tight
+	// -- that raises the thread cap back to 32.
 	config.AddExtensionOption("oasis_regex_max_in_flight",
-	                          "regex_fpga_scan: transfers outstanding per scan thread (0 = default 1)",
+	                          "regex_fpga_scan: transfers outstanding per scan thread (0 = default 2)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
-	// regex_fpga_scan saturates the card at ~12 scan threads (scripts/regex_report.py -s threads),
-	// so past that point extra threads buy the scan nothing while still occupying workers that the
-	// rest of the query -- joins, aggregation, other scans -- could be using. Capping the scan's
-	// own parallelism leaves those workers free without lowering DuckDB's global thread count.
+	// The scan already caps its own parallelism at kRegexMaxSubmissionsInFlight /
+	// oasis_regex_max_in_flight (16 by default) -- see the note above and
+	// RegexFpgaScanInitGlobal. This lowers that cap further, which is worth doing when the
+	// rest of the query -- joins, aggregation, other scans -- wants the workers more than
+	// the scan does. It can only lower the cap, never raise it above the credit bound.
 	config.AddExtensionOption("oasis_regex_max_threads",
-	                          "regex_fpga_scan: cap the scan's own parallelism (0 = no cap)",
+	                          "regex_fpga_scan: lower the scan's parallelism below the "
+	                          "arm-credit cap of 32/oasis_regex_max_in_flight (0 = no extra cap)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
 	// Oasis scan table function

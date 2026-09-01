@@ -17,6 +17,7 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "libstf/buffer.hpp"
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <vector>
@@ -175,6 +176,23 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	idx_t output_cache_read_idx = 0;
 	idx_t rows_in_current_row_group = 0;
 
+	// Payload bytes staged for the card in this batch: sum of len+1 over the strings that
+	// took a slot, so deduplicated rows cost nothing here just as they cost nothing on the
+	// wire. Within a chunk of the finalized rectangle, so it is what the byte target is
+	// tested against -- counted incrementally because the rectangle form needs a divide
+	// and this is asked once per scanned row.
+	uint64_t batch_payload_bytes = 0;
+	// Wire-byte target for the batch being staged. Equal to REGEX_FPGA_TARGET_WIRE_BYTES
+	// except during the opening ramp -- see REGEX_FPGA_FILL_RAMP_STEPS.
+	uint64_t batch_target_bytes = REGEX_FPGA_TARGET_WIRE_BYTES;
+	// Batches this thread has started, only to index the ramp.
+	idx_t batches_started = 0;
+	// Opening-ramp length for this scan; see REGEX_FPGA_FILL_RAMP_STEPS.
+	idx_t fill_ramp_steps = REGEX_FPGA_FILL_RAMP_STEPS;
+	// Steady-state wire-byte target; see REGEX_FPGA_TARGET_WIRE_BYTES.
+	uint64_t target_wire_bytes = REGEX_FPGA_TARGET_WIRE_BYTES;
+	// Whether this thread has submitted anything yet, for the fill measurement only.
+	bool submitted_any = false;
 	idx_t accum_count = 0; // distinct strings staged for the FPGA in this batch
 	idx_t staged_rows = 0; // rows this batch decides; >= accum_count once rows share a slot
 	// The storage scan has no more rows. Distinct from `finished`, which additionally
@@ -203,6 +221,26 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	// oasis_regex_wire_buffer_bytes so a sweep does not need a rebuild. A batch ends
 	// when either cap is hit: rows bind for short strings, bytes for long ones.
 	idx_t max_accum_count = REGEX_FPGA_MAX_ACCUM_COUNT;
+	// Row cap for the batch currently being staged, ramped from small to max_accum_count
+	// over the first few batches of the scan.
+	//
+	// The card is idle until the first transfer is enqueued, and with a flat cap that is
+	// one whole batch of scan-and-pack per thread -- every thread starts at the same
+	// instant and none of them submits anything for ~1.4 ms at 32 threads. Measured with
+	// the link-occupancy counters (regex_fpga_batch_phases): a 27 ms query spent 2.4 ms
+	// with nothing enqueued, essentially all of it in one gap before the first
+	// submission, and none at all once the window had filled.
+	//
+	// Ramping costs nothing in steady state because it is over after four batches, and
+	// nothing in link occupancy either: a wave of 32 transfers of r rows takes the card
+	// 32*r*73/12.6e9 s while the threads need r*85ns to pack the next one, a ratio of
+	// ~2.2 that is independent of r. So the card stays ahead at every rung of the ramp,
+	// and only the first rung is paid.
+	// Row cap for the batch currently being staged. Equal to max_accum_count today --
+	// kept as its own field because it is what WouldExceedFpgaBatch tests, and a scan
+	// that wants to vary the cap during the scan (a ramp, a stagger) changes only this.
+	// Both of those were tried and lost; see the note in RegexFpgaScanInitLocal.
+	idx_t accum_cap = 0;
 	uint64_t wire_buffer_bytes = REGEX_FPGA_WIRE_BUFFER_BYTES;
 	// Values at or above this are matched on the CPU and never sent to the card, from
 	// oasis_regex_outlier_bytes. Defaults to the celeris constant.
@@ -222,29 +260,24 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	// better error than failing at bind for a scan that would never have used it.
 	unique_ptr<duckdb_re2::Regex> cpu_regex;
 
-	// How many transfers this thread keeps outstanding, from oasis_regex_max_in_flight.
+	// How many transfers this thread keeps on the card, from oasis_regex_max_in_flight.
 	//
-	// Costs one wire buffer each (wire_buffer_bytes, out of the huge-page pool), so at
-	// the 4 MiB default this is 8 MiB per scan thread at depth 2. The *process-wide*
-	// bound is separate and smaller -- kRegexMaxSubmissionsInFlight arm credits -- so
-	// past a handful of threads a deeper per-thread window buys nothing and only
-	// costs pool. Drop it to 1 on a many-thread run that is short of huge pages.
-	// How many transfers this thread keeps on the card. 1, and this is measured.
+	// 2, and this is what the thread cap in RegexFpgaScanInitGlobal is derived from: a
+	// window of W on T threads holds T*W arm credits, and there are only
+	// kRegexMaxSubmissionsInFlight (32) because that is the RTL's strings_in_batch queue
+	// depth. So the two numbers are one decision, and the pair that wins is 16 x 2.
 	//
-	// A window of W means W transfers on the card, hence W arm credits held, so peak
-	// demand across the scan is threads x W. The credits are capped by the RTL's
-	// batCount queue (REGEX_BAT_COUNT_DEPTH = 32, no back-pressure), so at 32 scan
-	// threads anything above 1 oversubscribes the pool and threads block on credits
-	// instead of packing -- measured 0.144 s at W=1 against 0.177 s at W=2 and 0.169 s
-	// at W=3, with arm_wait going from 365 ms to 1985 ms.
+	// W=1 was the previous default and was measured against W=2 *at 32 threads*, where
+	// 32x2 oversubscribes the credit pool and threads block taking credits off each
+	// other -- which is what made W=1 look better. Held to 16 threads so the pool is
+	// exactly saturated, W=2 wins 16 rounds out of 16 (25.98 ms against 26.5 ms), because
+	// it is what stops a thread waiting out its own device round trip before it packs
+	// again. W=3 measured identical to W=2, as it must: the credit pool is already full.
 	//
-	// The overlap therefore comes from the other scan threads, which pack while this one
-	// waits on the card, not from a thread overlapping itself. Raising this only pays on
-	// a run with few enough threads that threads x W stays under the credit pool --
-	// where there are correspondingly fewer other threads to provide the overlap.
-	//
-	// Getting both would need REGEX_BAT_COUNT_DEPTH raised in RTL and a resynthesis.
-	idx_t max_in_flight = 1;
+	// Costs one wire buffer per outstanding transfer (wire_buffer_bytes, out of the
+	// huge-page pool), so the default is 16 threads x 2 x 4 MiB = 128 MiB -- the same
+	// footprint the old 32 x 1 default had.
+	idx_t max_in_flight = REGEX_FPGA_DEFAULT_IN_FLIGHT;
 
 	// Blocks on every outstanding transfer and discards its results.
 	//
