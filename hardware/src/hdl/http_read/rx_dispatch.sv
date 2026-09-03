@@ -41,6 +41,40 @@ import lynxTypes::*;
 // bypass path rxAppMemDataRead forwards words until currWord.last. Naming a larger length does not
 // coalesce segments; it only runs the receive window ahead of what was really consumed. That cost
 // build-90 a day, so the length here is always passed through from the notification unchanged.
+//
+// WHAT HAPPENS WHEN A CONSUMER NEVER COMES BACK
+// ---------------------------------------------
+// "Issue only when the destination has room" is head-of-line blocking by construction: the queue is
+// in arrival order, arrival order is the contract, and so a connection whose fifo is full holds up
+// every announcement behind it -- including announcements for lanes that are perfectly healthy.
+// While the consumer is merely slow that is a legal DELAY and the right behaviour. While the
+// consumer is DEAD it is a permanent one, and the whole receive path dies with the one lane
+// (lane_drain s_e, rxd_drain r2).
+//
+// Reordering around it is not available: the readPkg does not select a packet, it pops the head of
+// the shared fifo, so issuing out of order hands one session's bytes to another session's reader.
+// The only lever that keeps the drain moving is to READ the blocked connection's packets and THROW
+// THEM AWAY. So after HOL_STALL_CYCLES with the head waiting on one connection and that connection
+// accepting nothing, the connection is declared DEAD: its announcements are issued regardless of
+// its fifo, the bytes that come back are discarded, and dbg_lane_dead tells the handler -- which
+// makes the lane fatal and tears its session down, because a lane that has lost bytes out of the
+// middle of a response cannot be repaired by anything short of the host reissuing.
+//
+// The threshold is a long time on purpose. It has to sit above the longest transient a lane may
+// legitimately impose (lane_drain d and s_d hold a decoder off for ~58k cycles and must recover
+// with every byte intact) and below the point where the path is indistinguishable from dead. At
+// 250 MHz the default is 262 us -- longer than it takes a decoder running at its measured
+// ~615 MB/s to drain a whole 128 KiB lane fifo, so a lane that has accepted NOTHING for that long
+// is not a lane that is merely behind.
+//
+// AND WHY THE ANNOUNCEMENT QUEUE NO LONGER DROPS
+// ----------------------------------------------
+// It used to drop an announcement it could not enqueue. That is unrecoverable: the bytes it named
+// stay in the TOE's shared fifo with nobody left to ask for them, so every later packet queues
+// behind them forever (lane_drain s_d hung 3864 bytes short of 400000 exactly this way). Holding
+// the notification interface instead costs nothing in ordering -- an announcement that cannot be
+// enqueued could not have been issued ahead of the head anyway -- so TREADY now falls when, and
+// only when, a slot is genuinely needed and there is none.
 // =================================================================================================
 module rx_dispatch #(
     parameter int NUM_CONNS    = 4,
@@ -48,9 +82,13 @@ module rx_dispatch #(
     // TOE announces one segment at a time and the shared fifo holds 64 KB, so at MSS 4096 there can
     // never be more than 16 unread announcements in existence. 64 is comfortable.
     parameter int NOTIFY_DEPTH = 64,
+    // Cycles the head of the queue may wait on ONE connection that is accepting nothing before that
+    // connection is declared dead. See the note above for the sizing argument.
+    parameter int HOL_STALL_CYCLES = 65536,
     localparam int CONN_BITS   = (NUM_CONNS > 1) ? $clog2(NUM_CONNS) : 1,
     localparam int PTR_BITS    = $clog2(NOTIFY_DEPTH),
-    localparam int CNT_BITS    = $clog2(NOTIFY_DEPTH + 1)
+    localparam int CNT_BITS    = $clog2(NOTIFY_DEPTH + 1),
+    localparam int HOL_BITS    = $clog2(HOL_STALL_CYCLES + 1)
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -103,7 +141,10 @@ module rx_dispatch #(
 
     output logic [NUM_CONNS-1:0]       dbg_has_pending,
     output logic                       dbg_overflow,   // sticky: an announcement was dropped
-    output logic                       dbg_route_stall // sticky: a consumer refused a beat
+    output logic                       dbg_route_stall,// sticky: a consumer refused a beat
+    // Sticky, per connection: this connection blocked the head of the queue for HOL_STALL_CYCLES
+    // and its packets are now being read and thrown away. The handler turns this into a fatal lane.
+    output logic [NUM_CONNS-1:0]       dbg_lane_dead
 );
 
     // Packed appNotification layout (mirrors tcp_read.sv / tcp_session_table.sv):
@@ -139,9 +180,20 @@ module rx_dispatch #(
     // ---------------------------------------------------------------------------------------------
     logic [TCP_SESSION_BITS-1:0] nq_sid [NOTIFY_DEPTH];
     logic [TCP_LEN_BITS-1:0]     nq_len [NOTIFY_DEPTH];
+    // The connection each queued announcement was accepted FOR, recorded at enqueue time.
+    //
+    // The head's destination used to be re-derived with conn_of(head_sid), which stops working the
+    // moment a session is released: an unbound sid matches nothing and conn_of falls through to 0,
+    // so every stale entry claimed lane 0 -- gated on lane 0's fifo and, on the data side, spliced
+    // into lane 0's byte stream. Right by accident when the dead lane WAS lane 0, silent corruption
+    // otherwise. Three bits per entry make it exact and survive the release.
+    logic [CONN_BITS-1:0]        nq_conn[NOTIFY_DEPTH];
     logic [PTR_BITS-1:0]         nq_head_q, nq_tail_q;
     logic [CNT_BITS-1:0]         nq_cnt_q;
     logic                        ovf_q, route_stall_q;
+    // Per connection: declared dead by the head-of-line watchdog. Its announcements are issued
+    // without asking its fifo and the bytes are discarded, so the shared drain keeps moving.
+    logic [NUM_CONNS-1:0]        dead_q;
 
     // Announcements queued per connection, maintained incrementally.
     //
@@ -165,14 +217,27 @@ module rx_dispatch #(
     assign note_sid_w    = s_axis_notifications_TDATA[TCP_SESSION_BITS-1:0];
     assign note_len_w    = s_axis_notifications_TDATA[TCP_SESSION_BITS +: TCP_LEN_BITS];
     assign note_closed_w = s_axis_notifications_TDATA[CLOSED_BIT];
-    assign s_axis_notifications_TREADY = 1'b1;
-    assign note_fire_w   = s_axis_notifications_TVALID;
 
     // A notification for a session we do not have bound is not an error we can act on -- it belongs
     // to a connection torn down between the announcement and now. Dropping it is correct; queueing
     // it would issue a readPkg for a dead session and desynchronise the shared fifo for everyone.
+    // A bare FIN (length 0) needs no slot either: it only sets the sticky closed bit.
+    logic note_needs_slot_w;
+    assign note_needs_slot_w = (note_len_w != '0) && has_conn(note_sid_w);
+
+    // The ONLY thing this interface is ever held off for: a slot is needed and there is none.
+    //
+    // Back-pressuring it does stall every session at once, which is why it is not done casually --
+    // but by the time the queue is full the head is already blocked, so nothing could have been
+    // issued for any session anyway. The alternative is to drop the announcement, and a dropped
+    // announcement strands its bytes in the TOE's shared fifo permanently: nobody is left to ask
+    // for them and every packet behind them waits forever. Flow control loses nothing; dropping
+    // loses the connection.
+    assign s_axis_notifications_TREADY = !(note_needs_slot_w && nq_full_w);
+    assign note_fire_w   = s_axis_notifications_TVALID && s_axis_notifications_TREADY;
+
     logic note_keep_w;
-    assign note_keep_w = note_fire_w && (note_len_w != '0) && has_conn(note_sid_w);
+    assign note_keep_w = note_fire_w && note_needs_slot_w;
 
     // The enqueue condition, named once. Used by the queue pointers, by the count, and by the
     // per-connection pending counters below.
@@ -189,10 +254,17 @@ module rx_dispatch #(
     logic [CONN_BITS-1:0]        head_conn_w;
     assign head_sid_w  = nq_sid[nq_head_q];
     assign head_len_w  = nq_len[nq_head_q];
-    assign head_conn_w = conn_of(head_sid_w);
+    // An empty queue has no head, and the slot it would point at has never been written -- so
+    // reading it gives X, which then indexes conn_space_ok and, worse, latches into the watchdog's
+    // "who am I waiting on" register, where it stays: X != 0 is X, the compare that would refresh
+    // it is never taken, and the eventual dead_q[X] assigns nothing at all. The queue is only ever
+    // read when it is non-empty; saying so here keeps the X out of everything downstream.
+    assign head_conn_w = nq_empty_w ? CONN_BITS'(0) : nq_conn[nq_head_q];
 
+    // A dead connection's packets are read anyway, and thrown away on the data side. Asking its
+    // fifo would be pointless -- it is the fifo that is not draining -- and the drain must not stop.
     logic issue_ok_w;
-    assign issue_ok_w = !nq_empty_w && conn_space_ok[head_conn_w];
+    assign issue_ok_w = !nq_empty_w && (conn_space_ok[head_conn_w] || dead_q[head_conn_w]);
 
     assign m_axis_read_package_TVALID = issue_ok_w;
     assign m_axis_read_package_TDATA  = {head_len_w, head_sid_w};
@@ -201,10 +273,25 @@ module rx_dispatch #(
     assign issue_fire_w = m_axis_read_package_TVALID && m_axis_read_package_TREADY;
 
     // ---------------------------------------------------------------------------------------------
+    // Head-of-line watchdog. One counter, not N: only one connection can hold the head at a time,
+    // and that connection is the only one whose fifo anything is waiting on.
+    // ---------------------------------------------------------------------------------------------
+    logic                 hol_blocked_w;
+    logic [HOL_BITS-1:0]  hol_cnt_q;
+    logic [CONN_BITS-1:0] hol_conn_q;
+    assign hol_blocked_w = !nq_empty_w && !conn_space_ok[head_conn_w] && !dead_q[head_conn_w];
+
+    // ---------------------------------------------------------------------------------------------
     // Data routing. rx_meta names the session of the packet about to arrive; hold that until tlast.
     // ---------------------------------------------------------------------------------------------
     logic                 pkt_active_q;
     logic [CONN_BITS-1:0] pkt_conn_q;
+    // This packet is read off the bus and dropped rather than routed. Two reasons, both meaning the
+    // same thing -- nobody owns these bytes any more: the session was released (its lane has either
+    // gone away or been reconnected to a NEW session, and splicing an old session's bytes into a new
+    // one's stream is the corruption rxd_drain r6 exists to catch), or the connection was declared
+    // dead by the head-of-line watchdog.
+    logic                 pkt_drop_q;
 
     logic meta_fire_w;
     assign s_axis_rx_metadata_TREADY = !pkt_active_q;
@@ -219,7 +306,7 @@ module rx_dispatch #(
 
     always_comb begin
         conn_tvalid = '0;
-        if (pkt_active_q) conn_tvalid[pkt_conn_q] = s_axis_rx_data_TVALID;
+        if (pkt_active_q && !pkt_drop_q) conn_tvalid[pkt_conn_q] = s_axis_rx_data_TVALID;
     end
     assign conn_tdata = s_axis_rx_data_TDATA;
     assign conn_tkeep = s_axis_rx_data_TKEEP;
@@ -238,6 +325,10 @@ module rx_dispatch #(
             route_stall_q <= 1'b0;
             pkt_active_q  <= 1'b0;
             pkt_conn_q    <= '0;
+            pkt_drop_q    <= 1'b0;
+            dead_q        <= '0;
+            hol_cnt_q     <= '0;
+            hol_conn_q    <= '0;
             for (i = 0; i < NUM_CONNS; i++) begin
                 bound_q[i]  <= 1'b0;
                 sid_q[i]    <= '0;
@@ -245,15 +336,19 @@ module rx_dispatch #(
                 pend_q[i]   <= '0;
             end
         end else begin
-            // -- binding
+            // -- binding. A bind or a release is the only thing that revives a dead connection:
+            //    once bytes have been thrown away the lane's byte stream is broken, and only a
+            //    fresh session (which the handler opens after the host reissues) starts a new one.
             if (bind_en) begin
                 bound_q[bind_conn]  <= 1'b1;
                 sid_q[bind_conn]    <= bind_sid;
                 closed_q[bind_conn] <= 1'b0;
+                dead_q[bind_conn]   <= 1'b0;
             end
             if (release_en) begin
                 bound_q[release_conn]  <= 1'b0;
                 closed_q[release_conn] <= 1'b0;
+                dead_q[release_conn]   <= 1'b0;
             end
 
             // -- sticky FIN, recorded even for a zero-length notification
@@ -263,10 +358,14 @@ module rx_dispatch #(
 
             // -- enqueue / dequeue. Both can happen in the same cycle.
             if (enq_fire_w) begin
-                nq_sid[nq_tail_q] <= note_sid_w;
-                nq_len[nq_tail_q] <= note_len_w;
+                nq_sid[nq_tail_q]  <= note_sid_w;
+                nq_len[nq_tail_q]  <= note_len_w;
+                nq_conn[nq_tail_q] <= enq_conn_w;
                 nq_tail_q <= (nq_tail_q == PTR_BITS'(NOTIFY_DEPTH-1)) ? '0 : nq_tail_q + 1'b1;
             end
+            // Unreachable now that TREADY falls instead: an announcement that needs a slot is not
+            // accepted until it has one. Kept as the assertion that it stays that way -- if this
+            // bit ever reads back set, announcements are being lost again.
             if (note_keep_w && nq_full_w) ovf_q <= 1'b1;
 
             if (issue_fire_w) begin
@@ -296,19 +395,36 @@ module rx_dispatch #(
                 end
             end
 
-            // -- packet routing window
+            // -- packet routing window. The metadata names the session actually delivered, which is
+            //    what decides the lane; a session nobody holds any more decides nothing, and the
+            //    packet is consumed and dropped rather than falling through to lane 0.
             if (meta_fire_w) begin
                 pkt_active_q <= 1'b1;
                 pkt_conn_q   <= conn_of(s_axis_rx_metadata_TDATA[TCP_SESSION_BITS-1:0]);
+                pkt_drop_q   <= !has_conn(s_axis_rx_metadata_TDATA[TCP_SESSION_BITS-1:0]) ||
+                                 dead_q[conn_of(s_axis_rx_metadata_TDATA[TCP_SESSION_BITS-1:0])];
             end else if (data_fire_w && s_axis_rx_data_TLAST) begin
                 pkt_active_q <= 1'b0;
             end
 
             // A consumer that refuses a beat means its fifo filled despite conn_space_ok, i.e. the
             // space check is wrong or the fifo is undersized. Either way the shared fifo is being
-            // stalled again and the whole point of this module is lost.
-            if (pkt_active_q && s_axis_rx_data_TVALID && !conn_tready[pkt_conn_q]) begin
+            // stalled again and the whole point of this module is lost. A dropped packet is not
+            // offered to anyone, so it cannot be refused by anyone.
+            if (pkt_active_q && !pkt_drop_q && s_axis_rx_data_TVALID && !conn_tready[pkt_conn_q]) begin
                 route_stall_q <= 1'b1;
+            end
+
+            // -- head-of-line watchdog. Restarted whenever the head is free to go, or moves to a
+            //    different connection: what is being timed is one connection blocking continuously,
+            //    not the sum of every time it was briefly busy.
+            if (!hol_blocked_w || (head_conn_w != hol_conn_q)) begin
+                hol_conn_q <= head_conn_w;
+                hol_cnt_q  <= '0;
+            end else if (hol_cnt_q == HOL_BITS'(HOL_STALL_CYCLES)) begin
+                dead_q[hol_conn_q] <= 1'b1;
+            end else begin
+                hol_cnt_q <= hol_cnt_q + 1'b1;
             end
         end
     end
@@ -323,5 +439,6 @@ module rx_dispatch #(
 
     assign dbg_overflow    = ovf_q;
     assign dbg_route_stall = route_stall_q;
+    assign dbg_lane_dead   = dead_q;
 
 endmodule

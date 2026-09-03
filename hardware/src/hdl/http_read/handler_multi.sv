@@ -76,6 +76,24 @@ import http_types::*;
 //
 // Everything else is fatal for that lane -- dirty, or failing with work outstanding. The host holds
 // the request text and reissues the batch; that is the only place a retry can come from.
+//
+// FATAL MEANS THE CONNECTION GOES DOWN
+// ------------------------------------
+// A fatal lane is excluded from reconnect, and for a long time that also meant it was excluded from
+// TEARDOWN: conn_up_q stayed high forever, so clear_framing (which is !conn_up_q) never rose, so the
+// lane's decoupling fifo was never flushed and never discarded. A lane that had already stopped
+// consuming therefore went on refusing space for the rest of time, and rx_dispatch's queue is in
+// arrival order -- so the dead lane held the head and every other lane starved behind it.
+//
+// So fatal now closes the session. Not to reopen it: the lane stays down and only the host can
+// restart it, exactly as before. What the teardown buys is that a lane which is out of the game
+// stops PRETENDING to be in it -- clear_framing resets the framer, empties the fifo, and turns the
+// lane into something that accepts and discards whatever the dispatcher still routes to it. That is
+// what lets everyone else carry on.
+//
+// It is also what makes a later host-driven restart safe: the fifo is held empty and the framer
+// held in reset for as long as the lane is down, so there is no residue of the dead session left to
+// be spliced onto the front of a new one.
 // =================================================================================================
 module handler_multi #(
     // Lanes. One TCP session, one framer, one chunk-length queue and one decoder each.
@@ -87,6 +105,10 @@ module handler_multi #(
     parameter int RX_FIFO_DEPTH = 2048,
     parameter int TX_CHUNK_BYTES = 4096,
     parameter int STALL_CYCLES = 268435456,
+    // How long one lane may hold up the shared receive path before it is declared dead. See
+    // rx_dispatch, which does the timing and the discarding; this module only decides what a dead
+    // lane means, which is: fatal, and the session goes.
+    parameter int LANE_STALL_CYCLES = 65536,
     localparam int CONN_BITS = (NUM_CONNS > 1) ? $clog2(NUM_CONNS) : 1
 ) (
     input  logic ap_clk,
@@ -257,9 +279,11 @@ module handler_multi #(
 
     // Reconnect decision wires. The logic is below, after the per-lane signals it reads are
     // declared; only the declarations can live up here, where the bring-up FSM needs them.
-    logic [NUM_CONNS-1:0] lane_idle_w, lane_want_reconn_w, lane_must_die_w;
-    logic                 reconn_pending_w;
-    logic [CONN_BITS-1:0] reconn_lane_w;
+    logic [NUM_CONNS-1:0] lane_idle_w, lane_want_reconn_w, lane_must_die_w, lane_want_close_w;
+    logic                 reconn_pending_w, close_pending_w;
+    logic [CONN_BITS-1:0] reconn_lane_w, close_lane_w;
+    // A close with no open behind it. Same teardown as a reconnect, stopping one state early.
+    logic                 close_only_q, close_only_d;
 
     // =============================================================================================
     // Receive: one dispatcher, N framing lanes.
@@ -268,12 +292,13 @@ module handler_multi #(
     logic [AXI_DATA_BITS-1:0]   conn_tdata;
     logic [AXI_DATA_BITS/8-1:0] conn_tkeep;
     logic                       conn_tlast;
-    logic [NUM_CONNS-1:0]       rxd_has_pending;
+    logic [NUM_CONNS-1:0]       rxd_has_pending, rxd_lane_dead;
     logic                       rxd_overflow, rxd_route_stall;
 
     rx_dispatch #(
-        .NUM_CONNS   (NUM_CONNS),
-        .NOTIFY_DEPTH(64)
+        .NUM_CONNS       (NUM_CONNS),
+        .NOTIFY_DEPTH    (64),
+        .HOL_STALL_CYCLES(LANE_STALL_CYCLES)
     ) inst_rx_dispatch (
         .clk(ap_clk), .rst_n(ap_rst_n),
         .s_axis_notifications_TVALID(s_axis_notifications_TVALID),
@@ -297,7 +322,8 @@ module handler_multi #(
         .conn_space_ok(conn_space_ok), .conn_closed(conn_closed),
         .dbg_has_pending(rxd_has_pending),
         .dbg_overflow   (rxd_overflow),
-        .dbg_route_stall(rxd_route_stall)
+        .dbg_route_stall(rxd_route_stall),
+        .dbg_lane_dead  (rxd_lane_dead)
     );
 
     // =============================================================================================
@@ -492,6 +518,15 @@ module handler_multi #(
                                        ((lane_error[L] && !lane_error_dirty[L]) || conn_closed[L]);
 
         assign lane_must_die_w[L] = lane_error[L] && (lane_error_dirty[L] || !lane_idle_w[L]);
+
+        // A fatal lane that still holds a session. There is no precondition to wait for and
+        // deliberately so: the reasons a lane goes fatal are a failure it cannot replay, or a
+        // consumer that has taken nothing for LANE_STALL_CYCLES -- and in the second case waiting
+        // for the lane to be idle, or for its body output to be quiet, would wait for the very
+        // thing that is not going to happen. What teardown can lose is a beat strip_http was
+        // holding out to a sink that never took it; everything the sink DID take is already past
+        // the framer and untouched by clear_framing. The lane owes the host a reissue either way.
+        assign lane_want_close_w[L] = conn_up_q[L] && lane_fatal_q[L];
     end
 
     // First lane asking, lowest index. Reconnects are rare and one at a time is plenty -- the
@@ -499,10 +534,16 @@ module handler_multi #(
     always_comb begin
         reconn_pending_w = 1'b0;
         reconn_lane_w    = '0;
+        close_pending_w  = 1'b0;
+        close_lane_w     = '0;
         for (int i = NUM_CONNS - 1; i >= 0; i--) begin
             if (lane_want_reconn_w[i]) begin
                 reconn_pending_w = 1'b1;
                 reconn_lane_w    = CONN_BITS'(i);
+            end
+            if (lane_want_close_w[i]) begin
+                close_pending_w = 1'b1;
+                close_lane_w    = CONN_BITS'(i);
             end
         end
     end
@@ -510,6 +551,7 @@ module handler_multi #(
     always_comb begin
         br_d         = br_q;
         bring_lane_d = bring_lane_q;
+        close_only_d = close_only_q;
         bind_en_w    = 1'b0;
         bind_conn_w  = bring_lane_q;
         bind_sid_w   = init_session_id;
@@ -552,23 +594,37 @@ module handler_multi #(
 
             // All lanes up. The connect resource is free, so this is where a lane that wants a new
             // connection gets one -- one at a time, because there is only one tcp_init.
+            //
+            // A fatal lane's teardown goes FIRST. It needs no tcp_init and it is what unblocks the
+            // shared receive path, so making it wait behind a reconnect -- which does need the
+            // tcp_init, and can be held off by retry_wait_q for 65535 cycles after a failed open --
+            // would leave every other lane starving for the whole of that backoff.
             BR_DONE: begin
-                if (reconn_pending_w && (retry_wait_q == '0)) begin
+                if (close_pending_w) begin
+                    bring_lane_d = close_lane_w;
+                    close_only_d = 1'b1;
+                    br_d         = BR_CLOSE;
+                end else if (reconn_pending_w && (retry_wait_q == '0)) begin
                     bring_lane_d = reconn_lane_w;
+                    close_only_d = 1'b0;
                     br_d         = BR_CLOSE;
                 end
             end
 
-            // Drop the old session before asking for a new one. The release must reach rx_dispatch
-            // in the same breath: an unbound session id stops matching, so a late notification for
-            // the dead connection is dropped rather than turned into a readPkg for a session the
-            // TOE has forgotten -- which would desynchronise the shared fifo for every other lane.
+            // Drop the session. The release must reach rx_dispatch in the same breath: an unbound
+            // session id stops matching, so a late notification for the dead connection is dropped
+            // rather than turned into a readPkg for a session the TOE has forgotten -- which would
+            // desynchronise the shared fifo for every other lane.
+            //
+            // Then either open a fresh session (a reconnect) or stop here (a fatal lane). Stopping
+            // is the whole difference: the lane stays down, which is what holds clear_framing high,
+            // which is what makes it discard instead of block.
             BR_CLOSE: begin
                 m_axis_close_connection_TVALID = 1'b1;
                 if (m_axis_close_connection_TREADY) begin
                     release_en_w   = 1'b1;
                     release_conn_w = bring_lane_q;
-                    br_d           = BR_OPEN;
+                    br_d           = close_only_q ? BR_DONE : BR_OPEN;
                 end
             end
         endcase
@@ -586,6 +642,7 @@ module handler_multi #(
         if (!ap_rst_n) begin
             br_q          <= BR_IDLE;
             bring_lane_q  <= '0;
+            close_only_q  <= 1'b0;
             bringing_up_q <= 1'b1;
             conn_up_q     <= '0;
             reconn_cnt_q  <= '0;
@@ -608,6 +665,7 @@ module handler_multi #(
         end else begin
             br_q         <= br_d;
             bring_lane_q <= bring_lane_d;
+            close_only_q <= close_only_d;
             // The initial walk ends the first time every lane is up.
             if (br_q == BR_NEXT && int'(bring_lane_q) == NUM_CONNS - 1) bringing_up_q <= 1'b0;
 
@@ -620,7 +678,9 @@ module handler_multi #(
 
             if (release_en_w) begin
                 conn_up_q[release_conn_w] <= 1'b0;
-                if (reconn_cnt_q != 8'hFF) reconn_cnt_q <= reconn_cnt_q + 8'd1;
+                // Only a release that a new session follows is a reconnect. Counting a fatal
+                // lane's teardown here would report a recovery that never happened.
+                if (!close_only_q && (reconn_cnt_q != 8'hFF)) reconn_cnt_q <= reconn_cnt_q + 8'd1;
             end
             // Bind after release in source order so a same-cycle pair cannot leave the lane down;
             // they never coincide (BR_CLOSE and BR_OPEN are different states), but the ordering
@@ -656,7 +716,15 @@ module handler_multi #(
                 // reached the decoder, so replay would duplicate them) or with work outstanding
                 // (the request text is gone and only the host can reissue it). A clean error on an
                 // idle lane is a reconnect, handled by the bring-up FSM.
-                if (lane_must_die_w[L]) lane_fatal_q[L] <= 1'b1;
+                //
+                // The third way in is not a read failure at all. rx_dispatch declares a connection
+                // dead once it has held the head of the announcement queue for LANE_STALL_CYCLES
+                // while accepting nothing, and from then on it reads that connection's packets and
+                // throws them away to keep the shared drain moving. Bytes have been lost out of the
+                // middle of a response by the time we see this, so the lane is fatal in the
+                // strongest sense -- there is nothing left to reconnect to, only a batch for the
+                // host to reissue.
+                if (lane_must_die_w[L] || rxd_lane_dead[L]) lane_fatal_q[L] <= 1'b1;
                 if (lane_resp_error[L]) lane_resp_err_q[L] <= 1'b1;
 
                 // The read stage. Clear beats set, so a lane that still owes bytes drops `start`
