@@ -281,6 +281,49 @@ streams *below* the lane count carry request text and only those above it are ti
 (`vfpga_top.svh:32`). Sending a lane's text to a tied-off stream is silent data loss: `tready` stays
 high, the bytes are discarded, the DMA reports success, and the armed handler waits forever.
 
+### The CSR read map — revision 2
+
+Registers 0–15 are revision 1 and have not moved; **the write map is frozen** and revision 2 does not
+touch it. The full field tables live in `http_config.sv`'s header, which is the normative copy; this
+is the shape and the reason for it.
+
+Read `INFLIGHT[31:24]` **first**. It was a literal zero through revision 1 and reads `2` here, and
+that byte is the entire compatibility scheme: registers 16–20 do not exist on an earlier bitstream
+and reading them there comes back as `resp_error`, not as zeros, while a library that predates the
+byte ignores it. Neither side has to be upgraded in step with the other — which is the failure mode
+this project keeps paying for, because a bitstream and a host library that disagree about a map fail
+*silently*, in both directions.
+
+| id | name | what it carries |
+|---|---|---|
+| 16 | `LANE_OCC` | chunk entries queued and not yet retired, **one byte per lane** at `[8L+7:8L]`, saturating at 255 |
+| 17 | `LANE_READY` | the admission window, **one nibble per lane** at `[4L+3:4L]`: `+0` ARM_READY, `+1` ENTRY_READY, `+2` CONN_UP, `+3` FATAL |
+| 18 | `LANE_STATE` | `tcp_read` state at `[4L+3:4L]`, `http_req_stream` state at `[32+4L+3:32+4L]` |
+| 19 | `LANE_ERR` | sticky causes, **one byte per lane** at `[8L+7:8L]`: `+0` LANE_DEAD, `+1` DIRTY, `+2` INIT_ERR, `+3` RESP_ERR, `+4` STATUS_BAD, `+5` TX_REFUSED, `+6` READ_TIMEOUT, `+7` RX_FIFO_STALL |
+| 20 | `LANE_POLICY` | `[7:0]` revision, `[15:8]` `NUM_CONNS`, `[31:16]` `QUEUE_DEPTH`, `[55:32]` `LANE_STALL_CYCLES`, `[61:56]` its log2 |
+
+Three decisions in that table are load-bearing.
+
+**The stride is fixed at eight lanes, not `NUM_CONNS`.** A host compiled against one bitstream reads
+another; a stride that moved with the lane count would reinterpret every field the moment a two-lane
+bitstream was swapped for a four-lane one, and reinterpret it *plausibly*. Lanes the bitstream does
+not have read zero, and `INFLIGHT[23:20]` says how many are real.
+
+**Both admission bits sit in one register.** They are monotone in the host's favour — only a config
+beat the host itself writes can clear either — so a value read is still true when the write lands,
+and poll-then-write needs no retry and no lock. Splitting them across two registers would not break
+that (monotonicity is per bit) but would cost a second round trip on a path taken once per column
+chunk. Note `ARM_READY` stays **low** on a fatal lane that was armed and never sent: check `FATAL`
+first, or wait forever.
+
+**`LANE_DEAD` cannot be inferred from anything else.** `rx_dispatch`'s own `dead_q` is cleared when a
+session is bound or released — and releasing the session is exactly what `handler_multi` does to a
+lane it has just declared fatal. By the time the host polls, `dbg_lane_dead` is back to zero and
+`FATAL` is set, so "the head-of-line watchdog discarded bytes out of the middle of this lane's
+response" and "this lane failed a read it could not replay" are the same reading. They ask for
+different things from the host, so the cause is latched in `handler_multi` at the moment it is true.
+`lane_drain`'s `s_e` asserts it on the killed lane and asserts it clear on the survivors.
+
 ### What would overturn ADR-4
 
 - **MinIO does not scale in this request shape.** `scripts/util/conn_scaling.sh` measures GB/s *per

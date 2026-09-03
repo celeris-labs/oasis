@@ -170,6 +170,13 @@ logic [31:0]                   http_stall_word;
 logic [31:0]                   http_resp_word;
 logic [31:0]                   http_content_length_word;
 logic [31:0]                   http_body_remaining_word;
+// Per-lane readback (CSR revision 2, read registers 16..20). 64 bits because eight lanes need eight
+// bytes and the AXI-Lite data path is 64 wide; see the read map in http_config.sv.
+logic [63:0]                   http_lane_occ_word;
+logic [63:0]                   http_lane_ready_word;
+logic [63:0]                   http_lane_state_word;
+logic [63:0]                   http_lane_err_word;
+logic [63:0]                   http_lane_policy_word;
 
 // 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
 // 8 to 16 words, which put START on top of RANGE_BEGIN_W1: writing that parameter fired the request
@@ -192,7 +199,12 @@ HttpConfig #(
     .stall_word   (http_stall_word),
     .resp_word           (http_resp_word),
     .content_length_word (http_content_length_word),
-    .body_remaining_word (http_body_remaining_word)
+    .body_remaining_word (http_body_remaining_word),
+    .lane_occ_word       (http_lane_occ_word),
+    .lane_ready_word     (http_lane_ready_word),
+    .lane_state_word     (http_lane_state_word),
+    .lane_err_word       (http_lane_err_word),
+    .lane_policy_word    (http_lane_policy_word)
 );
 `elsif EN_RDMA
 RDMAReadConfig #(
@@ -434,7 +446,13 @@ handler_multi #(
     .respWord         (http_resp_word),
     .contentLengthWord(http_content_length_word),
     .bodyRemainingWord(http_body_remaining_word),
-    .state_debug      (http_client_state)
+    .state_debug      (http_client_state),
+
+    .laneOccWord      (http_lane_occ_word),
+    .laneReadyWord    (http_lane_ready_word),
+    .laneStateWord    (http_lane_state_word),
+    .laneErrWord      (http_lane_err_word),
+    .lanePolicyWord   (http_lane_policy_word)
 );
 
 // Each lane is already its own stream -- there is nothing left to select.

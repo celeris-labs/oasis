@@ -93,6 +93,76 @@ import http_types::*;
 //                        error document). BODY_REMAINING alone cannot say this -- it counts down
 //                        to zero and is meaningless once the response is over.
 //
+// Registers 16..20 are CSR REVISION 2 and did not exist before it. Read INFLIGHT[31:24] first: it
+// reads 2 here and 0 on every earlier bitstream, and reading 16..20 on one of those comes back as
+// resp_error, not as zeros. Registers 0..15 and the ENTIRE WRITE MAP are unchanged -- a library
+// that knows nothing about revision 2 keeps working, and a host that knows about it keeps working
+// against a revision-1 bitstream by not reading these.
+//
+// Everything below is indexed by LANE at a fixed stride of 8 lanes, whatever NUM_CONNS the
+// bitstream was built with. Lanes that do not exist read 0; INFLIGHT[23:20] says how many are real.
+// Widths are 64 bits -- the AXI-Lite data path is AXIL_DATA_BITS = 64 and registers 6/7/8 above
+// already carry fields above bit 31 that the host decodes today.
+//
+//   16 LANE_OCC        -- chunk entries QUEUED AND NOT YET RETIRED, one byte per lane, saturating
+//                         at 255. Lane L at [8L+7:8L]. Retired means a tlast completed the chunk's
+//                         byte count, so this is "responses this lane still owes", which is what
+//                         the host's credit is against. QUEUE_DEPTH (15) is the untruncated limit.
+//   17 LANE_READY      -- the ADMISSION WINDOW, one nibble per lane at [4L+3:4L]:
+//                           [4L+0] ARM_READY   the lane will accept an ARM beat (req_total_bytes
+//                                              != 0) -- its previous request text has gone out
+//                           [4L+1] ENTRY_READY the lane will accept a chunk ENTRY beat
+//                                              (req_total_bytes == 0) -- its queue has room
+//                           [4L+2] CONN_UP     the lane holds an established TCP session
+//                           [4L+3] FATAL       the lane is out of the game until the host reissues
+//                         BOTH admission bits are in ONE register on purpose. They are monotone in
+//                         the host's favour -- only a config beat the host itself writes can clear
+//                         either -- so a value read here is still true when the write lands, and
+//                         poll-then-write needs no retry and no lock. Note ARM_READY stays 0 on a
+//                         fatal lane that was armed and never sent: check FATAL first, or wait
+//                         forever.
+//   18 LANE_STATE      -- FSM states, one nibble per lane:
+//                           [4L+3:4L]      tcp_read state_debug (the receive/framing lane)
+//                           [32+4L+3:32+4L] http_req_stream state_debug (that lane's transmit side:
+//                                          0 IDLE, 1 SEND_META, 2 WAIT_STAT, 3 SEND_DATA, 4 DRAIN)
+//   19 LANE_ERR        -- STICKY causes, one byte per lane at [8L+7:8L]. Sticky since reset; a
+//                         reconnect does not clear them, which is the point -- the conditions that
+//                         matter are transient at the hardware and long gone by the time anyone
+//                         polls:
+//                           [8L+0] LANE_DEAD      rx_dispatch's head-of-line watchdog declared this
+//                                                 lane dead and started discarding its packets.
+//                                                 THE ONE THAT CANNOT BE INFERRED: the handler
+//                                                 tears the session down in response, which clears
+//                                                 rx_dispatch's own dead bit, so without this a
+//                                                 HOL kill and an unreplayable read failure look
+//                                                 identical. Bytes were dropped out of the MIDDLE
+//                                                 of a response -- the whole batch must be reissued
+//                           [8L+1] DIRTY          the read aborted after body bytes had already
+//                                                 reached the decoder, so a replay would duplicate
+//                           [8L+2] INIT_ERR       a connect attempt for this lane failed
+//                           [8L+3] RESP_ERR       a response could not be framed (no Content-Length)
+//                           [8L+4] STATUS_BAD     a response retired with a status read as neither
+//                                                 200 nor 206
+//                           [8L+5] TX_REFUSED     the TOE refused at least one transmit reservation
+//                                                 (informational; it is re-announced)
+//                           [8L+6] READ_TIMEOUT   the read watchdog expired -- nothing arrived, as
+//                                                 opposed to the server saying no
+//                           [8L+7] RX_FIFO_STALL  this lane's decoupling fifo back-pressured the
+//                                                 TCP stack, i.e. the decoder could not keep up
+//                         FATAL lives in 17, not here. fatal AND lane_dead is a HOL kill; fatal and
+//                         not lane_dead is a read that could not be replayed, and the other bits
+//                         say which.
+//   20 LANE_POLICY     -- fixed at elaboration, for the host to sanity-check itself against:
+//                           [7:0]   CSR revision (2 -- same value as INFLIGHT[31:24])
+//                           [15:8]  NUM_CONNS
+//                           [31:16] QUEUE_DEPTH, chunk entries PER LANE, saturating at 65535
+//                           [55:32] LANE_STALL_CYCLES, the HOL watchdog threshold in cycles,
+//                                   saturating at 2^24-1
+//                           [61:56] log2 of it, exact even where the 24-bit field saturates
+//                           [63:62] zero
+//                         A software watchdog shorter than LANE_STALL_CYCLES declares a lane dead
+//                         that the hardware is still waiting on; that is what this exists to stop.
+//
 // INFLIGHT is not optional bookkeeping. ConfigWriteReadyRegister does NOT back-pressure: a START
 // write that lands while the previous one is still unconsumed overwrites it, and the earlier request
 // is lost without a trace. With the handler pipelined over several slots the host can legitimately
@@ -127,7 +197,14 @@ module HttpConfig #(
     input  logic [31:0] stall_word,
     input  logic [31:0] resp_word,
     input  logic [31:0] content_length_word,
-    input  logic [31:0] body_remaining_word
+    input  logic [31:0] body_remaining_word,
+
+    // Per-lane readback, CSR revision 2. See the read map above for the field tables.
+    input  logic [63:0] lane_occ_word,
+    input  logic [63:0] lane_ready_word,
+    input  logic [63:0] lane_state_word,
+    input  logic [63:0] lane_err_word,
+    input  logic [63:0] lane_policy_word
 );
 
 `RESET_RESYNC
@@ -319,7 +396,7 @@ assign start_raw.ready = start_cfg.ready;
 // discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
 // ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-localparam int NUM_READ_REGS = 16;
+localparam int NUM_READ_REGS = 21;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -351,7 +428,28 @@ assign read_registers[14] = {32'b0, content_length_word};
 // that predates this register and must fall back to the saturated byte.
 assign read_registers[15] = {32'b0, queue_depth_word};
 
+// -------------------------------------------------------------------------------------------------
+// CSR revision 2: per-lane visibility.
+//
+// Everything from 10 to 15 folds N lanes into one 32-bit window with OR, which was right when there
+// was one lane and says almost nothing with four: the host learns that SOMETHING failed and then has
+// to guess which lane to reissue. These five are indexed by lane at a fixed stride.
+//
+// They are APPENDED at previously unused addresses, and nothing at 0..15 moved. That, plus the
+// revision byte in INFLIGHT, is the entire compatibility story -- deployed bitstreams and installed
+// libraries disagree about maps whenever a map is edited rather than extended, and that failure is
+// silent in both directions.
+// -------------------------------------------------------------------------------------------------
+assign read_registers[16] = lane_occ_word;
+assign read_registers[17] = lane_ready_word;
+assign read_registers[18] = lane_state_word;
+assign read_registers[19] = lane_err_word;
+assign read_registers[20] = lane_policy_word;
+
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
+// The read side shares HTTP_CONFIG_ADDR_SPACE with the write side (vfpga_top.svh), and the read
+// register file answers anything above NUM_READ_REGS-1 with resp_error. Both have to cover 20.
+`ASSERT_ELAB(AXIL_DATA_BITS >= 64)
 
 ConfigReadRegisterFile #(
     .NUM_REGS(NUM_READ_REGS)

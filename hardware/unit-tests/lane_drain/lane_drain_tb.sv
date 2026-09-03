@@ -83,6 +83,13 @@ module lane_drain_tb #(
     logic [31:0] totalWord, inflightWord, queueDepthWord, stallWord, respWord,
                  contentLengthWord, bodyRemainingWord;
     logic [3:0]  state_debug;
+    // Per-lane readback, CSR revision 2. See the map in http_config.sv.
+    logic [63:0] laneOccWord, laneReadyWord, laneStateWord, laneErrWord, lanePolicyWord;
+
+    // laneErrWord[8L+0]: rx_dispatch's head-of-line watchdog killed lane L. Latched in
+    // handler_multi rather than read from rx_dispatch, because the handler's response to a dead
+    // lane is to release the session -- which clears rx_dispatch's own dead bit.
+    function automatic bit lane_dead_sticky(input int L); return laneErrWord[8*L + 0]; endfunction
 
     handler_multi #(
         .NUM_CONNS    (NUM_CONNS),
@@ -127,7 +134,9 @@ module lane_drain_tb #(
         .m_axis_body_tlast (bd_tlast),
         .totalWord(totalWord), .inflightWord(inflightWord), .queueDepthWord(queueDepthWord),
         .stallWord(stallWord), .respWord(respWord), .contentLengthWord(contentLengthWord),
-        .bodyRemainingWord(bodyRemainingWord), .state_debug(state_debug)
+        .bodyRemainingWord(bodyRemainingWord), .state_debug(state_debug),
+        .laneOccWord(laneOccWord), .laneReadyWord(laneReadyWord), .laneStateWord(laneStateWord),
+        .laneErrWord(laneErrWord), .lanePolicyWord(lanePolicyWord)
     );
 
     // =============================================================================================
@@ -1154,6 +1163,32 @@ module lane_drain_tb #(
                 dump("s_e");
                 if (ln[1].resp_done > b1) verdict = "CONTAINED (lane 1 still served)";
                 else                      verdict = "NOT CONTAINED (whole receive path died with lane 0)";
+
+                // WHICH LANE DIED, AND OF WHAT.
+                //
+                // Containment is only half of what the host needs. Lane 0 was killed by the
+                // head-of-line watchdog, which means bytes were discarded out of the MIDDLE of its
+                // response and the batch must be reissued; a lane that failed a read it could not
+                // replay wants the same reissue but says something different about the connection.
+                // Both set FATAL and nothing else distinguished them, because the handler's answer
+                // to a dead lane is to release the session -- and releasing it clears rx_dispatch's
+                // dead bit before anyone can read it. laneErrWord[8L] is that cause, latched.
+                //
+                // The neighbours' bits matter as much as lane 0's: a sticky vector that set every
+                // lane would be as useless as no vector at all, and is exactly what an OR-folded
+                // signal or a mis-indexed slot produces.
+                $display("  [cyc=%0d] CSR laneErr=0x%016h  laneReady=0x%016h",
+                         cyc, laneErrWord, laneReadyWord);
+                if (!lane_dead_sticky(0)) begin
+                    $display("  lane 0 was killed by the HOL watchdog but its lane-dead sticky bit reads CLEAR");
+                    verdict = "FAIL (lane-dead sticky bit not set on the killed lane)";
+                end
+                for (int L = 1; L < NUM_CONNS; L++) begin
+                    if (lane_dead_sticky(L)) begin
+                        $display("  lane %0d reads lane-dead, but only lane 0's consumer was stopped", L);
+                        verdict = $sformatf("FAIL (lane-dead set on surviving lane %0d)", L);
+                    end
+                end
             end
         end
 

@@ -72,6 +72,25 @@ module handler_multi_tb;
     logic [31:0] totalWord, inflightWord, queueDepthWord, stallWord;
     logic [31:0] respWord, contentLengthWord, bodyRemainingWord;
     logic [3:0]  state_debug;
+    logic [63:0] laneOccWord, laneReadyWord, laneStateWord, laneErrWord, lanePolicyWord;
+
+    // The per-lane readback map (CSR revision 2), as software will index it. Decoding it here rather
+    // than writing bit numbers into the checks is the point: if the packing and the host's idea of it
+    // ever diverge, they diverge in one place.
+    localparam int LANE_STALL_CYCLES_EXP = 65536;   // handler_multi's default, not overridden below
+
+    function automatic int unsigned lane_occ (input int L); return laneOccWord[8*L +: 8]; endfunction
+    function automatic bit arm_ready  (input int L); return laneReadyWord[4*L + 0]; endfunction
+    function automatic bit entry_ready(input int L); return laneReadyWord[4*L + 1]; endfunction
+    function automatic bit lane_up    (input int L); return laneReadyWord[4*L + 2]; endfunction
+    function automatic bit lane_fatal (input int L); return laneReadyWord[4*L + 3]; endfunction
+    function automatic bit lane_dead  (input int L); return laneErrWord  [8*L + 0]; endfunction
+
+    function automatic string occ_str();
+        string s = "";
+        for (int L = 0; L < 8; L++) s = {s, $sformatf("%0d ", lane_occ(L))};
+        return s;
+    endfunction
 
     handler_multi #(
         .NUM_CONNS    (NUM_CONNS),
@@ -131,7 +150,11 @@ module handler_multi_tb;
         .totalWord(totalWord), .inflightWord(inflightWord),
         .queueDepthWord(queueDepthWord), .stallWord(stallWord),
         .respWord(respWord), .contentLengthWord(contentLengthWord),
-        .bodyRemainingWord(bodyRemainingWord), .state_debug(state_debug)
+        .bodyRemainingWord(bodyRemainingWord), .state_debug(state_debug),
+
+        .laneOccWord(laneOccWord), .laneReadyWord(laneReadyWord),
+        .laneStateWord(laneStateWord), .laneErrWord(laneErrWord),
+        .lanePolicyWord(lanePolicyWord)
     );
 
     assign body_ready = '1;
@@ -650,6 +673,260 @@ module handler_multi_tb;
                 ok("pipelined/no_sticky_stalls");
             else
                 bad($sformatf("pipelined/no_sticky_stalls (stallWord=%08h)", stallWord));
+        end
+
+        // =========================================================================================
+        // UNEQUAL LOAD ACROSS THE LANES, and the per-lane readback that has to track it.
+        //
+        // Every readback check above reads a word that ORs the lanes together. Those cannot tell
+        // "lane 0 owes eight responses and lane 2 owes one" from "some lane owes something" -- and
+        // the second is not an answer to the question the host actually asks, which is per lane and
+        // asked before every single config beat: may I push another entry on THIS lane, may I arm
+        // it. CSR revision 2 answers that; this case is what says the answer is true.
+        //
+        // The load is deliberately lopsided, and lane 0 is filled to QUEUE_DEPTH *exactly*. Filling
+        // one lane is what makes the check sharp: ENTRY_READY must go LOW on lane 0 while staying
+        // HIGH on its neighbours, which is a distinction a design that folded the lanes together --
+        // or that indexed one nibble along -- cannot produce. Lanes 1 and 3 stay empty throughout,
+        // so a packing that leaked a busy lane's count into a quiet lane's slot shows up as a
+        // non-zero count on a lane that was never used.
+        // =========================================================================================
+        $display("--- per_lane_readback_unequal_load ---");
+        begin
+            automatic int    body3   = 96;
+            automatic int    n_lane0 = QUEUE_DEPTH;   // exactly fills lane 0's chunk queue
+            automatic int    r_len [16];              // byte length of each of lane 0's responses
+            automatic int    r2_len  = 0;
+            automatic int    tl0     = tlasts[0];
+            automatic int    tl2     = tlasts[2];
+            automatic int    got0_before = got[0].size();
+            automatic int    got2_before = got[2].size();
+            automatic string txt0    = "";
+            automatic string txt2;
+            automatic bit    good3;
+            automatic int    t  = 0;
+            automatic int    sz = 0;
+
+            // Responses waiting on the wire: n_lane0 on lane 0, one on lane 2, none on 1 and 3.
+            // A distinct base byte per response, so a body served to the wrong lane or in the wrong
+            // order changes the bytes and not only their count.
+            for (int r = 0; r < n_lane0; r++) begin
+                sz = sess_bytes[0].size();
+                append_response(0, body3, byte'(8'hA0 + r));
+                r_len[r] = sess_bytes[0].size() - sz;
+            end
+            sz = sess_bytes[2].size();
+            append_response(2, body3, 8'h5A);
+            r2_len = sess_bytes[2].size() - sz;
+
+            for (int r = 0; r < n_lane0; r++)
+                txt0 = {txt0, $sformatf(
+                    "GET /bucket/u0_%0d.parquet HTTP/1.1\r\nHost: 10.0.0.1:9000\r\nRange: bytes=%0d-%0d\r\nConnection: keep-alive\r\n\r\n",
+                    r, 50000 + r*1000, 50000 + r*1000 + body3 - 1)};
+            txt2 = $sformatf(
+                "GET /bucket/u2.parquet HTTP/1.1\r\nHost: 10.0.0.1:9000\r\nRange: bytes=0-%0d\r\nConnection: keep-alive\r\n\r\n",
+                body3 - 1);
+
+            // -- BEFORE: the entries are queued, nothing is armed, nothing is on the wire ---------
+            for (int r = 0; r < n_lane0; r++) push_entry(0, body3);
+            push_entry(2, body3);
+            repeat (4) @(posedge clk);
+
+            good3 = 1;
+            if (lane_occ(0) != n_lane0) begin
+                $display("        lane 0 occupancy reads %0d, expected %0d", lane_occ(0), n_lane0);
+                good3 = 0;
+            end
+            if (lane_occ(2) != 1) begin
+                $display("        lane 2 occupancy reads %0d, expected 1", lane_occ(2));
+                good3 = 0;
+            end
+            // Lanes 1 and 3 were never touched; 4..7 do not exist on a 4-lane bitstream and must
+            // read as absent rather than as an alias of a lane that does.
+            for (int L = 0; L < 8; L++) begin
+                if (L != 0 && L != 2 && lane_occ(L) != 0) begin
+                    $display("        lane %0d occupancy reads %0d, expected 0 (unused lane)",
+                             L, lane_occ(L));
+                    good3 = 0;
+                end
+            end
+            if (good3) ok($sformatf("readback/occupancy_before_drain (%s)", occ_str()));
+            else       bad($sformatf("readback/occupancy_before_drain (occ = %s)", occ_str()));
+
+            good3 = 1;
+            if (entry_ready(0)) begin
+                $display("        lane 0 holds %0d of QUEUE_DEPTH=%0d entries but still reads ENTRY_READY",
+                         lane_occ(0), QUEUE_DEPTH);
+                good3 = 0;
+            end
+            for (int L = 1; L < NUM_CONNS; L++) begin
+                if (!entry_ready(L)) begin
+                    $display("        lane %0d reads ENTRY_READY low with %0d entries queued -- a full lane blocked an empty one",
+                             L, lane_occ(L));
+                    good3 = 0;
+                end
+            end
+            for (int L = 0; L < NUM_CONNS; L++) begin
+                if (!arm_ready(L)) begin
+                    $display("        lane %0d reads ARM_READY low with nothing armed", L);
+                    good3 = 0;
+                end
+                if (!lane_up(L)) begin
+                    $display("        lane %0d reads CONN_UP low", L);
+                    good3 = 0;
+                end
+                if (lane_fatal(L)) begin
+                    $display("        lane %0d reads FATAL on a healthy run", L);
+                    good3 = 0;
+                end
+            end
+            if (good3) ok("readback/admission_bits_before_drain (the full lane refuses entries, the empty ones do not)");
+            else       bad($sformatf("readback/admission_bits_before_drain (laneReady=0x%016h)",
+                                     laneReadyWord));
+
+            // -- arm both loaded lanes and let the request text go out ---------------------------
+            push_arm(0, txt0.len());
+            push_arm(2, txt2.len());
+            fork
+                dma_text(0, txt0);
+                dma_text(2, txt2);
+            join
+            repeat (8000) @(posedge clk);
+
+            // -- DURING: retire three of lane 0's eight responses ---------------------------------
+            for (int r = 0; r < 3; r++) announce(0, r_len[r]);
+            t = 0;
+            while (tlasts[0] < tl0 + 3 && t < 200000) begin @(posedge clk); t++; end
+            repeat (8) @(posedge clk);
+
+            good3 = 1;
+            if (tlasts[0] != tl0 + 3) begin
+                $display("        lane 0 framed %0d of 3 responses before the mid-drain sample",
+                         tlasts[0] - tl0);
+                good3 = 0;
+            end
+            if (lane_occ(0) != n_lane0 - 3) begin
+                $display("        lane 0 occupancy reads %0d after 3 of %0d retired, expected %0d",
+                         lane_occ(0), n_lane0, n_lane0 - 3);
+                good3 = 0;
+            end
+            if (lane_occ(2) != 1) begin
+                $display("        lane 2 occupancy reads %0d, expected 1 (its response is still on the wire)",
+                         lane_occ(2));
+                good3 = 0;
+            end
+            // Room again on lane 0, and only because it drained -- nothing else was written.
+            if (!entry_ready(0)) begin
+                $display("        lane 0 still refuses entries with %0d of %0d used",
+                         lane_occ(0), QUEUE_DEPTH);
+                good3 = 0;
+            end
+            if (good3) ok($sformatf("readback/occupancy_during_drain (%s)", occ_str()));
+            else       bad($sformatf("readback/occupancy_during_drain (occ = %s)", occ_str()));
+
+            // -- AFTER: everything drains ---------------------------------------------------------
+            for (int r = 3; r < n_lane0; r++) announce(0, r_len[r]);
+            announce(2, r2_len);
+            t = 0;
+            while ((tlasts[0] < tl0 + n_lane0 || tlasts[2] < tl2 + 1) && t < 400000) begin
+                @(posedge clk); t++;
+            end
+            repeat (8) @(posedge clk);
+
+            good3 = 1;
+            if (got[0].size() - got0_before != n_lane0 * body3) begin
+                $display("        lane 0 delivered %0d body bytes, expected %0d",
+                         got[0].size() - got0_before, n_lane0 * body3);
+                good3 = 0;
+            end
+            if (got[2].size() - got2_before != body3) begin
+                $display("        lane 2 delivered %0d body bytes, expected %0d",
+                         got[2].size() - got2_before, body3);
+                good3 = 0;
+            end
+            for (int i = 0; i < n_lane0 * body3 && good3; i++) begin
+                automatic int           r    = i / body3;
+                automatic int           off  = i % body3;
+                automatic byte unsigned want = byte'(8'hA0 + r) + off[7:0];
+                if (got[0][got0_before + i] !== want) begin
+                    $display("        lane 0 response %0d byte %0d: got %02h expected %02h",
+                             r, off, got[0][got0_before + i], want);
+                    good3 = 0;
+                end
+            end
+            for (int L = 0; L < 8; L++) begin
+                if (lane_occ(L) != 0) begin
+                    $display("        lane %0d occupancy reads %0d after the drain, expected 0",
+                             L, lane_occ(L));
+                    good3 = 0;
+                end
+            end
+            for (int L = 0; L < NUM_CONNS; L++) begin
+                if (!entry_ready(L) || !arm_ready(L) || !lane_up(L) || lane_fatal(L)) begin
+                    $display("        lane %0d admission nibble reads %04b after a clean drain",
+                             L, laneReadyWord[4*L +: 4]);
+                    good3 = 0;
+                end
+            end
+            // Not one sticky cause on a run where nothing went wrong. If this ever fires it is
+            // naming the lane and the reason, which is the entire point of the register.
+            if (laneErrWord != 64'd0) begin
+                $display("        sticky per-lane causes on a clean run: laneErr=0x%016h", laneErrWord);
+                good3 = 0;
+            end
+            // Every lane's transmit FSM back in ST_IDLE with its text sent. This is the state a
+            // wedged transmit path is NOT in, so it is worth reading even when nothing is wrong.
+            if (laneStateWord[63:32] != 32'd0) begin
+                $display("        a request-stream FSM is not idle after the drain: laneState=0x%016h",
+                         laneStateWord);
+                good3 = 0;
+            end
+            if (good3) ok($sformatf("readback/occupancy_after_drain (%s, no sticky causes)", occ_str()));
+            else       bad("readback/occupancy_after_drain");
+
+            // -- the compatibility stamp ----------------------------------------------------------
+            //
+            // The whole scheme for keeping deployed bitstreams and installed libraries apart rests
+            // on this byte: it was a literal zero through revision 1, so a host reading 0 knows not
+            // to touch registers 16..20 (which answer resp_error on those bitstreams), and a
+            // library that predates the byte ignores it.
+            if (inflightWord[31:24] == 8'd2)
+                ok("readback/csr_revision (inflightWord[31:24] == 2)");
+            else
+                bad($sformatf("readback/csr_revision (reads %0d, expected 2; inflight=0x%08h)",
+                              inflightWord[31:24], inflightWord));
+
+            // -- the identity word, against the parameters this instance was elaborated with ------
+            good3 = 1;
+            if (lanePolicyWord[7:0] != 8'd2) begin
+                $display("        policy revision reads %0d, expected 2", lanePolicyWord[7:0]);
+                good3 = 0;
+            end
+            if (lanePolicyWord[15:8] != 8'(NUM_CONNS)) begin
+                $display("        policy NUM_CONNS reads %0d, expected %0d",
+                         lanePolicyWord[15:8], NUM_CONNS);
+                good3 = 0;
+            end
+            if (lanePolicyWord[31:16] != 16'(QUEUE_DEPTH)) begin
+                $display("        policy QUEUE_DEPTH reads %0d, expected %0d",
+                         lanePolicyWord[31:16], QUEUE_DEPTH);
+                good3 = 0;
+            end
+            if (lanePolicyWord[55:32] != 24'(LANE_STALL_CYCLES_EXP)) begin
+                $display("        policy LANE_STALL_CYCLES reads %0d, expected %0d",
+                         lanePolicyWord[55:32], LANE_STALL_CYCLES_EXP);
+                good3 = 0;
+            end
+            if (lanePolicyWord[61:56] != 6'($clog2(LANE_STALL_CYCLES_EXP))) begin
+                $display("        policy log2(LANE_STALL_CYCLES) reads %0d, expected %0d",
+                         lanePolicyWord[61:56], $clog2(LANE_STALL_CYCLES_EXP));
+                good3 = 0;
+            end
+            if (good3)
+                ok($sformatf("readback/identity_word (rev=2 lanes=%0d depth=%0d hol=%0d cycles)",
+                             lanePolicyWord[15:8], lanePolicyWord[31:16], lanePolicyWord[55:32]));
+            else
+                bad($sformatf("readback/identity_word (lanePolicy=0x%016h)", lanePolicyWord));
         end
 
         // =========================================================================================

@@ -181,7 +181,20 @@ module handler_multi #(
     output logic [31:0] respWord,
     output logic [31:0] contentLengthWord,
     output logic [31:0] bodyRemainingWord,
-    output logic [3:0]  state_debug
+    output logic [3:0]  state_debug,
+
+    // -- PER-LANE readback (CSR revision 2) --------------------------------------------------------
+    //
+    // Everything above folds N lanes into one 32-bit window with OR, which answers "is anything
+    // wrong" and nothing else. These five say WHICH LANE. They are 64 bits wide because eight lanes
+    // need eight bytes, and the AXI-Lite read path is 64 bits (AXIL_DATA_BITS); read register 6
+    // already carries a field at [39:32] and the host already decodes it, so the upper half is not
+    // new ground. See http_config.sv for the register numbers and the field tables.
+    output logic [63:0] laneOccWord,
+    output logic [63:0] laneReadyWord,
+    output logic [63:0] laneStateWord,
+    output logic [63:0] laneErrWord,
+    output logic [63:0] lanePolicyWord
 );
 
     initial begin
@@ -203,17 +216,27 @@ module handler_multi #(
     logic [NUM_CONNS-1:0] stream_busy, stream_refused, stream_bus_req, stream_bus_grant;
     logic [NUM_CONNS-1:0] lane_occ_ok;
 
+    // THE TWO ADMISSION CONDITIONS, PER LANE.
+    //
     // req_ready answers about the lane this beat names, exactly as the single-lane version answers
     // about the only lane there is. An ARM waits for that lane's previous text to have gone out; an
     // ENTRY waits for that lane's chunk queue to have room. Conflating them deadlocks -- the arm is
     // what drains the queue, so gating it on queue room means a batch that exactly fills the queue
     // can never begin.
+    //
+    // They are named here rather than inlined into req_ready because the host now reads them back
+    // per lane (laneReadyWord). Both are MONOTONE IN THE HOST'S FAVOUR: nothing but a config beat
+    // from the host can clear either one, so "poll, then write" is race-free and needs no retry.
+    // stream_busy only rises on an ARM this module accepted; rwl_cfg_ready and lane_occ_ok only fall
+    // on an ENTRY it accepted. Assigned in gen_lane below, with the signals they read.
+    logic [NUM_CONNS-1:0] lane_arm_ready_w, lane_entry_ready_w;
+
     always_comb begin
         req_ready = 1'b0;
         for (int L = 0; L < NUM_CONNS; L++) begin
             if (cfg_lane == CONN_BITS'(L)) begin
-                req_ready = (req_data.req_total_bytes != 32'd0) ? !stream_busy[L]
-                                                                : (rwl_cfg_ready[L] && lane_occ_ok[L]);
+                req_ready = (req_data.req_total_bytes != 32'd0) ? lane_arm_ready_w[L]
+                                                                : lane_entry_ready_w[L];
             end
         end
     end
@@ -359,6 +382,7 @@ module handler_multi #(
     logic [NUM_CONNS-1:0]     lane_done, lane_status_ok, lane_resp_error;
     logic [NUM_CONNS-1:0]     lane_fifo_stall, lane_timeout;
     logic [3:0]               lane_read_state [NUM_CONNS];
+    logic [3:0]               lane_tx_state   [NUM_CONNS];
     logic [23:0]              lane_status_ascii [NUM_CONNS];
     logic [31:0]              lane_content_len [NUM_CONNS];
     logic [31:0]              lane_body_remain [NUM_CONNS];
@@ -424,7 +448,7 @@ module handler_multi #(
 
             .bus_req(stream_bus_req[L]), .bus_grant(stream_bus_grant[L]),
             .busy(stream_busy[L]), .refused_sticky(stream_refused[L]),
-            .tx_space(), .state_debug()
+            .tx_space(), .state_debug(lane_tx_state[L])
         );
 
         // -- receive and framing ------------------------------------------------------------------
@@ -492,6 +516,10 @@ module handler_multi #(
         );
 
         assign lane_occ_ok[L] = (lane_occ_q[L] < 32'(QUEUE_DEPTH));
+
+        // The two admission conditions, per lane. See the declaration above for why they are named.
+        assign lane_arm_ready_w[L]   = !stream_busy[L];
+        assign lane_entry_ready_w[L] = rwl_cfg_ready[L] && lane_occ_ok[L];
     end
 
     // A lane may be reconnected only when there is NOTHING TO REPLAY.
@@ -634,6 +662,22 @@ module handler_multi #(
     // State
     // =============================================================================================
     logic [NUM_CONNS-1:0] lane_init_err_q, lane_resp_err_q, lane_status_bad_q;
+    // WHY THESE FOUR ARE LATCHED HERE RATHER THAN READ WHERE THEY ARE PRODUCED.
+    //
+    // lane_dead_q is the important one. rx_dispatch's dead_q is cleared when the session is BOUND OR
+    // RELEASED -- and releasing the session is precisely what handler_multi does to a lane it has
+    // declared fatal (lane_want_close_w -> BR_CLOSE). So by the time the host polls, dbg_lane_dead
+    // has already gone back to 0 while lane_fatal_q stays 1, and "killed by the head-of-line
+    // watchdog" is indistinguishable from "failed a read it could not replay". They call for
+    // different things from the host -- the first means bytes were thrown away out of the middle of
+    // a response and the whole batch must be reissued on a new lane, the second is a retry -- so the
+    // cause has to be latched at the moment it is true.
+    //
+    // The other three are transients for the same structural reason: error_dirty is only asserted
+    // while tcp_read sits in ST_ABORT, read_timeout is reset with the framer on a reconnect, and
+    // rx_fifo_stall is a level from the decoupling fifo. The OR-folded copies in stallWord say some
+    // lane saw them; these say which, and still say it afterwards.
+    logic [NUM_CONNS-1:0] lane_dead_q, lane_dirty_q, lane_timeout_q, lane_fifo_stall_q;
     logic                 conn_stall_q;
     localparam int STALL_BITS = $clog2(STALL_CYCLES) + 1;
     logic [STALL_BITS-1:0] conn_cnt_q;
@@ -656,6 +700,10 @@ module handler_multi #(
             lane_init_err_q   <= '0;
             lane_resp_err_q   <= '0;
             lane_status_bad_q <= '0;
+            lane_dead_q       <= '0;
+            lane_dirty_q      <= '0;
+            lane_timeout_q    <= '0;
+            lane_fifo_stall_q <= '0;
             conn_stall_q  <= 1'b0;
             conn_cnt_q    <= '0;
             for (int L = 0; L < NUM_CONNS; L++) begin
@@ -727,6 +775,12 @@ module handler_multi #(
                 if (lane_must_die_w[L] || rxd_lane_dead[L]) lane_fatal_q[L] <= 1'b1;
                 if (lane_resp_error[L]) lane_resp_err_q[L] <= 1'b1;
 
+                // Per-lane causes, latched where they are true. See the declarations.
+                if (rxd_lane_dead[L])   lane_dead_q[L]       <= 1'b1;
+                if (lane_error_dirty[L])lane_dirty_q[L]      <= 1'b1;
+                if (lane_timeout[L])    lane_timeout_q[L]    <= 1'b1;
+                if (lane_fifo_stall[L]) lane_fifo_stall_q[L] <= 1'b1;
+
                 // The read stage. Clear beats set, so a lane that still owes bytes drops `start`
                 // for exactly one cycle and the reader walks ST_DONE -> ST_IDLE -> ST_ARM, which
                 // is where resp_ack retires the response just framed.
@@ -791,8 +845,15 @@ module handler_multi #(
     //   [18] every lane is connected                  [19] req_ready for the lane last addressed
     //   [23:20] LANE COUNT -- how many sessions this bitstream has, which is what the host sizes
     //           its per-lane batches from
-    //   [31:24] zero
-    assign inflightWord = {8'd0, 4'(NUM_CONNS), req_ready, (&conn_up_q),
+    //   [31:24] CSR REVISION. Was a literal zero through revision 1, which is the whole
+    //           compatibility scheme: a host that reads 0 is talking to a bitstream that predates
+    //           the per-lane registers and must not read 16..20 (the read register file answers
+    //           out-of-range addresses with resp_error), and a library that predates this byte
+    //           ignores it. Neither side has to be upgraded in step with the other. The write map
+    //           is FROZEN and this does not touch it.
+    localparam logic [7:0] CSR_REVISION = 8'd2;
+
+    assign inflightWord = {CSR_REVISION, 4'(NUM_CONNS), req_ready, (&conn_up_q),
                            |conn_closed, |rxd_has_pending,
                            depth_sat, occ_sat};
 
@@ -809,5 +870,91 @@ module handler_multi #(
     assign contentLengthWord = lane_content_len[0];
     assign bodyRemainingWord = lane_body_remain[0];
     assign state_debug       = lane_read_state[0];
+
+    // =============================================================================================
+    // PER-LANE READBACK -- CSR revision 2
+    //
+    // The words above answer "is anything wrong". With N lanes that is no longer a useful question:
+    // one dead lane sets |lane_fatal_q and the host learns that SOMETHING failed, then has to guess
+    // which lane to reissue. Everything below is indexed by lane, at a fixed stride, so software
+    // reads one register and shifts.
+    //
+    // SLOT WIDTH IS FIXED AT 8 LANES, not NUM_CONNS. A host compiled against one bitstream reads
+    // another; a stride that moved with the lane count would silently reinterpret every field the
+    // moment a 2-lane bitstream was swapped for a 4-lane one. Lanes this bitstream does not have
+    // read 0, and inflightWord[23:20] says how many are real.
+    //
+    // ATOMICITY. A lane's two admission bits sit in the SAME register (laneReadyWord), one AXI-Lite
+    // read, because that is what makes poll-then-write safe: both conditions are monotone in the
+    // host's favour (nothing but the host's own config beat can clear either), so a value read is
+    // still true when the write lands. Splitting them across two registers would not break that --
+    // monotonicity is per bit -- but it would make the host's check two round trips on a path it
+    // takes once per column chunk.
+    // =============================================================================================
+    localparam int         POLICY_STALL_LOG2 = $clog2(LANE_STALL_CYCLES);
+    localparam logic [23:0] POLICY_STALL_CYC =
+        (LANE_STALL_CYCLES > 24'hFF_FFFF) ? 24'hFF_FFFF : 24'(LANE_STALL_CYCLES);
+    localparam logic [15:0] POLICY_QDEPTH    =
+        (QUEUE_DEPTH > 16'hFFFF) ? 16'hFFFF : 16'(QUEUE_DEPTH);
+
+    logic [7:0] lane_occ_byte  [8];
+    logic [3:0] lane_ready_nib [8];
+    logic [3:0] lane_rd_nib    [8];
+    logic [3:0] lane_tx_nib    [8];
+    logic [7:0] lane_err_byte  [8];
+
+    always_comb begin
+        for (int L = 0; L < 8; L++) begin
+            lane_occ_byte[L]  = 8'd0;
+            lane_ready_nib[L] = 4'd0;
+            lane_rd_nib[L]    = 4'd0;
+            lane_tx_nib[L]    = 4'd0;
+            lane_err_byte[L]  = 8'd0;
+        end
+        for (int L = 0; L < NUM_CONNS; L++) begin
+            // Chunk entries queued and not yet retired by a tlast. This is the count the host's
+            // admission test is about; it saturates at 255 where QUEUE_DEPTH does not, and
+            // queueDepthWord (read register 15) carries the untruncated depth.
+            lane_occ_byte[L]  = (lane_occ_q[L] > 32'd255) ? 8'd255 : 8'(lane_occ_q[L]);
+            lane_ready_nib[L] = {lane_fatal_q[L], conn_up_q[L],
+                                 lane_entry_ready_w[L], lane_arm_ready_w[L]};
+            lane_rd_nib[L]    = lane_read_state[L];
+            lane_tx_nib[L]    = lane_tx_state[L];
+            lane_err_byte[L]  = {lane_fifo_stall_q[L], lane_timeout_q[L], stream_refused[L],
+                                 lane_status_bad_q[L], lane_resp_err_q[L], lane_init_err_q[L],
+                                 lane_dirty_q[L], lane_dead_q[L]};
+        end
+    end
+
+    always_comb begin
+        laneOccWord   = '0;
+        laneReadyWord = '0;
+        laneStateWord = '0;
+        laneErrWord   = '0;
+        for (int L = 0; L < 8; L++) begin
+            laneOccWord  [8*L      +: 8] = lane_occ_byte[L];
+            laneReadyWord[4*L      +: 4] = lane_ready_nib[L];
+            // Reader state in the low half, request-stream state in the high half, same nibble
+            // index. The transmit FSM is here because a lane parked in ST_IDLE with a transfer
+            // still armed is exactly the shape of a wedged transmit path, and nothing else exports
+            // it -- see the bus_req/conn_up interlock in http_req_stream.sv.
+            laneStateWord[4*L      +: 4] = lane_rd_nib[L];
+            laneStateWord[32 + 4*L +: 4] = lane_tx_nib[L];
+            laneErrWord  [8*L      +: 8] = lane_err_byte[L];
+        end
+    end
+
+    // Fixed at elaboration. The host cannot infer any of it and every one of them is something a
+    // mismatched host gets silently wrong: too many lanes addressed, a batch larger than the queue
+    // can hold, or a software watchdog shorter than the hardware's, which would report a lane dead
+    // that the hardware is still waiting on.
+    //   [7:0]   CSR revision -- 2, the same value as inflightWord[31:24]
+    //   [15:8]  NUM_CONNS
+    //   [31:16] QUEUE_DEPTH, chunk entries PER LANE, saturating at 65535
+    //   [55:32] LANE_STALL_CYCLES, the head-of-line watchdog threshold, saturating at 2^24-1
+    //   [61:56] $clog2(LANE_STALL_CYCLES) -- still exact when the 24-bit field saturates
+    //   [63:62] zero
+    assign lanePolicyWord = {2'd0, 6'(POLICY_STALL_LOG2), POLICY_STALL_CYC,
+                             POLICY_QDEPTH, 8'(NUM_CONNS), CSR_REVISION};
 
 endmodule
