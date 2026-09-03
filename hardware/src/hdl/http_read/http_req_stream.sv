@@ -239,7 +239,28 @@ module http_req_stream #(
     end
 
     assign busy           = (state_q != ST_IDLE) || (remaining_q != 32'd0);
-    assign bus_req = (remaining_q != 32'd0);
+
+    // ASK FOR THE BUS ONLY WHILE THIS LANE CAN ACTUALLY USE IT.
+    //
+    // `remaining_q != 0` alone was a lane that lies to the arbiter. Leaving ST_IDLE needs conn_up,
+    // so a lane whose connection goes away between the arm and the grant -- which is what
+    // handler_multi produces when a lane goes fatal with request text armed but not yet granted --
+    // goes on claiming a bus it can never leave ST_IDLE to use. The arbiter, holding the grant until
+    // the holder drops its request, hands the dead lane the bus and waits forever. ONE dead lane
+    // stops the transmit path for EVERY lane.
+    //
+    // Not reachable while request text fits in one chunk and one lane is armed at a time, which is
+    // why every bench passed; reachable on hardware with multi-chunk text, where a lane is armed and
+    // waiting behind another for a real length of time.
+    //
+    // The `state_q != ST_IDLE` term is not belt and braces, it is the half that keeps the fix safe.
+    // Once ST_SEND_META is entered a reservation is open at the TOE, and the bytes that fill it must
+    // follow it with nothing in between. Dropping the grant there would splice the next lane's
+    // request text into this lane's reservation -- exactly the corruption tx_arbiter exists to
+    // prevent, answered 400 by the server with every request behind it misframed. So a lane that
+    // dies mid-transfer finishes what it announced and gives the bus up at the chunk boundary, where
+    // remaining_q is what stops it.
+    assign bus_req        = (remaining_q != 32'd0) && (conn_up || (state_q != ST_IDLE));
     assign refused_sticky = refused_q;
     assign tx_space       = space_q;
     assign state_debug    = state_q;
