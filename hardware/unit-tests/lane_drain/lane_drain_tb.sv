@@ -872,6 +872,10 @@ module lane_drain_tb #(
     //   [25] rx_fifo_stall    the per-lane decoupling fifo refused the producer, i.e. back-pressure
     //                         reached the TCP stack again, which is the thing the fifo exists to
     //                         prevent.
+    //   [24] rxd_overflow     an announcement was dropped.  The bytes it named stay in the TOE's
+    //                         shared fifo with nobody left to ask for them, so every packet behind
+    //                         them waits forever -- data loss that presents as a hang much later,
+    //                         and the reason (s_d) ended 3864 bytes short of 400000.
     //   [7]  status_bad       a response was retired with a status the handler read as not 200/206.
     //
     // Bit positions are handler_multi.sv's stallWord concatenation, not a guess: {3'd0,
@@ -889,6 +893,7 @@ module lane_drain_tb #(
         if (stallWord[28]) why = {why, " route_stall(28)"};
         if (stallWord[27]) why = {why, " rwl_starved(27)"};
         if (stallWord[25]) why = {why, " rx_fifo_stall(25)"};
+        if (stallWord[24]) why = {why, " rxd_overflow(24)"};
         if (stallWord[7])  why = {why, " status_bad(7)"};
         if (why != "") begin
             $display("  STICKY stall bits set:%s   (stallWord=0x%08h)", why, stallWord);

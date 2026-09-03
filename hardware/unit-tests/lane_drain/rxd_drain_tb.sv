@@ -70,6 +70,7 @@ module rxd_drain_tb;
     logic [NUM_CONNS-1:0]       dbg_has_pending;
     logic                       dbg_overflow;
     logic                       dbg_route_stall;
+    logic [NUM_CONNS-1:0]       dbg_lane_dead;
 
     rx_dispatch #(
         .NUM_CONNS   (NUM_CONNS),
@@ -96,7 +97,8 @@ module rxd_drain_tb;
         .conn_tdata (conn_tdata),  .conn_tkeep (conn_tkeep), .conn_tlast(conn_tlast),
         .conn_space_ok(conn_space_ok), .conn_closed(conn_closed),
         .dbg_has_pending(dbg_has_pending),
-        .dbg_overflow(dbg_overflow), .dbg_route_stall(dbg_route_stall)
+        .dbg_overflow(dbg_overflow), .dbg_route_stall(dbg_route_stall),
+        .dbg_lane_dead(dbg_lane_dead)
     );
 
     // ---------------------------------------------------------------------------------------------
@@ -382,8 +384,8 @@ module rxd_drain_tb;
             $display("       lane %0d: sid=%0d space_ok=%0b tready=%0b closed=%0b has_pending=%0b bytes_in=%0d still_owed=%0d",
                      i, sid_of_lane[i], conn_space_ok[i], conn_tready[i], conn_closed[i],
                      dbg_has_pending[i], lane_bytes[i], lane_exp[i].d.size());
-        $display("     dbg_overflow=%0b dbg_route_stall=%0b  notif-backpressure=%0d cyc  rxdata-backpressure=%0d cyc",
-                 dbg_overflow, dbg_route_stall, notif_bp_cycles, rxdata_bp_cycles);
+        $display("     dbg_overflow=%0b dbg_route_stall=%0b dbg_lane_dead=%b  notif-backpressure=%0d cyc  rxdata-backpressure=%0d cyc",
+                 dbg_overflow, dbg_route_stall, dbg_lane_dead, notif_bp_cycles, rxdata_bp_cycles);
         $display("  ------------------------------------------");
     endtask
 
