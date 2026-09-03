@@ -222,8 +222,36 @@ module tcp_read #(
     // it used to hold TREADY low and let the TOE's single shared 64 KB rx fifo fill behind it --
     // ~35 KB of backlog per response, which is why a 32 KiB response worked and a 64 KiB one fell
     // off a cliff at every pipeline depth. See axis_fifo.sv for the full derivation.
-    assign fifo_s_tvalid         = (state_q == ST_RECV_DATA) && s_axis_rx_data_TVALID;
-    assign s_axis_rx_data_TREADY = (state_q == ST_RECV_DATA) && fifo_s_tready;
+    //
+    // AND, UNDER EXTERNAL DISPATCH, DECOUPLED FROM THIS FSM AS WELL.
+    //
+    // rx_dispatch accepts every beat of a packet it has issued a readPkg for, unconditionally --
+    // that line is what keeps the TOE's single shared fifo draining for all the other lanes, so it
+    // must never gain a term. The beats it routes here therefore arrive whether or not this state
+    // machine happens to be in ST_RECV_DATA, and it is NOT: between two responses the reader walks
+    // ST_DONE -> ST_IDLE -> ST_ARM -> ST_RECV_DATA, four cycles during which the old gate held
+    // TREADY low. Those beats were pulled off the shared bus by the dispatcher and silently
+    // dropped, and a response boundary lands mid-packet often enough that this is not rare -- it is
+    // the difference between a hang (before the re-arm fix in handler_multi) and corruption after.
+    //
+    // So under external dispatch the FIFO decides, and only the FIFO: it has room or it does not.
+    // Its s_axis_tready is independent of `clear`, so a lane being torn down still consumes what is
+    // routed to it -- and DISCARDS it, because those bytes belong to a session that no longer
+    // exists. Discarding is the point: stalling instead would back-pressure the shared bus.
+    //
+    // The EXTERNAL_DISPATCH=0 path is unchanged. There this module owns the readPkg, so bytes
+    // arrive only after it has asked for them and only while it is in ST_RECV_DATA anyway.
+    // The `|| clear_framing` makes the discard unconditional rather than merely usual. The fifo's
+    // s_axis_tready is almost-full, and `clear` zeroes its level only on the NEXT edge -- so a lane
+    // torn down while its fifo happened to be full would refuse for one cycle, which is one cycle
+    // of the shared bus stalled for every other lane. Discarding must never depend on there being
+    // room to discard into.
+    assign fifo_s_tvalid         = EXTERNAL_DISPATCH ? (s_axis_rx_data_TVALID && !clear_framing)
+                                                     : ((state_q == ST_RECV_DATA) && s_axis_rx_data_TVALID);
+    assign s_axis_rx_data_TREADY = EXTERNAL_DISPATCH ? (fifo_s_tready || clear_framing)
+                                                     : ((state_q == ST_RECV_DATA) && fifo_s_tready);
+    // Only ever read on the EXTERNAL_DISPATCH=0 path (the tlast exit from ST_RECV_DATA), where the
+    // two expressions above are the originals.
     assign in_fire               = s_axis_rx_data_TVALID && s_axis_rx_data_TREADY;
 
     // Space for one maximum segment, in beats. MSS is 4096 on this stack (see the TOE's

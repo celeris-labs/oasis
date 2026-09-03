@@ -339,6 +339,32 @@ module handler_multi #(
     logic [NUM_CONNS-1:0]     lane_armed_q;
     logic [31:0]              lane_occ_q [NUM_CONNS];
 
+    // THE READ STAGE. One bit per lane, and the only thing that drives tcp_read's `start`.
+    //
+    // tcp_read serves exactly ONE response per activation: it ends in ST_DONE (or ST_ABORT) and
+    // leaves only when `start` FALLS. That falling edge is not cosmetic -- the single cycle the
+    // reader then spends in ST_ARM is what asserts resp_ack, which is what retires strip_http's
+    // resp_done and unblocks the parser at the next header block. So `start` is an EDGE protocol,
+    // not a level.
+    //
+    // It used to be driven with the level `conn_up && rwl_busy && !fatal`. rwl_busy is high while
+    // ANY chunk entry is queued in axis_rewrite_last, so with two or more requests outstanding on a
+    // lane -- which is the whole point of pipelining, and what the board actually runs -- it never
+    // fell. The reader framed the first response, parked in ST_DONE, and the lane went silent while
+    // the wire kept delivering. handler_stream had this stage (a 2-state FSM around the same
+    // condition) and it was lost in the port to N lanes; lane_drain p1/p4/p5/a2/a10 are what found
+    // it missing.
+    //
+    // Set on the same condition as before, cleared when the reader reports this activation
+    // finished. lane_done covers ST_DONE and ST_ABORT, so an aborted activation releases the stage
+    // too rather than leaving it latched on a reader that has already given up. The clear wins over
+    // the set, so a lane with more work re-arms one cycle later -- exactly one cycle of `start` low,
+    // which is all the reader needs.
+    //
+    // The set condition still requires rwl_busy, so this cannot re-arm into a pending reconnect:
+    // lane_want_reconn_w demands lane_idle_w, which demands !rwl_busy.
+    logic [NUM_CONNS-1:0]     read_run_q;
+
     for (genvar L = 0; L < NUM_CONNS; L++) begin : gen_lane
         logic                       raw_tvalid, raw_tready;
         logic [AXI_DATA_BITS-1:0]   raw_tdata;
@@ -381,8 +407,9 @@ module handler_multi #(
             .EXTERNAL_DISPATCH(1)
         ) inst_tcp_read (
             .clk(ap_clk), .rst_n(ap_rst_n),
-            // A lane reads whenever it is up and its alignment counter still owes bytes.
-            .start        (conn_up_q[L] && rwl_busy[L] && !lane_fatal_q[L]),
+            // One activation per response. See read_run_q: the reader needs `start` to FALL between
+            // responses, and "up and still owing bytes" is a level that does not.
+            .start        (read_run_q[L]),
             .session_id   (conn_sid_q[L]),
             .body_last    (1'b0),   // tlast comes from axis_rewrite_last, by byte count
             .clear_framing(!conn_up_q[L]),
@@ -568,6 +595,7 @@ module handler_multi #(
             retry_wait_q  <= '0;
             lane_fatal_q  <= '0;
             lane_armed_q  <= '0;
+            read_run_q    <= '0;
             lane_init_err_q   <= '0;
             lane_resp_err_q   <= '0;
             lane_status_bad_q <= '0;
@@ -630,7 +658,31 @@ module handler_multi #(
                 // idle lane is a reconnect, handled by the bring-up FSM.
                 if (lane_must_die_w[L]) lane_fatal_q[L] <= 1'b1;
                 if (lane_resp_error[L]) lane_resp_err_q[L] <= 1'b1;
-                if (lane_done[L] && !lane_error[L] && !lane_status_ok[L])
+
+                // The read stage. Clear beats set, so a lane that still owes bytes drops `start`
+                // for exactly one cycle and the reader walks ST_DONE -> ST_IDLE -> ST_ARM, which
+                // is where resp_ack retires the response just framed.
+                if (read_run_q[L] && lane_done[L])
+                    read_run_q[L] <= 1'b0;
+                else if (conn_up_q[L] && rwl_busy[L] && !lane_fatal_q[L])
+                    read_run_q[L] <= 1'b1;
+                // Status is only meaningful while the framer that produced it still exists.
+                // clear_framing is !conn_up_q, and it resets strip_http -- status included -- so a
+                // lane sampled with its connection down reads 0, which is not 200 or 206, and a run
+                // of perfect 206s raises the sticky bad-status bit.
+                //
+                // That window is not hypothetical, it is the COMMON case on a reconnect. A lane
+                // becomes reconnectable the instant its last chunk retires (lane_idle_w), which is
+                // the same instant the reader is finishing that response: the bring-up FSM closes
+                // and releases the session two or three cycles later, while the reader is still
+                // sitting in ST_DONE waiting for `start` to fall. lane_drain c, f and s_f all set
+                // bit 7 that way, on runs where every byte of every response was correct.
+                //
+                // Requiring conn_up_q is sufficient as well as necessary: the framer can only have
+                // been reset if clear_framing was high last cycle, i.e. if conn_up_q was low last
+                // cycle, and a lane cannot be back up and still parked in ST_DONE -- the read stage
+                // drops `start` one cycle after `done`, long before an open handshake completes.
+                if (conn_up_q[L] && lane_done[L] && !lane_error[L] && !lane_status_ok[L])
                     lane_status_bad_q[L] <= 1'b1;
             end
 

@@ -214,6 +214,14 @@ module strip_http (
     // what it requested; this is what arrived, and the two disagreeing is the whole diagnosis.
     logic [31:0] cl_latched_q;
     logic [23:0] status_q;
+    // The status code of the response BEING RETIRED, latched beside cl_latched_q for the same
+    // reason and at the same instant. status_q is a live shift register: it takes the digits of
+    // whatever status line the parser is walking, so once responses are pipelined it holds the NEXT
+    // response's code while the handler is still sampling the previous one's completion. That is
+    // how a run of perfectly good 206s raised the sticky bad-status bit -- the handler sampled
+    // status on the level of `done` and caught the parser mid-"206". Content-Length was immune only
+    // because it was already latched here; status now is too.
+    logic [23:0] status_latched_q;
     logic [1:0]  status_sp_q;  // spaces seen in the status line (saturating)
     logic [1:0]  status_cnt_q; // status digits captured (0..3)
 
@@ -331,7 +339,8 @@ module strip_http (
             cl_q          <= '0;
             cl_seen_q     <= 1'b0;
             cl_latched_q  <= '0;
-            status_q      <= '0;
+            status_q          <= '0;
+            status_latched_q  <= '0;
             status_sp_q   <= '0;
             status_cnt_q  <= '0;
             resp_done_q   <= 1'b0;
@@ -402,7 +411,12 @@ module strip_http (
                         status_cnt_q <= '0;
                         cl_seen_q    <= 1'b0;
                         cl_q         <= '0;
-                        cl_latched_q <= cl_q;
+                        // Both header-derived facts about THIS response are frozen here, at the LF
+                        // that completes its header block. hdr_block_w holds the parser at exactly
+                        // this point until the previous response is retired, so the pair latched
+                        // here is provably the pair belonging to the response about to be framed.
+                        cl_latched_q     <= cl_q;
+                        status_latched_q <= status_q;
                         if (!cl_seen_q) begin
                             error_q <= 1'b1;
                         end else if (cl_q == 32'd0) begin
@@ -518,8 +532,8 @@ module strip_http (
     assign resp_done       = resp_done_q;
     assign resp_dirty      = dirty_q;
     assign resp_error      = error_q;
-    assign status_ascii    = status_q;
-    assign status_ok       = (status_q == "200") || (status_q == "206");
+    assign status_ascii    = status_latched_q;
+    assign status_ok       = (status_latched_q == "200") || (status_latched_q == "206");
     assign content_length  = cl_latched_q;
     assign body_remaining  = body_left_q;
 
