@@ -19,17 +19,6 @@ include_directories(duckdb/third_party/thrift)
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
-
-# Both parcore/coyote/sw and parcore/coyote/sim/sw declare a target named
-# "Coyote" — the former opens a real FPGA char device, the latter spawns
-# Vivado xsim in the background and pipes to it. Swap the subdirectory to
-# switch between real hardware and simulation; everything downstream
-# (libstf, ParCore) links to "Coyote" without caring which one it got.
-#
-# For simulation you also need:
-#   * parcore/build_hw/sim/ populated (run parcore/sim_setup.sh once)
-#   * xsim on PATH
-#   * COYOTE_SIM_DIR=<abs path to parcore/build_hw> at runtime
 option(EN_SIMULATION "Link against Coyote simulation library (no FPGA required)" OFF)
 if (EN_SIMULATION)
     find_package(CoyoteSimulation REQUIRED)

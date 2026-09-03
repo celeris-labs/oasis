@@ -1,11 +1,22 @@
+<p align="center">
+  <picture>
+    <img src="img/oasis-logo-light.png" width=250>
+  </picture>
+</p>
+
+[![SystemVerilog](https://img.shields.io/badge/SystemVerilog-IEEE%201800-blue.svg)](https://github.com/fpgasystems/libstf)
+[![GitHub last commit](https://img.shields.io/github/last-commit/fpgasystems/libstf)](https://github.com/fpgasystems/libstf/commits/main)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 # Oasis - Data Processing SmartNIC
 
-Oasis is a data processing SmartNIC for data lakes. It offloads Parquet decoding into
-the network data path. The main components are: A hardware design that embeds 
-[ParCore](https://github.com/celeris-labs/parcore) (hardware Parquet decoder) into an RDMA-enabled 
-[Coyote](https://github.com/fpgasystems/Coyote) vFPGA, a software abstraction featuring a scheduler 
-for easy integration into query engines, and a DuckDB extension with a table function (scan 
-operator).
+Oasis is a data processing SmartNIC for data processing systems working on Parquet files. It
+offloads Parquet decoding into the network data path of the compute node. The main components are: a
+top-level hardware design that embeds [ParCore](https://github.com/celeris-labs/parcore) (hardware
+Parquet decoder) into an RDMA-enabled [Coyote](https://github.com/fpgasystems/Coyote) vFPGA, a
+software abstraction featuring a scheduler for easy integration into data processing systems, and a
+DuckDB extension with a table function (scan operator) as an example integration into a real-world
+database system.
 
 The hardware component requires the ParCore submodule and its dependencies to be loaded by either 
 cloning this repo with submodules directly:
@@ -14,7 +25,7 @@ cloning this repo with submodules directly:
 git clone --recurse-submodules git@github.com:celeris-labs/oasis.git
 ```
 
-Or initializing the submodule as a step after cloning:
+Or initializing the submodules as a step after cloning:
 
 ```bash
 git submodule update --init extension/duckdb
@@ -24,21 +35,23 @@ git submodule update --init celeris
 ```
 
 ## Hardware
-The functionality of the hardware component can be verified with unit tests that are built on top of 
-the Coyote unit test framework. We also describe how to synthesize the hardware.
+The functionality of the hardware components can be verified with unit tests that are built on top
+of the Coyote unit test framework. We also describe how to synthesize the hardware.
 
 ### Unit tests
-To run the unit tests, the Vivado simulation project needs to be set up:
+To run the unit tests, a Vivado simulation project needs to be set up:
 
 ```bash
 ./scripts/setup_simulation.sh
 ```
 
-After this is finished, VSCode shows the unit tests as a test flask on the left side. The simulation
-project needs to be regenerated whenever new files are added (also for the dependencies).
+After this script is finished, VSCode shows the unit tests as a test flask on the left side of the
+UI. Run unit tests by clicking on the corresponding run button. The simulation project needs to be
+regenerated whenever new files are added (also true for the dependencies).
 
 ### Synthesis
-For synthesis, execute the following command on one of the build servers (`hacc-build-**`):
+For synthesis, execute the following command (only tested for the build servers in the
+[HACC](https://github.com/fpgasystems/hacc), i.e., `hacc-build-**`):
 
 ```bash
 ./scripts/synthesize.sh [--no-rdma] [--decoders <number-of-decoders>] [--v80]
@@ -50,16 +63,22 @@ disconnect from the server without the synthesis stopping. You can check the pro
 sometimes not printing anything new to the log for a while. The finished bitstream will be available 
 in `hardware/build-**/bitstreams/cyt_top.bit`.
 
-### Programming the FPGA
-To program an FPGA, book one of the `alveo-u55c-**` or `alveo-v80-01` servers respectively and clone 
-the Coyote repo. Inside the Coyote repo, go to the driver folder and execute `make -j`. Then, 
-execute this command:
+### Programming the FPGA (in the HACC)
+To program an FPGA, book one of the `hacc-u55c-**`, `hacc-gpu-v80-**` or `alveo-gpu-u55c-01` servers
+respectively and clone the Coyote repo. Inside the Coyote repo, go to the driver folder and execute
+`make -j`. Then, execute this command in the Coyote repo root:
 
 ```bash
 ./util/program_hacc_local.sh <bitstream> driver/build/coyote_driver.ko
 ```
 
-The easiest way to share bitstreams across servers is to copy it to `/scratch/<nethz-user>/...` 
+To run Oasis on an AMD V80 FPGA (`hacc-gpu-v80-**`), there are some extra steps due to PCIe 5:
+
+1. Program FPGA
+2. Warm reboot
+3. Insert driver
+
+The easiest way to share bitstreams across servers is to copy them to `/scratch/<nethz-user>/...` 
 which is available as a network mounted file system across servers.
 
 ## Software
@@ -91,22 +110,9 @@ cd extension
 make -j
 ```
 
-More detail can be found in `extension/README.md`.
-
-## Misc
-To generate a LaTeX table of the resource generation run:
-
-```bash
-./scripts/utilization_latex.py hardware/build-**
-```
-
-To run Oasis on an AMD V80 FPGA (hacc-box-04 & 05):
-
-1. Program FPGA
-2. Warm reboot
-3. Insert driver
+More details can be found in `extension/README.md`.
 
 ## License
 The Oasis code is licensed under the terms in 
-[LICENSE.md](https://github.com/fpgasystems/libstf/blob/master/LICENSE.md), which corresponds to the 
-MIT Licence. Any contributions to libstf will be accepted under the terms of the same license.
+[LICENSE.md](https://github.com/celeris-labs/oasis/blob/main/LICENSE.md), which corresponds to the 
+MIT Licence. Any contributions to Oasis will be accepted under the terms of the same license.
