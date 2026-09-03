@@ -9,6 +9,11 @@
 #
 #   ./run.sh                 all scenarios, all lane counts
 #   ./run.sh <scen> [lanes]  one scenario at one lane count (default 2)
+#   ./run.sh p1 1 DEPTH=2 NRESP=100
+#                            ...plus any extra plusargs, forwarded verbatim to xsim. The pipelined
+#                            scenarios take DEPTH (arms outstanding per lane), NRESP, BLEN and MSS;
+#                            without this there was no way to sweep the pipeline depth from here,
+#                            which is the one axis that decides whether the bug under test appears.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 HDL="$ROOT/../../src/hdl/http_read"
@@ -34,12 +39,21 @@ for N in 1 2 4; do
 done
 
 run_rxd() { echo "=== rx_dispatch : $1 ==="; xsim rxd_snap -R -testplusarg "SCEN=$1" | sed -n '/^rxd_drain_tb /p'; }
-run_hm()  { echo "=== handler_multi[$2] : $1 ==="; xsim "ld$2_snap" -R -testplusarg "SCEN=$1" | sed -n '/^lane_drain_tb /p'; }
+run_hm()  {
+  local scen="$1" lanes="$2"; shift 2
+  local extra=()
+  for p in "$@"; do extra+=(-testplusarg "$p"); done
+  echo "=== handler_multi[$lanes] : $scen ${*:-} ==="
+  xsim "ld${lanes}_snap" -R -testplusarg "SCEN=$scen" "${extra[@]}" \
+    | sed -n '/^lane_drain_tb /p;/STICKY/p'
+}
 
 if [ $# -ge 1 ]; then
   case "$1" in
     r*) run_rxd "$1" ;;
-    *)  run_hm "$1" "${2:-2}" ;;
+    *)  scen="$1"; shift; lanes="2"
+        if [ $# -ge 1 ] && [[ "$1" != *=* ]]; then lanes="$1"; shift; fi
+        run_hm "$scen" "$lanes" "$@" ;;
   esac
   exit 0
 fi

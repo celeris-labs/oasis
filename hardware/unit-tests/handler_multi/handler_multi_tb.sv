@@ -536,6 +536,123 @@ module handler_multi_tb;
         else bad($sformatf("readback/no_stall_bits (stallWord=%08h)", stallWord));
 
         // =========================================================================================
+        // TWO responses per lane, on every lane, with NO drain in between.
+        //
+        // Everything above arms exactly one chunk and one response per lane, which is why it never
+        // saw the bug this case exists for. tcp_read serves ONE response per activation and leaves
+        // ST_DONE only when `start` FALLS; a handler that drives `start` from a level which stays
+        // high while any chunk is queued frames the first response on each lane and then parks
+        // forever, with the wire still delivering. One response per lane cannot distinguish that
+        // from a working design.
+        //
+        // The announcements deliberately do NOT align with the response boundaries: three packets
+        // carry two responses, so the seam between them falls INSIDE a packet. That is the second
+        // half of the same bug -- beats routed to a lane which is between activations are accepted
+        // off the shared bus by rx_dispatch (unconditionally, by design) and must not be dropped on
+        // the way into the lane. A design that only re-arms turns the hang into corruption here.
+        // =========================================================================================
+        $display("--- two_responses_per_lane ---");
+        begin
+            automatic int    body2 = 208;
+            automatic int    got_before   [NUM_CONNS];
+            automatic int    tlast_before [NUM_CONNS];
+            automatic int    new_bytes    [NUM_CONNS];
+            automatic string txt2         [NUM_CONNS];
+            automatic int    t = 0;
+            automatic bit    all_done;
+
+            for (int L = 0; L < NUM_CONNS; L++) begin
+                automatic int before_sz = sess_bytes[L].size();
+                got_before[L]   = got[L].size();
+                tlast_before[L] = tlasts[L];
+                // One arm carries BOTH GETs, the way the host DMAs a batch's request text.
+                txt2[L] = $sformatf(
+                    "GET /bucket/col%0d.parquet HTTP/1.1\r\nHost: 10.0.0.1:9000\r\nRange: bytes=%0d-%0d\r\nConnection: keep-alive\r\n\r\nGET /bucket/col%0d.parquet HTTP/1.1\r\nHost: 10.0.0.1:9000\r\nRange: bytes=%0d-%0d\r\nConnection: keep-alive\r\n\r\n",
+                    L, 20000 + L*1000, 20000 + L*1000 + body2 - 1,
+                    L, 30000 + L*1000, 30000 + L*1000 + body2 - 1);
+                // Distinct bases per response AND per lane: a body served to the wrong lane, or the
+                // two responses merged into one, changes the bytes rather than only their count.
+                append_response(L, body2, byte'(8'h40 + L));
+                append_response(L, body2, byte'(8'h80 + L));
+                new_bytes[L] = sess_bytes[L].size() - before_sz;
+            end
+
+            // Both chunk-length entries, then the arm -- and the arm does not rewrite
+            // req_chunk_bytes, so the register still holds the last entry's value, as on the host.
+            for (int L = 0; L < NUM_CONNS; L++) begin
+                push_entry(L, body2);
+                push_entry(L, body2);
+                push_arm  (L, txt2[L].len());
+            end
+            fork
+                dma_text(0, txt2[0]);
+                dma_text(1, txt2[1]);
+                dma_text(2, txt2[2]);
+                dma_text(3, txt2[3]);
+            join
+            repeat (8000) @(posedge clk);
+
+            // Three packets per lane across two responses, interleaved over the lanes.
+            for (int round = 0; round < 3; round++) begin
+                for (int L = 0; L < NUM_CONNS; L++) begin
+                    automatic int chunk = (new_bytes[L] + 2) / 3;
+                    automatic int base  = round * chunk;
+                    automatic int n     = (base + chunk > new_bytes[L])
+                                          ? (new_bytes[L] - base) : chunk;
+                    if (n > 0) announce(L, n);
+                end
+            end
+
+            forever begin
+                all_done = 1;
+                for (int L = 0; L < NUM_CONNS; L++)
+                    if (tlasts[L] < tlast_before[L] + 2) all_done = 0;
+                if (all_done || t > 400000) break;
+                @(posedge clk); t++;
+            end
+
+            for (int L = 0; L < NUM_CONNS; L++) begin
+                automatic bit lane_ok = 1;
+                automatic int n_new   = got[L].size() - got_before[L];
+                if (tlasts[L] - tlast_before[L] != 2) begin
+                    $display("        lane %0d: %0d tlast pulses, expected 2 (one per response)",
+                             L, tlasts[L] - tlast_before[L]);
+                    lane_ok = 0;
+                end
+                if (n_new != 2*body2) begin
+                    $display("        lane %0d: %0d new body bytes, expected %0d",
+                             L, n_new, 2*body2);
+                    lane_ok = 0;
+                end else begin
+                    for (int i = 0; i < 2*body2; i++) begin
+                        automatic int             off  = (i < body2) ? i : (i - body2);
+                        automatic byte unsigned   want = (i < body2)
+                            ? (byte'(8'h40 + L) + off[7:0])
+                            : (byte'(8'h80 + L) + off[7:0]);
+                        if (got[L][got_before[L] + i] !== want) begin
+                            $display("        lane %0d response %0d byte %0d: got %02h expected %02h",
+                                     L, (i < body2) ? 1 : 2, off,
+                                     got[L][got_before[L] + i], want);
+                            lane_ok = 0;
+                            break;
+                        end
+                    end
+                end
+                if (lane_ok) ok($sformatf("pipelined/lane%0d_two_bodies", L));
+                else         bad($sformatf("pipelined/lane%0d_two_bodies", L));
+            end
+
+            // The sticky bits that say the receive path misbehaved even though the bytes came out
+            // right: [28] a lane refused a routed beat (it was dropped), [27] body bytes arrived
+            // with no chunk length configured, [25] the per-lane fifo back-pressured the TCP stack,
+            // [7] a response was retired with a status read as neither 200 nor 206.
+            if (!stallWord[28] && !stallWord[27] && !stallWord[25] && !stallWord[7])
+                ok("pipelined/no_sticky_stalls");
+            else
+                bad($sformatf("pipelined/no_sticky_stalls (stallWord=%08h)", stallWord));
+        end
+
+        // =========================================================================================
         // Reconnect: MinIO drops an idle connection. With N lanes this is the NORMAL case, not a
         // fault -- a lane can sit idle past the ~30 s server timeout while its neighbours work.
         // The lane must come back on a fresh session, and the other lanes must not notice.

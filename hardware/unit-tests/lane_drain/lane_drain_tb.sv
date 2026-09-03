@@ -850,10 +850,53 @@ module lane_drain_tb #(
         $display("     CSR stall=0x%08h (connect=%0b send=%0b read=%0b init_err=%0b send_err=%0b noCL=%0b dirty=%0b bad_status=%0b reconnects=%0d slot=%0d annq_overflow=%0b)",
                  stallWord, stallWord[0], stallWord[1], stallWord[2], stallWord[3], stallWord[4],
                  stallWord[5], stallWord[6], stallWord[7], stallWord[15:8], stallWord[23:16], stallWord[24]);
+        $display("     CSR stall upper (route_stall=%0b rwl_starved=%0b read_timeout=%0b rx_fifo_stall=%0b)",
+                 stallWord[28], stallWord[27], stallWord[26], stallWord[25]);
         $display("     CSR resp=0x%08h  content_length=%0d  body_remaining=%0d  queue_depth=%0d  state=%0d",
                  respWord, contentLengthWord, bodyRemainingWord, queueDepthWord, state_debug);
         $display("     notif-backpressure=%0d cyc  rx_data-backpressure=%0d cyc", notif_bp_cycles, rxdata_bp_cycles);
         $display("  ------------------------------------------");
+    endtask
+
+    // =============================================================================================
+    // STICKY STALL GATE
+    //
+    // Delivering every byte is necessary, not sufficient. Four bits in the handler's stallWord
+    // record, stickily, that the receive path misbehaved on the way even when the data came out
+    // right -- and each of them is a condition this bench exists to catch:
+    //
+    //   [28] rxd_route_stall  a lane refused a beat rx_dispatch had already accepted off the shared
+    //                         bus, so that beat was DROPPED. Silent corruption, or a hang.
+    //   [27] rwl_starved      body bytes arrived with no chunk length configured -- two columns
+    //                         about to be merged into one decoder stream.
+    //   [25] rx_fifo_stall    the per-lane decoupling fifo refused the producer, i.e. back-pressure
+    //                         reached the TCP stack again, which is the thing the fifo exists to
+    //                         prevent.
+    //   [7]  status_bad       a response was retired with a status the handler read as not 200/206.
+    //
+    // Bit positions are handler_multi.sv's stallWord concatenation, not a guess: {3'd0,
+    // rxd_route_stall, |rwl_starved, |lane_timeout, |lane_fifo_stall, rxd_overflow, 8'd0,
+    // reconn_cnt_q, |lane_status_bad_q, ...}.
+    //
+    // Applied only to a verdict that already says PASS. Scenarios (e)/(s_e) deliberately kill a
+    // lane's consumer for good and report CONTAINED/PARTIAL instead; their stall bits are the
+    // expected consequence of the transient, not a defect, and this must not turn a containment
+    // measurement into a failure.
+    // =============================================================================================
+    task automatic check_sticky();
+        string why;
+        why = "";
+        if (stallWord[28]) why = {why, " route_stall(28)"};
+        if (stallWord[27]) why = {why, " rwl_starved(27)"};
+        if (stallWord[25]) why = {why, " rx_fifo_stall(25)"};
+        if (stallWord[7])  why = {why, " status_bad(7)"};
+        if (why != "") begin
+            $display("  STICKY stall bits set:%s   (stallWord=0x%08h)", why, stallWord);
+            if (verdict.len() >= 4 && verdict.substr(0, 3) == "PASS") begin
+                verdict = $sformatf("FAIL (data ok, sticky stall bits:%s)", why);
+                dump("sticky");
+            end
+        end
     endtask
 
     // =============================================================================================
@@ -1034,10 +1077,13 @@ module lane_drain_tb #(
         end
 
         // ---- SERIALISED variants -------------------------------------------------------------------
-        // handler_multi frames only ONE response per transfer arm (see scenarios a2/a9/a10), so the
-        // scenarios below keep exactly one response outstanding per lane.  That is the configuration
-        // in which the design does work, and it is the only one in which the drain/containment
-        // questions can be asked of the handler at all.
+        // These keep exactly ONE response outstanding per lane, deliberately.  They were written
+        // that way because handler_multi could only ever frame one response per transfer arm, so
+        // the drain and containment questions could not otherwise be asked of it at all; that
+        // limitation is fixed (the read stage in handler_multi re-arms per response, and a2/a9/a10
+        // and the p* scenarios now pass pipelined).  They are kept because a serialised control is
+        // still the cleanest way to separate a receive-path fault from a pipelining one: if s_d or
+        // s_e fails while its pipelined twin passes, the pipelining is not what broke.
 
         "s_base": begin                     // serialised baseline, both lanes
             if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
@@ -1385,6 +1431,7 @@ module lane_drain_tb #(
         endcase
 
         wait_cycles(50);
+        check_sticky();
         $display("\n------------------------------------------------------------------");
         $display("lane_drain_tb '%s' (NUM_CONNS=%0d): %s", scen, NUM_CONNS, verdict);
         $display("  errors=%0d  liveness_failed=%0b(cyc %0d)  config_stalled=%0b(cyc %0d)",
