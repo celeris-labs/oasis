@@ -1,6 +1,7 @@
 #pragma once
 
 #include "libstf/common.hpp"
+#include <array>
 #include <atomic>
 #include <coyote/cThread.hpp>
 #include <cstdint>
@@ -34,6 +35,21 @@ constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
 // grew from 8 to 16 CSR words (32 -> 64 characters), which pushed START from 31 to 39.
 constexpr const uint64_t HTTP_READ_CONFIG_REGS = 64;
 constexpr const uint64_t HTTP_READ_CONFIG_ID   = 0x0000000000485454;
+
+/// CSR revision at which the per-lane readback registers (read ids 16..20) exist, reported in
+/// inflightWord[31:24]. It reads 0 on every bitstream built before them.
+///
+/// THIS IS NOT A COSMETIC CHECK. The read register file answers an out-of-range address with
+/// resp_error, not with zeros, so reading 16..20 on an older bitstream is a bus error rather than a
+/// harmless "all fields clear". Every accessor for those registers is gated on this, and everything
+/// gated falls back to the pre-lane behaviour rather than degrading.
+constexpr const uint8_t HTTP_CSR_REVISION_LANES = 2;
+
+/// Lanes the per-lane CSRs address, at a FIXED stride, whatever NUM_CONNS the bitstream was built
+/// with. Lanes the bitstream does not have read 0. The stride is fixed on purpose: one that moved
+/// with the lane count would silently reinterpret every field the moment a 2-lane bitstream was
+/// swapped for a 4-lane one. See the read map in hardware/src/hdl/http_read/http_config.sv.
+constexpr const uint8_t HTTP_LANE_SLOTS = 8;
 
 /**
  * Configues a hardware RDMARead module to properly process the next page
@@ -125,18 +141,47 @@ class HTTPReadConfig : public libstf::Config {
     /// Note this bounds chunks, not requests -- the request text is one DMA of any size.
     size_t max_batch_chunks();
 
-    /// Push the batch's body_last bits, then arm the transfer. The caller DMAs `batch.text` into
-    /// the request stream afterwards -- this only tells the hardware what is coming.
+    /// Which admission bit await_cfg_ready() is waiting on. Both live in the SAME nibble of read
+    /// register 17 and they are not interchangeable: an ARM waits for the lane's previous request
+    /// text to have gone out, an ENTRY waits for its chunk queue to have room. Waiting on the wrong
+    /// one deadlocks -- the arm that would drain the queue is the beat being withheld.
+    enum class LaneAdmit : uint8_t { Arm, Entry };
+
+    /// Push the batch's body_last bits, then arm the transfer, ALL ON `lane`. The caller DMAs
+    /// `batch.text` into that lane's request stream afterwards -- this only tells the hardware what
+    /// is coming.
+    ///
+    /// `lane` is what the hardware routes by (req_chunk_dest, bits [35:32] of the chunk-length
+    /// register); get it from lane_for_stream(). It used to be derived from the decode stream inside
+    /// here while operator.cpp derived the DMA sink from the same stream a different way, so the two
+    /// could disagree; and the arm carried no lane of its own at all, inheriting whatever the last
+    /// entry left in the register. Both are now one explicit parameter.
     void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch,
-                      libstf::stream_t stream);
+                      uint8_t lane);
 
-    /// Block until the config port can take another beat. See the definition for why skipping this
-    /// loses whole batches without raising anything.
-    void await_cfg_ready(const char *what);
+    /// Block until `lane` will accept a beat of this kind, or throw naming the lane and why it will
+    /// not. See the definition for why skipping this loses whole batches without raising anything,
+    /// and for what happens on a bitstream with no per-lane registers.
+    void await_cfg_ready(const char *what, uint8_t lane, LaneAdmit admit);
 
-    /// Block until the hardware queue has room for `needed` entries. Batches must reserve space for
-    /// all of their entries up front: the arm that starts a transfer is written after the entries,
-    /// so a batch that fills the queue part way through deadlocks against its own arm.
+    /// Block until `lane` has room for `needed` more chunk entries -- occ(lane) + needed <=
+    /// lane_depth_limit(). Batches must reserve space for all of their entries up front: the arm
+    /// that starts a transfer is written after the entries, so a batch that fills the queue part way
+    /// through deadlocks against its own arm.
+    ///
+    /// A `needed` above lane_depth_limit() is not an error and not an impossible wait: the limit is
+    /// the host's pipelining cap, and a batch bigger than it simply gets the lane to itself
+    /// (`needed` is already bounded by max_batch_chunks(), which is the hardware's real limit).
+    /// Fatal is checked first, so a dead lane fails immediately instead of never draining.
+    ///
+    /// On a bitstream below HTTP_CSR_REVISION_LANES there is no per-lane occupancy, and this
+    /// degrades to exactly the previous behaviour: await_queue_space() against the shared queue,
+    /// i.e. depth-1-per-batch semantics.
+    void await_lane_credit(uint8_t lane, size_t needed,
+                           const char *what = "a batch of chunk-length entries");
+
+    /// Block until the hardware queue has room for `needed` entries, against the OR-folded
+    /// occupancy in read id 10. The pre-lane path; await_lane_credit() is the per-lane one.
     void await_queue_space(size_t needed, const char *what);
 
     /// The three HTTP status digits from the last response strip_http parsed, as text ("206",
@@ -180,6 +225,10 @@ class HTTPReadConfig : public libstf::Config {
         /// single-session bitstream, where the field reads 0 and is normalised here -- an older
         /// bitstream has one shared connection, not zero.
         uint8_t lanes         = 1;
+        /// CSR revision, from inflightWord[31:24]. 0 on every bitstream built before the per-lane
+        /// registers; HTTP_CSR_REVISION_LANES or higher means read ids 16..20 exist. NOT normalised
+        /// -- 0 is a real answer here and the only safe one to act on.
+        uint8_t revision      = 0;
 
         bool multi_session() const { return lanes > 1; }
         bool legacy() const { return slots == 0; }
@@ -197,6 +246,149 @@ class HTTPReadConfig : public libstf::Config {
     /// which discards it while reporting success. See the note on req_dest in operator.cpp.
     uint8_t lane_count();
 
+    /// CSR revision the programmed bitstream reports (inflightWord[31:24]), cached after the first
+    /// read. 0 on everything built before the per-lane registers.
+    uint8_t revision();
+
+    /// Whether read ids 16..20 may be READ AT ALL. Reading them on a bitstream below
+    /// HTTP_CSR_REVISION_LANES is a resp_error, not zeros, so this gates every lane accessor.
+    bool lane_csrs_available();
+
+    /// The value written into req_chunk_dest -- bits [35:32] of the chunk-length register -- for a
+    /// chunk that decodes on `stream`.
+    ///
+    /// TWO BITSTREAMS READ THAT FIELD DIFFERENTLY, and it is the same four bits:
+    ///   - handler_multi (lane_count() > 1): it is the LANE. The lane owns a TCP session, a framer,
+    ///     a chunk queue and the decoder its body bytes come out on, so the lane index IS the
+    ///     decoder index. `stream % lanes`, matching what operator.cpp already does when it picks
+    ///     the axis_host_recv sink for the request text -- the two MUST agree or a lane's entries
+    ///     and its request text land on different lanes.
+    ///   - the single-session handler (lane_count() == 1): there is one connection and the field is
+    ///     purely the DECODER index, so it stays `stream & 0xF`. Folding it to 0 would send every
+    ///     column's bytes to decoder 0.
+    ///
+    /// WP5: the modulo is a routing hazard, not a design. A chunk placed on a decode stream the
+    /// bitstream has no lane for is silently rerouted to `stream % lanes` -- correct today only
+    /// because the scheduler's stream count is the decoder count and the bitstream is built with one
+    /// lane per decoder. Lane-aware dispatch should choose the lane and let the decode stream follow
+    /// it, not the other way round.
+    uint8_t lane_for_stream(libstf::stream_t stream);
+
+    /**
+     * One lane's admission window, from read ids 16 (LANE_OCC) and 17 (LANE_READY).
+     *
+     * Both admission bits are monotone in the host's favour: nothing but a config beat the host
+     * itself writes can clear either. So a value read here is still true when the write lands, and
+     * poll-then-write needs no retry and no lock -- which is why they are in one register and why
+     * this struct is a snapshot rather than a handle.
+     */
+    struct HTTPLane {
+        /// Chunk entries queued and not yet retired by a tlast, i.e. responses this lane still owes.
+        /// Saturates at 255; policy().queue_depth carries the untruncated per-lane limit.
+        uint8_t occ         = 0;
+        bool    arm_ready   = false; // will accept an ARM beat (req_total_bytes != 0)
+        bool    entry_ready = false; // will accept a chunk ENTRY beat (req_total_bytes == 0)
+        bool    conn_up     = false; // holds an established TCP session
+        /// Out of the game until the host reissues. CHECK THIS FIRST: arm_ready stays low forever on
+        /// a lane that was armed and then went fatal, so a poll that does not look at it waits out
+        /// the full timeout and then reports the wrong thing.
+        bool    fatal       = false;
+
+        bool ready_for(LaneAdmit admit) const {
+            return admit == LaneAdmit::Arm ? arm_ready : entry_ready;
+        }
+        std::string describe() const;
+    };
+
+    /// Every lane's admission window, read in TWO CSR reads whatever the lane count. `count` is the
+    /// lanes the bitstream actually has; slots beyond it read 0 and are not reported.
+    struct HTTPLanes {
+        uint8_t                                   count = 0;
+        std::array<HTTPLane, HTTP_LANE_SLOTS>     lane {};
+
+        /// True on a bitstream below HTTP_CSR_REVISION_LANES, where the registers were not read.
+        bool empty() const { return count == 0; }
+        /// Throws rather than clamping: a lane index out of range is a dispatch bug, and clamping
+        /// would admit a batch against a different lane's credit.
+        const HTTPLane &at(uint8_t l) const;
+        std::string describe() const;
+    };
+    HTTPLanes lanes();
+
+    /**
+     * One lane's STICKY failure causes, from read id 19. Sticky since reset -- a reconnect does not
+     * clear them, which is the point: the conditions that matter are transient in the hardware and
+     * long gone by the time anyone polls.
+     *
+     * FATAL IS NOT HERE, it is in the admission word, and the pair is what carries the meaning:
+     *   - fatal && lane_dead: rx_dispatch's head-of-line watchdog killed the lane and discarded its
+     *     packets, so bytes went missing out of the MIDDLE of a response. The whole batch must be
+     *     reissued; nothing about the partial data is usable.
+     *   - fatal && !lane_dead: a read error that cannot be replayed, and the bits below say which.
+     */
+    struct HTTPLaneError {
+        bool lane_dead     = false; // [8L+0] HOL-killed by rx_dispatch; bytes lost mid-response
+        bool dirty         = false; // [8L+1] aborted after body bytes had reached the decoder
+        bool init_err      = false; // [8L+2] a connect attempt for this lane failed
+        bool resp_err      = false; // [8L+3] a response could not be framed (no Content-Length)
+        bool status_bad    = false; // [8L+4] a response retired with neither 200 nor 206
+        bool tx_refused    = false; // [8L+5] the TOE refused a transmit reservation (informational)
+        bool read_timeout  = false; // [8L+6] the read watchdog expired -- nothing arrived at all
+        bool rx_fifo_stall = false; // [8L+7] this lane's decoupling fifo back-pressured the stack
+        /// The byte exactly as read, for comparing a condition already reported against a new one.
+        uint8_t raw        = 0;
+
+        bool any() const { return raw != 0; }
+        std::string describe() const;
+    };
+
+    struct HTTPLaneErrors {
+        uint8_t                                       count = 0;
+        std::array<HTTPLaneError, HTTP_LANE_SLOTS>    lane {};
+
+        bool empty() const { return count == 0; }
+        const HTTPLaneError &at(uint8_t l) const;
+        std::string describe() const;
+    };
+    HTTPLaneErrors lane_errors();
+
+    /**
+     * Read id 20: what the bitstream was ELABORATED with, for the host to check itself against.
+     *
+     * Every field here is something a mismatched host gets silently wrong -- too many lanes
+     * addressed, a batch larger than a lane's queue can hold, or a software watchdog shorter than
+     * the hardware's, which reports a lane dead that the hardware is still waiting on. WP8's
+     * pre-flight is the intended reader.
+     */
+    struct HTTPLanePolicy {
+        uint8_t  revision          = 0; // [7:0], the same value as inflightWord[31:24]
+        uint8_t  num_conns         = 0; // [15:8], UNTRUNCATED, unlike inflightWord[23:20]
+        uint16_t queue_depth       = 0; // [31:16], chunk entries PER LANE, saturating at 65535
+        uint32_t lane_stall_cycles = 0; // [55:32], the HOL watchdog threshold, saturating at 2^24-1
+        uint8_t  lane_stall_log2   = 0; // [61:56], exact even where the field above saturates
+
+        /// False on a bitstream below HTTP_CSR_REVISION_LANES, where the register was not read.
+        bool valid() const { return revision >= HTTP_CSR_REVISION_LANES; }
+        std::string describe() const;
+    };
+    HTTPLanePolicy policy();
+
+    /// Chunk entries the host will let ONE LANE owe at a time: `OASIS_HTTP_LANE_DEPTH` (default 4),
+    /// clamped to [1, max_batch_chunks()], read once and cached. 1 on a bitstream below
+    /// HTTP_CSR_REVISION_LANES, which has no per-lane occupancy to meter against.
+    ///
+    /// This is the HOST'S pipelining cap, not a hardware limit: the lane's queue is
+    /// policy().queue_depth deep. It exists because depth beyond a handful buys nothing on an
+    /// HTTP/1.1 connection (see the measurements at HTTP_RX_WINDOW_BYTES) while costing response
+    /// bytes in flight per lane.
+    size_t lane_depth_limit();
+
+    /// Pure decoders for the per-lane registers, exposed so a caller that already has the words --
+    /// a pre-flight dump, a test -- can decode without a board. `count` is lane_count().
+    static HTTPLanes       DecodeLanes(uint64_t occ_word, uint64_t ready_word, uint8_t count);
+    static HTTPLaneErrors  DecodeLaneErrors(uint64_t err_word, uint8_t count);
+    static HTTPLanePolicy  DecodePolicy(uint64_t policy_word);
+
     /**
      * Read CSR 11: which pipeline stage stopped making progress (`stallWord` in handler.sv).
      *
@@ -208,6 +400,26 @@ class HTTPReadConfig : public libstf::Config {
      * the old 4-tuple in TIME_WAIT for 60s. On reuse the TOE presents a random ISN, Linux usually
      * refuses to recycle, and the resulting challenge ACK resets the SYN retry counter in
      * rx_engine, so the SYN is retried forever and openStatus is never emitted at all.
+     *
+     * WHAT DRIVES EACH BIT ON handler_multi, because the field names here predate it and several
+     * now carry an OR over lanes rather than the one lane's condition they were named for (read the
+     * per-lane registers -- lanes() and lane_errors() -- to find out WHICH lane):
+     *
+     *   [0]     conn_stall_q      -> connect_stalled
+     *   [1]     tied to 0         -> send_stalled    (never set on a multi-lane bitstream)
+     *   [2]     tied to 0         -> read_stalled    (never set on a multi-lane bitstream)
+     *   [3]     |lane_init_err_q  -> init_error
+     *   [4]     |stream_refused   -> send_error
+     *   [5]     |lane_resp_err_q  -> resp_unframeable
+     *   [6]     |lane_fatal_q     -> dirty_abort     (ANY fatal lane now, not only a dirty abort)
+     *   [7]     |lane_status_bad_q-> status_bad
+     *   [15:8]  reconn_cnt_q      -> reconnects
+     *   [23:16] tied to 0         -> read_slot       (never set on a multi-lane bitstream)
+     *   [24]    rxd_overflow      -> notify_overflow
+     *   [25]    |lane_fifo_stall  -> rx_fifo_stall
+     *   [26]    |lane_timeout     -> read_timeout
+     *   [27]    |rwl_starved      -> align_starved
+     *   [28]    rxd_route_stall   -> route_stall
      */
     struct HTTPStall {
         bool connect_stalled = false;
@@ -251,8 +463,17 @@ class HTTPReadConfig : public libstf::Config {
         bool read_timeout = false;
         /// Body bytes arrived with no column-chunk length configured. Sticky. Means the host queued
         /// fewer chunk lengths than responses, so two columns merge into one decoder stream -- a
-        /// silent corruption, not a failure. Any result from such a run is suspect.
+        /// silent corruption, not a failure. Any result from such a run is suspect. Driven by
+        /// |rwl_starved on handler_multi.
         bool align_starved = false;
+        /// rx_dispatch offered a beat to a lane that then refused it, so the lane's fifo filled
+        /// despite the conn_space_ok check that exists to stop exactly that. Sticky. The shared
+        /// receive path is being stalled by one lane again, which is the whole thing rx_dispatch was
+        /// added to prevent -- so either the space check is wrong or that lane's fifo is undersized.
+        /// It is the multi-lane sibling of rx_fifo_stall: that one says a lane's fifo back-pressured
+        /// the stack, this one says the ROUTER was blocked behind it, which is what starves the
+        /// other lanes.
+        bool route_stall = false;
         /// The stallWord exactly as read, so a caller can tell a condition it has already reported
         /// from a new one. The named bools above are for reading; this is for comparing.
         uint32_t raw = 0;
@@ -260,7 +481,7 @@ class HTTPReadConfig : public libstf::Config {
         bool any() const {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
                    || resp_unframeable || dirty_abort || status_bad || notify_overflow
-                   || rx_fifo_stall || read_timeout || align_starved;
+                   || rx_fifo_stall || read_timeout || align_starved || route_stall;
         }
         std::string describe() const;
     };
@@ -337,6 +558,21 @@ class HTTPReadConfig : public libstf::Config {
     /// Lanes reported by the bitstream, cached on first read. 0 means "not read yet"; lane_count()
     /// normalises a single-session bitstream's 0 to 1.
     uint8_t lane_count_cached_ {0};
+
+    /// CSR revision, cached. -1 until the first read; the value is fixed by the bitstream.
+    int revision_ {-1};
+
+    /// lane_depth_limit(), cached. 0 means "not computed yet"; the limit itself is never 0.
+    size_t lane_depth_ {0};
+
+    /// await_cfg_ready() on a bitstream with no per-lane registers: EXACTLY the behaviour that
+    /// shipped before them -- the same register, the same spin, the same timeout and the same
+    /// message. A `--decoders 1` legacy bitstream must not notice that this work package happened.
+    void await_cfg_ready_legacy(const char *what);
+
+    /// Throw naming `lane`, what it was waiting for, and the decoded sticky causes -- including
+    /// whether this was a head-of-line kill (reissue the whole batch) or an unreplayable read error.
+    [[noreturn]] void throw_lane_fatal(uint8_t lane, const char *what);
 
     /// Bytes asked for in the most recent ranged GET, so response() can compare what the server
     /// said against what was requested.

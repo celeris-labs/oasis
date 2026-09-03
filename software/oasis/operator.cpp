@@ -230,7 +230,13 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
                 "to be DMA'd to.");
         }
     }
-    config->submit_batch(server_ip_, server_port_, batch, stream);
+    // ONE lane for the whole batch, decided here and passed to everything that needs it. It used to
+    // be re-derived at each use -- submit_batch from `stream & 0xF`, the DMA sink from
+    // `stream % lanes` -- which are the same number only while the scheduler keeps its stream count
+    // at or below the bitstream's lane count. When they disagreed, a batch's queue entries and its
+    // request text went to DIFFERENT lanes, and nothing on either side could notice.
+    const uint8_t lane = config->lane_for_stream(stream);
+    config->submit_batch(server_ip_, server_port_, batch, lane);
 
     // Then the text itself.
     //
@@ -259,9 +265,8 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     //
     // It stayed invisible until the second decoder existed, because every flow was on stream 0.
     const uint8_t          lanes    = config->lane_count();
-    const libstf::stream_t req_dest = (lanes > 1)
-                                        ? static_cast<libstf::stream_t>(stream % lanes)
-                                        : static_cast<libstf::stream_t>(0);
+    const libstf::stream_t req_dest = (lanes > 1) ? static_cast<libstf::stream_t>(lane)
+                                                  : static_cast<libstf::stream_t>(0);
     auto *byte_ptr = static_cast<std::byte *>(buf->ptr);
     for (size_t off = 0; off < buf->size; off += coyote::MAX_TRANSFER_SIZE) {
         coyote::localSg sg;
@@ -289,7 +294,13 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     // condition, which is exactly !stream_busy. Waiting on it here is therefore a wait for this
     // transfer to finish sending. It costs only as long as a few KB of request text takes to go
     // out, and it guarantees the buffer outlives the DMA reading it.
-    config->await_cfg_ready("request text to finish sending");
+    //
+    // Asked of THIS LANE, not of the config port in general. ARM_READY for lane L is !stream_busy[L]
+    // -- exactly "this lane's transfer has finished sending" -- whereas the old OR-folded req_ready
+    // answered for whichever lane was addressed last, which after a neighbour's beat is a different
+    // lane's answer to a different question. The wait would then end early and the buffer be freed
+    // under a DMA still reading it.
+    config->await_cfg_ready("request text to finish sending", lane, HTTPReadConfig::LaneAdmit::Arm);
 }
 
 void HTTPBatchSourceOperator::print(std::ostream &os) const {
