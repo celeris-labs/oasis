@@ -22,7 +22,7 @@ rm -rf "$OUT" xsim.jou xsim.log xvlog.pb xelab.pb webtalk* .Xil 2>/dev/null || t
 xvlog -sv ${TRACE:+-d TRACE} \
   lynxTypes_stub.sv \
   "$HDL/http_types.sv" \
-  "$HDL/tcp_session_table.sv" \
+  "$ARCHIVE/tcp_session_table.sv" \
   "$HDL/tcp_init.sv" \
   "$ARCHIVE/http_req_builder.sv" \
   "$ARCHIVE/tcp_send_http.sv" \

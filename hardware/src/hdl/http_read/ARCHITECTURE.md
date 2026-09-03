@@ -380,7 +380,7 @@ build-105 utilisation, for scale: LUT 31.9 %, FF 25.8 %, BRAM 44.5 %, URAM 10.3 
 | `rx_dispatch.sv` | **instantiated** via `handler_multi` under `EN_TCP_MULTI` (was dead code until `3edff95`) |
 | `tx_arbiter.sv` | shipped `3edff95` |
 | per-lane `strip_http` + per-lane decoupling fifo | shipped `3edff95` |
-| `handler_multi.sv` (N persistent sessions) | shipped `3edff95`. The single-session path is `handler_stream.sv`; the original descriptor-ring `handler.sv` is retired to `hardware/archive/http_read/` |
+| `handler_multi.sv` (N persistent sessions) | shipped `3edff95`, and now the **only** HTTP client. The single-session `handler_stream.sv` and its `tcp_session_table.sv` followed the descriptor-ring `handler.sv` into `hardware/archive/http_read/`; `EN_TCP_MULTI` off is an elaboration error |
 | concurrent-session testbench | `http_multilane_tb` — interleaves responses at packet granularity, 16/16 |
 | host lane count | read from the bitstream (`num_decoders()`); `scripts/synthesize.sh --multi` |
 | **hardware measurement of ADR-4** | **does not exist.** build-110 is the first bitstream; the A/B is M4 in `THESIS-MEASUREMENTS.md` |

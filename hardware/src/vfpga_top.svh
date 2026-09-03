@@ -449,121 +449,15 @@ for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_hm_lane
 end
 
 `else
-// Single-lane only: one shared body stream, demuxed by a host-chosen tag after the framer.
-AXI4S axi_http_body (.aclk(clk), .aresetn(rst_n));
-localparam int HTTP_DEST_BITS = (NUM_DECODERS > 1) ? $clog2(NUM_DECODERS) : 1;
-logic [HTTP_DEST_BITS-1:0] http_body_dest;
-
-handler_stream #(
-    .QUEUE_DEPTH(HTTP_QUEUE_DEPTH),
-    .NUM_DEST(NUM_DECODERS)
-) inst_handler (
-    .ap_clk  (clk),
-    .ap_rst_n(rst_n),
-
-    .m_axis_open_connection_TVALID (tcp_open_req.valid),
-    .m_axis_open_connection_TREADY (tcp_open_req.ready),
-    .m_axis_open_connection_TDATA  (tcp_open_req.data),
-    .s_axis_open_status_TVALID     (tcp_open_rsp.valid),
-    .s_axis_open_status_TREADY     (tcp_open_rsp.ready),
-    .s_axis_open_status_TDATA      (tcp_open_rsp.data),
-    .m_axis_close_connection_TVALID(tcp_close_req.valid),
-    .m_axis_close_connection_TREADY(tcp_close_req.ready),
-    .m_axis_close_connection_TDATA (tcp_close_req.data),
-
-    .s_axis_notifications_TVALID   (tcp_notify.valid),
-    .s_axis_notifications_TREADY   (tcp_notify.ready),
-    .s_axis_notifications_TDATA    (tcp_notify.data),
-    .m_axis_read_package_TVALID    (tcp_rd_pkg.valid),
-    .m_axis_read_package_TREADY    (tcp_rd_pkg.ready),
-    .m_axis_read_package_TDATA     (tcp_rd_pkg.data),
-    .s_axis_rx_metadata_TVALID     (tcp_rx_meta.valid),
-    .s_axis_rx_metadata_TREADY     (tcp_rx_meta.ready),
-    .s_axis_rx_metadata_TDATA      (tcp_rx_meta.data[TCP_RX_META_BITS-1:0]),
-    .s_axis_rx_data_TVALID         (axis_tcp_recv.tvalid),
-    .s_axis_rx_data_TREADY         (axis_tcp_recv.tready),
-    .s_axis_rx_data_TDATA          (axis_tcp_recv.tdata),
-    .s_axis_rx_data_TKEEP          (axis_tcp_recv.tkeep),
-    .s_axis_rx_data_TLAST          (axis_tcp_recv.tlast),
-    .s_axis_rx_data_TSTRB          ('0),
-
-    .m_axis_tx_meta_TVALID         (tcp_tx_meta.valid),
-    .m_axis_tx_meta_TREADY         (tcp_tx_meta.ready),
-    .m_axis_tx_meta_TDATA          (tcp_tx_meta.data),
-    .m_axis_tx_data_TVALID         (axis_tcp_send.tvalid),
-    .m_axis_tx_data_TREADY         (axis_tcp_send.tready),
-    .m_axis_tx_data_TDATA          (axis_tcp_send.tdata),
-    .m_axis_tx_data_TKEEP          (axis_tcp_send.tkeep),
-    .m_axis_tx_data_TLAST          (axis_tcp_send.tlast),
-    .s_axis_tx_status_TVALID       (tcp_tx_stat.valid),
-    .s_axis_tx_status_TREADY       (tcp_tx_stat.ready),
-    .s_axis_tx_status_TDATA        (tcp_tx_stat.data),
-
-    // One beat per ranged GET, straight from the START write into a free slot.
-    // Pre-built request text from the host. Every GET of the query, concatenated.
-    .s_axis_req_TVALID             (axis_host_recv[0].tvalid),
-    .s_axis_req_TREADY             (axis_host_recv[0].tready),
-    .s_axis_req_TDATA              (axis_host_recv[0].tdata),
-    .s_axis_req_TKEEP              (axis_host_recv[0].tkeep),
-    .s_axis_req_TLAST              (axis_host_recv[0].tlast),
-
-    .req_valid                     (http_start.valid),
-    .req_ready                     (http_start.ready),
-    .req_data                      (http_start.data),
-
-    .totalWord                     (http_total_word),
-    .inflightWord                  (http_inflight_word),
-    .queueDepthWord                (http_queue_depth_word),
-    .stallWord                     (http_stall_word),
-    .respWord                      (http_resp_word),
-    .contentLengthWord             (http_content_length_word),
-    .bodyRemainingWord             (http_body_remaining_word),
-    .state_debug                   (http_client_state),
-
-    .m_axis_body_tvalid  (axi_http_body.tvalid),
-    .m_axis_body_tready  (axi_http_body.tready),
-    .m_axis_body_tdata   (axi_http_body.tdata),
-    .m_axis_body_tkeep   (axi_http_body.tkeep),
-    .m_axis_body_tlast   (axi_http_body.tlast),
-    .m_axis_body_tdest   (http_body_dest)
-);
-
-// One decode lane per decoder, fed by a chunk-granular demux.
+// The single-session HTTP path (handler_stream + tcp_session_table) is gone. It demuxed AFTER the
+// framer on one shared body stream, so a lane busy on a large chunk back-pressured every other
+// lane; and the measured ceiling of a single TCP connection -- ~0.46 GB/s however deeply pipelined,
+// against 4.60 across sixteen -- made one session the wrong shape no matter how the demux behaved.
 //
-// The demux switches only between chunks -- axis_rewrite_last holds tdest constant from a chunk's
-// first beat to its tlast -- so a chunk is never split across lanes. The lane is chosen by the
-// HOST, in the spare upper bits of the chunk-length register, and is the same stream index it
-// enqueued that chunk's decoder configuration on. Hardware round-robin would have been simpler and
-// wrong: one retried or dropped chunk would desynchronise host and hardware permanently.
-//
-// Back-pressure is per lane, so a lane busy on a large chunk stalls the shared body stream. That is
-// the same head-of-line behaviour the single-lane design had; it does not get worse, and the gain
-// is that two chunks decode concurrently rather than in sequence.
-AXI4S axi_http_lane [NUM_DECODERS] (.aclk(clk), .aresetn(rst_n));
-
-// An interface array may only be indexed by an elaboration-time constant, so the lanes' tready
-// cannot be selected inside always_comb -- Vivado rejects it with "'L' is not a constant". Mirror
-// each lane's tready into a packed vector from the generate loop, where the index IS constant, and
-// mux that instead.
-logic [NUM_DECODERS-1:0] lane_tready;
-
-for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_http_lane_sel
-    assign axi_http_lane[L].tvalid = axi_http_body.tvalid &&
-                                     (http_body_dest == HTTP_DEST_BITS'(L));
-    assign axi_http_lane[L].tdata  = axi_http_body.tdata;
-    assign axi_http_lane[L].tkeep  = axi_http_body.tkeep;
-    assign axi_http_lane[L].tlast  = axi_http_body.tlast;
-    assign lane_tready[L]          = axi_http_lane[L].tready;
-end
-
-// Lane 0 is the default, so a dest wider than the lane count (HTTP_DEST_BITS rounds up) parks on a
-// real consumer rather than hanging the body stream.
-always_comb begin
-    axi_http_body.tready = lane_tready[0];
-    for (int L = 1; L < NUM_DECODERS; L++) begin
-        if (http_body_dest == HTTP_DEST_BITS'(L)) axi_http_body.tready = lane_tready[L];
-    end
-end
+// ENABLE_HTTP_MULTI survives as a CMake option, so this branch is still reachable by configuration.
+// Failing here, at elaboration, is the point: without it the build dies much later with an
+// unresolved handler_stream module, which reads like a missing file rather than a retired mode.
+if (1) $error("ENABLE_HTTP without ENABLE_HTTP_MULTI: the single-session HTTP path was removed -- reconfigure with -DENABLE_HTTP_MULTI=ON");
 
 `endif
 

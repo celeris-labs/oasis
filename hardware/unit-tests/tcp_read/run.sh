@@ -14,7 +14,7 @@ fi
 cd "$ROOT"
 rm -rf "$OUT" xsim.jou xsim.log xvlog.pb xelab.pb webtalk* .Xil 2>/dev/null || true
 
-xvlog -sv lynxTypes_stub.sv "$HDL/tcp_session_table.sv" "$HDL/axis_fifo.sv" "$HDL/strip_http.sv" \
+xvlog -sv lynxTypes_stub.sv "$HDL/axis_fifo.sv" "$HDL/strip_http.sv" \
           "$HDL/tcp_read.sv" tcp_read_tb.sv
 xelab -debug typical -timescale 1ns/1ps -top tcp_read_tb -snapshot tcp_read_tb_snap
 xsim tcp_read_tb_snap -R
