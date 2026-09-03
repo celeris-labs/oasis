@@ -118,6 +118,11 @@ class HTTPBatchSourceOperator final : public SourceOperator {
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
 
+    /// Column chunks this flow will ask a lane to queue, one entry each whatever each splits into.
+    /// The scheduler needs it BEFORE apply() runs: a batch reserves room for all of its entries
+    /// before pushing any of them, so this is the credit the lane it is placed on has to have.
+    [[nodiscard]] size_t chunk_count() const { return chunks_.size(); }
+
   private:
     std::string        path_;
     uint32_t           server_ip_;
