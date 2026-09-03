@@ -35,9 +35,14 @@ if(ENABLE_HTTP_MULTI)
 else()
     set(OASIS_DEF_EN_TCP_MULTI "// EN_TCP_MULTI off: one shared TCP session for all decoder lanes")
 endif()
+# Generated into src/hdl/, NOT src/ -- Coyote's cr_user.tcl copies `src/hdl/*` and `vfpga_top.svh`
+# into the Vivado project and nothing else, so a header generated one level up never reaches
+# synthesis. Until 2026-08-28 an untracked hand-copy at src/hdl/oasis_defines.svh was covering for
+# that; it was deleted along with a vfpga_top.svh edit and build-111 failed elaboration with
+# "cannot open include file 'oasis_defines.svh'". Keep this path in step with the glob.
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/oasis_defines.svh.in
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/oasis_defines.svh
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hdl/oasis_defines.svh
     @ONLY
 )
 
