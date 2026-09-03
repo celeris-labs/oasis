@@ -1,0 +1,45 @@
+diff --git a/hls/toe/rx_sar_table/rx_sar_table.cpp b/hls/toe/rx_sar_table/rx_sar_table.cpp
+index 6039e25..e01775a 100755
+--- a/hls/toe/rx_sar_table/rx_sar_table.cpp
++++ b/hls/toe/rx_sar_table/rx_sar_table.cpp
+@@ -67,12 +67,39 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
+ 		rxSarReply reply (entry);
+ 
+ 		//Pre-calculated usedLength, windowSize to improve timing in metaLoader
++		// NEVER ADVERTISE A WINDOW THE RX ENGINE WILL REFUSE.
++		//
++		// rx_engine accepts a segment only when more than 375 beats are free
++		// (rx_engine.cpp, the RX_DDR_BYPASS branch):
++		//     (rxbuffer_max_data_count - rxbuffer_data_count) > 375
++		// which is 375 * 64 = 24000 bytes. This table, however, advertises (appd - recvd) - 1 and
++		// knows nothing about that floor. So whenever the reader falls behind far enough for the
++		// window to land between 1 and 24000, the receiver invites the peer to send bytes it will
++		// then drop: dup-ACK storm, go-back-N, exponential backoff. Measured on this design, one
++		// such event costs up to 13 s of dead air, and a receiver that is slower than the sender
++		// reaches that band eventually every time.
++		//
++		// A ZERO window is the state TCP already handles correctly: the sender stops, its persist
++		// timer probes every ~200 ms, and it resumes the moment the application drains. Same
++		// throttling, without the storm. So collapse the whole refuse-band to zero.
++		//
++		// One MSS of margin, because free space can shrink between advertising and arrival.
++		const ap_uint<WINDOW_BITS> RX_ENGINE_ACCEPT_FLOOR = 375 * 64;   // beats * bytes-per-beat
+ #if (WINDOW_SCALE)
+ 				ap_uint<WINDOW_BITS> actualWindowSize = (entry.appd - ((ap_uint<WINDOW_BITS>)entry.recvd)) - 1; // This works even for wrap around
++				if (actualWindowSize <= (RX_ENGINE_ACCEPT_FLOOR + MSS))
++				{
++					actualWindowSize = 0;
++				}
+ 				reply.windowSize = actualWindowSize >> entry.win_shift;
+ #else
+ 				//This works even for wrap around
+-				reply.windowSize = (entry.appd - ((ap_uint<16>)entry.recvd)) - 1; // This works even for wrap around
++				ap_uint<16> plainWindowSize = (entry.appd - ((ap_uint<16>)entry.recvd)) - 1; // This works even for wrap around
++				if (plainWindowSize <= (RX_ENGINE_ACCEPT_FLOOR + MSS))
++				{
++					plainWindowSize = 0;
++				}
++				reply.windowSize = plainWindowSize;
+ #endif
+ 
+ 		rxSar2txEng_rsp.write(reply);
