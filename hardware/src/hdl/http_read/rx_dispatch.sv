@@ -143,6 +143,17 @@ module rx_dispatch #(
     logic [CNT_BITS-1:0]         nq_cnt_q;
     logic                        ovf_q, route_stall_q;
 
+    // Announcements queued per connection, maintained incrementally.
+    //
+    // This replaces a combinational sweep of all NOTIFY_DEPTH entries that computed a rotated index
+    // (nq_head_q + j) % NOTIFY_DEPTH and called has_conn()/conn_of() on every one of them -- a
+    // NOTIFY_DEPTH-way barrel rotate over the whole sid array plus 2*NUM_CONNS*NOTIFY_DEPTH session
+    // comparators, 8603 LUTs against 1158 FFs in build-110. It existed only to drive
+    // dbg_has_pending, whose single consumer OR-reduces it into a debug word; and by reading every
+    // queue entry combinationally it also kept nq_sid/nq_len out of RAM. Counters cost NUM_CONNS
+    // registers and say the same thing more exactly.
+    logic [CNT_BITS-1:0]         pend_q [NUM_CONNS];
+
     logic nq_empty_w, nq_full_w;
     assign nq_empty_w = (nq_cnt_q == '0);
     assign nq_full_w  = (nq_cnt_q == CNT_BITS'(NOTIFY_DEPTH));
@@ -162,6 +173,13 @@ module rx_dispatch #(
     // it would issue a readPkg for a dead session and desynchronise the shared fifo for everyone.
     logic note_keep_w;
     assign note_keep_w = note_fire_w && (note_len_w != '0) && has_conn(note_sid_w);
+
+    // The enqueue condition, named once. Used by the queue pointers, by the count, and by the
+    // per-connection pending counters below.
+    logic                 enq_fire_w;
+    logic [CONN_BITS-1:0] enq_conn_w;
+    assign enq_fire_w = note_keep_w && !nq_full_w;
+    assign enq_conn_w = conn_of(note_sid_w);
 
     // ---------------------------------------------------------------------------------------------
     // readPkg issue. Head of the queue, gated ONLY on the destination having room.
@@ -224,6 +242,7 @@ module rx_dispatch #(
                 bound_q[i]  <= 1'b0;
                 sid_q[i]    <= '0;
                 closed_q[i] <= 1'b0;
+                pend_q[i]   <= '0;
             end
         end else begin
             // -- binding
@@ -243,7 +262,7 @@ module rx_dispatch #(
             end
 
             // -- enqueue / dequeue. Both can happen in the same cycle.
-            if (note_keep_w && !nq_full_w) begin
+            if (enq_fire_w) begin
                 nq_sid[nq_tail_q] <= note_sid_w;
                 nq_len[nq_tail_q] <= note_len_w;
                 nq_tail_q <= (nq_tail_q == PTR_BITS'(NOTIFY_DEPTH-1)) ? '0 : nq_tail_q + 1'b1;
@@ -254,11 +273,28 @@ module rx_dispatch #(
                 nq_head_q <= (nq_head_q == PTR_BITS'(NOTIFY_DEPTH-1)) ? '0 : nq_head_q + 1'b1;
             end
 
-            case ({(note_keep_w && !nq_full_w), issue_fire_w})
+            case ({enq_fire_w, issue_fire_w})
                 2'b10:   nq_cnt_q <= nq_cnt_q + 1'b1;
                 2'b01:   nq_cnt_q <= nq_cnt_q - 1'b1;
                 default: ;
             endcase
+
+            // -- per-connection pending count. A release drops the accounting for that connection:
+            //    its queued entries are already unroutable (conn_of returns 0 for an unbound sid),
+            //    so counting them against the new binding would be worse than forgetting them. The
+            //    decrement is guarded so a stale head cannot underflow a lane back to all-ones.
+            for (i = 0; i < NUM_CONNS; i++) begin
+                if (release_en && (release_conn == CONN_BITS'(i))) begin
+                    pend_q[i] <= '0;
+                end else begin
+                    case ({enq_fire_w   && (enq_conn_w  == CONN_BITS'(i)),
+                           issue_fire_w && (head_conn_w == CONN_BITS'(i)) && (pend_q[i] != '0)})
+                        2'b10:   pend_q[i] <= pend_q[i] + 1'b1;
+                        2'b01:   pend_q[i] <= pend_q[i] - 1'b1;
+                        default: ;
+                    endcase
+                end
+            end
 
             // -- packet routing window
             if (meta_fire_w) begin
@@ -278,14 +314,7 @@ module rx_dispatch #(
     end
 
     always_comb begin
-        dbg_has_pending = '0;
-        for (int j = 0; j < NOTIFY_DEPTH; j++) begin
-            // Only meaningful as a coarse "is anything queued for this connection" indicator.
-            if (j < int'(nq_cnt_q)) begin
-                automatic int idx = (int'(nq_head_q) + j) % NOTIFY_DEPTH;
-                if (has_conn(nq_sid[idx])) dbg_has_pending[conn_of(nq_sid[idx])] = 1'b1;
-            end
-        end
+        for (int j = 0; j < NUM_CONNS; j++) dbg_has_pending[j] = (pend_q[j] != '0);
     end
 
     always_comb begin

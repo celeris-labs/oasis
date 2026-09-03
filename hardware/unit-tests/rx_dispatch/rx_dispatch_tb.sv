@@ -257,6 +257,52 @@ module rx_dispatch_tb;
         if (dbg_overflow) bad("overflow latched unexpectedly");
         else              ok("no_overflow");
 
+        // ---- 6. per-connection pending count ----------------------------------------------------
+        // dbg_has_pending is maintained incrementally rather than swept out of the queue, so it has
+        // its own failure modes -- a missed decrement leaves a lane flagged forever, and an
+        // unguarded one wraps it to all-ones. Every announcement made above has been issued by now,
+        // so the first check also covers the decrement path across the whole run.
+        repeat (5) @(posedge clk);
+        if (dbg_has_pending != '0)
+            bad($sformatf("has_pending_idle: queue drained but bits still set (%b)", dbg_has_pending));
+        else
+            ok("has_pending_idle (everything issued -> no bits set)");
+
+        conn_space_ok    = '1;
+        conn_space_ok[2] = 1'b0;          // hold connection 2's announcements in the queue
+        notify(102, 4096, 0);
+        notify(102, 2048, 0);
+        repeat (10) @(posedge clk);
+        if (!dbg_has_pending[2])
+            bad("has_pending_set: two announcements queued for conn 2, bit not set");
+        else if (dbg_has_pending[0] || dbg_has_pending[1] || dbg_has_pending[3])
+            bad($sformatf("has_pending_set: leaked to other lanes (%b)", dbg_has_pending));
+        else
+            ok("has_pending_set (queued for conn 2 only, no other lane flagged)");
+
+        conn_space_ok = '1;
+        repeat (20) @(posedge clk);
+        if (dbg_has_pending != '0)
+            bad($sformatf("has_pending_clears: expected all clear after drain, got %b", dbg_has_pending));
+        else
+            ok("has_pending_clears (both entries issued -> bit clears)");
+
+        // A release drops the accounting for that connection: its queued entries are unroutable.
+        conn_space_ok    = '1;
+        conn_space_ok[1] = 1'b0;
+        notify(101, 4096, 0);
+        repeat (10) @(posedge clk);
+        if (!dbg_has_pending[1]) bad("has_pending_release: bit not set before release");
+        @(negedge clk);
+        release_en = 1'b1; release_conn = 2'd1;
+        @(posedge clk); #1;
+        release_en = 1'b0;
+        repeat (5) @(posedge clk);
+        if (dbg_has_pending[1])
+            bad("has_pending_release: released connection still flagged");
+        else
+            ok("has_pending_release (release clears the lane's count)");
+
         $display("========================================");
         $display("rx_dispatch_tb: %0d passed, %0d failed", passes, fails);
         $display("========================================");
