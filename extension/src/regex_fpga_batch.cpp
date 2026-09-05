@@ -398,17 +398,20 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// call that would release one. Ownership sits with the caller precisely so it can
 	// collect its own oldest transfer instead of blocking. See AcquireRegexArmCredit.
 
-	// Allocate and TLB-map this transfer's output buffer BEFORE taking the lock.
+	// Size this transfer's output buffer. The allocation itself now happens inside
+	// acquire_output_handle, below.
 	//
-	// The handle registration has to stay ordered -- the OBM matches buffers to handles
-	// positionally -- but the allocation and the TLB ioctl behind it do not, and they are
-	// what the critical section was actually made of: 18.0 ms of a 18.9 ms section at 32
-	// threads, with threads queued 118 ms behind it. Split, the ordered part is a queue
-	// push and one descriptor write.
+	// This used to allocate and TLB-map here, before the lock, via a libstf
+	// prepare_output_buffer() that split the allocation off from the ordered registration:
+	// the allocation and the TLB ioctl were 18.0 ms of an 18.9 ms critical section at 32
+	// threads, with threads queued 118 ms behind it. That split only ever existed as an
+	// uncommitted local edit to libstf, so nothing outside one developer's ~/opt could build
+	// against it; this path is back on upstream's fused acquire_output_handle(stream, size),
+	// which does the allocation under libstf's own enqueued_buffers_mutex. Restoring the
+	// split means landing prepare_output_buffer in libstf proper.
 	CALI_MARK_BEGIN("prepare_output");
 	const auto t_acquire = PhaseClock::now();
 	const size_t output_bytes = (static_cast<size_t>(plan.strings_in_batch) + 7) / 8;
-	libstf::Buffer prepared = ctx.get_output_buffer_manager().prepare_output_buffer(0, output_bytes);
 	g_acquire_ns.fetch_add(NanosSince(t_acquire), std::memory_order_relaxed);
 	CALI_MARK_END("prepare_output");
 
@@ -437,11 +440,12 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// ceil(bat_count/8) bytes is exactly what this batch will produce -- and one
 	// correctly-sized buffer per handle is what lets several batches be outstanding.
 	//
-	// The registration has to stay inside this lock. OutputBufferManager matches arriving
-	// buffers to handles positionally, so acquire order must equal enqueue order; two
-	// threads registering outside the lock and enqueueing inside it would hand each
-	// other's results over with no error anywhere. Only the allocation moved out.
-	submission.handle = ctx.get_output_buffer_manager().acquire_output_handle(0, prepared);
+	// This has to stay inside this lock. OutputBufferManager matches arriving buffers to
+	// handles positionally, so acquire order must equal enqueue order; two threads
+	// registering outside the lock and enqueueing inside it would hand each other's results
+	// over with no error anywhere. The allocation and TLB mapping happen in here too -- see
+	// the note above.
+	submission.handle = ctx.get_output_buffer_manager().acquire_output_handle(0, output_bytes);
 	const auto t_handle = PhaseClock::now();
 	g_handle_ns.fetch_add(
 	    uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_handle - t_getcfg).count()),
