@@ -5,14 +5,15 @@
 #include "libstf/configuration.hpp"
 #include "libstf/memory_pool.hpp"
 #include "libstf/tlb_manager.hpp"
-#include "oasis/bypass_receiver.hpp"
 #include "oasis/scheduler.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace oasis {
 
@@ -32,7 +33,6 @@ public:
     std::shared_ptr<libstf::TLBManager> tlb_manager();
 
     Scheduler &scheduler();
-    BypassStreamReceiver &bypass_receiver();
 
     /**
      * Allocates an output buffer the hardware decoder can write into. `size` is the exact decoded
@@ -48,8 +48,7 @@ public:
     void enqueue_output_buffer(libstf::stream_t stream, libstf::Buffer &buffer);
 
     /**
-     * Routes a hardware interrupt: Bypass-stream interrupts go to the BypassStreamReceiver, 
-     * everything else goes straight to the scheduler.
+     * Routes a hardware interrupt to the scheduler.
      */
     void handle_interrupt(int value);
 
@@ -60,16 +59,43 @@ public:
 
     bool isRDMAEnabled() const { return rdma_enabled_; }
 
-    libstf::stream_t rdmaBypassStream() const { return bypass_stream_; }
-
     /**
-     * Establishes the RDMA queue pair with the remote server and configures the read-request module
-     * with the remote region's base vaddr (only known once the queue pair has been exchanged).
+     * Establishes one RDMA queue pair (i.e. one cThread) per hardware read-request stream with the
+     * remote server, and configures each stream's ctid and remote-region base vaddr (only known
+     * once its queue pair has been exchanged). A queue pair per stream keeps each stream's
+     * in-flight reads within the per-QP outstanding-read budget the server NIC grants
+     * (max_dest_rd_atomic), which all streams would otherwise overrun through a single shared QP.
      */
     void initRDMA(const std::string &server, uint16_t port);
 
     int device_id() const { return device_id_; }
     int vfpga_id() const { return vfpga_id_; }
+
+    /**
+     * Cold-start prefetch coordination, shared across all OASIS scans on this device. Each scan
+     * registers (at schedule time) a number of yields it wants performed -- roughly one per
+     * prospective worker -- so that during cold start a worker that has primed its in-flight queue
+     * steps aside, letting other workers get the CPU to issue their own submissions and fill the
+     * hardware pipeline breadth-first before anyone starts draining.
+     *
+     * try_consume_yield atomically takes one yield from the budget, returning true if one was
+     * available. The budget is consumed only by yields that actually happen, so unstarted workers
+     * simply leave budget unused -- no reconciliation, and yielding is self-limiting (the total
+     * number of yields is capped at the registered budget, so workers can never yield forever).
+     */
+    void add_yield_budget(std::size_t count) {
+        yield_budget_.fetch_add(count, std::memory_order_relaxed);
+    }
+    bool try_consume_yield() {
+        std::size_t budget = yield_budget_.load(std::memory_order_acquire);
+        while (budget > 0) {
+            if (yield_budget_.compare_exchange_weak(budget, budget - 1, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
 private:
     static OasisContext *instance_;
@@ -84,11 +110,13 @@ private:
     std::shared_ptr<libstf::TLBManager> tlb_manager_;
     std::shared_ptr<libstf::MemConfig> mem_config_;
 
-    bool             rdma_enabled_;
-    libstf::stream_t bypass_stream_;
+    bool rdma_enabled_;
+    std::vector<std::shared_ptr<coyote::cThread>> rdma_cthreads_;
 
-    std::unique_ptr<BypassStreamReceiver> bypass_receiver_;
     std::unique_ptr<Scheduler> scheduler_;
+
+    // Cross-scan budget of cold-start yields still to be performed.
+    std::atomic<std::size_t> yield_budget_ {0};
 
     explicit OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool);
     ~OasisContext();

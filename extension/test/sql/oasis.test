@@ -1,23 +1,37 @@
 # name: test/sql/oasis.test
-# description: test Oasis extension
-# group: [sql]
+# description: Oasis extension smoke test -- loading, registration, a minimal end-to-end scan
+# group: [oasis]
 
-# Before we load the extension, this will fail
-statement error
-SELECT oasis('Sam');
-----
-Catalog Error: Scalar Function with name oasis does not exist!
+# Paths below are relative to the extension root, which is the working directory `make test` runs
+# the unittest binary from.
 
-# Require statement will ensure this test is run with this extension loaded
+# Loading the extension opens the FPGA context, so every test in this suite needs the accelerator
+# (or a simulation build with COYOTE_SIM_DIR set) to be available.
 require oasis
 
-# Confirm the extension works
-query I
-SELECT oasis('Sam');
-----
-Oasis Sam 🐥
+require parquet
 
+# Bind reads the schema straight from the Parquet footer.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_oasis('data/int32.parquet'));
+----
+a	INTEGER
+
+# A full scan of one row group through the hardware decoder.
+query III
+SELECT count(*), min(a), max(a) FROM read_oasis('data/int32.parquet');
+----
+1000	0	999
+
+# data/int32.parquet holds exactly the integers 0..999, so the sum pins the whole multiset down
+# together with the count and distinct count above.
+query III
+SELECT count(DISTINCT a), sum(a), count(*) FILTER (WHERE a < 0 OR a > 999) FROM read_oasis('data/int32.parquet');
+----
+1000	499500	0
+
+# The stream profiler is queryable and reports one row per hardware decoder.
 query I
-SELECT oasis_openssl_version('Michael') ILIKE 'Oasis Michael, my linked OpenSSL version is OpenSSL%';
+SELECT count(*) > 0 FROM oasis_stream_profile();
 ----
 true

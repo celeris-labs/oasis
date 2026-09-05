@@ -1,0 +1,213 @@
+# name: test/sql/oasis_filter.test
+# description: Filter pushdown into read_oasis -- zone-map pruning, row-level filtering, filter_prune
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# data/mixed_small.parquet is laid out so that filters on c_int32 line up exactly with row-group
+# boundaries: c_int32 = 0..65535 in 8 groups of 8192, so group k covers [8192k, 8192k + 8191].
+# That makes it possible to aim a filter at the zone-map path (whole groups ruled out by
+# statistics), at the always-true path (statistics prove every row passes, so row-level evaluation
+# is skipped), or at both at once.
+
+# ---------------------------------------------------------------------------
+# Zone-map pruning: whole row groups ruled out by statistics
+# ---------------------------------------------------------------------------
+
+# Above every group's maximum -- all 8 groups pruned, nothing decoded.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 > 100000;
+----
+0
+
+# Below every group's minimum.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 < 0;
+----
+0
+
+# Exactly on a group boundary: groups 0-4 pruned, groups 5-7 pass wholesale (always-true, so the
+# row filter is skipped for them).
+query II
+SELECT count(*), sum(c_int64) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 >= 40960;
+----
+24576	1308610560000000
+
+# Inside a single group: seven groups pruned, the eighth needs row-level filtering.
+query II
+SELECT count(*), min(c_int32) FROM read_oasis('data/mixed_small.parquet')
+WHERE c_int32 BETWEEN 20000 AND 20005;
+----
+6	20000
+
+query IIII
+SELECT * FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 BETWEEN 20000 AND 20002
+ORDER BY c_int32;
+----
+20000	20000000000	10000.0	25000.0
+20001	20001000000	10000.5	25001.25
+20002	20002000000	10001.0	25002.5
+
+# Every row passes -- the always-true path for all 8 groups.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 >= 0;
+----
+65536
+
+# A filter on a FLOAT column pruned by its own statistics.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_float > 1e9;
+----
+0
+
+# ---------------------------------------------------------------------------
+# Row-level filtering on hardware-decoded columns
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 = 12345;
+----
+1
+
+query IIII
+SELECT * FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 = 12345;
+----
+12345	12345000000	6172.5	15431.25
+
+# A predicate no zone map can help with, so it runs on every decoded row of every group.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 % 2 = 0;
+----
+32768
+
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 IN (0, 8192, 65535);
+----
+3
+
+# A disjunction spanning the first and last row group -- no group can be pruned on either side.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 < 10 OR c_int32 > 65530;
+----
+15
+
+# ---------------------------------------------------------------------------
+# Conjunctions
+#
+# A top-level AND is split into conjuncts applied in sequence, each with its own zone-map check.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet')
+WHERE c_int32 % 2 = 0 AND c_int64 > 30000000000;
+----
+17767
+
+# Three columns at once, one of which (c_int32 % 3) is not prunable.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet')
+WHERE c_double > 50000 AND c_float < 50000 AND c_int32 % 3 = 0;
+----
+8512
+
+# Contradictory conjuncts on the same column: every group is ruled out.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet')
+WHERE c_int32 > 60000 AND c_int32 < 100;
+----
+0
+
+# One conjunct always-true for a group, the other still needing row evaluation.
+query II
+SELECT count(*), sum(c_int32) FROM read_oasis('data/mixed_small.parquet')
+WHERE c_int32 >= 57344 AND c_int32 % 1000 = 0;
+----
+8	492000
+
+# ---------------------------------------------------------------------------
+# filter_prune: columns that only a filter reads are never emitted
+#
+# The scan still has to decode them to evaluate the predicate, but must reference only the
+# consumed columns into the output chunk.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT count(*), sum(c_int64) FROM read_oasis('data/mixed_small.parquet') WHERE c_float < 100;
+----
+200	19900000000
+
+# Filter on one column, project a different one.
+query I
+SELECT count(DISTINCT c_double) FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 < 500;
+----
+500
+
+# Filter on two columns, project a third.
+query II
+SELECT count(*), max(c_double) FROM read_oasis('data/mixed_small.parquet')
+WHERE c_int32 >= 1000 AND c_int64 < 2000000000;
+----
+1000	2498.75
+
+# Filter columns only, no column emitted at all.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet') WHERE c_int64 > 60000000000;
+----
+5535
+
+# ---------------------------------------------------------------------------
+# Filters on the other fixtures
+# ---------------------------------------------------------------------------
+
+# Single row group, so there is nothing for the zone map to prune away.
+query II
+SELECT count(*), sum(a) FROM read_oasis('data/int32.parquet') WHERE a >= 500;
+----
+500	374750
+
+query II
+SELECT count(*), sum(d) FROM read_oasis('data/mixed_int_small.parquet') WHERE a < 10;
+----
+10	495
+
+# Full-width INT32/INT64 values, so the filter constants exercise the wide end of the range.
+query I
+SELECT count(*) FROM read_oasis('data/mixed_int_large.parquet') WHERE a > 1000000000;
+----
+491
+
+# ---------------------------------------------------------------------------
+# Differential: filtered hardware scan against the same filter in software
+# ---------------------------------------------------------------------------
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 % 7 = 3
+                              EXCEPT ALL
+                              SELECT * FROM read_parquet('data/mixed_small.parquet') WHERE c_int32 % 7 = 3))
+     + (SELECT count(*) FROM (SELECT * FROM read_parquet('data/mixed_small.parquet') WHERE c_int32 % 7 = 3
+                              EXCEPT ALL
+                              SELECT * FROM read_oasis('data/mixed_small.parquet') WHERE c_int32 % 7 = 3));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT c_int64 FROM read_oasis('data/mixed_small.parquet') WHERE c_double BETWEEN 30000 AND 40000
+                              EXCEPT ALL
+                              SELECT c_int64 FROM read_parquet('data/mixed_small.parquet') WHERE c_double BETWEEN 30000 AND 40000))
+     + (SELECT count(*) FROM (SELECT c_int64 FROM read_parquet('data/mixed_small.parquet') WHERE c_double BETWEEN 30000 AND 40000
+                              EXCEPT ALL
+                              SELECT c_int64 FROM read_oasis('data/mixed_small.parquet') WHERE c_double BETWEEN 30000 AND 40000));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM read_oasis('data/float4_large.parquet') WHERE a < b AND d > 1000
+                              EXCEPT ALL
+                              SELECT * FROM read_parquet('data/float4_large.parquet') WHERE a < b AND d > 1000))
+     + (SELECT count(*) FROM (SELECT * FROM read_parquet('data/float4_large.parquet') WHERE a < b AND d > 1000
+                              EXCEPT ALL
+                              SELECT * FROM read_oasis('data/float4_large.parquet') WHERE a < b AND d > 1000));
+----
+0

@@ -1,0 +1,272 @@
+# name: test/sql/oasis_scan.test
+# description: read_oasis decode correctness across the checked-in Parquet fixtures
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# ---------------------------------------------------------------------------
+# Schema binding
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_oasis('data/float32.parquet'));
+----
+a	FLOAT
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_oasis('data/mixed_int_small.parquet'));
+----
+a	INTEGER
+b	BIGINT
+c	INTEGER
+d	BIGINT
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_oasis('data/mixed_small.parquet'));
+----
+c_int32	INTEGER
+c_int64	BIGINT
+c_float	FLOAT
+c_double	DOUBLE
+
+# ---------------------------------------------------------------------------
+# Row counts
+#
+# COUNT(*) with no filter consumes no column values, so the optimizer projects the zero-width
+# virtual column and the scan takes the EmitCardinalityOnly path -- row counts come from the
+# footer without any decoding.
+# ---------------------------------------------------------------------------
+
+query IIIIIIII
+SELECT
+    (SELECT count(*) FROM read_oasis('data/int32.parquet')),
+    (SELECT count(*) FROM read_oasis('data/float32.parquet')),
+    (SELECT count(*) FROM read_oasis('data/float4_small.parquet')),
+    (SELECT count(*) FROM read_oasis('data/float4_large.parquet')),
+    (SELECT count(*) FROM read_oasis('data/mixed_int_small.parquet')),
+    (SELECT count(*) FROM read_oasis('data/mixed_int_large.parquet')),
+    (SELECT count(*) FROM read_oasis('data/mixed_small.parquet')),
+    (SELECT count(*) FROM read_oasis('data/test.parquet'));
+----
+1000	1000	1000	1000	1000	1000	65536	10000
+
+# The same counts must come out of the decoding path, not just the footer. Referencing a column
+# in the aggregate keeps the optimizer from projecting the virtual column away.
+query IIII
+SELECT
+    (SELECT count(a) FROM read_oasis('data/int32.parquet')),
+    (SELECT count(a) FROM read_oasis('data/float4_small.parquet')),
+    (SELECT count(c_int32) FROM read_oasis('data/mixed_small.parquet')),
+    (SELECT count(col0) FROM read_oasis('data/test.parquet'));
+----
+1000	1000	65536	10000
+
+# ---------------------------------------------------------------------------
+# Value correctness, checked against the structure the fixtures were generated with
+# ---------------------------------------------------------------------------
+
+# data/test.parquet holds the INT64 range 0..9999.
+query III
+SELECT count(DISTINCT col0), min(col0), max(col0) FROM read_oasis('data/test.parquet');
+----
+10000	0	9999
+
+# data/mixed_int_small.parquet: a = 0..999, b = 7a, c = 3a, d = 11a. A single row decoded into the
+# wrong lane or shifted by a value would break one of these relations.
+query II
+SELECT count(*), count(*) FILTER (WHERE b <> a * 7 OR c <> a * 3 OR d <> a * 11)
+FROM read_oasis('data/mixed_int_small.parquet');
+----
+1000	0
+
+# data/mixed_small.parquet: c_int32 = 0..65535 across 8 row groups of 8192, with
+# c_int64 = 1e6*i, c_float = 0.5*i and c_double = 1.25*i. All three derived values are exactly
+# representable, so this is an exact check on every value in all four columns.
+query IIII
+SELECT count(*), count(DISTINCT c_int32), min(c_int32), max(c_int32)
+FROM read_oasis('data/mixed_small.parquet');
+----
+65536	65536	0	65535
+
+query I
+SELECT count(*) FROM read_oasis('data/mixed_small.parquet')
+WHERE c_int64 <> c_int32::BIGINT * 1000000
+   OR c_float <> c_int32 * 0.5
+   OR c_double <> c_int32 * 1.25;
+----
+0
+
+# data/float4_small.parquet: a = 1.5i, b = 2.7i, c = 0.3i, d = 4.1i rounded to FLOAT, i = 0..999.
+query IIII
+SELECT count(DISTINCT a), min(a), max(a), count(*) FILTER (WHERE c > a)
+FROM read_oasis('data/float4_small.parquet');
+----
+1000	0.0	1498.5	0
+
+# ---------------------------------------------------------------------------
+# Differential against DuckDB's own Parquet reader
+#
+# The strongest available check: the hardware decoder and DuckDB's software reader are independent
+# implementations, so any bit that differs shows up here. read_oasis parallelizes over row groups
+# and does not preserve global row order, so compare multisets rather than sequences.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('data/int32.parquet') EXCEPT ALL FROM read_parquet('data/int32.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('data/int32.parquet') EXCEPT ALL FROM read_oasis('data/int32.parquet')));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('data/float32.parquet') EXCEPT ALL FROM read_parquet('data/float32.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('data/float32.parquet') EXCEPT ALL FROM read_oasis('data/float32.parquet')));
+----
+0
+
+# Uncompressed, four FLOAT columns.
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('data/float4_small.parquet') EXCEPT ALL FROM read_parquet('data/float4_small.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('data/float4_small.parquet') EXCEPT ALL FROM read_oasis('data/float4_small.parquet')));
+----
+0
+
+# Snappy, four FLOAT columns, values spread over the full exponent range.
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('data/float4_large.parquet') EXCEPT ALL FROM read_parquet('data/float4_large.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('data/float4_large.parquet') EXCEPT ALL FROM read_oasis('data/float4_large.parquet')));
+----
+0
+
+# Uncompressed, mixed INT32/INT64, small magnitudes.
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('data/mixed_int_small.parquet') EXCEPT ALL FROM read_parquet('data/mixed_int_small.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('data/mixed_int_small.parquet') EXCEPT ALL FROM read_oasis('data/mixed_int_small.parquet')));
+----
+0
+
+# Snappy, mixed INT32/INT64, values up to the full width of each type.
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('data/mixed_int_large.parquet') EXCEPT ALL FROM read_parquet('data/mixed_int_large.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('data/mixed_int_large.parquet') EXCEPT ALL FROM read_oasis('data/mixed_int_large.parquet')));
+----
+0
+
+# Eight row groups, all four fixed-width types at once -- the multi-worker, multi-group path.
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('data/mixed_small.parquet') EXCEPT ALL FROM read_parquet('data/mixed_small.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('data/mixed_small.parquet') EXCEPT ALL FROM read_oasis('data/mixed_small.parquet')));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('data/test.parquet') EXCEPT ALL FROM read_parquet('data/test.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('data/test.parquet') EXCEPT ALL FROM read_oasis('data/test.parquet')));
+----
+0
+
+# ---------------------------------------------------------------------------
+# Row order within a scan
+#
+# Global order is not guaranteed, but sorting must recover the original sequence.
+# ---------------------------------------------------------------------------
+
+query IIII
+SELECT * FROM read_oasis('data/mixed_small.parquet') ORDER BY c_int32 LIMIT 3;
+----
+0	0	0.0	0.0
+1	1000000	0.5	1.25
+2	2000000	1.0	2.5
+
+query IIII
+SELECT * FROM read_oasis('data/mixed_small.parquet') ORDER BY c_int32 DESC LIMIT 2;
+----
+65535	65535000000	32767.5	81918.75
+65534	65534000000	32767.0	81917.5
+
+# ---------------------------------------------------------------------------
+# Projection pushdown
+#
+# Only the requested columns should be decoded, in the requested order, and the values must match
+# what the full scan produces.
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT c_double, c_int32 FROM read_oasis('data/mixed_small.parquet'));
+----
+c_double	DOUBLE
+c_int32	INTEGER
+
+# A single hardware column out of four.
+query III
+SELECT count(*), min(c_int64), max(c_int64) FROM read_oasis('data/mixed_small.parquet');
+----
+65536	0	65535000000
+
+# Reordered projection, differentially checked.
+query I
+SELECT (SELECT count(*) FROM (SELECT c_double, c_int32 FROM read_oasis('data/mixed_small.parquet')
+                              EXCEPT ALL
+                              SELECT c_double, c_int32 FROM read_parquet('data/mixed_small.parquet')))
+     + (SELECT count(*) FROM (SELECT c_double, c_int32 FROM read_parquet('data/mixed_small.parquet')
+                              EXCEPT ALL
+                              SELECT c_double, c_int32 FROM read_oasis('data/mixed_small.parquet')));
+----
+0
+
+# The same column projected twice must not confuse the projection mapping.
+query II
+SELECT count(*), count(*) FILTER (WHERE l <> r) FROM (
+    SELECT c_int32 AS l, c_int32 AS r FROM read_oasis('data/mixed_small.parquet')
+);
+----
+65536	0
+
+# A projection of a middle column only, so the scan has to skip both neighbours. Every c_float is
+# 0.5*i with i < 2^16, so the sum is exact and independent of the order the row groups arrive in.
+query II
+SELECT count(*), sum(c_float::DOUBLE) FROM read_oasis('data/mixed_small.parquet');
+----
+65536	1073725440.0
+
+# ---------------------------------------------------------------------------
+# The scan composes with the rest of the engine
+# ---------------------------------------------------------------------------
+
+# Grouped aggregation over a scan that spans all eight row groups.
+query II
+SELECT c_int32 // 8192 AS grp, count(*) FROM read_oasis('data/mixed_small.parquet')
+GROUP BY grp ORDER BY grp;
+----
+0	8192
+1	8192
+2	8192
+3	8192
+4	8192
+5	8192
+6	8192
+7	8192
+
+# Joining a hardware scan against a software scan of the same file.
+query II
+SELECT count(*), count(*) FILTER (WHERE o.c_int64 <> p.c_int64)
+FROM read_oasis('data/mixed_small.parquet') o
+JOIN read_parquet('data/mixed_small.parquet') p USING (c_int32);
+----
+65536	0
+
+# Two hardware scans in one query.
+query I
+SELECT count(*) FROM read_oasis('data/int32.parquet') a
+JOIN read_oasis('data/mixed_int_small.parquet') b ON a.a = b.a;
+----
+1000
+
+# Re-scanning the same file in the same session must give the same answer.
+query II
+SELECT (SELECT sum(c_int32) FROM read_oasis('data/mixed_small.parquet')),
+       (SELECT sum(c_int32) FROM read_oasis('data/mixed_small.parquet'));
+----
+2147450880	2147450880

@@ -1,0 +1,219 @@
+# name: test/sql/oasis_settings.test
+# description: Oasis extension settings, the stream profiler, and read_oasis bind-time errors
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# ---------------------------------------------------------------------------
+# Settings are registered with their documented defaults
+# ---------------------------------------------------------------------------
+
+query TTTT
+SELECT
+    current_setting('oasis_logging_level'),
+    current_setting('oasis_scheduler_num_streams'),
+    current_setting('oasis_scheduler_queue_depth'),
+    current_setting('oasis_scan_groups_in_flight');
+----
+ERROR	0	0	16
+
+query I
+SELECT current_setting('oasis_rdma_server') IS NULL;
+----
+true
+
+# ---------------------------------------------------------------------------
+# oasis_logging_level
+# ---------------------------------------------------------------------------
+
+statement ok
+SET oasis_logging_level = 'DEBUG';
+
+query T
+SELECT current_setting('oasis_logging_level');
+----
+DEBUG
+
+# The level is parsed case-insensitively.
+statement ok
+SET oasis_logging_level = 'trace';
+
+statement ok
+SET oasis_logging_level = 'OFF';
+
+statement error
+SET oasis_logging_level = 'VERBOSE';
+----
+Unknown oasis_log_level
+
+statement ok
+SET oasis_logging_level = 'ERROR';
+
+# ---------------------------------------------------------------------------
+# Scheduler knobs
+#
+# Note: both settings default to 0 and document 0 as "use the hardware default", but their SET
+# callbacks reject it. The default is only ever applied by never being set.
+# ---------------------------------------------------------------------------
+
+statement error
+SET oasis_scheduler_queue_depth = 0;
+----
+oasis_scheduler_queue_depth must be at least 1
+
+statement ok
+SET oasis_scheduler_queue_depth = 4;
+
+query T
+SELECT current_setting('oasis_scheduler_queue_depth');
+----
+4
+
+# More streams than the bitstream has decoders.
+statement error
+SET oasis_scheduler_num_streams = 1000000;
+----
+oasis_scheduler_num_streams must be between 1 and
+
+statement error
+SET oasis_scheduler_num_streams = 0;
+----
+oasis_scheduler_num_streams must be between 1 and
+
+# A queue depth of 1 removes all pipelining, which must not change what the scan returns.
+statement ok
+SET oasis_scheduler_queue_depth = 1;
+
+query II
+SELECT count(*), sum(c_int32) FROM read_oasis('data/mixed_small.parquet');
+----
+65536	2147450880
+
+statement ok
+SET oasis_scheduler_queue_depth = 8;
+
+# ---------------------------------------------------------------------------
+# oasis_scan_groups_in_flight
+#
+# The budget is split across the scan's worker threads and only controls how far submission runs
+# ahead of collection, so every setting must produce identical results.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET oasis_scan_groups_in_flight = 1;
+
+query III
+SELECT count(*), sum(c_int32), sum(c_double) FROM read_oasis('data/mixed_small.parquet');
+----
+65536	2147450880	2684313600.0
+
+statement ok
+SET oasis_scan_groups_in_flight = 3;
+
+query III
+SELECT count(*), sum(c_int32), sum(c_double) FROM read_oasis('data/mixed_small.parquet');
+----
+65536	2147450880	2684313600.0
+
+statement ok
+SET oasis_scan_groups_in_flight = 256;
+
+query III
+SELECT count(*), sum(c_int32), sum(c_double) FROM read_oasis('data/mixed_small.parquet');
+----
+65536	2147450880	2684313600.0
+
+statement ok
+RESET oasis_scan_groups_in_flight;
+
+# ---------------------------------------------------------------------------
+# oasis_stream_profile
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM oasis_stream_profile());
+----
+decoder	UBIGINT
+in_handshakes_cycles	UBIGINT
+in_starved_cycles	UBIGINT
+in_stalled_cycles	UBIGINT
+in_idle_cycles	UBIGINT
+out_handshakes_cycles	UBIGINT
+out_starved_cycles	UBIGINT
+out_stalled_cycles	UBIGINT
+out_idle_cycles	UBIGINT
+in_throughput_gbps	DOUBLE
+in_throughput_excl_idle_gbps	DOUBLE
+out_throughput_gbps	DOUBLE
+out_throughput_excl_idle_gbps	DOUBLE
+
+# One row per decoder, numbered from zero without gaps.
+query III
+SELECT count(*) = count(DISTINCT decoder), min(decoder), max(decoder) = count(*) - 1
+FROM oasis_stream_profile();
+----
+true	0	true
+
+# Throughput is bytes per cycle-time and cannot exceed 64 B per 4 ns = 16 GB/s, and excluding idle
+# cycles can only raise it.
+query I
+SELECT count(*) FROM oasis_stream_profile()
+WHERE in_throughput_gbps < 0 OR in_throughput_gbps > 16
+   OR out_throughput_gbps < 0 OR out_throughput_gbps > 16
+   OR in_throughput_excl_idle_gbps < in_throughput_gbps
+   OR out_throughput_excl_idle_gbps < out_throughput_gbps;
+----
+0
+
+# ---------------------------------------------------------------------------
+# Bind-time errors
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_oasis('data/no_such_file.parquet');
+----
+IO Error
+
+# The ParCore decoder handles BOOLEAN, INT32, INT64, FLOAT, DOUBLE and BYTE_ARRAY. A DECIMAL wide
+# enough to be stored as FIXED_LEN_BYTE_ARRAY is not one of them.
+statement ok
+COPY (SELECT i::INTEGER AS a, i::DECIMAL(38, 2) AS d FROM range(0, 100) t(i))
+TO '__TEST_DIR__/flba.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY);
+
+statement error
+SELECT * FROM read_oasis('__TEST_DIR__/flba.parquet');
+----
+not supported by ParCore
+
+# Only UNCOMPRESSED and SNAPPY column chunks can be fed to the decoder.
+statement ok
+COPY (SELECT i::INTEGER AS a FROM range(0, 100) t(i))
+TO '__TEST_DIR__/zstd.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
+
+statement error
+SELECT * FROM read_oasis('__TEST_DIR__/zstd.parquet');
+----
+not supported by ParCore
+
+# A file with a schema but no row groups has nothing to scan.
+statement ok
+COPY (SELECT 1::INTEGER AS a WHERE false) TO '__TEST_DIR__/empty.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT * FROM read_oasis('__TEST_DIR__/empty.parquet');
+----
+Parquet file contains no row groups
+
+# ---------------------------------------------------------------------------
+# rdma:// requires configuration
+#
+# The exact message depends on whether the loaded bitstream was synthesized with RDMA, so match
+# only the part both errors share.
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM read_oasis('rdma://some_file.parquet');
+----
+rdma://

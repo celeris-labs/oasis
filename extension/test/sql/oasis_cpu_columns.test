@@ -1,0 +1,179 @@
+# name: test/sql/oasis_cpu_columns.test
+# description: BYTE_ARRAY columns, which read_oasis decodes on the CPU alongside the hardware columns
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# There is no checked-in fixture with a variable-length column, so generate one. Every value in the
+# fixed-width columns is distinct, which keeps DuckDB's writer from dictionary-encoding them -- the
+# ParCore decoder only handles PLAIN-encoded fixed-width data. The string column is free to use
+# whatever encoding the writer picks, since DuckDB's own ColumnReader decodes it.
+#
+# 20000 rows at a row-group size of 8192 also leaves a short final row group (3616 rows), which is
+# where a slice shorter than the previous one has to avoid inheriting stale definition levels.
+
+statement ok
+COPY (SELECT i::INTEGER AS a, (i * 1000000)::BIGINT AS b, 'str' || i AS s FROM range(0, 20000) t(i))
+TO '__TEST_DIR__/plain_strings.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 8192);
+
+# A low-cardinality string column is dictionary-encoded, which takes a different route through the
+# CPU reader: the predicate is evaluated once per dictionary entry rather than once per row.
+
+statement ok
+COPY (SELECT i::INTEGER AS a, ['alpha', 'beta', 'gamma', 'delta'][(i % 4) + 1] AS g FROM range(0, 20000) t(i))
+TO '__TEST_DIR__/dict_strings.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 8192);
+
+# ---------------------------------------------------------------------------
+# Binding and full scans
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_oasis('__TEST_DIR__/plain_strings.parquet'));
+----
+a	INTEGER
+b	BIGINT
+s	VARCHAR
+
+query II
+SELECT count(*), count(*) FILTER (WHERE s <> 'str' || a::VARCHAR OR b <> a::BIGINT * 1000000)
+FROM read_oasis('__TEST_DIR__/plain_strings.parquet');
+----
+20000	0
+
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('__TEST_DIR__/plain_strings.parquet')
+                              EXCEPT ALL FROM read_parquet('__TEST_DIR__/plain_strings.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('__TEST_DIR__/plain_strings.parquet')
+                              EXCEPT ALL FROM read_oasis('__TEST_DIR__/plain_strings.parquet')));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('__TEST_DIR__/dict_strings.parquet')
+                              EXCEPT ALL FROM read_parquet('__TEST_DIR__/dict_strings.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('__TEST_DIR__/dict_strings.parquet')
+                              EXCEPT ALL FROM read_oasis('__TEST_DIR__/dict_strings.parquet')));
+----
+0
+
+# ---------------------------------------------------------------------------
+# Projection: the string column on its own, and the hardware columns on their own
+# ---------------------------------------------------------------------------
+
+# Only the CPU column is projected, so both hardware columns must be skipped.
+query II
+SELECT count(*), count(DISTINCT s) FROM read_oasis('__TEST_DIR__/plain_strings.parquet');
+----
+20000	20000
+
+# Only hardware columns are projected, so the string reader must not run at all.
+query III
+SELECT count(*), sum(a), sum(b) FROM read_oasis('__TEST_DIR__/plain_strings.parquet');
+----
+20000	199990000	199990000000000
+
+query TT
+SELECT min(s), max(s) FROM read_oasis('__TEST_DIR__/plain_strings.parquet');
+----
+str0	str9999
+
+# ---------------------------------------------------------------------------
+# Filtering on a string column
+#
+# The first active conjunct on a CPU column consumes the slice through the reader's Filter() path;
+# any further conjunct filters the already-decoded vector in place.
+# ---------------------------------------------------------------------------
+
+query III
+SELECT count(*), min(a), min(b) FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE s = 'str12345';
+----
+1	12345	12345000000
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE s LIKE 'str1%';
+----
+11111
+
+# String filter, integer column projected -- the string column is filter-only and never emitted.
+query I
+SELECT sum(a) FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE s = 'str7';
+----
+7
+
+query I
+SELECT sum(b) FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE s LIKE 'str1999_';
+----
+199945000000
+
+# A filter that rejects every row: the readers must still consume each slice exactly once.
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE s = 'nope';
+----
+0
+
+# ---------------------------------------------------------------------------
+# Mixed hardware and CPU filters in one scan
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE a > 15000 AND s LIKE '%99';
+----
+50
+
+# Hardware filter first, then a string filter over the survivors.
+query II
+SELECT count(*), sum(a) FROM read_oasis('__TEST_DIR__/plain_strings.parquet')
+WHERE b >= 19990000000 AND s LIKE 'str1999%';
+----
+10	199945
+
+# String filter that leaves nothing, combined with a hardware filter that leaves plenty.
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE a < 5000 AND s = 'str12345';
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE a % 3 = 1 AND s LIKE '%7'
+                              EXCEPT ALL
+                              SELECT * FROM read_parquet('__TEST_DIR__/plain_strings.parquet') WHERE a % 3 = 1 AND s LIKE '%7'))
+     + (SELECT count(*) FROM (SELECT * FROM read_parquet('__TEST_DIR__/plain_strings.parquet') WHERE a % 3 = 1 AND s LIKE '%7'
+                              EXCEPT ALL
+                              SELECT * FROM read_oasis('__TEST_DIR__/plain_strings.parquet') WHERE a % 3 = 1 AND s LIKE '%7'));
+----
+0
+
+# ---------------------------------------------------------------------------
+# Dictionary-encoded string column
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/dict_strings.parquet') WHERE g = 'alpha';
+----
+5000
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/dict_strings.parquet') WHERE g IN ('beta', 'delta');
+----
+10000
+
+query I
+SELECT sum(a) FROM read_oasis('__TEST_DIR__/dict_strings.parquet') WHERE g = 'gamma';
+----
+50000000
+
+# A hardware filter that prunes the first two row groups plus a dictionary filter on the rest.
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/dict_strings.parquet') WHERE a >= 16384 AND g = 'delta';
+----
+904
+
+query TI
+SELECT g, count(*) FROM read_oasis('__TEST_DIR__/dict_strings.parquet') GROUP BY g ORDER BY g;
+----
+alpha	5000
+beta	5000
+delta	5000
+gamma	5000

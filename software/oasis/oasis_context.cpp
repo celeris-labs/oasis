@@ -6,9 +6,11 @@
 #include <libstf/profiling.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <sstream>
 #include <stdexcept>
 #include <unistd.h>
+#include <vector>
 
 namespace oasis {
 
@@ -45,8 +47,7 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     , global_config_(cthread())
     , tlb_manager_(std::make_shared<libstf::TLBManager>(cthread(), memory_pool_))
     , mem_config_(global_config_.get_config<libstf::MemConfig>())
-    , rdma_enabled_(false)
-    , bypass_stream_(0) {
+    , rdma_enabled_(false) {
 
     // Verify the bitstream loaded on the device is actually an Oasis system.
     if (global_config_.system_id() != OASIS_SYSTEM_ID) {
@@ -60,8 +61,11 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // The hardware exposes one MemConfig stream per column-chunk decoder plus an extra bypass
     // stream when RDMA is wired in. If the counts match, RDMA wasn't synthesized into this shell.
     rdma_enabled_ = mem_config_->num_streams() != cc_config->num_decoders();
-    // ID of the RDMA bypass stream -- the last MemConfig stream, sitting past the decoders.
-    bypass_stream_ = cc_config->num_decoders();
+
+    auto read_req_config = config<ReadReqConfig>();
+    for (libstf::stream_t stream = 0; stream < read_req_config->num_streams(); ++stream) {
+        read_req_config->set_ctid(stream, cthread_->getCtid());
+    }
 
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());
@@ -72,15 +76,25 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // Clear any stale buffers left enqueued in hardware from a previous run.
     mem_config_->flush_buffers();
 
-    // Receivers must exist before the scheduler so any interrupt has somewhere to route.
-    bypass_receiver_ = std::make_unique<BypassStreamReceiver>(
-        *this, bypass_stream_, mem_config_->maximum_num_enqueued_buffers());
-    scheduler_       = std::make_unique<Scheduler>(*this);
+    // Stream scheduler.
+    std::vector<StreamDescription> stream_descriptions;
+    stream_descriptions.reserve(mem_config_->num_streams());
+    for (libstf::stream_t stream = 0; stream < cc_config->num_decoders(); ++stream) {
+        stream_descriptions.push_back({StreamCapability::DECODE,
+                                       cc_config->maximum_num_enqueued_configs(),
+                                       mem_config_->maximum_num_enqueued_buffers()});
+    }
+    if (rdma_enabled_) {
+        stream_descriptions.push_back({StreamCapability::BYPASS,
+                                       ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
+                                       mem_config_->maximum_num_enqueued_buffers()});
+    }
+    assert(stream_descriptions.size() == mem_config_->num_streams());
+    scheduler_ = std::make_unique<Scheduler>(*this, std::move(stream_descriptions));
 }
 
 OasisContext::~OasisContext() {
     scheduler_.reset();
-    bypass_receiver_.reset();
 }
 
 void OasisContext::init(std::shared_ptr<libstf::MemoryPool> memory_pool) {
@@ -120,30 +134,36 @@ Scheduler &OasisContext::scheduler() {
     return *scheduler_;
 }
 
-BypassStreamReceiver &OasisContext::bypass_receiver() {
-    return *bypass_receiver_;
-}
-
 void OasisContext::initRDMA(const std::string &server, uint16_t port) {
-    // Minimal stub region for initRDMA -- the hardware writes straight into the caller's buffers, so
-    // no host-side staging buffer is used, but Coyote still requires a region to set up the QP.
+    // Minimal stub region per queue pair -- the hardware writes straight into the caller's buffers,
+    // so no host-side staging buffer is used, but Coyote still requires a region to set up a QP.
     constexpr uint32_t RDMA_INIT_STUB_SIZE = 4096;
 
-    void *staging_buffer = nullptr;
-    if (!memory_pool_->allocate(RDMA_INIT_STUB_SIZE, &staging_buffer).ok()) {
-        std::ostringstream msg;
-        msg << "Failed to allocate RDMA staging buffer of " << RDMA_INIT_STUB_SIZE << " bytes";
-        throw std::runtime_error(msg.str());
-    }
-    if (!cthread_->initRDMA(RDMA_INIT_STUB_SIZE, port, server.c_str(), staging_buffer)) {
-        std::ostringstream msg;
-        msg << "Coyote initRDMA failed for server " << server << ":" << port;
-        throw std::runtime_error(msg.str());
-    }
+    auto read_req_config = config<ReadReqConfig>();
 
-    // The remote region's base vaddr is only known once the queue pair has been exchanged.
-    config<ReadReqConfig>()->set_base_vaddr(
-        reinterpret_cast<uintptr_t>(cthread_->getQpair()->remote.vaddr));
+    rdma_cthreads_.reserve(read_req_config->num_streams());
+    for (libstf::stream_t stream = 0; stream < read_req_config->num_streams(); ++stream) {
+        auto cthread = std::make_shared<coyote::cThread>(vfpga_id_, getpid(), device_id_);
+
+        void *staging_buffer = nullptr;
+        if (!memory_pool_->allocate(RDMA_INIT_STUB_SIZE, &staging_buffer).ok()) {
+            std::ostringstream msg;
+            msg << "Failed to allocate RDMA staging buffer of " << RDMA_INIT_STUB_SIZE
+                << " bytes for stream " << static_cast<int>(stream);
+            throw std::runtime_error(msg.str());
+        }
+        if (!cthread->initRDMA(RDMA_INIT_STUB_SIZE, port, server.c_str(), staging_buffer)) {
+            std::ostringstream msg;
+            msg << "Coyote initRDMA failed for server " << server << ":" << port << " (stream "
+                << static_cast<int>(stream) << ")";
+            throw std::runtime_error(msg.str());
+        }
+
+        read_req_config->set_ctid(stream, cthread->getCtid());
+        read_req_config->set_base_vaddr(
+            stream, reinterpret_cast<uintptr_t>(cthread->getQpair()->remote.vaddr));
+        rdma_cthreads_.push_back(std::move(cthread));
+    }
 }
 
 std::shared_ptr<libstf::Buffer> OasisContext::allocate_output_buffer(size_t size) {
@@ -178,11 +198,7 @@ void OasisContext::handle_interrupt(int value) {
                                   libstf::FPGA_INTERRUPT_TRANSFER_SIZE_BITS)) &
                        1) != 0;
 
-    if (rdma_enabled_ && stream_id == bypass_stream_) {
-        bypass_receiver_->handle_completion(bytes_written, last);
-    } else {
-        scheduler_->handle_completion(stream_id, bytes_written, last);
-    }
+    scheduler_->handle_completion(stream_id, bytes_written, last);
     libstf::Profiler::close_regions({"oasis::OasisContext::handle_interrupt"});
 }
 

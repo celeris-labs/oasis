@@ -1,7 +1,7 @@
 # Oasis RDMA Server
 
-The RDMA server hosts a set of Parquet files in a Coyote RDMA memory region so they can be
-accessed by the Oasis DuckDB extension via the `rdma://` filesystem.
+The RDMA server hosts a set of Parquet files in a memory region exposed to a client through a
+Mellanox NIC so they can be accessed by the Oasis DuckDB extension via the `rdma://` filesystem.
 
 ## Build
 

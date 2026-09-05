@@ -106,15 +106,30 @@ echo ""
 # ---------- Utilization ----------
 echo "================= UTILIZATION =================="
 if [ -r "$UTIL" ]; then
-    echo "Device: $(grep -m1 -E '^\| Device' "$UTIL" | sed 's/^| Device[ :]*//')"
+    device_line=$(grep -m1 -E '^\| Device' "$UTIL" | sed 's/^| Device[ :]*//')
+    echo "Device: $device_line"
     echo ""
-    echo "Total resource utilization (cyt_top):  (device: xcu55c / Alveo U55C)"
+
+    # Per-device resource capacities and a friendly label, keyed by the part name
+    # reported in the utilization report's "Device" line.
+    #   xcu55c-fsvh2892 (Alveo U55C):  https://docs.amd.com/r/en-US/ds963-u55c
+    #   xcv80-lsva4737  (Alveo V80):   https://docs.amd.com/r/en-US/ds1013-v80
+    # V80 block counts derived from the published totals (132 Mb BRAM @ 36 Kb,
+    # 541 Mb URAM @ 288 Kb) and the Versal 2:1 FF:LUT CLB ratio.
+    case "$device_line" in
+        *xcv80*)  dev_label="xcv80 / Alveo V80"
+                  cLUT=2574720; cFF=5149440; cBRAM=3756; cURAM=1923; cDSP=10848 ;;
+        *xcu55c*) dev_label="xcu55c / Alveo U55C"
+                  cLUT=1303680; cFF=2607360; cBRAM=2016; cURAM=960; cDSP=9024 ;;
+        *)        dev_label="unknown device; using xcu55c capacities"
+                  cLUT=1303680; cFF=2607360; cBRAM=2016; cURAM=960; cDSP=9024 ;;
+    esac
+
+    echo "Total resource utilization (cyt_top):  (device: $dev_label)"
     # Lines start with '|' so $1 is empty: Instance=$2 Module=$3 PR=$4 PPLOCs=$5
     # TotalLUTs=$6 LogicLUTs=$7 LUTRAMs=$8 SRLs=$9 FFs=$10 RAMB36=$11 RAMB18=$12 URAM=$13 DSP=$14
-    # Device capacities for xcu55c-fsvh2892 (Alveo U55C).
-    awk -F'|' '
+    awk -F'|' -v cLUT="$cLUT" -v cFF="$cFF" -v cBRAM="$cBRAM" -v cURAM="$cURAM" -v cDSP="$cDSP" '
         BEGIN {
-            cLUT=1303680; cFF=2607360; cBRAM=2016; cURAM=960; cDSP=9024
             printf "  %-6s %12s %10s %8s\n", "Rsrc", "Used", "Avail", "Util%"
         }
         /^\| cyt_top / {
