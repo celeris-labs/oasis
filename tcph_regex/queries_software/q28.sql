@@ -10,7 +10,7 @@ SELECT
 FROM
     customer
 WHERE
-    c_address SIMILAR TO '[ -~]*8[0-9][0-9][0-9] [A-Z][ -~]*'
+    c_address SIMILAR TO '.*8[0-9][0-9][0-9] [A-Z].*'
 GROUP BY
     c_mktsegment
 ORDER BY

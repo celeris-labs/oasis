@@ -1093,9 +1093,28 @@ static void EmitFromOutputCache(RegexFpgaScanLocalState &lstate, DataChunk &outp
 	const idx_t emit_count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
 	const idx_t end = lstate.output_cache_read_idx + emit_count;
 	// output_cache is already materialized in output-projection layout, so emit it directly.
+	//
+	// `output` is a *slice over* output_cache's vectors, not a copy. Vector::Slice hands the
+	// new buffer the string_t values, but StandardVectorBuffer::FlattenSliceInternal copies
+	// only the data and the validity mask -- never the auxiliary data that owns the string
+	// heap. Resetting output_cache here therefore freed the heap the caller was still
+	// reading from, and a fraction of emitted strings arrived as a run of NUL bytes with the
+	// length field intact and the payload gone. It was rare, non-deterministic and scaled
+	// with row-group count, and it never touched the match verdicts -- only the payload --
+	// so count(*) was always right and only projections of a VARCHAR column were affected.
+	// The reset is deferred to the next call instead: see ResetDrainedOutputCache.
 	output.Slice(lstate.output_cache, lstate.output_cache_read_idx, end);
 	lstate.output_cache_read_idx = end;
-	if (lstate.output_cache_read_idx >= lstate.output_cache.size()) {
+}
+
+// True once every row of output_cache has been emitted. The cache is reset only on the call
+// *after* that, so the slice handed to the caller keeps the heap its strings point into.
+static bool DrainedOutputCache(const RegexFpgaScanLocalState &lstate) {
+	return lstate.output_cache.size() > 0 && lstate.output_cache_read_idx >= lstate.output_cache.size();
+}
+
+static void ResetDrainedOutputCache(RegexFpgaScanLocalState &lstate) {
+	if (DrainedOutputCache(lstate)) {
 		lstate.output_cache.Reset();
 		lstate.output_cache_read_idx = 0;
 	}
@@ -1106,6 +1125,12 @@ void RegexFpgaScanFunction(ClientContext &context, TableFunctionInput &data_p, D
 	auto &bind_data = data_p.bind_data->Cast<RegexFpgaScanBindData>();
 	auto &global_state = data_p.global_state->Cast<RegexFpgaScanGlobalState>();
 	auto &lstate = data_p.local_state->Cast<RegexFpgaScanLocalState>();
+
+	// The chunk handed back by the previous call has been consumed by the pipeline by now, so
+	// the cache it was sliced from can finally be recycled. This has to run before anything
+	// below can refill the cache: the refill paths test output_cache.size() == 0 to decide
+	// whether there is more work to do.
+	ResetDrainedOutputCache(lstate);
 
 	if (lstate.output_cache_read_idx < lstate.output_cache.size()) {
 		CALI_MARK_BEGIN("emit_output_cache");

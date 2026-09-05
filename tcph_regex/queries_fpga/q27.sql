@@ -12,8 +12,6 @@ FROM
         regex_column := 'c_address',
         pattern := '\d+ \w+(\.)? 8\d\d\d \w+'
     ) AS customer
-WHERE
-    c_nationkey = 7
 GROUP BY
     c_mktsegment
 ORDER BY

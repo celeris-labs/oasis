@@ -8,8 +8,7 @@ SELECT
 FROM
     customer
 WHERE
-    c_nationkey = 7
-    AND c_address SIMILAR TO '\d+ \w+\.? 8\d\d\d \w+'
+    c_address SIMILAR TO '\d+ \w+\.? 8\d\d\d \w+'
 GROUP BY
     c_mktsegment
 ORDER BY
