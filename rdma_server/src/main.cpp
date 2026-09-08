@@ -18,6 +18,7 @@
 //     uint64 offset    // absolute offset within the region
 //     uint64 size      // bytes
 //   <file payloads, packed at the recorded offsets>
+//   <63 zero bytes for FPGA RDMA read-length rounding>
 
 #include <boost/program_options.hpp>
 
@@ -54,6 +55,9 @@ constexpr uint16_t DEFAULT_PORT     = 18488; // matches Coyote's DEF_PORT
 constexpr int      DEFAULT_IB_PORT  = 1;
 constexpr int      DEFAULT_GID_IDX  = 3;     // RoCEv2 IPv4 sgid index
 constexpr int      DEFAULT_DEV_IDX  = 0;
+
+// The FPGA rounds read lengths up to 64 bytes, potentially reading past the final file.
+constexpr uint64_t RDMA_READ_PADDING = 63;
 
 // Upper bound on live client QPs. The FPGA opens one per read-request stream (a handful); this is a
 // safety valve so a misbehaving/looping client cannot make the server accumulate QPs without bound.
@@ -616,7 +620,8 @@ int main(int argc, char *argv[]) {
         payload_total += file_size;
     }
 
-    uint64_t region_size = dir_header_size + payload_total;
+    uint64_t data_size = dir_header_size + payload_total;
+    uint64_t region_size = data_size + RDMA_READ_PADDING;
 
     // Compute file offsets within the region.
     std::vector<uint64_t> offsets(files.size());
@@ -630,7 +635,8 @@ int main(int argc, char *argv[]) {
 
     // Print the directory of hosted files before bringing up the connection.
     std::cout << "Oasis RDMA Server: " << files.size() << " file(s), directory header " << dir_header_size
-              << " Bytes + payload " << payload_total << " Bytes = region " << region_size << " Bytes, on port "
+              << " Bytes + payload " << payload_total << " Bytes + padding " << RDMA_READ_PADDING
+              << " Bytes = region " << region_size << " Bytes, on port "
               << port << std::endl;
     size_t max_name_len   = 0;
     size_t max_offset_len = 0;
@@ -648,6 +654,7 @@ int main(int argc, char *argv[]) {
     if (!setup_endpoint(ep, region_size, dev_idx)) {
         return EXIT_FAILURE;
     }
+    std::memset(ep.mem + data_size, 0, RDMA_READ_PADDING);
 
     // Discover the RoCE IPv4 we advertise from the GID at the index we connect with.
     uint32_t local_ip = 0;
