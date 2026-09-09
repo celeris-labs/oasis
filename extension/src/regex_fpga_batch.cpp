@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <output_handle.hpp>
@@ -76,6 +77,12 @@ std::atomic<uint64_t> g_wirealloc_ns {0};
 std::atomic<uint64_t> g_enqueue_ns {0};
 std::atomic<uint64_t> g_drain_ns {0};
 std::atomic<uint64_t> g_read_ns {0};
+
+// FSST passthrough row dispositions -- see RegexBatchPhases in the header.
+std::atomic<uint64_t> g_rows_compressed {0};
+std::atomic<uint64_t> g_rows_not_fsst {0};
+std::atomic<uint64_t> g_rows_mode0 {0};
+std::atomic<uint64_t> g_rows_outlier {0};
 
 using PhaseClock = std::chrono::steady_clock;
 
@@ -181,6 +188,29 @@ void Diag(const char *what, uint64_t seq) {
 // single-entry arm mailbox and not a throughput knob.
 //
 // Hand-rolled rather than std::counting_semaphore: the extension is built at C++17.
+// The arm-credit budget. Normally kRegexMaxSubmissionsInFlight; overridable so the queue
+// bound can be tested in both directions without a rebuild.
+//
+// This is a diagnostic, not a tuning knob, and raising it past REGEX_STRINGS_IN_BATCH_DEPTH
+// (32, in common.sv) is deliberately unsafe: ConfigWriteFIFO leaves the FIFO's `.i_ready()`
+// unconnected, so an arm written into a full queue is dropped with no error, and rem_engines
+// then waits on a count nobody sent -- an armed, drained, idle array that never retires.
+// Lowering it instead widens the margin, which is the control for the same experiment.
+inline uint32_t ArmCreditBudget() {
+	static const uint32_t budget = [] {
+		if (const char *s = std::getenv("OASIS_REGEX_ARM_CREDITS")) {
+			const long v = std::strtol(s, nullptr, 10);
+			if (v > 0 && v <= 4096) {
+				std::fprintf(stderr, "[regexdiag] arm credits overridden to %ld (default %u)\n", v,
+				             kRegexMaxSubmissionsInFlight);
+				return static_cast<uint32_t>(v);
+			}
+		}
+		return static_cast<uint32_t>(kRegexMaxSubmissionsInFlight);
+	}();
+	return budget;
+}
+
 class ArmCredits {
 public:
 	// Returns nanoseconds spent waiting, so the caller can tell "queued behind the
@@ -227,7 +257,7 @@ public:
 private:
 	std::mutex mutex_;
 	std::condition_variable cv_;
-	uint32_t available_ = kRegexMaxSubmissionsInFlight;
+	uint32_t available_ = ArmCreditBudget();
 	uint32_t blocked_ = 0;
 };
 
@@ -248,6 +278,23 @@ void AddRegexStageNs(uint64_t ns) { g_stage_ns.fetch_add(ns, std::memory_order_r
 void AddRegexEmitNs(uint64_t ns) { g_emit_ns.fetch_add(ns, std::memory_order_relaxed); }
 void AddRegexInitLocalNs(uint64_t ns) { g_initlocal_ns.fetch_add(ns, std::memory_order_relaxed); }
 void AddRegexWireAllocNs(uint64_t ns) { g_wirealloc_ns.fetch_add(ns, std::memory_order_relaxed); }
+
+void NoteRegexRowPath(RegexRowPath path, uint64_t rows) {
+	switch (path) {
+	case RegexRowPath::COMPRESSED:
+		g_rows_compressed.fetch_add(rows, std::memory_order_relaxed);
+		break;
+	case RegexRowPath::NOT_FSST:
+		g_rows_not_fsst.fetch_add(rows, std::memory_order_relaxed);
+		break;
+	case RegexRowPath::MODE0:
+		g_rows_mode0.fetch_add(rows, std::memory_order_relaxed);
+		break;
+	case RegexRowPath::OUTLIER:
+		g_rows_outlier.fetch_add(rows, std::memory_order_relaxed);
+		break;
+	}
+}
 
 RegexBatchPhases GetRegexBatchPhases() {
 	RegexBatchPhases p;
@@ -270,6 +317,10 @@ RegexBatchPhases GetRegexBatchPhases() {
 	p.enqueue_ns = g_enqueue_ns.load(std::memory_order_relaxed);
 	p.drain_ns = g_drain_ns.load(std::memory_order_relaxed);
 	p.read_ns = g_read_ns.load(std::memory_order_relaxed);
+	p.rows_compressed = g_rows_compressed.load(std::memory_order_relaxed);
+	p.rows_not_fsst = g_rows_not_fsst.load(std::memory_order_relaxed);
+	p.rows_mode0 = g_rows_mode0.load(std::memory_order_relaxed);
+	p.rows_outlier = g_rows_outlier.load(std::memory_order_relaxed);
 	{
 		// Bring the integrals up to date before reading them, or a window that has been
 		// empty since the last submit reports zero idle.
@@ -316,6 +367,10 @@ void ResetRegexBatchPhases() {
 	g_enqueue_ns.store(0, std::memory_order_relaxed);
 	g_drain_ns.store(0, std::memory_order_relaxed);
 	g_read_ns.store(0, std::memory_order_relaxed);
+	g_rows_compressed.store(0, std::memory_order_relaxed);
+	g_rows_not_fsst.store(0, std::memory_order_relaxed);
+	g_rows_mode0.store(0, std::memory_order_relaxed);
+	g_rows_outlier.store(0, std::memory_order_relaxed);
 	{
 		std::lock_guard<std::mutex> lock(g_depth_mutex);
 		const auto now = PhaseClock::now();
@@ -382,7 +437,7 @@ void AcquireRegexArmCredit() {
 
 RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
                                  const celeris::RegexStreamPacker::Plan &plan, idx_t count,
-                                 const std::vector<uint8_t> &regex_blob) {
+                                 const std::vector<uint8_t> &regex_blob, bool fsst_compressed) {
 	CALI_CXX_MARK_FUNCTION;
 	if (count == 0) {
 		return {};
@@ -473,7 +528,12 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// ahead of its arm -- which happens routinely, since AXI-Lite and DMA are
 	// independent paths -- back-pressures until the count lands rather than being
 	// walked under whatever the array was last doing.
-	config->write_strings_in_batch(plan.strings_in_batch);
+	// The arm entry's top bit tells the card this transfer's payload opens with a symbol
+	// table and is FSST codes rather than plaintext. It rides here, not in the config
+	// blob, because the blob is 2240 bits with zero slack and is latched once per query
+	// while this varies per transfer. REGEX_ARM_TABLE_BIT in common.sv is the same bit.
+	config->write_strings_in_batch(plan.strings_in_batch |
+	                               (fsst_compressed ? (uint32_t(1) << 31) : uint32_t(0)));
 	g_csr_ns.fetch_add(NanosSince(t_handle), std::memory_order_relaxed);
 	g_config_ns.fetch_add(NanosSince(t_config), std::memory_order_relaxed);
 	CALI_MARK_END("config_setup");
@@ -491,12 +551,119 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	submission.seq = g_seq.fetch_add(1, std::memory_order_relaxed);
 	g_submitted.fetch_add(1, std::memory_order_relaxed);
 	Diag("SUBMIT", submission.seq);
+	// Geometry of this transfer, so a wedge can be matched against the RTL's `in` tap.
+	// That tap freezes on tlast (regex_top.sv:203), so after a hang it holds the beat
+	// count of the last transfer whose delivery actually completed; comparing it with the
+	// wire_bytes logged here says whether the stuck batch reached the card at all.
+	if (DiagOn()) {
+		// rd_completed is Coyote's cumulative LOCAL_READ completion count. Only
+		// enqueue_stream_input posts LOCAL_READs, so it should track submissions. If it
+		// stalls at N while submissions climb past N, the DMA for that transfer never
+		// completed and the loss is host/driver side; if it counts past the stuck
+		// transfer, the DMA finished and the bytes were lost inside the shell or the
+		// user logic instead. That is the fork the `in` tap cannot resolve on its own.
+		const uint32_t rd_done =
+		    ctx.get_cthread()->checkCompleted(coyote::CoyoteOper::LOCAL_READ);
+		std::fprintf(stderr,
+		             "[regexdiag] GEOM           seq=%-6llu wire_bytes=%llu beats=%llu armed=%u rd_completed=%u\n",
+		             (unsigned long long)submission.seq, (unsigned long long)plan.wire_bytes,
+		             (unsigned long long)(plan.wire_bytes / 64), plan.strings_in_batch, rd_done);
+	}
 	g_enqueue_ns.fetch_add(NanosSince(t_enqueue), std::memory_order_relaxed);
 	CALI_MARK_END("enqueue");
 
 	// Everything past this point is per-handle and needs no shared state, so the lock
 	// ends here and the next thread can arm while this batch is still on the card.
 	return submission;
+}
+
+// See TryAcquireRegexTableSlot in the header for why this exists.
+//
+// The double-buffered symbol RAM makes this gate redundant: rem_symbol_header stalls its
+// own IDLE->HEADER transition while the bank it would overwrite is still busy, so the card
+// backpressures instead of corrupting the tail of the previous transfer. Keep the gate as
+// the default until that is proven on hardware; OASIS_REGEX_TABLE_GATE=0 turns it off.
+static bool RegexTableGateEnabled() {
+	static const bool enabled = [] {
+		const char *env = std::getenv("OASIS_REGEX_TABLE_GATE");
+		return !(env && env[0] == '0');
+	}();
+	return enabled;
+}
+
+std::mutex g_table_mutex;
+std::condition_variable g_table_cv;
+// Distinct symbol tables currently on the card, and how many transfers each is holding.
+// A table occupies one of the RTL's symbol-RAM banks for as long as any of its transfers
+// is uncollected, so the number of *distinct* tables is what must be capped -- transfers
+// sharing a table share its bank and are unlimited.
+std::map<const void *, uint64_t> g_table_inflight;
+
+// How many distinct tables may be live at once. One is the conservative gate: the card
+// then only ever holds the table it is decoding, and the double-buffered symbol RAM is
+// never exercised. The RTL has two banks, so two *should* be safe and is what makes the
+// double buffering worth having -- OASIS_REGEX_TABLE_SLOTS=2 is the experiment that says
+// whether the second bank actually works. Zero means unlimited (gate off).
+static uint64_t RegexTableSlots() {
+	static const uint64_t slots = [] () -> uint64_t {
+		const char *env = std::getenv("OASIS_REGEX_TABLE_SLOTS");
+		if (env) {
+			const auto parsed = std::strtoull(env, nullptr, 10);
+			return parsed;
+		}
+		// Back-compatible with the original switch: TABLE_GATE=0 turns the gate off.
+		const char *gate = std::getenv("OASIS_REGEX_TABLE_GATE");
+		if (gate && gate[0] == '0') {
+			return 0;
+		}
+		return 1;
+	}();
+	return slots;
+}
+
+static bool TableSlotAvailable(const void *decoder) {
+	const uint64_t slots = RegexTableSlots();
+	if (g_table_inflight.find(decoder) != g_table_inflight.end()) {
+		return true;  // already resident, so it costs no new bank
+	}
+	return g_table_inflight.size() < slots;
+}
+
+bool TryAcquireRegexTableSlot(const void *decoder) {
+	if (RegexTableSlots() == 0) {
+		return true;
+	}
+	std::lock_guard<std::mutex> lock(g_table_mutex);
+	if (!TableSlotAvailable(decoder)) {
+		return false;
+	}
+	g_table_inflight[decoder]++;
+	return true;
+}
+
+void AcquireRegexTableSlot(const void *decoder) {
+	if (RegexTableSlots() == 0) {
+		return;
+	}
+	std::unique_lock<std::mutex> lock(g_table_mutex);
+	g_table_cv.wait(lock, [&] { return TableSlotAvailable(decoder); });
+	g_table_inflight[decoder]++;
+}
+
+void ReleaseRegexTableSlot(const void *decoder) {
+	if (RegexTableSlots() == 0) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_table_mutex);
+	auto it = g_table_inflight.find(decoder);
+	D_ASSERT(it != g_table_inflight.end() && it->second > 0);
+	if (it == g_table_inflight.end()) {
+		return;
+	}
+	if (--it->second == 0) {
+		g_table_inflight.erase(it);
+		g_table_cv.notify_all();
+	}
 }
 
 RegexMatchBitmap CollectRegexBatch(RegexSubmission &submission) {
@@ -595,63 +762,6 @@ RegexMatchBitmap CollectRegexBatch(RegexSubmission &submission) {
 	results.assign_from_device(reinterpret_cast<const uint8_t *>(output_buffer->ptr), output_buffer->size, count);
 	g_read_ns.fetch_add(NanosSince(t_read), std::memory_order_relaxed);
 	CALI_MARK_END("read_results");
-	return results;
-}
-
-RegexMatchBitmap RunFpgaRegexPackedBatch(celeris::CelerisContext &ctx, void *wire_ptr,
-                                         const celeris::RegexStreamPacker::Plan &plan, idx_t count,
-                                         const std::vector<uint8_t> &regex_blob) {
-	CALI_CXX_MARK_FUNCTION;
-	if (count == 0) {
-		return {};
-	}
-	// Nothing outstanding to collect, so blocking for a credit is safe here.
-	CALI_MARK_BEGIN("arm_wait");
-	AcquireRegexArmCredit();
-	CALI_MARK_END("arm_wait");
-	RegexSubmission submission = SubmitRegexBatch(ctx, wire_ptr, plan, count, regex_blob);
-	return CollectRegexBatch(submission);
-}
-
-std::vector<bool> RunFpgaRegexBatch(celeris::CelerisContext &ctx, const std::vector<string_t> &inputs,
-                                    const std::vector<uint8_t> &regex_blob) {
-	CALI_CXX_MARK_FUNCTION;
-	const idx_t count = inputs.size();
-	if (count == 0) {
-		return {};
-	}
-
-	CALI_MARK_BEGIN("compute_sizes");
-	std::vector<uint64_t> lengths;
-	lengths.reserve(count);
-	for (idx_t i = 0; i < count; i++) {
-		lengths.push_back(static_cast<uint64_t>(inputs[i].GetSize()));
-	}
-	const uint64_t wire_bytes = celeris::RegexStreamPacker::required_bytes(lengths.data(), count);
-	CALI_MARK_END("compute_sizes");
-
-	CALI_MARK_BEGIN("allocate_buffers");
-	libstf::Status status;
-	std::shared_ptr<libstf::Buffer> wire_buffer = libstf::make_buffer(ctx.get_memory_pool(), wire_bytes, status);
-	if (!status.ok()) {
-		throw InternalException("Failed to allocate FPGA regex wire buffer");
-	}
-	CALI_MARK_END("allocate_buffers");
-
-	CALI_MARK_BEGIN("pack_inputs");
-	celeris::RegexStreamPacker packer;
-	packer.reset(static_cast<uint8_t *>(wire_buffer->ptr), wire_bytes);
-	for (idx_t i = 0; i < count; i++) {
-		packer.append(inputs[i].GetData(), inputs[i].GetSize());
-	}
-	const celeris::RegexStreamPacker::Plan plan = packer.finalize();
-	CALI_MARK_END("pack_inputs");
-
-	const RegexMatchBitmap bitmap = RunFpgaRegexPackedBatch(ctx, wire_buffer->ptr, plan, count, regex_blob);
-	std::vector<bool> results(count, false);
-	for (idx_t i = 0; i < count; i++) {
-		results[i] = bitmap.test(i);
-	}
 	return results;
 }
 

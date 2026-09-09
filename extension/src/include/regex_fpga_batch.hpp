@@ -110,7 +110,7 @@ static constexpr idx_t REGEX_FPGA_FILL_RAMP_STEPS = 0;
 void EnsureCelerisContext();
 celeris::CelerisContext &GetCelerisContext();
 
-// Per-phase wall time inside RunFpgaRegexPackedBatch, accumulated across batches.
+// Per-phase wall time inside SubmitRegexBatch/CollectRegexBatch, accumulated across batches.
 // Everything here happens under the global fpga_mutex, so it is serialized across
 // threads and is exactly the cost that shows up as "device time" in a
 // scan/pack/device decomposition. Four clock reads per batch is nothing against a
@@ -196,6 +196,23 @@ struct RegexBatchPhases {
 	uint64_t done_min_ns = 0;
 	uint64_t done_mean_ns = 0;
 	uint64_t done_max_ns = 0;
+
+	// Row dispositions for the FSST compressed passthrough.  Bucketed by *reason*, not a
+	// single "fell back" count, because the reasons have unrelated fixes and two of them
+	// look identical in aggregate throughput:
+	//
+	//   ~86% compressed        working as designed; the rest is the inherent straddle below
+	//   0% compressed          the database was written by a build without the FSST fork,
+	//                          so every segment is zeroTerminated=0 and cannot be NUL-framed
+	//   low, rows_outlier      outlier threshold, nothing to do with compression
+	//   low, rows_not_fsst     the column landed on Uncompressed/Dictionary/DICT_FSST
+	//
+	// Without the split, "no speedup" is indistinguishable from "wrong binary wrote the
+	// data" -- the silent-measurement failure the huge-page preflight exists to prevent.
+	uint64_t rows_compressed = 0;    // FSST vector, zeroTerminated, shipped compressed
+	uint64_t rows_not_fsst = 0;      // not an FSST vector at all
+	uint64_t rows_mode0 = 0;         // FSST vector, but zeroTerminated=0: no NUL framing
+	uint64_t rows_outlier = 0;       // diverted to host RE2 on length
 };
 
 // Accumulators for the phases above, incremented from regex_table.cpp.
@@ -205,6 +222,11 @@ void AddRegexStageNs(uint64_t ns);
 void AddRegexEmitNs(uint64_t ns);
 void AddRegexInitLocalNs(uint64_t ns);
 void AddRegexWireAllocNs(uint64_t ns);
+
+// One call per staged row, recording which path it took.  See RegexBatchPhases above for
+// why this is bucketed rather than a boolean.
+enum class RegexRowPath : uint8_t { COMPRESSED, NOT_FSST, MODE0, OUTLIER };
+void NoteRegexRowPath(RegexRowPath path, uint64_t rows = 1);
 
 // Marks the start of a query's regex scan (first RegexFpgaScanInitGlobal) and clears the
 // fill/drain stats; NoteRegexFirstSubmit and NoteRegexThreadDone record one thread's
@@ -225,7 +247,7 @@ void ResetRegexBatchPhases();
 uint64_t align_to_64_multiple(uint64_t size);
 
 // One verdict per slot, kept in the card's own packed layout. The collector emits
-// bit i for string i (see the parallel-pop note in RunFpgaRegexPackedBatch), so the
+// bit i for string i (see the parallel-pop note in SubmitRegexBatch), so the
 // device buffer is already in destination order and the read-back is a memcpy.
 //
 // This replaced a std::vector<bool> that was filled a bit at a time. That loop
@@ -313,6 +335,40 @@ bool TryAcquireRegexArmCredit();
 // collect -- otherwise it can be waiting on credits that only it could release.
 void AcquireRegexArmCredit();
 
+// Only one FSST symbol table may be in flight on the card at a time.
+//
+// The card holds ONE symbol table shared by all 64 engines, and rem_symbol_header rewrites
+// it as soon as the next transfer's header arrives -- which is long before the engines have
+// finished decoding the previous transfer. Each engine buffers 2 KB of un-decoded input
+// (INPUT_FIFO_ADDR_BITS = 5), `tlast` only means the splitter accepted the beats, and under
+// the passthrough an engine consumes code bytes 3-5x slower than the wire delivers them
+// (one code expands to ~2.9 bytes on FSST's average), so its FIFO is permanently full and
+// there is ALWAYS un-decoded data at a transfer boundary. sym_hold is a fixed
+// START_HOLD_CYCLES countdown on engine *input* and does not cover it.
+//
+// When consecutive transfers carry the same table the rewrite is a no-op. When they differ,
+// the tail of the earlier transfer decodes against the later table. Measured on
+// p_substring_72_10_15728k: at 16384-row batches this loses terminators and wedges the
+// array; at 1024-row batches it silently undercounts (1571197 vs 1572864 at 16 threads).
+//
+// One scan thread rarely trips it, because consecutive batches come from the same
+// ColumnSegment and share a decoder; two threads read different row groups and interleave.
+// So this gate is what makes the passthrough correct above one thread. `decoder` is the
+// batch's FSST decoder pointer, or nullptr for plaintext -- with the passthrough off every
+// transfer passes nullptr, they all match, and nothing serialises.
+//
+// The cost is a drain of the in-flight window at every table change, which is why the RTL
+// fix (double-buffer the symbol RAM and flip per engine at its own transfer boundary) is
+// still worth doing.
+bool TryAcquireRegexTableSlot(const void *decoder);
+
+// Blocks until the card's table is `decoder` or nothing is outstanding. Same rule as
+// AcquireRegexArmCredit: only safe when the caller has nothing of its own left to collect.
+void AcquireRegexTableSlot(const void *decoder);
+
+// Releases one slot; the last release lets a different table through.
+void ReleaseRegexTableSlot(const void *decoder);
+
 // Arms the card for a batch already packed into `wire_ptr` by a RegexStreamPacker and
 // enqueues its DMA, then returns without waiting for results. `count` is the number
 // of real strings; `plan` carries the padded result geometry the card needs.
@@ -324,21 +380,12 @@ void AcquireRegexArmCredit();
 // AcquireRegexArmCredit); CollectRegexBatch releases it.
 RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
                                  const celeris::RegexStreamPacker::Plan &plan, idx_t count,
-                                 const std::vector<uint8_t> &regex_blob);
+                                 const std::vector<uint8_t> &regex_blob, bool fsst_compressed = false);
 
 // Blocks until `submission`'s results have landed and returns one verdict per slot,
 // in slot order. Releases the submission's arm credit. Idempotent on an already
 // collected (or default-constructed) submission, which is what lets a destructor
 // drain a window without tracking which entries it already took.
 RegexMatchBitmap CollectRegexBatch(RegexSubmission &submission);
-
-// Submit immediately followed by collect. The serial path, kept for callers with
-// nothing to overlap (RunFpgaRegexBatch, the SQL scalar function).
-RegexMatchBitmap RunFpgaRegexPackedBatch(celeris::CelerisContext &ctx, void *wire_ptr,
-                                         const celeris::RegexStreamPacker::Plan &plan, idx_t count,
-                                         const std::vector<uint8_t> &regex_blob);
-
-std::vector<bool> RunFpgaRegexBatch(celeris::CelerisContext &ctx, const std::vector<string_t> &inputs,
-                                    const std::vector<uint8_t> &regex_blob);
 
 } // namespace duckdb

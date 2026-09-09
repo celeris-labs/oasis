@@ -15,6 +15,9 @@ include_directories(src/include)
 include_directories(duckdb/extension/parquet/include)
 include_directories(duckdb/third_party/parquet)
 include_directories(duckdb/third_party/thrift)
+# fsst.h, for duckdb_fsst_decoder_t. DuckDB adds this on its own directory scope only, and
+# the extension is a sibling, so the regex path's FSST passthrough cannot see it otherwise.
+include_directories(duckdb/third_party/fsst)
 
 # ---------------------------------------------------------------------------
 # Dependencies
@@ -103,7 +106,7 @@ set(FPGA_REGEX_SOURCES
 set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/oasis_profile.cpp
                       src/rdma_file_system.cpp src/filter_pushdown.cpp src/parcore_metadata_util.cpp
                       src/oasis_settings.cpp src/coalesced_fetcher.cpp
-                      src/regex.cpp src/regex_fpga_batch.cpp src/regex_table.cpp src/regex_profile.cpp ${FPGA_REGEX_SOURCES})
+                      src/regex_fpga_batch.cpp src/regex_table.cpp src/regex_profile.cpp ${FPGA_REGEX_SOURCES})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -117,7 +120,7 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # These come from the command line only. celeris/generated/regex_limits.h used to
 # be a fallback for them, but it was generated once and then went stale at 12
 # states while the RTL moved to 28, so a build that picked it up compiled a blob
-# layout the card could not decode. Both regex.cpp and regex_table.cpp now #error
+# layout the card could not decode. regex_table.cpp now #errors
 # if the definitions are absent, and the generated directory is gone.
 # build_hw_24 is CHAR_COUNT=32/STATE_COUNT=24.
 foreach(_t ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})

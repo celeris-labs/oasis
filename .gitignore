@@ -1,4 +1,5 @@
 .claude
+scripts/results
 build*
 extension/CMakeFiles/**
 extension/CMakeCache.txt 

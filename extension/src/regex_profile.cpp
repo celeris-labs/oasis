@@ -187,6 +187,15 @@ unique_ptr<FunctionData> PhasesBind(ClientContext &context, TableFunctionBindInp
 	add("done_min_ms", LogicalType::DOUBLE);
 	add("done_mean_ms", LogicalType::DOUBLE);
 	add("done_max_ms", LogicalType::DOUBLE);
+	// FSST passthrough dispositions. compressed_pct is the number to read: ~86% is working
+	// as designed (the remainder is the segment-straddle DuckDB decompresses for us), while
+	// 0% means the data was written by a build without the FSST fork and nothing was
+	// eligible. Those two are indistinguishable from throughput alone.
+	add("rows_compressed", LogicalType::UBIGINT);
+	add("rows_not_fsst", LogicalType::UBIGINT);
+	add("rows_mode0", LogicalType::UBIGINT);
+	add("rows_outlier", LogicalType::UBIGINT);
+	add("compressed_pct", LogicalType::DOUBLE);
 	return make_uniq<PhasesBindData>();
 }
 
@@ -244,6 +253,12 @@ void PhasesFunction(ClientContext &context, TableFunctionInput &data_p, DataChun
 	output.data[c++].SetValue(0, Value::DOUBLE(double(p.done_min_ns) / 1e6));
 	output.data[c++].SetValue(0, Value::DOUBLE(double(p.done_mean_ns) / 1e6));
 	output.data[c++].SetValue(0, Value::DOUBLE(double(p.done_max_ns) / 1e6));
+	const double staged = double(p.rows_compressed + p.rows_not_fsst + p.rows_mode0 + p.rows_outlier);
+	output.data[c++].SetValue(0, Value::UBIGINT(p.rows_compressed));
+	output.data[c++].SetValue(0, Value::UBIGINT(p.rows_not_fsst));
+	output.data[c++].SetValue(0, Value::UBIGINT(p.rows_mode0));
+	output.data[c++].SetValue(0, Value::UBIGINT(p.rows_outlier));
+	output.data[c++].SetValue(0, Value::DOUBLE(staged > 0 ? 100.0 * double(p.rows_compressed) / staged : 0.0));
 	g.done = true;
 	output.SetChildCardinality(1);
 }

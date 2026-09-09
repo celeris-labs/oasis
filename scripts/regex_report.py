@@ -33,6 +33,7 @@ import os
 import shutil
 import hashlib
 import platform
+import shlex
 import statistics
 import subprocess
 import sys
@@ -60,24 +61,37 @@ from regex_patterns import PATTERNS                 # noqa: E402
 # is genuinely matching), so measuring against it reports DuckDB's storage layer as much
 # as either engine. Each of these has a compressed twin at the same path without the
 # suffix if you ever want that comparison.
-SF30 = os.environ.get("REGEX_SF30_DB", "/scratch/vifranz/tpch_regex_sf30_uncompressed.duckdb")
+# Where they live.  /scratch is NFSv4 with sec=krb5p and reads at ~39 MB/s, so a case's
+# first scan of a 1.13 GB table costs ~12 s against ~0.5 s once it is warm -- and every case
+# is its own benchmark_runner process, so each pays that again.  REGEX_DB_DIR moves all six
+# defaults to a copy on local disk (/local/home/vifranz/regexdb here), which changes no
+# measured quantity and is the largest wall-clock saving available.  The per-database
+# variables below still win where they are set.
+DB_DIR = os.environ.get("REGEX_DB_DIR", "/scratch/vifranz")
+
+
+def _db(var: str, name: str) -> str:
+    return os.environ.get(var, os.path.join(DB_DIR, name))
+
+
+SF30 = _db("REGEX_SF30_DB", "tpch_regex_sf30_uncompressed.duckdb")
 # Uncompressed by default; regex_gen.py writes these with force_compression off.
 # Override with REGEX_GEN_DB to measure against a compressed set.
-GEN_DB = os.environ.get("REGEX_GEN_DB", "/scratch/vifranz/regex_gen_uncompressed.duckdb")
-SEL_DB = os.environ.get("REGEX_SEL_DB", "/scratch/vifranz/regex_sel_rg128_uncompressed.duckdb")
+GEN_DB = _db("REGEX_GEN_DB", "regex_gen_uncompressed.duckdb")
+SEL_DB = _db("REGEX_SEL_DB", "regex_sel_rg128_uncompressed.duckdb")
 # The anchored twin of SEL_DB, at the same geometry.  `.*[a-z]ructi.*` inspects every byte,
 # so neither path cares how many rows match; an anchored pattern is the case where software
 # *does* care, because it rejects a non-matching row after its first token and a matching one
 # only at the end.  Sweeping selectivity against it is the only way to measure that, and the
 # sel_* tables cannot serve: their selectivity is pinned for the unanchored pattern, and this
 # one matches them at whatever rate it happens to.
-ASEL_DB = os.environ.get("REGEX_ASEL_DB", "/scratch/vifranz/regex_asel_rg128_uncompressed.duckdb")
+ASEL_DB = _db("REGEX_ASEL_DB", "regex_asel_rg128_uncompressed.duckdb")
 ANCHORED_PATTERN = "[a-z]+ [rs].*"
 # regex_par32: 3_932_160 rows per table = exactly 32 row groups at every length, built by
 # scripts/util/gen_par32.sh.  The older regex_par_uncompressed.duckdb holds the same seven
 # lengths at 524288 rows (4.27 row groups); reach it with REGEX_PAR_DB, but then PAR_ROWS
 # and the thread pin below have to come back down with it or the MB column lies.
-PAR_DB = os.environ.get("REGEX_PAR_DB", "/scratch/vifranz/regex_par32_uncompressed.duckdb")
+PAR_DB = _db("REGEX_PAR_DB", "regex_par32_uncompressed.duckdb")
 
 # Text volume in MB for throughput.  Measured, not nominal.
 # Query shapes.  "floor" is the regex-free scan baseline: the same column read and
@@ -135,10 +149,13 @@ MB_SEL = SEL_ROWS * 72 / 1e6
 # point be re-measured without paying for the 8 and 16 GB tables again.
 LENGTHS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
-THREADS_ROW_GROUPS = 480
-THREADS_DB = os.environ.get(
-    "REGEX_THREADS_DB", "/scratch/vifranz/regex_threads480_uncompressed.duckdb")
-THREADS_T = [t for t in range(1, 33) if THREADS_ROW_GROUPS % t == 0]
+# 480 = 2^5*3*5 is the smallest count exact at 15 of the 32 thread counts <= 32.
+# A wider box wants a different one -- 768 = 2^8*3 is exact at 1,2,3,4,6,8,12,16,
+# 24,32,48,64,96,128 -- so it is overridable together with REGEX_THREADS_DB.
+THREADS_ROW_GROUPS = int(os.environ.get("REGEX_THREADS_ROW_GROUPS", 480))
+THREADS_DB = _db("REGEX_THREADS_DB", "regex_threads480_uncompressed.duckdb")
+THREADS_T = [t for t in range(1, (os.cpu_count() or 32) + 1)
+             if THREADS_ROW_GROUPS % t == 0]
 THREADS_PATTERN = replace(next(p for p in PATTERNS if p.label == "Literal + class"),
                           rows=THREADS_ROW_GROUPS * 122_880, db=THREADS_DB)
 
@@ -196,6 +213,25 @@ def row_groups(db: str, table: str, _cache={}) -> int | None:
     return _cache[key]
 
 
+def column_compression(db: str, table: str, column: str, _cache={}) -> set[str] | None:
+    """Distinct segment encodings of `table.column`, or None if it cannot be read.
+
+    Constant segments are excluded: an all-equal segment records no encoding choice, so
+    counting it would make a uniformly FSST table look mixed for a reason that says
+    nothing about how its strings are stored.
+    """
+    key = (db, table, column)
+    if key not in _cache:
+        sql = (f"SELECT DISTINCT compression FROM pragma_storage_info('{table}') "
+               f"WHERE column_name='{column}' AND compression <> 'Constant';")
+        r = sh(f"{DUCKDB} '{db}' -readonly -noheader -list -c {shlex.quote(sql)}")
+        got = {x.strip() for x in r.stdout.split() if x.strip()}
+        if not got:
+            return None          # missing or unreadable; never cached, it may be built next
+        _cache[key] = got
+    return _cache[key]
+
+
 def check_parallelism(cases, default_threads: int) -> None:
     """Report scan utilisation, and warn where the row-group count wastes the machine.
 
@@ -224,8 +260,52 @@ def check_parallelism(cases, default_threads: int) -> None:
                   f"({rg - (waves - 1) * thr} group(s) in the last wave)", flush=True)
 
 
-def preflight() -> str:
-    """Catch the two failure modes that otherwise look like mysterious FPGA errors."""
+def check_fsst_storage(cases, existing_only: bool = False) -> bool:
+    """Is every table --fsst will scan actually stored FSST?  False means stop.
+
+    The passthrough is invisible when it does not fire.  On plaintext storage ColumnData
+    hands back a flat vector, regex_table.cpp:1059 falls to the NOT_FSST path, and the run
+    reports ordinary FPGA numbers with fsst_passthrough=on in its config columns.  Nothing
+    errors and no timing looks wrong, so the storage is the only signal available before
+    the run -- compressed_pct in regex_fpga_batch_phases() reports it afterwards, which is
+    too late to save the measurement.
+
+    A table with *some* FSST segments still exercises the passthrough, so that is a warning
+    and compressed_pct says for what fraction; a table with none cannot fire it at all.
+
+    `existing_only` skips tables that cannot be read yet, for the pass that runs *before*
+    generation -- which has to run, because ensure_table rewrites a table whose encoding
+    does not match REGEX_GEN_COMPRESSION, and checking only afterwards would report the
+    loss of the benchmark set rather than prevent it.
+    """
+    ok = True
+    for db, table, column in sorted({(c.db, c.table, c.column) for c in cases}):
+        got = column_compression(db, table, column)
+        if got is None:
+            if existing_only:
+                continue          # not built yet; the post-generation pass will see it
+            print(f"  ! --fsst: cannot read the storage of {table}.{column} in {db}",
+                  file=sys.stderr)
+            ok = False
+        elif "FSST" not in got:
+            print(f"  ! --fsst: {db}: {table}.{column} is stored "
+                  f"{'+'.join(sorted(got))}, not FSST -- every vector would arrive "
+                  f"decompressed and the passthrough would never fire", file=sys.stderr)
+            ok = False
+        elif got != {"FSST"}:
+            print(f"  ! --fsst: {table}.{column} is only partly FSST "
+                  f"({'+'.join(sorted(got))}); the passthrough fires for some segments "
+                  f"only -- read compressed_pct to see how many", flush=True)
+    return ok
+
+
+def preflight(needs_fpga: bool = True) -> str:
+    """Catch the two failure modes that otherwise look like mysterious FPGA errors.
+
+    Both are about the card.  A software-only run (`--variant software`) touches
+    neither the huge-page pool nor the device, so on a box with no FPGA -- where the
+    pool is legitimately empty -- the page check would abort a run it has no stake in.
+    """
     r = sh("pgrep -af 'benchmark_runner' | grep -v pgrep || true")
     others = [ln for ln in r.stdout.splitlines() if "benchmark_runner" in ln]
     if others:
@@ -233,7 +313,7 @@ def preflight() -> str:
                 "pages and the card, so this run would fail every FPGA case:\n    "
                 + "\n    ".join(others[:3]))
     free = Path("/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages")
-    if free.exists():
+    if needs_fpga and free.exists():
         try:
             if int(free.read_text().strip()) == 0:
                 return ("0 free 1GiB huge pages. Something still holds them; check for a "
@@ -247,7 +327,11 @@ def preflight() -> str:
 # 1GiB pages to keep provisioned.  16 no longer fits: hdev enforces a cap of 25% of RAM
 # per NUMA domain, which on this 64 GB box is 15 pages, and it counts the 2 MiB pool
 # towards the same budget.
-DEFAULT_BITSTREAM = "/scratch/vifranz/build_hw_decoder_fixed/bitstreams/cyt_top.bit"
+# build_hw_decompress is the FSST-passthrough build (WNS +0.010 ns, all constraints met).
+# Not build_hw_decoder_fixed, which this pointed at for a long time and which fails
+# timing at WNS -2.103 ns / 139,126 failing endpoints -- it was never a valid record
+# of what the card was running.  The plaintext-only predecessor is build_hw_cleanup.
+DEFAULT_BITSTREAM = "/scratch/vifranz/celeris/build_hw_decompress/bitstreams/cyt_top.bit"
 
 HUGEPAGES_1G = 12
 _hugepage_warned = False
@@ -301,6 +385,12 @@ def run_config(a) -> dict:
         "in_flight": a.in_flight if a.in_flight is not None else "",
         "outlier_bytes": a.outlier_bytes if a.outlier_bytes is not None else "",
         "repeat": a.repeat,
+        # Whether the card was fed FSST codes or plaintext. Without this a compressed
+        # run and a plaintext one are indistinguishable in the CSV while differing by
+        # ~3x in wire bytes, which is exactly the kind of unrecorded variable the
+        # length_oncard.csv / threads_480rg_w1.csv confusion came from.
+        "fsst_passthrough": "on" if getattr(a, "fsst", False) else "off",
+        "gen_db": GEN_DB,
         "bitstream": bit_id,
         "git_rev": sh("git rev-parse --short HEAD").stdout.strip(),
         "host": platform.node(),
@@ -626,6 +716,16 @@ def main() -> int:
                          "outstanding transfer holds an arm credit and there are only "
                          "kRegexMaxSubmissionsInFlight (32), so the scan's thread cap is "
                          "32/in_flight. Sweeping T at fixed W measures nothing above the cap.")
+    ap.add_argument("--fsst", action="store_true",
+                    help="Ship FSST-compressed strings to the card instead of host-decompressed "
+                         "plaintext (oasis_regex_fsst_passthrough). Requires tables actually "
+                         "stored FSST -- generate them with REGEX_GEN_COMPRESSION=auto and point "
+                         "REGEX_GEN_DB at the result; this flag only sets the session settings "
+                         "and does not choose a database, so the storage is checked before the "
+                         "run and a plaintext table aborts it rather than reporting ordinary "
+                         "FPGA numbers under fsst_passthrough=on. Forces the count shape: the "
+                         "passthrough refuses to project the regex column, so materialise and "
+                         "emit would abort the run.")
     ap.add_argument("--outlier-bytes", type=int, default=None,
                     help="SET oasis_regex_outlier_bytes on every case. Strings at or above "
                          "the threshold are matched on the host by RE2 and never reach the "
@@ -660,6 +760,10 @@ def main() -> int:
                          "caught too. The queries suite compares whole result sets instead. "
                          "Costs one extra execution per side (~7%% on top of 15 timed runs) "
                          "and makes the run exit non-zero if any case disagrees.")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="drop cases whose label matches (case-insensitive, repeatable). "
+                         "Use to skip a case that is slow and not under study, "
+                         "e.g. --exclude 'State explosion'.")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--latex", action="store_true")
     ap.add_argument("--csv")
@@ -679,6 +783,10 @@ def main() -> int:
     if bad:
         print(f"error: unknown shape(s) {bad}; known: {list(SHAPES)}", file=sys.stderr)
         return 2
+    if a.fsst:
+        # Not a preference: regex_fpga_scan throws on a projected regex column under the
+        # passthrough, so materialise/emit would fail every case rather than measure one.
+        shapes = tuple(x for x in shapes if x == "count") or ("count",)
     cases = build_cases(shapes)
     # "queries" is deliberately not in the default set: it is the only suite that runs
     # whole TPC-H queries rather than a single predicate, it needs the 24 GB sf30
@@ -686,6 +794,18 @@ def main() -> int:
     # explicitly with -s queries.
     suites = a.suite or ["patterns", "states", "threads", "selectivity", "length"]
     cases = [c for c in cases if c.suite in suites]
+
+    if a.exclude:
+        drop = {x.strip().lower() for x in a.exclude}
+        kept = [c for c in cases if c.label.strip().lower() not in drop]
+        for lbl in sorted({c.label for c in cases} - {c.label for c in kept}):
+            print(f"  - excluding {lbl}", flush=True)
+        unmatched = drop - {c.label.strip().lower() for c in cases}
+        if unmatched:
+            print(f"error: --exclude matched nothing: {sorted(unmatched)}",
+                  file=sys.stderr)
+            return 2
+        cases = kept
 
     if a.list:
         for c in cases:
@@ -697,7 +817,7 @@ def main() -> int:
             print(f"missing {b}; build the extension first (make -j)", file=sys.stderr)
             return 1
 
-    problem = preflight()
+    problem = preflight(needs_fpga="fpga" in (tuple(a.variant) if a.variant else ("software", "fpga")))
     if problem:
         print(f"preflight: {problem}", file=sys.stderr)
         return 1
@@ -713,6 +833,26 @@ def main() -> int:
         need = [p for p in PATTERNS if not p.table]
     elif any(c.suite == "threads" for c in cases) and not THREADS_PATTERN.table:
         need = [THREADS_PATTERN]
+    if a.fsst and not check_fsst_storage(cases, existing_only=True):
+        # Before generation, not only after: a table whose encoding does not match
+        # REGEX_GEN_COMPRESSION is rebuilt in place, so REGEX_GEN_COMPRESSION=auto against
+        # the uncompressed database would silently convert the whole benchmark set to FSST.
+        print("error: --fsst needs FSST-encoded storage; see the warnings above",
+              file=sys.stderr)
+        return 2
+    if need and a.fsst:
+        # regex_gen reuses a table only if its encoding matches REGEX_GEN_COMPRESSION, so
+        # with the default the six FSST tables all look wrong and ensure_table rebuilds
+        # them -- uncompressed, in place, over the twin this run needs.  Refuse before
+        # generating rather than after.
+        want = os.environ.get("REGEX_GEN_COMPRESSION", "uncompressed").lower()
+        if want not in ("auto", "fsst"):
+            print(f"error: --fsst with REGEX_GEN_COMPRESSION={want}: regex_gen would "
+                  f"REGENERATE every table in {GEN_DB} as {want}, destroying an FSST twin "
+                  f"if that is what it holds. Set REGEX_GEN_COMPRESSION=auto, and point "
+                  f"REGEX_GEN_DB at the FSST database "
+                  f"(e.g. /scratch/vifranz/regex_gen_fsst.duckdb).", file=sys.stderr)
+            return 2
     if need:
         print(f"checking {len(need)} generated table(s) in {GEN_DB}")
         for pat in need:
@@ -720,6 +860,11 @@ def main() -> int:
 
     # After generation, so freshly built tables are checked too.
     check_parallelism(cases, a.threads or (os.cpu_count() or 1))
+
+    if a.fsst and not check_fsst_storage(cases):
+        print("error: --fsst needs FSST-encoded storage; see the warnings above",
+              file=sys.stderr)
+        return 2
 
     cfg = run_config(a)
     rows = []
@@ -757,6 +902,13 @@ def main() -> int:
             case_settings = list(c.settings)
             # FPGA variant only: the software case does not `require oasis`, so the
             # extension's settings do not exist in that session.
+            if a.fsst and variant == "fpga":
+                # enable_fsst_vectors is GLOBAL_ONLY; without it ColumnData hands back
+                # flattened plaintext and the passthrough never sees a compressed vector.
+                # Left off the software case deliberately: that baseline should stay the
+                # ordinary scan, decompressing on the host as it always has.
+                case_settings.insert(0, "SET oasis_regex_fsst_passthrough = true")
+                case_settings.insert(0, "SET GLOBAL enable_fsst_vectors = true")
             if a.outlier_bytes is not None and variant == "fpga":
                 case_settings.insert(0, f"SET oasis_regex_outlier_bytes = {a.outlier_bytes}")
             if a.in_flight is not None and variant == "fpga":

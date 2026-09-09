@@ -125,6 +125,20 @@ struct InFlightTransfer {
 	// Packed in full but never sent (oasis_regex_dry_run): collect returns all-zero
 	// without touching the device.
 	bool dry_run = false;
+	// This transfer holds one of the card's symbol-table slots, released when it is
+	// collected. table_decoder identifies which table, so the release matches the acquire
+	// once more than one slot can be live. See TryAcquireRegexTableSlot.
+	bool table_slot = false;
+	// Wire audit taken at submit and re-checked at collect, under OASIS_REGEX_VERIFY_WIRE.
+	// The submit-side check alone cannot see a buffer mutated after the arm and before the
+	// DMA has read it; comparing the two is what closes that.
+	celeris::RegexStreamPacker::Plan audit_plan;
+	uint64_t audit_header_bytes = 0;
+	uint64_t audit_delims = 0;
+	uint64_t audit_hash = 0;
+	bool     audit_compressed = false;
+	bool     audit_taken = false;
+	const void *table_decoder = nullptr;
 };
 
 struct RegexFpgaScanLocalState : public LocalTableFunctionState {
@@ -253,6 +267,34 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	// filler wire for a single outlier, so one 64 KB value would cost a 4 MiB transfer
 	// to decide one row.
 	uint64_t outlier_bytes = celeris::kRegexOutlierBytes;
+
+	// oasis_regex_fsst_passthrough: ship FSST-compressed bytes to the card instead of
+	// decompressing them on the host first. Off by default, and it must stay off until the
+	// RTL carries a decompressor -- the engines match whatever bytes arrive, so with a
+	// plaintext bitstream this returns valid-looking wrong answers rather than an error.
+	//
+	// Enabling it is not sufficient on its own: DuckDB only hands out an FSST_VECTOR when
+	// enable_fsst_vectors is also on, and only for reads that do not straddle a
+	// ColumnSegment boundary. Rows that arrive decompressed anyway fall back to the host
+	// RE2 outlier path, so the setting degrades in throughput, never in correctness.
+	bool fsst_passthrough = false;
+
+	// The FSST decoder of the segment whose rows are in the batch being packed, or nullptr
+	// while the batch is empty. It doubles as the segment's identity: DuckDB builds one
+	// decoder per ColumnSegment, so the pointer changing means the scan has crossed into a
+	// segment with a different symbol table.
+	//
+	// A batch carries exactly one symbol table to the card, so it must not span two. Mixing
+	// them decodes the second segment's rows against the first segment's symbols, which is
+	// the failure this design has to avoid above all others: every code is still a valid
+	// code, so it yields plausible strings and a valid-looking wrong answer, with no error.
+	const void *batch_fsst_decoder = nullptr;
+
+	// Where this batch's symbol-table header sits in the wire buffer, or nullptr when the
+	// batch carries no table. Reserved at the head of the buffer by the packer, filled once
+	// the batch's segment is known -- which is the first compressed row, since the flush on
+	// a decoder change guarantees a batch has only one.
+	uint8_t *batch_symbol_header = nullptr;
 
 	// RE2 for the outlier path, compiled on first use. Lazy because a scan with no
 	// outlier never needs it, and because a pattern the NFA accepts is not guaranteed to

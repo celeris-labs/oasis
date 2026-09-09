@@ -3,7 +3,6 @@
 #include "oasis_extension.hpp"
 #include "oasis_profile.hpp"
 #include "oasis_scan.hpp"
-#include "regex.hpp"
 #include "regex_table.hpp"
 #include "regex_profile.hpp"
 #include "oasis_context_cache_entry.hpp"
@@ -79,6 +78,28 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "regex_fpga_scan: solo-batch threshold in bytes (0 = default 2048)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
+	// Ship FSST-compressed bytes straight to the card rather than decompressing them on the
+	// host and sending plaintext. DuckDB stores string columns FSST-compressed by default, so
+	// today the scan pays to expand data it then pays PCIe to ship; o_comment compresses ~2.9x,
+	// which is wire bandwidth the accelerator is otherwise bounded by.
+	//
+	// OFF, and it must stay off until the RTL carries a decompressor. The engines match
+	// whatever bytes reach them, so against a plaintext bitstream this returns valid-looking
+	// WRONG answers with no error -- it exists so the host side can be built and tested ahead
+	// of the hardware, not because it is usable yet.
+	//
+	// It also needs enable_fsst_vectors=true (a DuckDB GLOBAL_ONLY setting this extension
+	// cannot flip for you); regex_fpga_scan raises an error if one is set without the other.
+	// Even then DuckDB only emits an FSST_VECTOR for reads that stay inside one ColumnSegment,
+	// so a fraction of rows -- ~2048/rows_per_segment, which is 18% on o_comment and 100% once
+	// a 256 KB segment holds fewer than 2048 rows -- arrives decompressed and falls back to the
+	// host RE2 path. regex_fpga_batch_phases() reports the split as compressed_pct.
+	config.AddExtensionOption("oasis_regex_fsst_passthrough",
+	                          "regex_fpga_scan: send FSST-compressed bytes to the FPGA instead of "
+	                          "host-decompressed plaintext (requires enable_fsst_vectors, and a "
+	                          "bitstream with a decompressor -- WRONG RESULTS without one)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	// How many transfers one scan thread keeps on the card. Depth 1 makes the host and
 	// the card take turns: pack a batch, submit it, block on its results, pack the next,
 	// so a thread's only overlap is other threads'. Depth 2 packs the next batch while
@@ -127,14 +148,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<RDMAFileSystem>());
 
 	// FPGA contexts are established lazily on first use: read_oasis initializes the OasisContext
-	// in its scan-init path, and regex_fpga initializes the CelerisContext on first execution.
-	// Connecting eagerly here would require a specific bitstream to be loaded at extension-load
-	// time, which breaks regex-only simulation runs against the Celeris regex bitstream.
-	ScalarFunction regex_function("regex_fpga",
-	                              {LogicalType::VARCHAR, LogicalType::VARCHAR}, // string, pattern
-	                              LogicalType::BOOLEAN, RegexFpgaFunction, RegexFpgaBind);
-	loader.RegisterFunction(regex_function);
-
+	// in its scan-init path, and regex_fpga_scan initializes the CelerisContext in its scan-init
+	// path. Connecting eagerly here would require a specific bitstream to be loaded at
+	// extension-load time, which breaks regex-only simulation runs against the Celeris regex
+	// bitstream.
 	RegisterRegexFpgaScanFunction(loader);
 
 	// Stream-profiler readout for the regex datapath (see regex_profile.cpp).
