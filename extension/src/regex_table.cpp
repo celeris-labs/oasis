@@ -114,6 +114,8 @@ static inline uint64_t StageNanos(const StageClock::time_point &t) {
 }
 static bool CollectOldestTransfer(RegexFpgaScanLocalState &lstate);
 
+
+
 // How close to the row cap a batch has to be before it is allowed to close early on a
 // chunk boundary. One chunk of a 64 B string is 4 strings per engine, i.e. 256 rows; at
 // 512 the rule can fire for anything up to 128 B strings and still give up at most half
@@ -535,6 +537,46 @@ static void MaterializeRetainedColumns(DataChunk &chunk, const vector<idx_t> &co
 // byte. Codes the table never uses carry len 0, which would underflow the stored len-1,
 // so they are clamped -- the card never looks them up, but a garbage length there would
 // be a live-lock waiting for a symbol that never ends.
+// Sentinel "decoder" for the identity table. Batches are grouped by decoder pointer, so this
+// only has to be a unique address that can never collide with a real duckdb_fsst_decoder_t.
+static const uint8_t kIdentityDecoderTag = 0;
+static const void *const kRegexIdentityDecoder = &kIdentityDecoderTag;
+
+// A symbol table where code c decodes to the single byte c.
+//
+// This is what lets a segment-straddle row -- one DuckDB handed back decompressed, which
+// therefore cannot join a batch carrying that segment's real table -- go to the CARD instead of
+// to host RE2. Its plaintext bytes ARE valid codes under this table, so staging costs a memcpy
+// and no encoding at all.
+//
+// The point is what it avoids. Routing those rows to RE2 costs ~27% of host time on an easy
+// pattern and 90x on a hard one (.*[30-member class].{26}: 0.12 GB/s against 10.94 plaintext),
+// because the accelerator inherits software's worst case on 10% of rows. The obvious
+// alternative -- send them in a *plaintext* batch -- makes fsst_mode vary within a query, and
+// that wedges the array: the mode is read from the arm-queue head at input time but popped at
+// retire time, and it is a single global wire that all 64 engines read live, so queued beats
+// get decoded under a newer transfer's mode. Confirmed in xsim (`--fsst-mismatch` and
+// `--fsst-fixed` both hang; `--fsst-serial`, which drains between mode changes, passes).
+//
+// An identity batch is a *compressed* batch, so the mode never changes -- only the table does,
+// and per-transfer table changes are already safe (double-buffered banks, and xsim passes 12
+// pipelined transfers with a distinct table each). It needs no RTL change.
+//
+// Safe because the data is printable ASCII: code 0 is the terminator and 255 is FSST_ESC under
+// zeroTerminated=1, and neither byte occurs, so nothing needs escaping.
+static void WriteIdentitySymbolTableHeader(uint8_t *header) {
+	D_ASSERT(header != nullptr);
+	auto *words = reinterpret_cast<uint64_t *>(header);
+	for (uint32_t code = 0; code < celeris::kRegexSymbolCount; code++) {
+		// Codes 0 and 255 are reserved and never emitted. Give them the same self-consistent
+		// filler byte the unused-code path below uses -- decoding them to 0x00 would make the
+		// compressed filler a delimiter and wedge the array, as documented there.
+		const bool reserved = (code == 0) || (code >= 255);
+		words[code * 2]     = reserved ? uint64_t(celeris::kRegexCompressedFillerByte) : uint64_t(code);
+		words[code * 2 + 1] = 0;  // stored length is len-1, so 0 means one byte
+	}
+}
+
 static void WriteSymbolTableHeader(uint8_t *header, const void *decoder) {
 	D_ASSERT(header != nullptr && decoder != nullptr);
 	const auto *dec = reinterpret_cast<const duckdb_fsst_decoder_t *>(decoder);
@@ -721,11 +763,19 @@ static void StartNewStagedBatch(RegexFpgaScanLocalState &lstate, celeris::Celeri
 	// capacity, so a reservation taken earlier would be applied to the previous batch's
 	// buffer and then thrown away -- leaving batch_symbol_header dangling.
 	//
-	// Reserved unconditionally under the passthrough rather than on the first compressed
-	// row, because it has to happen before any append: it moves the packing origin. A
-	// batch that ends up holding only host-routed rows simply never submits, so an unused
-	// reservation costs nothing.
-	lstate.batch_symbol_header = lstate.fsst_passthrough ? lstate.packer.reserve_symbol_header() : nullptr;
+	// Taken on the first compressed row, not here: it must precede every append because it
+	// moves the packing origin, and that holds because a batch only becomes compressed at its
+	// first compressed row, when accum_count is still 0.
+	//
+	// This is what lets a batch be plaintext while the query is in passthrough mode. Reserving
+	// unconditionally would leave 2304 bytes of never-written header at the head of a plaintext
+	// rectangle -- the shape that feeds header beats to the engines as strings. With deferral
+	// off it is behaviour-identical: every submitted batch has a compressed row.
+	//
+	// (An earlier note here blamed this line for hanging the default path. That measurement was
+	// taken on a card already poisoned by an earlier wedge, so it was void; the default path
+	// was fine.)
+	lstate.batch_symbol_header = nullptr;
 }
 
 static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const InFlightTransfer &transfer,
@@ -1074,10 +1124,15 @@ static bool MatchOutlierOnHost(const RegexFpgaScanBindData &bind_data, RegexFpga
 	}
 	const char *data = value.GetData();
 	// Pointer range, not a std::string: these are the values big enough that copying
-	// them to ask one question would be the most expensive thing on this path. The
-	// overload that takes a range needs a Match to fill; the groups are discarded.
-	duckdb_re2::Match groups;
-	return duckdb_re2::RegexMatch(data, data + value.GetSize(), groups, *lstate.cpu_regex);
+	// them to ask one question would be the most expensive thing on this path.
+	//
+	// NoGroups, not the Match overload: this path only needs yes/no, and asking RE2 for
+	// submatches it then discards cost 2.36 us/row on `.*(warthogs|instruction[a-z]).*`
+	// versus ~65 ns/row on the same data with a group-free pattern -- the capture group
+	// pushes RE2 off its DFA, and the wrapper heap-allocates per call besides. Under the
+	// passthrough ~10% of rows land here (the segment straddle), so it set the whole
+	// query's throughput: 3.31 GB/s against 12.31 for the group-free twin.
+	return duckdb_re2::RegexMatchNoGroups(data, data + value.GetSize(), *lstate.cpu_regex);
 }
 
 // Whether staging one more *distinct* string would overrun the batch. `next_length` is the string's
@@ -1124,9 +1179,39 @@ static bool WouldExceedFpgaBatch(const RegexFpgaScanLocalState &lstate, uint64_t
 	return !lstate.packer.fits(next_length);
 }
 
+// Push the per-thread row-path tallies into the global counters. One atomic per path per
+// call instead of one per row; the counts are only read by regex_fpga_batch_phases(), so
+// they need to be correct by the end of the scan, not row by row.
+static void FlushRegexRowPaths(RegexFpgaScanLocalState &lstate) {
+	if (lstate.path_compressed) {
+		NoteRegexRowPath(RegexRowPath::COMPRESSED, lstate.path_compressed);
+		lstate.path_compressed = 0;
+	}
+	if (lstate.path_not_fsst) {
+		NoteRegexRowPath(RegexRowPath::NOT_FSST, lstate.path_not_fsst);
+		lstate.path_not_fsst = 0;
+	}
+	if (lstate.path_mode0) {
+		NoteRegexRowPath(RegexRowPath::MODE0, lstate.path_mode0);
+		lstate.path_mode0 = 0;
+	}
+	if (lstate.path_outlier) {
+		NoteRegexRowPath(RegexRowPath::OUTLIER, lstate.path_outlier);
+		lstate.path_outlier = 0;
+	}
+}
+
 static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScanGlobalState &global_state,
                            RegexFpgaScanLocalState &lstate, ClientContext &context) {
 	CALI_CXX_MARK_FUNCTION;
+	// Scoped, not a call at the end: this function returns early from inside the staging
+	// loop, and a missed flush would silently under-report compressed_pct.
+	struct RowPathFlush {
+		RegexFpgaScanLocalState &state;
+		~RowPathFlush() {
+			FlushRegexRowPaths(state);
+		}
+	} row_path_flush {lstate};
 	while (lstate.output_cache.size() == 0 && !lstate.finished) {
 		if (!TryRefillScanChunk(context, bind_data, global_state, lstate)) {
 			// Scan exhausted. Submit whatever is staged, then drain the window: every
@@ -1208,6 +1293,16 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			regex_validity = &regex_format.validity;
 		}
 
+		// Which symbol table this chunk's rows ride. Under the passthrough a decompressed
+		// (straddling) chunk rides the identity table so that it can still reach the card;
+		// everything else rides its segment's real table. Outside the passthrough there is no
+		// table at all and batches stay plaintext exactly as before.
+		const void *row_decoder = nullptr;
+		if (lstate.fsst_passthrough) {
+			row_decoder = fsst_passthrough ? static_cast<const void *>(fsst_decoder)
+			                               : kRegexIdentityDecoder;
+		}
+
 		if (dedup) {
 			// Dictionary indices only mean anything within the chunk that produced them.
 			lstate.dict_stamp++;
@@ -1223,23 +1318,16 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 				continue;
 			}
 
-			// Under the passthrough a batch carries compressed bytes and exactly one symbol
-			// table, so a chunk DuckDB handed back decompressed cannot join it -- the card
-			// decodes the whole batch against that table, and plaintext mixed in would be
-			// decoded as though it were codes. Match those rows on the host instead, the same
-			// route outliers take. This is what makes a straddling segment cost throughput
-			// rather than correctness, and it is why compressed_pct is worth watching: every
-			// point below 100 is a row the CPU matched.
-			if (lstate.fsst_passthrough && !fsst_passthrough) {
-				NoteRegexRowPath(RegexRowPath::NOT_FSST);
-				lstate.batch_row_refs.push_back(
-				    {lstate.retained_chunks[lstate.current_retained_chunk_idx].id, kCpuResolvedSlot,
-				     static_cast<uint16_t>(row_idx),
-				     MatchOutlierOnHost(bind_data, lstate, regex_data[regex_idx])});
-				lstate.staged_rows++;
-				lstate.chunk_offset++;
-				continue;
-			}
+			// A chunk DuckDB handed back decompressed (a vector straddling two ColumnSegments)
+			// used to be matched here on the host with RE2, because it cannot join a batch
+			// carrying that segment's real symbol table. It now goes to the card under the
+			// IDENTITY table instead -- its plaintext bytes are already valid codes there --
+			// so it costs a memcpy rather than a software regex. See
+			// WriteIdentitySymbolTableHeader for why identity rather than a plaintext batch.
+			//
+			// Nothing else in this loop changes: row_decoder below routes the row to a batch
+			// grouped by the identity sentinel, and the existing table-change check closes the
+			// batch on the boundary.
 
 			// Reuse the slot if this dictionary entry has already been sent in this batch.
 			idx_t slot = DConstants::INVALID_INDEX;
@@ -1262,7 +1350,7 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			//
 			// The verdict rides in the row ref, so scan order is preserved with no merge.
 			if (needs_slot && next_length >= lstate.outlier_bytes) {
-				NoteRegexRowPath(RegexRowPath::OUTLIER);
+				lstate.path_outlier++;
 				// Under the passthrough regex_value is compressed, and RE2 must not see those
 				// bytes -- it would match the symbol codes and quietly return a verdict for a
 				// string that does not exist. Decompress this one value; outliers are rare by
@@ -1298,8 +1386,13 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			// pointing at the row, so it is staged exactly once against the next batch.
 			// A batch ships one symbol table, so crossing into a segment with a different
 			// decoder closes the batch even when neither the row nor the byte cap binds.
-			const bool crosses_symbol_table = fsst_passthrough && lstate.batch_fsst_decoder != nullptr &&
-			                                  lstate.batch_fsst_decoder != fsst_decoder;
+			// row_decoder, not fsst_decoder: a straddling chunk rides the identity table, so
+			// moving between real and identity tables closes the batch just like moving
+			// between two real ones. The MODE never changes -- both are compressed batches --
+			// which is the whole point.
+			const bool crosses_symbol_table = lstate.fsst_passthrough &&
+			                                  lstate.batch_fsst_decoder != nullptr &&
+			                                  lstate.batch_fsst_decoder != row_decoder;
 			if (lstate.staged_rows > 0 &&
 			    (crosses_symbol_table || WouldExceedFpgaBatch(lstate, next_length, needs_slot))) {
 				AddRegexStageNs(StageNanos(t_stage));
@@ -1329,16 +1422,25 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 				continue;
 			}
 
-			if (fsst_passthrough) {
-				D_ASSERT(lstate.batch_fsst_decoder == nullptr || lstate.batch_fsst_decoder == fsst_decoder);
+			if (lstate.fsst_passthrough) {
+				D_ASSERT(lstate.batch_fsst_decoder == nullptr || lstate.batch_fsst_decoder == row_decoder);
 				if (lstate.batch_fsst_decoder == nullptr) {
-					// First compressed row of this batch. The padding finalize() adds must be
-					// codes too, not 0xFF -- that is FSST_ESC and would eat the filler's own
-					// terminator. reset() restores the plaintext filler for the next batch.
+					// First compressed row of this batch, so take the reservation now.
+					// accum_count must still be 0: reserve_symbol_header() moves the packing
+					// origin and cannot run after an append.
+					D_ASSERT(lstate.accum_count == 0);
+					lstate.batch_symbol_header = lstate.packer.reserve_symbol_header();
+					// The padding finalize() adds must be codes too, not 0xFF -- that is
+					// FSST_ESC and would eat the filler's own terminator. reset() restores the
+					// plaintext filler for the next batch.
 					lstate.packer.set_compressed_filler(true);
-					WriteSymbolTableHeader(lstate.batch_symbol_header, fsst_decoder);
+					if (row_decoder == kRegexIdentityDecoder) {
+						WriteIdentitySymbolTableHeader(lstate.batch_symbol_header);
+					} else {
+						WriteSymbolTableHeader(lstate.batch_symbol_header, fsst_decoder);
+					}
 				}
-				lstate.batch_fsst_decoder = fsst_decoder;
+				lstate.batch_fsst_decoder = row_decoder;
 			}
 
 			if (needs_slot) {
@@ -1359,10 +1461,13 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 				}
 			}
 
-			NoteRegexRowPath(fsst_passthrough ? RegexRowPath::COMPRESSED
-			                                  : (regex_vector_type == VectorType::FSST_VECTOR
-			                                         ? RegexRowPath::MODE0
-			                                         : RegexRowPath::NOT_FSST));
+			if (fsst_passthrough) {
+				lstate.path_compressed++;
+			} else if (regex_vector_type == VectorType::FSST_VECTOR) {
+				lstate.path_mode0++;
+			} else {
+				lstate.path_not_fsst++;
+			}
 			lstate.batch_row_refs.push_back({lstate.retained_chunks[lstate.current_retained_chunk_idx].id,
 			                                 static_cast<uint32_t>(slot), static_cast<uint16_t>(row_idx), false});
 			lstate.staged_rows++;

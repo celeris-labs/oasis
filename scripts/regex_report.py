@@ -475,6 +475,13 @@ def run_sql(root: Path, name: str, db: str, sql: str, settings, reset_pool: bool
     return r.stdout.strip(), ""
 
 
+# Set from --fsst.  The passthrough refuses to project the regex column, so the
+# checksum half of the verification query cannot be computed on the FPGA side and
+# verification degrades to comparing cardinality only.  Kept as module state rather
+# than threaded through verify_sql/verify_case, which are called from one place.
+VERIFY_COUNT_ONLY = False
+
+
 def verify_sql(c: Case, variant: str) -> str | None:
     """The correctness query for one side of a case, or None if it has no counterpart.
 
@@ -491,7 +498,12 @@ def verify_sql(c: Case, variant: str) -> str | None:
     if c.suite == "queries":
         f = c.sql_software if variant == "software" else c.sql_fpga
         return Path(f).read_text().strip() if f else None
-    agg = f"count(*), sum(hash({c.column}))"
+    # sum(hash(c)) projects the regex column, which regex_fpga_scan rejects under
+    # oasis_regex_fsst_passthrough ("cannot also project the regex column yet").  Asking
+    # for it anyway makes every case report `error (fpga)` and leaves the run with no
+    # correctness check at all, so fall back to cardinality -- weaker, but it is what
+    # caught the lost-result-beat undercount, which was a multiple of 512 rows.
+    agg = "count(*)" if VERIFY_COUNT_ONLY else f"count(*), sum(hash({c.column}))"
     if variant == "software":
         return f"SELECT {agg} FROM {c.table} WHERE {sw_predicate(c)};"
     return (f"SELECT {agg} FROM regex_fpga_scan('{c.table}', "
@@ -526,11 +538,18 @@ def verify_case(root: Path, name: str, c: Case, built: dict, rec: dict) -> None:
             if len(parts) == 2:
                 rec[variant + "_rows"] = parts[0].strip()
                 rec[variant + "_check"] = parts[1].strip()
+            elif len(parts) == 1 and VERIFY_COUNT_ONLY:
+                rec[variant + "_rows"] = parts[0].strip()
 
     if len(out) < 2:
         rec["verify"] = "skipped: one variant measured"
         return
-    rec["verify"] = "ok" if out["software"] == out["fpga"] else "MISMATCH"
+    # Never plain "ok" when the checksum was skipped: a reader must not take a matching
+    # row count for a verified matched set.
+    if out["software"] != out["fpga"]:
+        rec["verify"] = "MISMATCH"
+    else:
+        rec["verify"] = "ok (count only)" if VERIFY_COUNT_ONLY else "ok"
 
 
 def build_cases(shapes=("count", "materialise", "emit")) -> list[Case]:
@@ -787,6 +806,9 @@ def main() -> int:
         # Not a preference: regex_fpga_scan throws on a projected regex column under the
         # passthrough, so materialise/emit would fail every case rather than measure one.
         shapes = tuple(x for x in shapes if x == "count") or ("count",)
+        # Same restriction applies to the verification query's checksum.
+        global VERIFY_COUNT_ONLY
+        VERIFY_COUNT_ONLY = True
     cases = build_cases(shapes)
     # "queries" is deliberately not in the default set: it is the only suite that runs
     # whole TPC-H queries rather than a single predicate, it needs the 24 GB sf30

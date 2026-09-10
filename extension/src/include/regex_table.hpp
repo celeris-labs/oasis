@@ -156,6 +156,18 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	uint32_t next_chunk_id = 0;
 	vector<StagedRowRef> batch_row_refs;
 
+	// Row-path tallies, accumulated per thread and flushed once per AccumulateRows call.
+	// NoteRegexRowPath() is a fetch_add on a process-wide atomic, and it used to be called
+	// once per row from the staging loop. Measured cost of that: staging went from 59 ns/row
+	// at one thread to 630 ns/row at sixteen -- per-row cost rising linearly with the thread
+	// count, the signature of one contended cache line -- so 16 threads bought 1.96x wall
+	// time instead of ~10x. The four counters are also declared adjacently, so they shared
+	// lines with each other as well.
+	uint64_t path_compressed = 0;
+	uint64_t path_not_fsst = 0;
+	uint64_t path_mode0 = 0;
+	uint64_t path_outlier = 0;
+
 	// Transfers on the card, oldest first. Collected from the front, so results are
 	// consumed in submission order and output rows stay in scan order.
 	std::deque<InFlightTransfer> in_flight;
