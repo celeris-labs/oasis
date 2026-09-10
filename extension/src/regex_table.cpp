@@ -1310,7 +1310,22 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 
 		CALI_MARK_BEGIN("stage_rows_for_fpga_batch");
 		auto t_stage = StageClock::now();
-		while (lstate.chunk_offset < current_chunk.size() && lstate.output_cache.size() == 0) {
+		// Hoisted, and the output_cache test dropped, because DataChunk::size() is not the
+		// register read it looks like in this fork:
+		//
+		//     inline idx_t size() const {
+		//         if (count.IsValid()) { return count.GetIndex(); }
+		//         for (const auto &v : data) { if (v.GetBufferRef()) { return v.size(); } }
+		//
+		// It was called TWICE per row -- 31 M calls for a 15.7 M-row table -- and showed up
+		// at 6.8% of host time in perf, more than duckdb_fsst_decompress.
+		//
+		// chunk_size is constant for the chunk. The output_cache test is dead: the cache is
+		// empty on entry (the caller's loop guarantees it) and the only thing inside this
+		// loop that can grow it is the CollectOldestTransfer below, which is immediately
+		// followed by `return` when it does.
+		const idx_t chunk_size = current_chunk.size();
+		while (lstate.chunk_offset < chunk_size) {
 			const idx_t row_idx = lstate.chunk_offset;
 			const idx_t regex_idx = regex_sel->get_index(row_idx);
 			if (!regex_validity->RowIsValid(regex_idx)) {
