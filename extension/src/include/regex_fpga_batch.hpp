@@ -53,7 +53,12 @@ static constexpr uint64_t REGEX_FPGA_WIRE_BUFFER_BYTES = 4ULL << 20;
 // Transfers one scan thread keeps on the card. See the long note on
 // RegexFpgaScanLocalState::max_in_flight: this and the scan's thread cap are a single
 // decision, because their product is bounded by kRegexMaxSubmissionsInFlight.
-static constexpr idx_t REGEX_FPGA_DEFAULT_IN_FLIGHT = 2;
+//
+// 4, which with 64 credits caps the scan at 16 threads. Measured on the 128-engine card over
+// p_substring_72_10_15728k (FSST, 40 queries per point, GB/s): 16x2 25.7-26.2, 16x4 26.5,
+// 32x2 24.6-24.8, 16x3 25.0, 20x2 25.7, 24x2 24.5, 12x5 22.3, 8x8 17.2, window 1 at
+// 16/24/32 threads 20.4-23.0. Only plain FSST 72 B text was measured; plaintext is PCIe-bound.
+static constexpr idx_t REGEX_FPGA_DEFAULT_IN_FLIGHT = 4;
 
 // Wire bytes a batch aims for, which is what actually decides a transfer's size; the row
 // cap above is a backstop for the result FIFO, not the target.

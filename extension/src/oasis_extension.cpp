@@ -117,8 +117,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// pool (oasis_regex_wire_buffer_bytes, 4 MiB by default); 16 threads at depth 2 is
 	// the same 128 MiB the old 32-at-depth-1 default used. Set it to 1 if pages are tight
 	// -- that raises the thread cap back to 32.
+	//
+	// Now 64 credits and a default of 4, so the cap is 16 threads: 16x4 was the best point on the
+	// 128-engine card (REGEX_FPGA_DEFAULT_IN_FLIGHT has the sweep).
 	config.AddExtensionOption("oasis_regex_max_in_flight",
-	                          "regex_fpga_scan: transfers outstanding per scan thread (0 = default 2)",
+	                          "regex_fpga_scan: transfers outstanding per scan thread (0 = default 4)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
 	// The scan already caps its own parallelism at kRegexMaxSubmissionsInFlight /
@@ -128,7 +131,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// the scan does. It can only lower the cap, never raise it above the credit bound.
 	config.AddExtensionOption("oasis_regex_max_threads",
 	                          "regex_fpga_scan: lower the scan's parallelism below the "
-	                          "arm-credit cap of 32/oasis_regex_max_in_flight (0 = no extra cap)",
+	                          "arm-credit cap of 64/oasis_regex_max_in_flight (0 = no extra cap)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
 	// Oasis scan table function

@@ -392,6 +392,9 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 
 	// How many transfers this thread keeps on the card, from oasis_regex_max_in_flight.
 	//
+	// Now 4 by default (64 credits -> 16 threads); see REGEX_FPGA_DEFAULT_IN_FLIGHT for the
+	// 128-engine sweep. The rest of this note is the 64-engine history.
+	//
 	// 2, and this is what the thread cap in RegexFpgaScanInitGlobal is derived from: a
 	// window of W on T threads holds T*W arm credits, and there are only
 	// kRegexMaxSubmissionsInFlight (32) because that is the RTL's strings_in_batch queue

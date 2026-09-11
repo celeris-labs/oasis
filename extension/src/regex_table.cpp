@@ -322,10 +322,14 @@ unique_ptr<GlobalTableFunctionState> RegexFpgaScanInitGlobal(ClientContext &cont
 	// Scan threads are capped by the arm-credit pool, not by the machine.
 	//
 	// Every transfer on the card holds one arm credit, and there are exactly
-	// kRegexMaxSubmissionsInFlight (32) of them because that is the depth of the RTL's
+	// kRegexMaxSubmissionsInFlight (64) of them because that is the depth of the RTL's
 	// strings_in_batch queue, which does not back-pressure. A thread that cannot get a
 	// credit stops packing and collects instead, so T threads each keeping W transfers
-	// outstanding need T*W <= 32 or they spend the scan taking credits off each other.
+	// outstanding need T*W <= 64 or they spend the scan taking credits off each other.
+	//
+	// The default window is now 4, so the cap is 16 threads -- the best point measured on the
+	// 128-engine card (see REGEX_FPGA_DEFAULT_IN_FLIGHT). The history below is from the
+	// 64-engine card with 32 credits, when W=2 and a 16-thread cap won.
 	//
 	// That fixes the shape of the operating point rather than leaving it to the machine's
 	// core count. W = 1 makes a thread wait out its own device round trip before it packs
