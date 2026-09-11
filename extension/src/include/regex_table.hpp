@@ -63,24 +63,40 @@ struct RegexFpgaScanGlobalState : public GlobalTableFunctionState {
 //   chunk_id  one per scanned DataChunk, so ~2048 rows apart; 2^32 covers 8.8e12 rows
 //   row_idx   an offset within one DataChunk, so < STANDARD_VECTOR_SIZE (2048)
 //   slot_idx  a slot within one batch, bounded by max_accum_count (<= 131008)
+//
+// And it is a RUN, not a row: `Count()` consecutive rows of one chunk whose verdicts are
+// `Count()` consecutive slots. A plain FSST chunk stages as one ref instead of 2048. One ref
+// per row had cost 12 B written at staging and re-read at collect for every row scanned --
+// ~190 MB per query on the 15.7 M-row benchmark table, with the collect walk at 4.5% of CPU.
 struct StagedRowRef {
 	// Stable id, not an index. Several transfers are outstanding at once and each holds
 	// its own refs, so a position in a container that shifts underneath them is not
 	// enough -- the batch-relative index this replaced was only ever correct because
 	// exactly one batch existed at a time.
 	uint32_t chunk_id;
-	// Transfer slot whose match bit decides this row, or kCpuResolvedSlot when the
-	// verdict was computed on the CPU and is carried in cpu_match instead. Usually one
+	// Transfer slot whose match bit decides the run's first row, or kCpuResolvedSlot when the
+	// verdict was computed on the CPU and is carried in the run field instead. Usually one
 	// slot per row, but rows sharing a dictionary entry share a slot -- see the
-	// dictionary fast path in AccumulateRows.
+	// dictionary fast path in AccumulateRows -- which is simply where a run ends.
 	uint32_t slot_idx;
+	// First row of the run.
 	uint16_t row_idx;
-	// Only meaningful when slot_idx is kCpuResolvedSlot. Outliers (>= outlier_bytes)
-	// never reach the card, so their answer travels with the ref; keeping it here rather
-	// than in a side list means AppendMatchedRows still walks one array in scan order and
-	// needs no merge step.
-	bool cpu_match;
+	// Low 15 bits: rows in the run. Bit 15: the verdict, for CPU-resolved refs only, which are
+	// always a run of one. Outliers (>= outlier_bytes) never reach the card, so their answer
+	// travels with the ref; keeping it here rather than in a side list means AppendMatchedRows
+	// still walks one array in scan order and needs no merge step.
+	uint16_t run;
+
+	idx_t Count() const {
+		return run & 0x7FFF;
+	}
+	bool CpuMatch() const {
+		return (run & 0x8000) != 0;
+	}
 };
+
+static constexpr uint16_t kRunCountMask = 0x7FFF;
+static constexpr uint16_t kRunCpuMatchBit = 0x8000;
 
 // slot_idx sentinel for "already decided on the host". Not DConstants::INVALID_INDEX,
 // which is idx_t-wide and would not fit the field above.
@@ -139,6 +155,26 @@ struct InFlightTransfer {
 	bool     audit_compressed = false;
 	bool     audit_taken = false;
 	const void *table_decoder = nullptr;
+	// Keeps table_decoder's allocation alive until collect; see batch_decoder_owner.
+	buffer_ptr<VectorBuffer> decoder_owner;
+};
+
+// The staging state of a batch that is open but not the one rows are currently packed into.
+// Mirrors the batch fields of RegexFpgaScanLocalState one for one, and is swapped with them
+// wholesale. See RegexFpgaScanLocalState::parked.
+struct ParkedStagedBatch {
+	celeris::RegexStreamPacker packer;
+	// Null until this batch is first activated.
+	std::shared_ptr<libstf::Buffer> wire_buffer;
+	vector<StagedRowRef> batch_row_refs;
+	idx_t accum_count = 0;
+	idx_t staged_rows = 0;
+	idx_t accum_cap = 0;
+	uint64_t batch_payload_bytes = 0;
+	uint64_t batch_target_bytes = 0;
+	const void *batch_fsst_decoder = nullptr;
+	uint8_t *batch_symbol_header = nullptr;
+	buffer_ptr<VectorBuffer> batch_decoder_owner;
 };
 
 struct RegexFpgaScanLocalState : public LocalTableFunctionState {
@@ -307,6 +343,46 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	// the batch's segment is known -- which is the first compressed row, since the flush on
 	// a decoder change guarantees a batch has only one.
 	uint8_t *batch_symbol_header = nullptr;
+
+	// The FSST vector buffer that owns batch_fsst_decoder, held for as long as the batch is open.
+	// The decoder pointer is the batch's table IDENTITY: a row joins the batch only if its
+	// decoder has the same address. Scanned chunks can now be recycled before their batch is
+	// submitted, and once the last reference to a segment's decoder goes, a later segment's
+	// decoder may be allocated at the same address and slip into a batch carrying the wrong
+	// symbols -- a wrong answer with no error. Holding the buffer rules that out.
+	buffer_ptr<VectorBuffer> batch_decoder_owner;
+
+	// Scanned DataChunks ready for reuse, already Reset(). Each thread used to allocate a fresh
+	// chunk per scan and free it at collect, so the scan always wrote into memory last touched
+	// a whole in-flight window ago. Measured in dry run at 16 threads: per-row scan and stage
+	// cost rose 14.2 -> 16.7 and 13.2 -> 16.8 ns going from window 2 to 4, with no card involved.
+	// With nothing projected (the count(*) shape), a chunk's data is not needed once it is
+	// staged, so it comes back here as soon as the cursor leaves it. OASIS_REGEX_CHUNK_RECYCLE=0
+	// turns both off.
+	vector<unique_ptr<DataChunk>> chunk_pool;
+	bool chunk_recycle = true;
+
+	// Straddle side batch. Under the passthrough a thread scans segment rows (real table),
+	// then a straddling vector (identity table), then the next segment, and so on. With one
+	// open batch every one of those alternations closes it, so each ~2048-row straddle vector
+	// became its own transfer: 823 of the 1728 transfers on p_substring_72_10_15728k, each
+	// paying the full per-transfer cost (table header, padding, a host notification) for
+	// ~140 KB of text.
+	//
+	// So identity-table rows get their own batch, which stays open across segments and closes
+	// only on its own caps. The batch fields above always describe the ACTIVE batch; the other
+	// one waits here and the two are swapped when a chunk's table kind differs from the active
+	// batch's. OASIS_REGEX_SIDE_BATCH=0 turns this off.
+	//
+	// A parked batch holds row refs into chunks it has not submitted yet, so those chunks'
+	// staging refs must survive the active batch's submit; see SubmitStagedBatch.
+	ParkedStagedBatch parked;
+	bool active_is_side = false;
+	bool side_batching = true;
+
+	// Chunk-level staging fast path; see the top of the row loop in AccumulateRows.
+	// OASIS_REGEX_FAST_STAGE=0 turns it off, for A/B measurement.
+	bool fast_staging = true;
 
 	// RE2 for the outlier path, compiled on first use. Lazy because a scan with no
 	// outlier never needs it, and because a pattern the NFA accepts is not guaranteed to

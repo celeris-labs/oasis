@@ -532,6 +532,29 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// table and is FSST codes rather than plaintext. It rides here, not in the config
 	// blob, because the blob is 2240 bits with zero slack and is latched once per query
 	// while this varies per transfer. REGEX_ARM_TABLE_BIT in common.sv is the same bit.
+	// Diagnostic (OASIS_REGEX_DUMP_WIRE=<dir>): write each transfer exactly as armed, in
+	// submission order (we hold g_fpga_mutex), so celeris's `06_regex --bench-replay` can resend
+	// the real DuckDB wire with no host work. That separates what the host integration costs from
+	// what the data shape costs the card: on p_substring_72_10_15728k the replay ran 28.0 GB/s
+	// against 21-24.5 live. Capped by OASIS_REGEX_DUMP_WIRE_MAX (default 4000 transfers). Each
+	// file is a 4 x uint64 header {wire_bytes, strings_in_batch, count, compressed} + the wire.
+	if (const char *dump_dir = std::getenv("OASIS_REGEX_DUMP_WIRE")) {
+		static uint64_t dump_seq = 0;
+		static const uint64_t dump_max = [] {
+			const char *e = std::getenv("OASIS_REGEX_DUMP_WIRE_MAX");
+			return e ? std::strtoull(e, nullptr, 10) : 4000ull;
+		}();
+		if (dump_seq < dump_max) {
+			char path[512];
+			std::snprintf(path, sizeof(path), "%s/xfer_%06llu.bin", dump_dir, (unsigned long long)dump_seq++);
+			if (FILE *f = std::fopen(path, "wb")) {
+				const uint64_t header[4] = {plan.wire_bytes, plan.strings_in_batch, count, fsst_compressed ? 1u : 0u};
+				std::fwrite(header, sizeof(header), 1, f);
+				std::fwrite(wire_ptr, 1, plan.wire_bytes, f);
+				std::fclose(f);
+			}
+		}
+	}
 	config->write_strings_in_batch(plan.strings_in_batch |
 	                               (fsst_compressed ? (uint32_t(1) << 31) : uint32_t(0)));
 	g_csr_ns.fetch_add(NanosSince(t_handle), std::memory_order_relaxed);
@@ -581,15 +604,12 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 //
 // The double-buffered symbol RAM makes this gate redundant: rem_symbol_header stalls its
 // own IDLE->HEADER transition while the bank it would overwrite is still busy, so the card
-// backpressures instead of corrupting the tail of the previous transfer. Keep the gate as
-// the default until that is proven on hardware; OASIS_REGEX_TABLE_GATE=0 turns it off.
-static bool RegexTableGateEnabled() {
-	static const bool enabled = [] {
-		const char *env = std::getenv("OASIS_REGEX_TABLE_GATE");
-		return !(env && env[0] == '0');
-	}();
-	return enabled;
-}
+// backpressures instead of corrupting the tail of the previous transfer. Off by default
+// since 2026-09-11. On the 128-engine build it cost 10x: every FSST batch carries its own
+// segment's table, so one slot serialised all transfers through the host round trip
+// (p_substring_72_10_15728k at 32 threads: 1.9 GB/s gated, 18.2 ungated). The ungated
+// configuration passed regex_fsst_stress.sh on that bitstream. OASIS_REGEX_TABLE_SLOTS=1
+// restores the gate.
 
 std::mutex g_table_mutex;
 std::condition_variable g_table_cv;
@@ -599,11 +619,10 @@ std::condition_variable g_table_cv;
 // sharing a table share its bank and are unlimited.
 std::map<const void *, uint64_t> g_table_inflight;
 
-// How many distinct tables may be live at once. One is the conservative gate: the card
-// then only ever holds the table it is decoding, and the double-buffered symbol RAM is
-// never exercised. The RTL has two banks, so two *should* be safe and is what makes the
-// double buffering worth having -- OASIS_REGEX_TABLE_SLOTS=2 is the experiment that says
-// whether the second bank actually works. Zero means unlimited (gate off).
+// How many distinct tables may be live at once. Zero, the default, means unlimited: the
+// card's bank-busy stall does the sequencing. One is the old conservative gate, under
+// which the card only ever holds the table it is decoding. Two is slower than either:
+// 3.0 GB/s at 32 threads on the same query.
 static uint64_t RegexTableSlots() {
 	static const uint64_t slots = [] () -> uint64_t {
 		const char *env = std::getenv("OASIS_REGEX_TABLE_SLOTS");
@@ -611,12 +630,12 @@ static uint64_t RegexTableSlots() {
 			const auto parsed = std::strtoull(env, nullptr, 10);
 			return parsed;
 		}
-		// Back-compatible with the original switch: TABLE_GATE=0 turns the gate off.
+		// Back-compatible with the original switch: TABLE_GATE=1 turns the gate on.
 		const char *gate = std::getenv("OASIS_REGEX_TABLE_GATE");
-		if (gate && gate[0] == '0') {
-			return 0;
+		if (gate && gate[0] == '1') {
+			return 1;
 		}
-		return 1;
+		return 0;
 	}();
 	return slots;
 }

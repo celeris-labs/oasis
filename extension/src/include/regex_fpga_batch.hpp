@@ -302,7 +302,13 @@ struct RegexMatchBitmap {
 // Raising it past the RTL queue depth needs the FIFO deepened first.
 //
 // A credit is released in CollectRegexBatch.
-static constexpr uint32_t kRegexMaxSubmissionsInFlight = 32;
+// 64, matching REGEX_STRINGS_IN_BATCH_DEPTH in common.sv, which was raised with the engine
+// count. At depth 32 the cap T*W <= 32 forced a choice between threads and per-thread device
+// overlap: W=1 gave 32 threads and 31.5 GB/s of host but only 11.75 end-to-end (a thread waits
+// out its own round trip, 38 ms/thread of drain), while W=2 gave 16 threads, 25.5 GB/s of host
+// and 13.48 end-to-end. Depth 64 allows T=32 with W=2, which is what lets the host feed a
+// 128-engine array.
+static constexpr uint32_t kRegexMaxSubmissionsInFlight = 64;
 
 // A batch handed to the card and not yet collected. Submission order is global and
 // fixed at submit time: OutputBufferManager matches buffers to handles positionally
@@ -357,9 +363,10 @@ void AcquireRegexArmCredit();
 // batch's FSST decoder pointer, or nullptr for plaintext -- with the passthrough off every
 // transfer passes nullptr, they all match, and nothing serialises.
 //
-// The cost is a drain of the in-flight window at every table change, which is why the RTL
-// fix (double-buffer the symbol RAM and flip per engine at its own transfer boundary) is
-// still worth doing.
+// The cost is a drain of the in-flight window at every table change. The RTL fix has since
+// landed: the symbol RAM is double-buffered and rem_symbol_header stalls while the bank it
+// would overwrite is busy. So the gate now defaults OFF (OASIS_REGEX_TABLE_SLOTS=0), and
+// =1 restores it. Gated, it serialised every FSST transfer and cost 10x at 128 engines.
 bool TryAcquireRegexTableSlot(const void *decoder);
 
 // Blocks until the card's table is `decoder` or nothing is outstanding. Same rule as

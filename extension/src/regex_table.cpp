@@ -239,8 +239,20 @@ static void ReleaseStagingRef(RetainedChunk &entry) {
 // Drops chunks at the front that nothing references any more, and slides the staging
 // cursor to match. Only the front is examined: chunks are referenced in scan order, so
 // a live one at the front means everything behind it is live too.
+// Returns a scanned chunk to the per-thread pool. Bounded, so a burst of retained chunks does
+// not pin their memory for the rest of the scan.
+static void RecycleChunk(RegexFpgaScanLocalState &lstate, unique_ptr<DataChunk> chunk) {
+	static constexpr idx_t kChunkPoolMax = 64;
+	if (!lstate.chunk_recycle || !chunk || lstate.chunk_pool.size() >= kChunkPoolMax) {
+		return;
+	}
+	chunk->Reset();
+	lstate.chunk_pool.push_back(std::move(chunk));
+}
+
 static void ReleaseRetiredChunks(RegexFpgaScanLocalState &lstate) {
 	while (!lstate.retained_chunks.empty() && lstate.retained_chunks.front().pending_refs == 0) {
+		RecycleChunk(lstate, std::move(lstate.retained_chunks.front().chunk));
 		lstate.retained_chunks.pop_front();
 		if (lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX) {
 			// The cursor is an index into a deque that just lost its front. It can never
@@ -462,6 +474,16 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	// Wire-byte target per batch. OASIS_REGEX_TARGET_WIRE_BYTES overrides
 	// REGEX_FPGA_TARGET_WIRE_BYTES so the size can be swept without a rebuild; the row cap
 	// (oasis_regex_batch_rows) is a backstop and cannot raise it.
+	// Straddle side batch, on by default; OASIS_REGEX_SIDE_BATCH=0 restores one open batch.
+	if (const char *side_env = std::getenv("OASIS_REGEX_SIDE_BATCH")) {
+		lstate->side_batching = side_env[0] != '0';
+	}
+	if (const char *fast_env = std::getenv("OASIS_REGEX_FAST_STAGE")) {
+		lstate->fast_staging = fast_env[0] != '0';
+	}
+	if (const char *recycle_env = std::getenv("OASIS_REGEX_CHUNK_RECYCLE")) {
+		lstate->chunk_recycle = recycle_env[0] != '0';
+	}
 	lstate->target_wire_bytes = REGEX_FPGA_TARGET_WIRE_BYTES;
 	if (const char *target_env = std::getenv("OASIS_REGEX_TARGET_WIRE_BYTES")) {
 		const auto bytes = std::strtoull(target_env, nullptr, 10);
@@ -607,6 +629,31 @@ static void WriteSymbolTableHeader(uint8_t *header, const void *decoder) {
 	}
 }
 
+// The code to pad a compressed batch with: the table's shortest symbol.
+//
+// finalize() squares every engine's stream off to whole 256 B chunks, and the engines walk the
+// padding *decoded*. Code 1 is usually the segment's most valuable symbol, so often 8 B, which
+// made up to 255 filler bytes per engine cost up to 2040 cycles per transfer. On the 128-engine
+// bench that was ~6 us of every ~40 us transfer (72 B x 16384: 25.8 -> 29.8 GB/s with this).
+//
+// An unused code 1 already decodes to the single byte 0x01 (see WriteSymbolTableHeader), which
+// is as short as it gets.
+static uint8_t ShortestSymbolCode(const void *decoder) {
+	const auto *dec = reinterpret_cast<const duckdb_fsst_decoder_t *>(decoder);
+	uint8_t best = celeris::kRegexCompressedFillerByte;
+	if (dec->len[best] == 0) {
+		return best;
+	}
+	uint8_t best_len = dec->len[best];
+	for (uint32_t code = 1; code < 255 && best_len > 1; code++) {
+		if (dec->len[code] > 0 && dec->len[code] < best_len) {
+			best = uint8_t(code);
+			best_len = dec->len[code];
+		}
+	}
+	return best;
+}
+
 // Returns the real predicate hidden inside an "optional" filter wrapper, or nullptr if @p expr is
 // not such a wrapper. DuckDB pushes OR/IN/LIKE predicates down wrapped in an internal marker
 // function whose own evaluation is hard-coded to return all-true, parking the actual predicate in
@@ -675,11 +722,26 @@ static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindDa
 		return true;
 	}
 
+	// The cursor's chunk is fully staged. With nothing projected, its data is never read again --
+	// the wire holds the bytes and collect needs only row counts -- so its memory goes straight
+	// back to the pool for the scan below. The entry stays in retained_chunks, empty, because
+	// its id still anchors the refs and the release order.
+	if (lstate.chunk_recycle && lstate.output_column_map.empty() &&
+	    lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX) {
+		RecycleChunk(lstate, std::move(lstate.retained_chunks[lstate.current_retained_chunk_idx].chunk));
+	}
+
 	auto &storage = bind_data.table.GetStorage();
 	auto &transaction = DuckTransaction::Get(context, bind_data.table.catalog);
 	while (true) {
-		auto retained = make_uniq<DataChunk>();
-		retained->Initialize(context, lstate.scanned_types);
+		unique_ptr<DataChunk> retained;
+		if (!lstate.chunk_pool.empty()) {
+			retained = std::move(lstate.chunk_pool.back());
+			lstate.chunk_pool.pop_back();
+		} else {
+			retained = make_uniq<DataChunk>();
+			retained->Initialize(context, lstate.scanned_types);
+		}
 		CALI_MARK_BEGIN("table_scan");
 		const auto t_scan = StageClock::now();
 		storage.Scan(transaction, *retained, lstate.scan_state);
@@ -707,6 +769,7 @@ static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindDa
 			lstate.current_retained_chunk_idx = lstate.retained_chunks.size() - 1;
 			return true;
 		}
+		RecycleChunk(lstate, std::move(retained));
 
 		lstate.rows_in_current_row_group =
 		    storage.NextParallelScan(context, global_state.parallel_scan, lstate.scan_state);
@@ -725,6 +788,7 @@ static void StartNewStagedBatch(RegexFpgaScanLocalState &lstate, celeris::Celeri
 	lstate.accum_cap = lstate.max_accum_count;
 	lstate.batch_payload_bytes = 0;
 	lstate.batch_fsst_decoder = nullptr;
+	lstate.batch_decoder_owner.reset();
 	// Opening ramp: the first few batches are deliberately small so the card has
 	// something to read while the rest of the first full batch is still being packed.
 	// See REGEX_FPGA_FILL_RAMP_STEPS.
@@ -778,24 +842,101 @@ static void StartNewStagedBatch(RegexFpgaScanLocalState &lstate, celeris::Celeri
 	lstate.batch_symbol_header = nullptr;
 }
 
+// Exchanges the active batch with the parked one. See RegexFpgaScanLocalState::parked.
+static void SwapStagedBatch(RegexFpgaScanLocalState &lstate, celeris::CelerisContext &ctx) {
+	auto &parked = lstate.parked;
+	std::swap(lstate.packer, parked.packer);
+	std::swap(lstate.wire_buffer, parked.wire_buffer);
+	std::swap(lstate.batch_row_refs, parked.batch_row_refs);
+	std::swap(lstate.accum_count, parked.accum_count);
+	std::swap(lstate.staged_rows, parked.staged_rows);
+	std::swap(lstate.accum_cap, parked.accum_cap);
+	std::swap(lstate.batch_payload_bytes, parked.batch_payload_bytes);
+	std::swap(lstate.batch_target_bytes, parked.batch_target_bytes);
+	std::swap(lstate.batch_fsst_decoder, parked.batch_fsst_decoder);
+	std::swap(lstate.batch_symbol_header, parked.batch_symbol_header);
+	std::swap(lstate.batch_decoder_owner, parked.batch_decoder_owner);
+	lstate.active_is_side = !lstate.active_is_side;
+	// Dictionary slots name slots of the batch that was active, not of this one.
+	lstate.dict_stamp++;
+	if (!lstate.wire_buffer) {
+		StartNewStagedBatch(lstate, ctx);
+	}
+}
+
+// Records that `count` rows of `chunk_id` starting at `row` are decided by `count` slots starting
+// at `slot`, extending the previous run when both ranges continue it. Merging is exact whenever
+// rows and slots are both contiguous, however they came to be -- a dictionary row reusing the
+// slot right after the run decides the row right after it just as a fresh append would.
+static inline void PushSlotRun(RegexFpgaScanLocalState &lstate, uint32_t chunk_id, uint32_t slot, idx_t row,
+                               idx_t count) {
+	auto &refs = lstate.batch_row_refs;
+	if (!refs.empty()) {
+		auto &last = refs.back();
+		const idx_t n = last.Count();
+		if (last.chunk_id == chunk_id && last.slot_idx != kCpuResolvedSlot && last.slot_idx + n == slot &&
+		    idx_t(last.row_idx) + n == row && n + count <= kRunCountMask) {
+			last.run = uint16_t(n + count);
+			return;
+		}
+	}
+	refs.push_back({chunk_id, slot, static_cast<uint16_t>(row), static_cast<uint16_t>(count)});
+}
+
 static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const InFlightTransfer &transfer,
                               const RegexMatchBitmap &matches) {
+	// Nothing projected: the output is a row count, so count the set bits and never touch a
+	// chunk -- which is also what lets TryRefillScanChunk recycle chunks before collect.
+	if (lstate.output_column_map.empty()) {
+		idx_t matched = 0;
+		for (const auto &row_ref : transfer.row_refs) {
+			if (row_ref.slot_idx == kCpuResolvedSlot) {
+				matched += row_ref.CpuMatch() ? 1 : 0;
+				continue;
+			}
+			idx_t bit = row_ref.slot_idx;
+			const idx_t end = bit + row_ref.Count();
+			for (; bit < end && (bit & 7) != 0; bit++) {
+				matched += matches.test(bit);
+			}
+			for (; bit + 8 <= end; bit += 8) {
+				matched += idx_t(__builtin_popcount(matches.bits[bit >> 3]));
+			}
+			for (; bit < end; bit++) {
+				matched += matches.test(bit);
+			}
+		}
+		if (matched > 0) {
+			DataChunk no_columns;
+			no_columns.InitializeEmpty(lstate.output_types);
+			lstate.output_cache.Append(no_columns, *FlatVector::IncrementalSelectionVector(), matched);
+		}
+		return;
+	}
+
 	auto &matches_by_chunk = lstate.match_indices_scratch;
 	matches_by_chunk.resize(lstate.retained_chunks.size());
 	for (auto &row_indices : matches_by_chunk) {
 		row_indices.clear();
 	}
-	// One entry per row the transfer decides, which is more than the strings sent to the FPGA
-	// whenever rows shared a dictionary entry: several rows then read the same slot's match bit.
+	// One run per stretch of rows the transfer decides. Rows sharing a dictionary entry read the
+	// same slot's match bit, which is why a run can be as short as one row.
 	for (const auto &row_ref : transfer.row_refs) {
-		// A ref carries either a card slot or a verdict already computed on the CPU, so
-		// the two kinds interleave in scan order and neither needs a merge pass.
-		const bool matched =
-		    row_ref.slot_idx == kCpuResolvedSlot ? row_ref.cpu_match : matches.test(row_ref.slot_idx);
-		if (!matched) {
+		auto &row_indices = matches_by_chunk[RetainedChunkIndex(lstate, row_ref.chunk_id)];
+		// A ref carries either card slots or a verdict already computed on the CPU, so the two
+		// kinds interleave in scan order and neither needs a merge pass.
+		if (row_ref.slot_idx == kCpuResolvedSlot) {
+			if (row_ref.CpuMatch()) {
+				row_indices.push_back(row_ref.row_idx);
+			}
 			continue;
 		}
-		matches_by_chunk[RetainedChunkIndex(lstate, row_ref.chunk_id)].push_back(row_ref.row_idx);
+		const idx_t count = row_ref.Count();
+		for (idx_t i = 0; i < count; i++) {
+			if (matches.test(row_ref.slot_idx + i)) {
+				row_indices.push_back(row_ref.row_idx + i);
+			}
+		}
 	}
 
 	// Project each retained chunk down to the output columns (zero-copy view) before copying the matched
@@ -862,9 +1003,9 @@ static void SubmitStagedBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaS
 		}
 	}
 
-	// The card holds one symbol table at a time, so a transfer whose table differs from the
-	// one already in flight must wait for that one to drain -- otherwise its header rewrites
-	// the symbol RAM while the engines are still decoding the earlier transfer. Same
+	// Optional (OASIS_REGEX_TABLE_SLOTS=1; off by default now that the card double-buffers its
+	// symbol RAM): a transfer whose table differs from the one already in flight waits for
+	// that one to drain, so its header cannot rewrite a bank still being decoded. Same
 	// collect-on-failure shape as the credit loop above, and for the same reason: blocking
 	// here while holding uncollected transfers can be waiting on a slot only we could free.
 	// With the passthrough off every decoder is nullptr, so this never serialises anything.
@@ -937,6 +1078,7 @@ static void SubmitStagedBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaS
 	transfer.dry_run = global_state.dry_run;
 	transfer.table_slot = arms_device;
 	transfer.table_decoder = lstate.batch_fsst_decoder;
+	transfer.decoder_owner = std::move(lstate.batch_decoder_owner);
 	if (audit_taken) {
 		transfer.audit_plan = plan;
 		transfer.audit_header_bytes = audit_header_bytes;
@@ -975,9 +1117,15 @@ static void SubmitStagedBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaS
 
 	// Every chunk the cursor has already moved past is now owned by the transfers that
 	// reference it, so drop the staging ref. The chunk the cursor is still inside keeps
-	// its ref -- rows from it may yet be staged into the next batch.
-	const idx_t keep_from =
+	// its ref -- rows from it may yet be staged into the next batch. So does every chunk the
+	// parked batch has rows in: it has not submitted, so nothing else holds them yet. Its
+	// refs are in scan order, so the first one bounds them all.
+	idx_t keep_from =
 	    lstate.current_retained_chunk_idx == DConstants::INVALID_INDEX ? 0 : lstate.current_retained_chunk_idx;
+	if (!lstate.parked.batch_row_refs.empty()) {
+		keep_from = MinValue<idx_t>(keep_from,
+		                            RetainedChunkIndex(lstate, lstate.parked.batch_row_refs.front().chunk_id));
+	}
 	for (idx_t i = 0; i < keep_from; i++) {
 		ReleaseStagingRef(lstate.retained_chunks[i]);
 	}
@@ -1220,19 +1368,26 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			// on the card and are collected on the next call, which is exactly the
 			// overlap the window exists for.
 			SubmitStagedBatch(bind_data, global_state, lstate);
-			// The cursor's chunk has no more rows to give, so its staging ref goes too.
-			// Without this the last chunk of the scan is never released. Guarded by
-			// scan_exhausted because this branch is re-entered once per GetData call
-			// while the window drains, and the ref must only be dropped once.
+			// And the parked side batch, if it holds anything. Re-entry finds it empty: the
+			// swap leaves the batch just submitted, restarted with no rows, in its place.
+			if (lstate.parked.staged_rows > 0) {
+				SwapStagedBatch(lstate, global_state.ctx);
+				SubmitStagedBatch(bind_data, global_state, lstate);
+			}
+			// Nothing is staged any more, so every staging ref goes -- the cursor's chunk, and
+			// any the parked batch was holding before it submitted. Without this those chunks
+			// are never released. Guarded by scan_exhausted because this branch is re-entered
+			// once per GetData call while the window drains, and the refs must only be dropped
+			// once (ReleaseStagingRef is idempotent regardless).
 			if (!lstate.scan_exhausted) {
 				lstate.scan_exhausted = true;
-				if (lstate.current_retained_chunk_idx != DConstants::INVALID_INDEX) {
-					ReleaseStagingRef(lstate.retained_chunks[lstate.current_retained_chunk_idx]);
-					// Clearing the cursor keeps ReleaseRetiredChunks from trying to slide
-					// an index that no longer tracks anything.
-					lstate.current_retained_chunk_idx = DConstants::INVALID_INDEX;
-					ReleaseRetiredChunks(lstate);
+				for (auto &entry : lstate.retained_chunks) {
+					ReleaseStagingRef(entry);
 				}
+				// Clearing the cursor keeps ReleaseRetiredChunks from trying to slide an index
+				// that no longer tracks anything.
+				lstate.current_retained_chunk_idx = DConstants::INVALID_INDEX;
+				ReleaseRetiredChunks(lstate);
 			}
 			while (lstate.output_cache.size() == 0 && CollectOldestTransfer(lstate)) {
 			}
@@ -1303,6 +1458,14 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			                               : kRegexIdentityDecoder;
 		}
 
+		// Straddle rows ride their own batch rather than closing the segment's; swap to the batch
+		// of this chunk's table kind. Per chunk is enough, since every row of a chunk rides the
+		// same table. See RegexFpgaScanLocalState::parked.
+		if (lstate.fsst_passthrough && lstate.side_batching &&
+		    (row_decoder == kRegexIdentityDecoder) != lstate.active_is_side) {
+			SwapStagedBatch(lstate, global_state.ctx);
+		}
+
 		if (dedup) {
 			// Dictionary indices only mean anything within the chunk that produced them.
 			lstate.dict_stamp++;
@@ -1325,7 +1488,81 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 		// loop that can grow it is the CollectOldestTransfer below, which is immediately
 		// followed by `return` when it does.
 		const idx_t chunk_size = current_chunk.size();
+
+		// Chunk-level fast path. The general loop below decides each row separately: selection
+		// vector, validity, dictionary slot, outlier, wire-buffer bound, table change, the batch
+		// caps, the header, then one ref per row. On a plain FSST chunk -- no dictionary, identity
+		// selection, no NULLs -- nearly all of that is settled once per chunk, and at 16 threads
+		// the loop was 52% of CPU (30 ns/row against 16 for DuckDB's own scan).
+		//
+		// The tight loop keeps only what can change row to row: the length bounds and whether
+		// the batch might close. It stops at the first row that fails any of them and hands that
+		// row to the general loop, which decides exactly as before. So batch boundaries are
+		// unchanged -- the fast condition implies WouldExceedFpgaBatch() is false -- and the
+		// staged run becomes a single ref.
+		const bool fast_chunk =
+		    lstate.fast_staging && !dedup && !regex_sel->IsSet() &&
+		    (regex_validity->CannotHaveNull() || regex_validity->CheckAllValid(chunk_size));
+		// Below outlier_bytes, and small enough that one engine's stream fits the wire buffer.
+		const uint64_t fast_len_limit =
+		    MinValue<uint64_t>(lstate.outlier_bytes, lstate.wire_buffer_bytes / celeris::kRegexEngineCount);
+		const RegexRowPath fast_path = fsst_passthrough                                ? RegexRowPath::COMPRESSED
+		                               : regex_vector_type == VectorType::FSST_VECTOR ? RegexRowPath::MODE0
+		                                                                               : RegexRowPath::NOT_FSST;
+
 		while (lstate.chunk_offset < chunk_size) {
+			// The batch must already carry this chunk's table: its first row reserves the header,
+			// and that stays in the general loop. Outside the passthrough both are nullptr.
+			if (fast_chunk && lstate.batch_fsst_decoder == row_decoder) {
+				const idx_t run_start = lstate.chunk_offset;
+				const uint32_t first_slot = static_cast<uint32_t>(lstate.accum_count);
+				// staged + kBoundaryCloseSlack < accum_cap, without the add in the loop.
+				const idx_t staged_limit =
+				    lstate.accum_cap > kBoundaryCloseSlack ? lstate.accum_cap - kBoundaryCloseSlack : 0;
+				const uint64_t target_bytes = lstate.batch_target_bytes;
+				idx_t staged = lstate.staged_rows;
+				uint64_t payload = lstate.batch_payload_bytes;
+				idx_t offset = run_start;
+				while (offset < chunk_size) {
+					const string_t &value = regex_data[offset];
+					const uint64_t length = value.GetSize();
+					// accum_count <= staged_rows, so the staged bound covers both row caps; with the
+					// payload under target neither rectangle-closing clause can fire; and fits() is
+					// the capacity test itself.
+					if (length >= fast_len_limit || staged >= staged_limit || payload >= target_bytes ||
+					    !lstate.packer.fits(length)) {
+						break;
+					}
+					lstate.packer.append(value.GetData(), length);
+					staged++;
+					payload += length + 1;
+					offset++;
+				}
+				const idx_t staged_now = offset - run_start;
+				if (staged_now > 0) {
+					lstate.accum_count += staged_now;
+					lstate.staged_rows = staged;
+					lstate.batch_payload_bytes = payload;
+					lstate.chunk_offset = offset;
+					PushSlotRun(lstate, lstate.retained_chunks[lstate.current_retained_chunk_idx].id, first_slot,
+					            run_start, staged_now);
+					switch (fast_path) {
+					case RegexRowPath::COMPRESSED:
+						lstate.path_compressed += staged_now;
+						break;
+					case RegexRowPath::MODE0:
+						lstate.path_mode0 += staged_now;
+						break;
+					default:
+						lstate.path_not_fsst += staged_now;
+						break;
+					}
+					if (offset >= chunk_size) {
+						break;
+					}
+				}
+			}
+
 			const idx_t row_idx = lstate.chunk_offset;
 			const idx_t regex_idx = regex_sel->get_index(row_idx);
 			if (!regex_validity->RowIsValid(regex_idx)) {
@@ -1379,8 +1616,9 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 				} else {
 					outlier_match = MatchOutlierOnHost(bind_data, lstate, regex_value);
 				}
-				lstate.batch_row_refs.push_back({lstate.retained_chunks[lstate.current_retained_chunk_idx].id,
-				                                 kCpuResolvedSlot, static_cast<uint16_t>(row_idx), outlier_match});
+				lstate.batch_row_refs.push_back(
+				    {lstate.retained_chunks[lstate.current_retained_chunk_idx].id, kCpuResolvedSlot,
+				     static_cast<uint16_t>(row_idx), static_cast<uint16_t>(1 | (outlier_match ? kRunCpuMatchBit : 0))});
 				lstate.staged_rows++;
 				lstate.chunk_offset++;
 				continue;
@@ -1448,11 +1686,14 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 					// The padding finalize() adds must be codes too, not 0xFF -- that is
 					// FSST_ESC and would eat the filler's own terminator. reset() restores the
 					// plaintext filler for the next batch.
-					lstate.packer.set_compressed_filler(true);
 					if (row_decoder == kRegexIdentityDecoder) {
+						lstate.packer.set_compressed_filler(true);   // every identity code is 1 B
 						WriteIdentitySymbolTableHeader(lstate.batch_symbol_header);
 					} else {
+						lstate.packer.set_compressed_filler(true, ShortestSymbolCode(fsst_decoder));
 						WriteSymbolTableHeader(lstate.batch_symbol_header, fsst_decoder);
+						// Pin the decoder for as long as its address identifies this batch's table.
+						lstate.batch_decoder_owner = regex_vector.GetBufferRef();
 					}
 				}
 				lstate.batch_fsst_decoder = row_decoder;
@@ -1483,8 +1724,8 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			} else {
 				lstate.path_not_fsst++;
 			}
-			lstate.batch_row_refs.push_back({lstate.retained_chunks[lstate.current_retained_chunk_idx].id,
-			                                 static_cast<uint32_t>(slot), static_cast<uint16_t>(row_idx), false});
+			PushSlotRun(lstate, lstate.retained_chunks[lstate.current_retained_chunk_idx].id,
+			            static_cast<uint32_t>(slot), row_idx, 1);
 			lstate.staged_rows++;
 			lstate.chunk_offset++;
 		}
