@@ -354,6 +354,67 @@ is ours to choose.
 that pops the fifo head (`toe.cpp:317`). Hence ADR-1's arrival-order contract, and hence
 `rx_dispatch` owning the handshake for every lane.
 
+### Lanes are coupled head-of-line — the price of arrival order
+**Documented 2026-09-11 · Decision: accepted as a constraint, no change.**
+
+Because every `readPkg` pops the head of one shared fifo, `rx_dispatch` keeps all announcements in a
+single arrival-ordered queue and may only ever serve its head. It issues the head's `readPkg` only
+when the head's lane has room for a whole MSS, counting segments already requested (`issue_ok_w`,
+`rx_dispatch.sv:273-279`; `rx_space_ok`, `tcp_read.sv:322-323`). **When that lane's fifo is full, no
+lane is served**: packets for idle lanes queued behind it wait, and one slow decoder paces the whole
+receive path.
+
+**It cannot be designed away inside `rx_dispatch`.** Serving a later entry first would hand its lane
+the head's bytes (the read is positional) — the failure that wedged builds 90–92. Taking the head with
+nowhere to put it would discard bytes the TOE has already ACKed. Under `RX_DDR_BYPASS` the design only
+chooses *where* the wait happens.
+
+**Why it costs nothing today — measured 2026-09-11.** A lane's fifo fills only when its bytes arrive
+faster than its decoder takes them. On build-117, per-lane delivery is ~150 MB/s (157 / 152 / 144 MB/s
+at 1 / 2 / 3 lanes, bounded by MinIO's ~1.4 ms per GET). Decoder intake *with data waiting* —
+`hs·64 / ((hs + stalled) · 4 ns)` from the profile counters — is:
+
+| workload | decoder intake | cycles accepted |
+|---|---|---|
+| `latency` (`l_orderkey`) | 0.53 GB/s | 3.3% |
+| `wide` (8 columns) | 1.28 GB/s | 8% |
+| `q1` / `q6` (4 columns) | 1.7–1.8 GB/s | 11% |
+
+It is identical at 1, 2 and 3 lanes and at 64 KiB and 256 KiB GETs, so it is the decoder's own rate:
+**3.5x to 12x headroom** over delivery. (Compressed input bytes. These supersede the "~615 MB/s" in
+`tcp_read.sv`'s `RX_FIFO_DEPTH` comment, which was one column.) A throughput bench of the real
+`rx_dispatch` + `tcp_read` + `strip_http` against an ideal TOE puts the receive path at 1–2% occupancy
+at those rates.
+
+**Slow is not dead.** The head-of-line watchdog counts only while the head stays blocked on the *same*
+connection, and resets the moment that lane regains an MSS of room (`rx_dispatch.sv:433-435`). A slow
+decoder holds the head only as long as it takes to drain one segment — ~8 µs at the slowest intake
+above, against the 262 µs of `HOL_STALL_CYCLES`. Only a decoder that *stops* for 262 µs has its lane
+declared dead.
+
+**When it would start to cost.** When a lane's delivery exceeds its decoder's intake for longer than
+its 128 KiB fifo absorbs: a faster or lower-latency server, much larger GETs, or strongly uneven lanes
+(one decompressing heavy pages while the others race). Measured on the same bench: with one lane's
+sink throttled to 16 B/cycle and 2 lanes running, the other lane lost 20% (33.90 → 27.26 B/cycle) and
+the rx bus fell to 80%; at 3 lanes, where 16 B/cycle is close to a fair share, the neighbours were
+unaffected. On hardware it would show in the profile counters as `stalled` high on the slow lane while
+`starved` rises on lanes whose decoders sit idle.
+
+**Options, if it ever matters**, cheapest first:
+
+- **Deeper lane fifos** — `RX_FIFO_DEPTH` (`vfpga_top.svh:388`). Postpones the stall, does not remove
+  it. 2048 → 4096 doubles the absorbable burst and the `readPkg` latency cover (30 → 61 segments in
+  flight, 7.7 → 15.6 µs at line rate), for ~32 RAMB36 more per lane (build-117: 96 RAMB36 for three
+  lanes at 2048).
+- **Host-side pacing** — never have more bytes outstanding on a lane than its fifo holds. Removes the
+  coupling, but by Little's law caps a lane at ~128 KiB / 1.4 ms ≈ 94 MB/s, below the 157 MB/s it
+  achieves today. Not worth it.
+- **Per-session TOE buffering** — `RX_DDR_BYPASS_EN=0` (below). The only change that removes the
+  coupling, at the price of every received byte going through HBM.
+
+Bench: `hardware/unit-tests/rx_perf/` (`./run.sh` full sweep; `./run.sh lanes N SLOW=1 SLOWDIV=4` for the
+slow-lane coupling case; `TOE_GAP=1` for the board's one-idle-cycle-per-packet TOE shape).
+
 ### The `rx_engine` window cliff — a Coyote bug, worked around in our checkout
 `rx_engine.cpp:1295` (the `RX_DDR_BYPASS` branch) accepts a segment only when
 `(rxbuffer_max_data_count - rxbuffer_data_count) > 375` beats — **24,000 bytes** — while
@@ -382,8 +443,9 @@ generated under `{% elif cnfg.en_tcp %}` in `hw/templates/common/shell_top_tmplt
 config. Two changes would flip it: `TCP_STACK_RX_DDR_BYPASS_EN 0` in `toe/CMakeLists.txt`, and the
 `RX_DDR_BYPASS_EN` parameter on `tcp_stack` (defaults 1, no instantiation overrides it).
 
-Not doing it: it buys per-session receive buffering, which ADR-4 obtains without touching the shell,
-and it would put every received byte through HBM.
+Not doing it: ADR-4 obtains per-lane buffering without touching the shell, and this would put every
+received byte through HBM. What ADR-4 does *not* obtain is lane independence — the lanes stay coupled
+head-of-line through the shared fifo (see above), and this is the only change that would remove that.
 
 ### Window scaling stays on
 `WINDOW_SCALE_BITS` is 4, so the stack advertises 1 MiB, and `rx_buffer_fifo` is `d16384` = 1 MiB to
