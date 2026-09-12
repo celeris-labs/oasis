@@ -930,11 +930,22 @@ module handler_multi_tb;
         end
 
         // =========================================================================================
-        // Reconnect: MinIO drops an idle connection. With N lanes this is the NORMAL case, not a
+        // LAZY OPEN. MinIO drops an idle connection. With N lanes this is the NORMAL case, not a
         // fault -- a lane can sit idle past the ~30 s server timeout while its neighbours work.
-        // The lane must come back on a fresh session, and the other lanes must not notice.
+        //
+        // This block used to require the lane to come straight back on a fresh session, and that is
+        // the behaviour being removed: a session opened on the heels of the dead one raced the dead
+        // one's own announcements, the reader waited out its ~2 s watchdog for a notification that
+        // could never arrive, and an abort with body bytes already delivered is dirty, which kills
+        // the lane. Measured on the board as a flat ~4.7 s on four of the 22 TPC-H queries.
+        //
+        // The contract now: the FIN RELEASES the session (which is what makes the lane honestly
+        // down, framer reset and session unbound, so a late notification for it is dropped), the
+        // lane then STAYS down for as long as it has no work, and the next batch on it opens one
+        // session -- a fresh one -- by itself. Neighbours unaffected throughout, and none of it is
+        // a fault.
         // =========================================================================================
-        $display("--- reconnect_on_idle_fin ---");
+        $display("--- lazy_open_on_idle_fin ---");
         begin
             automatic int opens_before = opens;
             automatic int t = 0;
@@ -943,29 +954,25 @@ module handler_multi_tb;
             // Lane 2 is idle (its query finished above). Close it from the server side.
             announce_fin(2);
 
-            // Wait for the lane to actually come BACK, not merely for the open to be issued:
-            // `opens` increments in the TOE model as soon as it accepts the request, several
-            // cycles before tcp_init reports done and the FSM rebinds. Sampling on `opens` reads
-            // the lane mid-reconnect, when it is legitimately down.
-            while (dut.conn_up_q[2] && t < 40000) begin @(posedge clk); t++; end   // released
-            while (!dut.conn_up_q[2] && t < 40000) begin @(posedge clk); t++; end  // rebound
-            repeat (4) @(posedge clk);
+            // The release: conn_up_q can only fall on release_en_w, which only fires in BR_CLOSE
+            // once the TOE has taken the close request -- so this also witnesses the close going out.
+            while (dut.conn_up_q[2] && t < 40000) begin @(posedge clk); t++; end
+            if (!dut.conn_up_q[2]) ok("lazy_open/released (the idle FIN gave the session up)");
+            else bad("lazy_open/released (lane 2 still holds the session its peer closed)");
 
-            if (opens == opens_before + 1)
-                ok("reconnect/reopened_once (idle FIN -> exactly one new connection)");
+            // And now the point of the whole change: NOTHING reopens it. 20000 cycles is ~100x the
+            // reconnect this used to do, which completed in ~200.
+            repeat (20000) @(posedge clk);
+            if (opens == opens_before)
+                ok("lazy_open/no_idle_reconnect (an idle FIN draws no new connection)");
             else
-                bad($sformatf("reconnect/reopened_once (%0d new opens)", opens - opens_before));
+                bad($sformatf("lazy_open/no_idle_reconnect (%0d new open(s) -- the race is still there)",
+                              opens - opens_before));
 
-            // It must be a NEW session id, not the dead one rebound.
-            new_sid = int'(dut.conn_sid_q[2]);
-            if (new_sid == 200 + opens_before)
-                ok($sformatf("reconnect/fresh_session (lane 2 moved 202 -> %0d)", new_sid));
+            if (!lane_up(2) && !lane_fatal(2))
+                ok("lazy_open/csr_reports_down (laneReady says no session, not dead)");
             else
-                bad($sformatf("reconnect/fresh_session (lane 2 on session %0d, expected %0d)",
-                              new_sid, 200 + opens_before));
-
-            if (dut.conn_up_q[2]) ok("reconnect/lane_back_up");
-            else bad("reconnect/lane_back_up");
+                bad($sformatf("lazy_open/csr_reports_down (laneReady=0x%016h)", laneReadyWord));
 
             // The other three lanes are untouched: still up, still on their original sessions.
             good = 1;
@@ -974,15 +981,42 @@ module handler_multi_tb;
                     if (!dut.conn_up_q[L] || int'(dut.conn_sid_q[L]) != 200 + L) good = 0;
                 end
             end
-            if (good) ok("reconnect/neighbours_undisturbed");
-            else bad("reconnect/neighbours_undisturbed");
+            if (good) ok("lazy_open/neighbours_undisturbed");
+            else bad("lazy_open/neighbours_undisturbed");
 
-            // A reconnect is not a fault: no lane may have latched fatal.
-            if (dut.lane_fatal_q == '0) ok("reconnect/no_fatal (a clean idle close is recoverable)");
-            else bad($sformatf("reconnect/no_fatal (lane_fatal_q=%b)", dut.lane_fatal_q));
+            // Losing a session to an idle timeout is not a fault.
+            if (dut.lane_fatal_q == '0) ok("lazy_open/no_fatal (a clean idle close is recoverable)");
+            else bad($sformatf("lazy_open/no_fatal (lane_fatal_q=%b)", dut.lane_fatal_q));
 
-            if (stallWord[15:8] == 8'd1) ok("reconnect/counted_once (reconnect count = 1)");
-            else bad($sformatf("reconnect/counted_once (count=%0d)", stallWord[15:8]));
+            // Still counted, because the host's one signal that idle timeouts are happening is this
+            // counter. The release is what it counts; the open that follows is the lane's own.
+            if (stallWord[15:8] == 8'd1) ok("lazy_open/counted_once (reconnect count = 1)");
+            else bad($sformatf("lazy_open/counted_once (count=%0d)", stallWord[15:8]));
+
+            // THE LAZY OPEN. One chunk-length entry is work: it is what the host writes first, and
+            // it is enough to make the lane ask for a session. No arm or request text is needed to
+            // ask the question, and this TOE model keys its receive stream off the ORIGINAL session
+            // id per lane, so a transfer over the new session is lane_drain's lz1 to check.
+            push_entry(2, 64);
+            t = 0;
+            while (!dut.conn_up_q[2] && t < 40000) begin @(posedge clk); t++; end
+            repeat (4) @(posedge clk);
+
+            if (opens == opens_before + 1)
+                ok("lazy_open/reopened_once (work on a down lane -> exactly one new connection)");
+            else
+                bad($sformatf("lazy_open/reopened_once (%0d new opens)", opens - opens_before));
+
+            // It must be a NEW session id, not the dead one rebound.
+            new_sid = int'(dut.conn_sid_q[2]);
+            if (new_sid == 200 + opens_before)
+                ok($sformatf("lazy_open/fresh_session (lane 2 moved 202 -> %0d)", new_sid));
+            else
+                bad($sformatf("lazy_open/fresh_session (lane 2 on session %0d, expected %0d)",
+                              new_sid, 200 + opens_before));
+
+            if (dut.conn_up_q[2]) ok("lazy_open/lane_back_up");
+            else bad("lazy_open/lane_back_up");
         end
 
         $display("========================================");

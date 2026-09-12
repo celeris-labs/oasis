@@ -37,14 +37,21 @@ for N in 1 2 4; do
   xelab -debug typical -timescale 1ns/1ps -top lane_drain_tb \
         -snapshot "ld${N}_snap" -generic_top "NUM_CONNS=${N}"
 done
+# lz2 has to WAIT for handler_multi's connect watchdog, which defaults to 2^28 cycles -- a second on
+# the board, a week in xsim. Its own snapshot shrinks only that parameter.
+xelab -debug typical -timescale 1ns/1ps -top lane_drain_tb \
+      -snapshot ldto_snap -generic_top "NUM_CONNS=2" -generic_top "STALL_CYCLES=8192"
 
 run_rxd() { echo "=== rx_dispatch : $1 ==="; xsim rxd_snap -R -testplusarg "SCEN=$1" | sed -n '/^rxd_drain_tb /p'; }
 run_hm()  {
   local scen="$1" lanes="$2"; shift 2
   local extra=()
   for p in "$@"; do extra+=(-testplusarg "$p"); done
+  # lz2 waits out the connect watchdog, so it runs on the short-watchdog snapshot.
+  local snap="ld${lanes}_snap"
+  if [ "$scen" = "lz2" ]; then snap="ldto_snap"; fi
   echo "=== handler_multi[$lanes] : $scen ${*:-} ==="
-  xsim "ld${lanes}_snap" -R -testplusarg "SCEN=$scen" "${extra[@]}" \
+  xsim "$snap" -R -testplusarg "SCEN=$scen" "${extra[@]}" \
     | sed -n '/^lane_drain_tb /p;/STICKY/p'
 }
 
@@ -66,6 +73,9 @@ for s in a b c d e f g h; do run_hm "$s" 2; done
 
 # handler_multi: probes that localise the pipelining failure
 for s in a2 a8 a9 a10; do run_hm "$s" 2; done
+
+# handler_multi: lazy open -- an idle peer FIN must not reconnect, and a silent open must time out
+for s in lz1 lz2; do run_hm "$s" 2; done
 
 # handler_multi: serialised variants -- one response outstanding per lane, which is the
 # configuration the design does work in, so the drain/containment questions can be asked

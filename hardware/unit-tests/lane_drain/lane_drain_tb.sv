@@ -26,7 +26,12 @@ import http_types::*;
 module lane_drain_tb #(
     parameter int NUM_CONNS     = 2,
     parameter int QUEUE_DEPTH   = 64,
-    parameter int RX_FIFO_DEPTH = 2048
+    parameter int RX_FIFO_DEPTH = 2048,
+    // handler_multi's connect watchdog, in cycles: it raises the sticky conn_stall bit and, with it,
+    // gives BR_OPEN its only escape. Left at the DUT's own default for every scenario but 'lz2',
+    // which has to WAIT for it -- 2^28 cycles is a second of wall clock on the board and a week in
+    // xsim, so that one scenario gets its own snapshot with a small value.
+    parameter int STALL_CYCLES  = 268435456
 );
 
     localparam int BPB            = AXI_DATA_BITS/8;
@@ -91,10 +96,18 @@ module lane_drain_tb #(
     // lane is to release the session -- which clears rx_dispatch's own dead bit.
     function automatic bit lane_dead_sticky(input int L); return laneErrWord[8*L + 0]; endfunction
 
+    // laneReadyWord nibble per lane: {fatal, conn_up, entry_ready, arm_ready}. conn_up is the bit
+    // the lazy-open scenarios ask about -- "does this lane hold a TCP session right now" is not
+    // otherwise visible from outside, and it is the whole difference between a lane that was
+    // reconnected behind the host's back and one that is honestly down waiting for work.
+    function automatic bit lane_conn_up(input int L);  return laneReadyWord[4*L + 2]; endfunction
+    function automatic bit lane_is_fatal(input int L); return laneReadyWord[4*L + 3]; endfunction
+
     handler_multi #(
         .NUM_CONNS    (NUM_CONNS),
         .QUEUE_DEPTH  (QUEUE_DEPTH),
-        .RX_FIFO_DEPTH(RX_FIFO_DEPTH)
+        .RX_FIFO_DEPTH(RX_FIFO_DEPTH),
+        .STALL_CYCLES (STALL_CYCLES)
     ) dut (
         .ap_clk(clk), .ap_rst_n(rst_n),
         .m_axis_open_connection_TVALID(oc_tvalid),
@@ -247,12 +260,17 @@ module lane_drain_tb #(
         end
     end
 
+    // 1 = the TOE takes the open request and never answers it. This is a real Coyote failure and
+    // the one tcp_init calls out: an ephemeral port reused against the peer's TIME_WAIT gives no
+    // openStatus at all, success or failure. The request stays queued, so clearing the bit lets the
+    // TOE answer late -- which is also what the real one does.
+    bit open_hang = 1'b0;
     initial begin : open_svc
         Sess s; int lat, sid;
         os_tvalid = 1'b0; os_tdata = '0;
         forever begin
             @(posedge clk);
-            if (rst_n && openq.size() > 0) begin
+            if (rst_n && !open_hang && openq.size() > 0) begin
                 void'(openq.pop_front());
                 lat = 40 + ($urandom_range(0, 240));      // tens..hundreds of cycles
                 repeat (lat) @(posedge clk);
@@ -1464,6 +1482,150 @@ module lane_drain_tb #(
                 if (!ok) verdict = "HANG";
                 else if (n_err) verdict = "FAIL";
                 else verdict = "PASS";
+            end
+        end
+
+        // ---- LAZY OPEN -----------------------------------------------------------------------------
+        //
+        // (lz1) An idle lane whose peer FINs must STAY DOWN, and the next batch on it must open a
+        // fresh session by itself.
+        //
+        // MinIO closes a connection idle for ~30 s, and with N lanes a lane sits idle that long
+        // routinely.  Reconnecting the instant the FIN arrives puts a brand-new session where one
+        // whose announcements were still in flight used to be, and the reader then waits out its
+        // ~2 s watchdog for a notification that can never come -- measured on the board as a flat
+        // ~4.7 s on four of the 22 TPC-H queries, and the origin of every lane wedge seen.  The
+        // contract asked for here is the one that removes the race entirely:
+        //   (a) the FIN takes the session away and NOTHING reopens it while the lane has no work;
+        //   (b) a later batch on that lane opens a session by itself and completes byte-exact.
+        // Both halves matter: (a) alone would be satisfied by a lane that is simply dead.
+        "lz1": begin
+            int o_before_fin, c_before_fin, o_before_arm;
+            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
+            submit_batch(0, 2, 3000, o); wait_drain(200000, ok);
+            submit_batch(1, 2, 3000, o); wait_drain(200000, ok);
+            wait_cycles(500);                            // let both lanes go quiet
+            $display("  [cyc=%0d] warm-up drained=%0b  lane0 session=%0d lane1 session=%0d  opens=%0d closes=%0d",
+                     cyc, ok, ln[0].sid, ln[1].sid, n_open_req, n_close_req);
+            if (!ok) begin verdict = "HANG (warm-up)"; dump("lz1"); end
+            else begin
+                o_before_fin = n_open_req;
+                c_before_fin = n_close_req;
+                peer_close(ln[0].sid);                   // the IDLE lane's peer goes away
+                wait_cycles(20000);                      // ~70x the longest open this TOE takes
+                $display("  [cyc=%0d] 20k cycles after the idle FIN: opens=%0d (was %0d) closes=%0d (was %0d) laneReady=0x%016h",
+                         cyc, n_open_req, o_before_fin, n_close_req, c_before_fin, laneReadyWord);
+                // (a) no new session, and the lane says so
+                if (n_open_req != o_before_fin)
+                    verdict = $sformatf("FAIL (the idle FIN drew %0d new open request(s): the reconnect race is still there)",
+                                        n_open_req - o_before_fin);
+                else if (lane_conn_up(0))
+                    verdict = "FAIL (lane 0 still reports connected after its peer FINed: the host would place work on a dead session)";
+                else if (lane_is_fatal(0))
+                    verdict = "FAIL (an idle peer FIN made lane 0 fatal)";
+                else if (lane_conn_up(1) !== 1'b1)
+                    verdict = "FAIL (lane 1 lost its session over lane 0's FIN)";
+                if (verdict == "") begin
+                    // lane 1 must be unaffected while lane 0 sits down
+                    submit_batch(1, 2, 3000, o);
+                    if (!o) begin verdict = "CONFIG STALL (lane 1 blocked by the down lane)"; dump("lz1"); end
+                    else begin
+                        wait_drain(300000, ok);
+                        if (!ok) begin verdict = "HANG (lane 1 stopped while lane 0 was down)"; dump("lz1"); end
+                    end
+                end
+                if (verdict == "") begin
+                    // (b) the lazy open
+                    o_before_arm = n_open_req;
+                    submit_batch(0, 2, 3000, o);
+                    if (!o) begin verdict = "CONFIG STALL (arm refused on a lane with no session)"; dump("lz1"); end
+                    else begin
+                        wait_drain(300000, ok);
+                        $display("  [cyc=%0d] after the batch on the down lane: drained=%0b opens=%0d (was %0d) lane0 session=%0d, %0d responses",
+                                 cyc, ok, n_open_req, o_before_arm, ln[0].sid, ln[0].resp_done);
+                        dump("lz1");
+                        if (!ok)
+                            verdict = "HANG (a batch on a lane with no session never opened one)";
+                        else if (n_open_req == o_before_arm)
+                            verdict = "FAIL (the batch drained without an open: the lane never actually went down)";
+                        else if (lane_is_fatal(0))
+                            verdict = "FAIL (lane 0 went fatal serving its first batch after the FIN)";
+                        else if (n_err)
+                            verdict = "FAIL (routing/framing violated across the lazy open)";
+                        else
+                            verdict = "PASS (idle FIN stayed down; the next batch opened its own session)";
+                    end
+                end
+            end
+        end
+
+        // (lz2) An open whose openStatus NEVER ARRIVES must time out and give the bring-up resource
+        // back.
+        //
+        // tcp_init has no timeout of its own -- it waits in ST_WAIT for ever, and its own comment
+        // names the failure that gets it there: an ephemeral port reused against the peer's
+        // TIME_WAIT produces no openStatus at all, neither success nor failure.  BR_OPEN is the ONE
+        // shared bring-up resource, so parking in it stops every other lane's reconnect AND every
+        // other lane's TEARDOWN -- and teardown is what stops a dead lane holding the head of the
+        // shared receive path.  So the assertion is about a DIFFERENT lane: lane 1's release, which
+        // is queued behind the silent open, must get through, and lane 1 must then open and drain.
+        //
+        // Needs a snapshot with a small STALL_CYCLES; see the parameter.
+        "lz2": begin
+            int o_before;
+            if (STALL_CYCLES > 100000) begin
+                verdict = $sformatf("FAIL (scenario needs a small STALL_CYCLES snapshot; this one has %0d)",
+                                    STALL_CYCLES);
+            end else begin
+                if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
+                submit_batch(0, 1, 3000, o); wait_drain(200000, ok);
+                submit_batch(1, 1, 3000, o); wait_drain(200000, ok);
+                wait_cycles(500);
+                $display("  [cyc=%0d] warm-up drained=%0b  connect watchdog is %0d cycles", cyc, ok, STALL_CYCLES);
+                if (!ok) begin verdict = "HANG (warm-up)"; dump("lz2"); end
+                else begin
+                    open_hang = 1'b1;                    // from here the TOE answers no open at all
+                    peer_close(ln[0].sid);
+                    wait_cycles(3000);                   // lane 0 released and down
+                    o_before = n_open_req;
+                    submit_batch(0, 1, 3000, o);         // lane 0 wants a session -> BR_OPEN, silent
+                    if (!o) begin verdict = "CONFIG STALL (arm on the down lane)"; dump("lz2"); end
+                    else begin
+                        t0 = cyc;
+                        while (n_open_req == o_before && (cyc - t0) < 50000) @(posedge clk);
+                        $display("  [cyc=%0d] lane 0's open request is out (opens=%0d) and will never be answered",
+                                 cyc, n_open_req);
+                        peer_close(ln[1].sid);           // lane 1's release is now queued behind it
+                        wait_cycles(2000);
+                        $display("  [cyc=%0d] 2k cycles later lane 1 conn_up=%0b (still held behind the silent open)",
+                                 cyc, lane_conn_up(1));
+                        wait_cycles(STALL_CYCLES + 2000);
+                        $display("  [cyc=%0d] past the watchdog: conn_stall=%0b lane1 conn_up=%0b opens=%0d closes=%0d",
+                                 cyc, stallWord[0], lane_conn_up(1), n_open_req, n_close_req);
+                        if (!stallWord[0])
+                            verdict = "FAIL (the connect watchdog never even counted the silent open)";
+                        else if (lane_conn_up(1))
+                            verdict = "FAIL (lane 1's release never got through: BR_OPEN is still holding the bring-up resource)";
+                        else begin
+                            open_hang = 1'b0;            // the TOE comes back
+                            submit_batch(1, 1, 3000, o);
+                            if (!o) begin verdict = "CONFIG STALL (lane 1 after the silent open)"; dump("lz2"); end
+                            else begin
+                                wait_drain(400000, ok);
+                                $display("  [cyc=%0d] after the TOE came back: drained=%0b lane0=%0d/%0d lane1=%0d/%0d opens=%0d",
+                                         cyc, ok, ln[0].resp_done, ln[0].planned_total,
+                                         ln[1].resp_done, ln[1].planned_total, n_open_req);
+                                dump("lz2");
+                                if (!ok)
+                                    verdict = "HANG (neither lane recovered from the silent open)";
+                                else if (n_err)
+                                    verdict = "FAIL (routing/framing violated after the silent open)";
+                                else
+                                    verdict = "PASS (silent open timed out; both lanes reopened and drained)";
+                            end
+                        end
+                    end
+                end
             end
         end
 
