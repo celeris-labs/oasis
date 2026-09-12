@@ -1,22 +1,41 @@
 # Thesis measurements — open questions, and the ledger of what is already known
 
-Working document. Three questions are open (M1 network ceiling, M2 decoder utilisation,
-M3 end-to-end throughput) plus M4, which build-110 will answer on its own.
+Working document. Three questions were open (M1 network ceiling, M2 decoder utilisation,
+M3 end-to-end throughput) plus M4, multi-decoder scaling. **M4 is now answered — see M8**, not by
+build-110 (which never finished routing) but by build-119. M1 and M2 are answered in the negative:
+neither the network nor the decoder is the binding constraint (M8.3). M3's absolute numbers are
+superseded by M8.1.
 
 **Each experiment states its decision rule BEFORE the run**, so the result is falsifiable rather
 than reassuring. Paste raw output under "Result" and we read it against the rule.
 
-State as of 2026-08-26:
+State as of **2026-09-12**. Every build the older sections refer to is listed here too, so a number
+found in §0 or M1–M7 can be traced to the shape it was measured on:
 
 | | bitstream | lanes | sessions | note |
 |---|---|---|---|---|
-| reference | **build-105** | 1 decoder | 1 TCP | 22/22 at sf30, all numbers below are this shape |
-| building | **build-110** | **4 decoders** | **4 TCP** (`ENABLE_HTTP_MULTI=ON`) | started 18:20, synth_shell stage |
-| failed | build-109 | — | — | bitgen error 2 |
+| **citable** | **build-119** | **4 decoders** | 4 TCP | **775.3 MB/s = 3.76x one lane**, order-cancelled; 22/22 at sf30. See **M8** |
+| equal to it | build-118 | 4 decoders | 4 TCP | 118 vs 119 differ by 0.8 %, inside noise — the `axis_skid` slice bought nothing (M8.5) |
+| in flight | build-120 | 4 decoders + TODO 1 | 4 TCP | launched 13:10, **still in bitgen at 19:32 — no bitstream, no hardware number** |
+| earlier | build-117 | 3 decoders | 3 TCP | WNS -0.849 ns, the last build that met timing comfortably |
+| superseded | build-105 | 1 decoder | 1 TCP | the reference every number in §0 and M1–M7 was taken against |
+| never completed | build-110 | 4 decoders | 4 TCP | M4's subject; abandoned in routing. **M4 was never answered by 110** — it is answered by M8 |
 
 ---
 
 ## 0. The ledger — every measurement so far that bears on these three questions
+
+> ### ⚠️ CORRECTIONS from the session of 2026-09-12 — these supersede the 08-27 block below
+>
+> | claim | status | superseded by |
+> |---|---|---|
+> | **"chunk size buys +33 %"** (579 → 642 → 732 → 770 MB/s across 0 / 256K / 512K / 1M) | **CONFOUNDED — strike it.** The sweep ran in a single increasing-chunk order, so throughput tracked *run order*, i.e. MinIO cache warmth. The tell: the last setting issued 18x more and 17x smaller GETs and was still "fastest". An order-cancelling A/B reverses the sign. | **M8.4** |
+> | **the per-GET cost model** (`451 µs fixed + 4.4 ns/byte`) | **RETRACTED.** Fitted to three collinear, time-ordered points, and `dead_us_per_get` is not additive — GETs pipeline, so per-GET dead time never sums to wall time. The fit predicted 707 ms of overhead against a 115 ms actual window. | — |
+> | **the `lane_depth × chunk_bytes ≤ 256 KiB` budget rule** (2026-09-06) | **LIFTED.** The readPkg reservation is now hardware-verified with correct sums at depth 4 × 256 KiB = 1 MiB per lane. | **M8.4** |
+> | §0.4 rule 2, **"run every configuration twice and report the second"** | **NOT SUFFICIENT** for anything compared across settings. Two runs in a fixed order still ride the cache ramp. Any A/B or sweep must alternate or palindrome its arms. | **§0.4 rule 9** |
+>
+> **Read M8 before quoting any throughput number in this document.** Everything in §0 and M1–M7 was
+> measured on **build-105, one decoder**. The design is now four decoders and the absolute numbers moved.
 
 > ### ⚠️ CORRECTIONS from the session of 2026-08-27 — read before using anything below
 >
@@ -48,6 +67,9 @@ State as of 2026-08-26:
 | 08-12 | same request pattern from a plain Linux host | **1.55 ms/req** | the TOE is not losing anything; we pay MinIO's price like everyone else |
 | 08-10 | ceiling as an equation | `window / latency` = 256 KiB / 730 µs = 359 MB/s | window is 1 MiB since build-97 |
 | — | link | 12.5 GB/s (100 GbE); MinIO tops out at ~4.6 | the server, not the wire, is the limit |
+| 09-12 | **RTT host → MinIO**, first time measured | **0.092 / 0.135 / 0.292 ms** (min/avg/max) | `ping -c 200` from the deploy node |
+| 09-12 | **BDP bound `W/RTT`** | **7.77 GB/s** with W = 1 MiB (the TOE's `rx_buffer_fifo`), or **1.94 GB/s** per lane | derived; `TCP_STACK_RX_DDR_BYPASS_EN=1` gives ONE buffer shared across all lanes |
+| 09-12 | what MinIO actually is | a **single-process dev deployment** — `serve_tpch.sh:95` runs `minio server /local/home/jkreissl/minio-data`: one process, one directory, one node, no erasure sets | its 4.60 GB/s over 16 streams is unremarkable for that shape, and is probably page-cache-served (4 GiB read out of a ~6.2 GB object), so it measures MinIO's Go HTTP path, not storage |
 
 **FPGA on one session: 0.33 GB/s = 72 % of the 0.463 the session can deliver.** Everything inside
 the FPGA therefore competes for a **1.4x** gap. That is the single most important number here.
@@ -62,6 +84,9 @@ the FPGA therefore competes for a **1.4x** gap. That is the single most importan
 | 08-11 | profiler split at 192 KiB chunk | latency: idle 73 % starved 5 % stalled 21 % · q6/q1: idle 49 / starved 45 / stalled 5 · wide: 44 / 48 / 7. Decoder duty **0.6 %** |
 | 08-12 | effective decode throughput per query, sf30 | q8 **185** MiB/s, q9 136, q21 130, q6 126 … q3 47, q1 29, q2 29 — a **6x spread**, and the slow three are exactly the three the CPU wins |
 | 08-23 | 2-lane A/B | **never completed a 2-lane arm.** 1-lane arm: q01 sf30 = 62.07 s, 1462.8 MiB through lane 0 (`OASIS_HTTP_BATCH=0`, which is why it is slow) |
+| 09-12 | **decoder occupancy at 4 lanes** | `stalled` **10–14 %** — the decoder is not the constraint at four lanes either | build-119, `scale_pal` runs (M8) |
+| 09-12 | **TOE → decoder datapath capacity** | **~13.9 GB/s per lane** in RTL — 18x the 0.775 GB/s the whole design achieves | the datapath, the normalizer and `readPkg` are all cleared as suspects |
+| 09-12 | **a 5th decoder does not fit** | `inst_dynamic` = **409,908 LUTs** against a U55C SLR's **434,560** (~94 %); one decoder + glue measured at ~95k (117 → 118) | **area is the honest reason to stop at four — not diminishing returns**, since scaling is still linear at 4 |
 
 **Arithmetic worth staring at:** 1.02 GB/s ÷ 250 MHz = **4.08 bytes per cycle**, against a port that
 can carry 64. For an 8-byte column that is **one value every two cycles**. That is a specific,
@@ -77,6 +102,7 @@ testable shape — see M2.
 | 08-19 | 105 | sf30, **one session per side** | 354.9 s | **249.2 s** | **CPU 1.42x** |
 | 08-19 | 105 | sf30, CPU on all 80 cores | — | **43.15 s** | CPU 8.2x |
 | 08-10 | 95 | sf1, process per query | 31.63 s | 34.62 s | FPGA, 18/22 queries |
+| 09-12 | **119** | **sf30, one session per side, cache off both sides, 4 decoders** | **26.98 s** | **14.45 s** | CPU 1.87x — **but see M8.2**: four queries carry 74 % of the FPGA total, and on the other 18 the FPGA is **1.65x faster** |
 
 Throughput, as opposed to time: the 7-column lineitem scan moved **2938 MB in 14.31 s = 205 MB/s**
 wall clock, against a server that can do 4600. The FPGA's own counters say 0.33 GB/s in-chunk.
@@ -100,6 +126,23 @@ Those two numbers differ because of idle between chunks — which is the whole p
 7. Rebuild **and reinstall `software/`** after any branch switch — `make` in `extension/` does not,
    and a stale `liboasis.so` drives the board with a mismatched CSR map, silently.
 8. Bitstream identity is readable on the wire: `Win=1048560` = 1 MiB window = build-97 and later.
+9. **Never sweep a parameter in one monotone order.** MinIO's cache warms as the sweep proceeds, so
+   the result encodes run order, not the parameter. Use an order-cancelling harness — `chunks_ab`
+   (alternating A/B/A/B/A/B) or `scale_pal` (a prewarm pass, then forward 1→4 *and* reverse 4→1).
+   The forward and reverse curves agreeing is the evidence that drift cancelled; if they disagree,
+   the run is worthless. This rule cost a full retraction (the "+33 % chunk size" result).
+10. **The profile counters are NOT reset between runs.** A decoder that is idle in the current run
+    reports whatever it last did. After a 4-lane prewarm those leftovers are ~180 MB/s *each*, which
+    once turned a 1-lane measurement into 737 MB/s. Exclude any decoder whose `(rate, hs)` pair does
+    not **change** across repeats, and cross-check that the active decoders' `mib_in` sums to the
+    workload.
+11. **The shell's `BUILD` variable does not tell you which bitstream is loaded** — it only selects
+    `$BIT` for `reprogram`. On 2026-09-12 every run from 12:11 on was build-119 while the shell said
+    118, because only `sudo insmod` had been run. **Ground truth is the `.bit` file's atime:**
+    `stat -c '%n atime=%x' hardware/build-*/bitstreams/cyt_top.bit`.
+12. With `OASIS_HTTP_CHUNK_BYTES=0`, `gets` reads 392 for every decoder at every lane count.
+    `kib_per_get` and `dead_us_per_get` are therefore meaningless in that configuration;
+    `mib_in` and `in_mbytes_s` remain genuine.
 
 ---
 
@@ -747,6 +790,148 @@ not found. This is the one open hardware question from today.
 
 ---
 
+## M8 — Multi-decoder scaling: the result the thesis is built on ✅ measured 2026-09-12
+
+This section answers **M4** (which build-110 was supposed to answer and never did) and supersedes
+every absolute throughput number in §0 and M1–M7, all of which were taken on build-105 with **one**
+decoder.
+
+### M8.0 — Why these runs are trustworthy, when the ones before them were not
+
+The three results retracted in the corrections block above were all killed by the same mechanism:
+**MinIO's page cache warms as a run proceeds, so anything swept in a fixed order measures run order.**
+Rule 9 in §0.4 is the fix, and these runs obey it:
+
+- a **prewarm pass** first, discarded;
+- then the lane count is swept **forward 1→4 and reverse 4→1** (`scale_pal`);
+- `wide` workload, `OASIS_HTTP_CHUNK_BYTES=0`, median of 3 repeats per point;
+- decoders whose `(rate, hs)` pair does not change across repeats are **excluded as stale** (rule 10).
+
+**The decision rule, stated before the run:** forward and reverse must agree at every lane count, or
+the curve is discarded. They agree at all four points: the two directions differ by **1.8 % / 1.9 % /
+0.2 % / 2.0 %** at 1 / 2 / 3 / 4 lanes — worst case **2.0 %**, best **0.2 %** at 3 lanes, and the
+deviations are small enough that the 3.76x conclusion does not depend on them.
+
+One honest caveat: the reverse pass is the higher of the two at **3 of the 4 points**, and reverse ran
+second, which is the direction a small residual cache-warming effect would push. It is bounded by the
+2.0 % spread, so it cannot manufacture the result — but the palindrome damps drift rather than
+eliminating it, and a third pass in a randomised order would settle it.
+
+### M8.1 — The scaling curve (build-119, `scale_pal`) — **the headline result**
+
+| lanes | forward | reverse | **mean MB/s** | **vs 1 lane** |
+|---|---|---|---|---|
+| 1 | 204.1 | 207.9 | **206.0** | 1.00x |
+| 2 | 398.7 | 391.3 | **395.0** | **1.92x** |
+| 3 | 587.5 | 588.5 | **588.0** | **2.85x** |
+| 4 | 767.4 | 783.2 | **775.3** | **3.76x** |
+
+Increments **+189.0, +193.0, +187.3 MB/s** — uniform to within 3 %. **There is no sign of flattening
+at four lanes**; the design stops at four because a fifth decoder does not fit in the SLR (§0.2), not
+because scaling ran out.
+
+Raw logs: `oasis-debug/b119_pal_{fwd,rev}_{1,2,3,4}.txt`, provenance in `oasis-debug/RUN-PROVENANCE.md`.
+
+> **Do not confuse this with the ~570 MB/s 4-lane figure** that also appears in the 2026-09-12 record
+> (`b11{8,9}_scale_*`, 569.7 and 574.4). Those come from the older `scale` harness, which sweeps in one
+> direction and does not exclude stale counters. They are used **only** for the like-for-like 118-vs-119
+> comparison in M8.5, where both arms share the bias. The citable absolute is **775.3**.
+
+### M8.2 — TPC-H at sf30 on four decoders, and where the FPGA time actually goes
+
+`./scripts/tpch_demo.sh --single-session --threads 1`, cache off on both sides, **22/22 PASS**.
+Log: `oasis-debug/b119_tpch_fair.txt`.
+
+| | FPGA | CPU (1 thread) |
+|---|---|---|
+| q1 / q10 / q12 / q19 | 5.15 / 5.01 / 5.10 / 4.74 = **20.00 s** | 2.95 s |
+| the other 18 | **6.98 s** | 11.50 s → **FPGA 1.65x faster** |
+| all 22 | 26.98 s | 14.45 s → CPU 1.87x |
+
+Those four queries carry **74 % of total FPGA runtime** and each sits at a flat ~5 s, which is the
+signature of the two ~2 s `READ_TIMEOUT_CYCLES` watchdogs, not of decode work. **The FPGA already wins
+13 of the 22 outright** (q16 is a tie at 0.12 s). The CPU phase ran after the entire FPGA phase and so
+read a warm server cache — by a whole phase, not by one query — so the 1.65x on the other 18 is if
+anything understated.
+
+**Prediction on record, before build-120's hardware run:** if TODO 1 (lazy open / no idle reconnect)
+removes the watchdog penalty on those four, the total lands near **~11 s and beats the CPU outright**.
+Build-120 was still in bitgen at 19:32 on 2026-09-12, so this is **unfalsified, not confirmed**.
+
+### M8.3 — Where the limits are, and none of them is the FPGA
+
+| candidate bottleneck | what it permits | what we achieve | verdict |
+|---|---|---|---|
+| receive window (`W/RTT`) | **7.77 GB/s** | 0.463 one session = **6.0 %**; 0.775 at 4 lanes = **10.0 %** | **not binding.** Do not claim to have reached `W/RTT` |
+| MinIO aggregate | **4.60 GB/s** over 16 streams | 0.775 = **17 %**, i.e. **5.9x headroom** | **not binding** |
+| TOE → decoder datapath | ~13.9 GB/s per lane | 0.775 total | **not binding** |
+| decoder itself | `stalled` 10–14 % | — | **not binding** |
+| **per-connection service rate** | 0.463 GB/s = ~1.70 ms of serialized service per 768 KiB GET | — | **this is the one** |
+
+**The defensible thesis paragraph:** the receive window is not binding (7.8 GB/s permitted, 0.46
+achieved on one session); the object store's aggregate is not binding (4.60 available, 0.78
+collected); the binding constraint is **per-connection service rate under HTTP/1.1's in-order
+responses**, and therefore concurrency. What caps concurrency is the TOE's positional
+`rxBufferReadCmd`, which forces a single arrival-ordered receive path across all lanes.
+
+### M8.4 — Clean negatives (trustworthy precisely because drift produces false positives, not nulls)
+
+- **Pipelining depth does nothing.** 4 / 8 / 16 outstanding GETs → **557.0 / 552.9 / 585.1 MB/s**, no
+  trend. More outstanding requests on one socket cannot overlap under HTTP/1.1.
+  Logs `b119_depth{4,8,16}.txt`.
+- **Chunk size does nothing — the default is the best setting.** The order-cancelling A/B
+  (`chunks_ab 0 1048576`) gives default **742.6 / 774.7 / 775.0** against 1 MiB **703.6 / 747.0 /
+  720.4**: the default wins all three pairs, **+7.5 %**. Keep `HTTP_DEFAULT_CHUNK_BYTES = 0`.
+  Logs `b119_ab_{A0,B1048576}_{1,2,3}.txt`. This is the run that reversed the retracted "+33 %".
+- **The `lane_depth × chunk_bytes ≤ 256 KiB` budget rule is lifted.** The readPkg reservation is
+  hardware-verified with correct sums at depth 4 × 256 KiB = 1 MiB per lane.
+
+### M8.5 — build-118 vs build-119: the `axis_skid` register slice bought nothing
+
+A like-for-like A/B on the same harness (`scale`, hence the lower absolutes — see the note in M8.1):
+
+| | build-118 | build-119 (+ `axis_skid`) |
+|---|---|---|
+| WNS | **−1.344 ns** | **−1.474 ns** |
+| failing endpoints | 2,464,261 | 2,472,435 |
+| HTTP-logic violated paths | **59** | **59** |
+| 4-lane MB/s | 569.7 | 574.4 (**+0.8 %, inside noise**) |
+
+Timing slightly worse, throughput unchanged, the targeted violation count identical. At four decoders
+the constraint is the decoder itself (`decoder:page/run` went 170 → 476 paths) and the HBM shell, not
+the `skid_keep_q` cone the slice was aimed at. **Decision: do not commit `axis_skid.sv`.** It is
+reverted from the tree and kept untracked; the pre-revert file is at
+`oasis-debug/handler_multi.sv.slice119.bak`.
+
+For context, WNS across the decoder counts: build-117 (3 decoders) **−0.849 ns**, build-118 (4)
+**−1.344**, build-119 (4 + slice) **−1.474**. Timing degrades with decoder count, which is the second
+reason — after area — that four is the stopping point.
+
+### M8.6 — What is still unexplained: the ~190 MB/s per lane
+
+Each lane delivers ~190 MB/s and we cannot yet say why that number and not a larger one. It is **not**
+the decoder (`stalled` 10–14 %), **not** the datapath (~13.9 GB/s/lane), **not** the window (10 % of
+BDP), **not** MinIO's aggregate (17 % of it). It is **~42 % of the 0.46 GB/s single-connection
+ceiling**, so there is headroom even within one connection.
+
+**Next probe:** `win_profile.sh` against a packet capture — a wide-open advertised window points
+upstream (request issue / service rate), a window parked low points at the reader. This needs
+`tshark`, which is **not installed on the deploy node**.
+
+### M8.7 — Provenance of this section
+
+Re-derived from the raw logs while writing this entry, not carried over on trust: **every value in the
+M8.1 scaling table** (all eight forward/reverse figures reproduce as consecutive 4-decoder window sums
+in `b119_pal_*`), **the entire M8.2 TPC-H table** (read directly from `b119_tpch_fair.txt`, including
+the 13-of-22 count and the 20.00 s subtotal), and **all three WNS figures in M8.5** (read from
+`hardware/build-1{17,18,19}/reports/shell_timing_summary.rpt`).
+
+Carried from the 2026-09-12 run notes without independent re-derivation, because they depend on
+`sumrate`'s median-with-stale-exclusion statistic: the depth medians and the chunk A/B medians in
+M8.4, the RTT figures, the LUT counts, and the `stalled` percentages.
+
+---
+
 ## What was NOT tested — an honest list, 2026-08-27
 
 Nothing below has evidence behind it. Written down so no draft accidentally claims it.
@@ -789,3 +974,33 @@ Nothing below has evidence behind it. Written down so no draft accidentally clai
 - **DuckDB's connection count was sampled by eye**, not logged: "2 connections for about a third of
   the time, otherwise 1". The ~1.3 average behind M1.4's per-connection parity claim is that
   estimate. Worth a proper count before it goes in the thesis.
+
+---
+
+## Addendum to the honest list — 2026-09-12
+
+Still no evidence behind any of this. The 08-27 list above stands except where M8 answered it.
+
+- **build-120 has never run on hardware.** It was still in bitgen at 19:32 on 2026-09-12. M8.2's
+  "~11 s and beats the CPU outright" is a **prediction on record, not a result**. Nothing in this
+  document may cite a build-120 number.
+- **The ~190 MB/s per lane is unexplained** (M8.6). Every candidate bottleneck has been excluded and
+  none of them accounts for it. A thesis can state what it is *not*; it cannot yet state what it is.
+- **`win_profile.sh` has never been run** — `tshark` is not installed on the deploy node. This is the
+  one probe that would separate "upstream" from "reader" for M8.6.
+- **`scripts/soak.sh` has still never been run**, now against *any* of builds 117–120. The 20-case
+  decoder corpus remains entirely unexercised on the multi-decoder design; 22/22 TPC-H covers the
+  workload, not the encoding edge cases.
+- **Correctness has still never been checked across request shapes** (the `OASIS_HTTP_CHUNK_BYTES` ×
+  `OASIS_HTTP_MAX_INFLIGHT` matrix) — and now there is a second axis, lane count, that has not been
+  crossed with it either.
+- **The chunk and depth medians in M8.4 were not independently re-derived** (M8.7). They rest on
+  `sumrate`'s stale-exclusion statistic. The *conclusions* are robust — a null result cannot be
+  manufactured by cache drift, which produces false positives — but the specific medians should be
+  recomputed from the raw logs before any of them is printed as a figure.
+- **The code under measurement was uncommitted working-tree state at the time.** Every M8 number was
+  taken between 12:11 and 14:09; the readPkg reservation (`a9a99e8`) and the TODO 1 lazy-open change
+  (`a08b100`) were only committed at 14:24–14:28, after the fact. They are in `feature/minio` now, so
+  the tree is reproducible going forward — but no run in M8 was taken from a clean, tagged checkout,
+  and the bitstreams remain the only exact record of what was on the board
+  (`hardware/build-11{8,9}/`).
