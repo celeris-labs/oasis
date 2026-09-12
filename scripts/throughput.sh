@@ -74,7 +74,13 @@ URL="httpfpga://$FILE"
 # enable_progress_bar=false is not cosmetic. The bar redraws with carriage returns and leaves
 # partial lines behind, so a captured run comes out full of blank gaps between the query result and
 # its profile readback -- and the redraw thread runs during the window being measured.
-SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=false;"
+# Extra SET statements, so the scheduler knobs are reachable without editing this file.
+# The two that matter for isolation:
+#   OASIS_EXTRA_SETUP="SET oasis_scheduler_num_streams=1;"   -- one lane only. THE isolation switch:
+#       OASIS_HTTP_LANE_DEPTH caps pipelining DEPTH, not the lane count, so on a 2-lane bitstream
+#       depth 1 still runs both lanes and still contends for the shared receive path.
+#   OASIS_EXTRA_SETUP="SET oasis_scheduler_queue_depth=1;"   -- one host pipeline slot per stream.
+SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=false; ${OASIS_EXTRA_SETUP:-}"
 
 # ---------------------------------------------------------------------------------------------
 # Workload definitions. Each is a query over read_oasis($URL) plus the number of hardware column
