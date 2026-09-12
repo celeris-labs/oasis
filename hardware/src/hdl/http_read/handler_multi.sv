@@ -312,6 +312,8 @@ module handler_multi #(
     // Receive: one dispatcher, N framing lanes.
     // =============================================================================================
     logic [NUM_CONNS-1:0]       conn_tvalid, conn_tready, conn_space_ok, conn_closed;
+    // One-hot: rx_dispatch issued a readPkg for this lane. Feeds that lane's fifo reservation.
+    logic [NUM_CONNS-1:0]       conn_pkg_issued;
     logic [AXI_DATA_BITS-1:0]   conn_tdata;
     logic [AXI_DATA_BITS/8-1:0] conn_tkeep;
     logic                       conn_tlast;
@@ -343,6 +345,7 @@ module handler_multi #(
         .conn_tvalid(conn_tvalid), .conn_tready(conn_tready),
         .conn_tdata (conn_tdata),  .conn_tkeep(conn_tkeep), .conn_tlast(conn_tlast),
         .conn_space_ok(conn_space_ok), .conn_closed(conn_closed),
+        .conn_pkg_issued(conn_pkg_issued),
         .dbg_has_pending(rxd_has_pending),
         .dbg_overflow   (rxd_overflow),
         .dbg_route_stall(rxd_route_stall),
@@ -489,6 +492,7 @@ module handler_multi #(
             .read_timeout(lane_timeout[L]),
             .rx_fifo_level(), .rx_fifo_stall(lane_fifo_stall[L]),
             .rx_space_ok  (conn_space_ok[L]),
+            .rx_pkg_issued(conn_pkg_issued[L]),
             .debug_rx_write_ptr(), .debug_rx_buffer_w0(), .debug_rx_buffer_w1(),
             .state_debug(lane_read_state[L])
         );

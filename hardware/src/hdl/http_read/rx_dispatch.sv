@@ -136,6 +136,12 @@ module rx_dispatch #(
     //    conn_space_ok[i] is high, so it must mean "room for a whole MSS", not "room for one beat".
     input  logic [NUM_CONNS-1:0]       conn_space_ok,
 
+    // -- One-hot pulse: a readPkg was issued for this connection. The fifo reserves a segment
+    //    against it, because conn_space_ok is computed from a level that the bytes now on their way
+    //    have not reached yet -- so without this the same room is promised to every readPkg issued
+    //    before the first one lands. See the reservation in tcp_read.sv.
+    output logic [NUM_CONNS-1:0]       conn_pkg_issued,
+
     // -- Per-connection sticky FIN.
     output logic [NUM_CONNS-1:0]       conn_closed,
 
@@ -271,6 +277,12 @@ module rx_dispatch #(
 
     logic issue_fire_w;
     assign issue_fire_w = m_axis_read_package_TVALID && m_axis_read_package_TREADY;
+
+    // Charge the reservation to the lane the head names, on the cycle it is actually accepted.
+    always_comb begin
+        conn_pkg_issued = '0;
+        if (issue_fire_w) conn_pkg_issued[head_conn_w] = 1'b1;
+    end
 
     // ---------------------------------------------------------------------------------------------
     // Head-of-line watchdog. One counter, not N: only one connection can hold the head at a time,

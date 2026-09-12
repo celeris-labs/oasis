@@ -107,6 +107,11 @@ module tcp_read #(
     // residue, which holds the bytes of the next header.
     input  logic                                      clear_framing,
 
+    // EXTERNAL_DISPATCH only: rx_dispatch has just issued a readPkg for THIS lane. One pulse per
+    // readPkg; the bytes it names arrive later. See the reservation below -- without this,
+    // rx_space_ok is a promise the fifo cannot keep.
+    input  logic                                      rx_pkg_issued,
+
     // Receive accounting for this session, from tcp_session_table.
     input  logic [TCP_LEN_BITS-1:0]                   rx_req_len, // oldest unread announcement
     input  logic                                      rx_closed,  // peer has FINed (sticky)
@@ -258,7 +263,64 @@ module tcp_read #(
     // MSS/mss_table); at 512 bit that is 64 beats. The +2 covers the fifo's own registered
     // output stage, which is occupied but not counted in rx_fifo_level.
     localparam int MSS_BEATS = (4096 / (AXI_DATA_BITS/8)) + 2;
-    assign rx_space_ok = (RX_FIFO_DEPTH - rx_fifo_level) > MSS_BEATS;
+
+    // ---------------------------------------------------------------------------------------------
+    // readPkg reservation. WHY rx_space_ok CANNOT SIMPLY ASK THE FIFO.
+    //
+    // A readPkg's bytes do not arrive when it is issued -- they arrive some time later. So
+    // rx_fifo_level says nothing about what is already on its way, and a check for "room for one
+    // MSS" passes again the very next cycle, and again after that. rx_dispatch can therefore issue
+    // an unbounded run of readPkgs against the SAME single-segment reservation, and every one of
+    // them delivers a full segment. With N in flight the fifo takes N*MSS into space that was only
+    // ever checked once. It is not the fifo that is undersized, it is over-committed.
+    //
+    // Measured on build-116 against MinIO, with the host varying lane_depth x chunk_bytes:
+    //   256 KiB in flight per lane -> completes;  512 KiB -> overruns, framing desynchronises and
+    //   the response comes out unframeable. 8192 beats / 66 beats-per-segment is 124 segments,
+    //   i.e. ~508 KiB, which is exactly where it broke. The arithmetic is the bug.
+    //
+    // One readPkg returns exactly ONE announced segment however many bytes it names (rx_dispatch's
+    // header says so), so a segment is the right unit and MSS_BEATS the right size -- no length has
+    // to be plumbed across the module boundary.
+    localparam int RSV_BITS = $clog2(RX_FIFO_DEPTH+1) + 1;
+    logic [RSV_BITS-1:0] rsv_beats_q;
+
+    // A promised packet becomes real space at its tlast on the way INTO the fifo.
+    logic rx_pkt_done_w;
+    assign rx_pkt_done_w = fifo_s_tvalid && fifo_s_tready && s_axis_rx_data_TLAST;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            rsv_beats_q <= '0;
+        end else if (clear_framing) begin
+            // The session is gone and the fifo is being cleared, so every outstanding promise dies
+            // with it. This is also what stops the one leak: a packet rx_dispatch DROPS (a released
+            // or dead session) never reaches this fifo, so its tlast never arrives and nothing else
+            // would ever hand the reservation back. clear_framing is exactly when that happens.
+            rsv_beats_q <= '0;
+        end else begin
+            case ({rx_pkg_issued, rx_pkt_done_w})
+                // Saturate rather than wrap: a lane the head-of-line watchdog has declared dead is
+                // issued readPkgs with the space check bypassed, so this can otherwise keep climbing.
+                2'b10:   rsv_beats_q <= (rsv_beats_q > RSV_BITS'(RX_FIFO_DEPTH))
+                                            ? rsv_beats_q
+                                            : rsv_beats_q + RSV_BITS'(MSS_BEATS);
+                2'b01:   rsv_beats_q <= (rsv_beats_q >= RSV_BITS'(MSS_BEATS))
+                                            ? rsv_beats_q - RSV_BITS'(MSS_BEATS)
+                                            : '0;
+                default: ;
+            endcase
+        end
+    end
+
+    // Room for everything already promised PLUS the segment this would admit. Written as an
+    // addition, not as (DEPTH - level - reserved), because level + reserved may legitimately exceed
+    // the depth for a cycle and the subtraction would wrap to a huge unsigned "yes".
+    //
+    // With EXTERNAL_DISPATCH=0 nothing drives rx_pkg_issued, rsv_beats_q stays 0, and this reduces
+    // to (RX_FIFO_DEPTH - rx_fifo_level) > MSS_BEATS -- the original check, bit for bit.
+    assign rx_space_ok = (RSV_BITS'(rx_fifo_level) + rsv_beats_q + RSV_BITS'(MSS_BEATS))
+                         < RSV_BITS'(RX_FIFO_DEPTH);
 
     axis_fifo #(
         .DATA_BITS(AXI_DATA_BITS),
