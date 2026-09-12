@@ -352,6 +352,17 @@ class HTTPReadConfig : public libstf::Config {
     };
     HTTPLaneErrors lane_errors();
 
+    /// Throw naming `lane`, what it was waiting for, and the decoded sticky causes -- including
+    /// whether this was a head-of-line kill (reissue the whole batch) or an unreplayable read error.
+    ///
+    /// PUBLIC because the admission path is no longer the only caller. A lane can go fatal with work
+    /// ALREADY on it, and those flows are never admitted again -- the scheduler routes around a fatal
+    /// lane by design -- so the dispatcher needs this same diagnosis to fail the queries that are
+    /// waiting on them. See Scheduler::fail_flows_on_fatal_lanes.
+    ///
+    /// Reads CSRs, so call it with no scheduler lock held.
+    [[noreturn]] void throw_lane_fatal(uint8_t lane, const char *what);
+
     /**
      * Read id 20: what the bitstream was ELABORATED with, for the host to check itself against.
      *
@@ -569,10 +580,6 @@ class HTTPReadConfig : public libstf::Config {
     /// shipped before them -- the same register, the same spin, the same timeout and the same
     /// message. A `--decoders 1` legacy bitstream must not notice that this work package happened.
     void await_cfg_ready_legacy(const char *what);
-
-    /// Throw naming `lane`, what it was waiting for, and the decoded sticky causes -- including
-    /// whether this was a head-of-line kill (reissue the whole batch) or an unreplayable read error.
-    [[noreturn]] void throw_lane_fatal(uint8_t lane, const char *what);
 
     /// Bytes asked for in the most recent ranged GET, so response() can compare what the server
     /// said against what was requested.

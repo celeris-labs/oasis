@@ -12,6 +12,8 @@
 #include <cassert>
 #include <chrono>
 #include <exception>
+#include <utility>
+#include <vector>
 
 namespace oasis {
 
@@ -47,6 +49,19 @@ constexpr auto kLaneRetry = std::chrono::microseconds(100);
 // fire on a pipeline that is merely slow, and this deliberately does not diagnose anything itself --
 // it hands the question to the code that already knows how to answer it.
 constexpr auto kLaneStallGrace = std::chrono::seconds(30);
+
+// How long ~Scheduler waits, in total, for flows already in flight to retire.
+//
+// IT MUST BE BOUNDED, for the same reason kLaneStallGrace exists and for a sharper one. The slots
+// this waits on retire from a completion callback fired by the hardware interrupt path -- and a lane
+// the handler has declared FATAL never fires it: handler_multi tears that session down and
+// deliberately does not reopen it, because a dirty abort cannot be replayed. So the predicate
+// "every slot is done" is not merely slow to become true, it is false forever, and the unbounded
+// wait that used to be here turned one dead lane into a process that could not exit.
+//
+// Matched to kLaneStallGrace, and it is a TOTAL deadline across all streams rather than per stream,
+// so a wedged board costs the teardown this once and not once per decoder.
+constexpr auto kDrainTimeout = std::chrono::seconds(30);
 
 libstf::stream_t default_num_streams(OasisContext &ctx) {
     return ctx.config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
@@ -168,9 +183,10 @@ Scheduler::~Scheduler() {
     dispatcher_.join();
 
     // The dispatcher is gone, but flows it already placed may still be in flight with callbacks
-    // pending. Wait until every slot's callback has run, then reap. Erasing only after `done`
-    // guarantees ~OutputHandle (which joins the callback thread) never runs while that callback is
-    // still executing. The callback signals dispatch_cv_, so wait on that.
+    // pending. Wait (bounded -- see kDrainTimeout) until every slot's callback has run, then reap.
+    // Erasing only after `done` guarantees ~OutputHandle (which joins the callback thread) never
+    // runs while that callback is still executing. The callback signals dispatch_cv_, so wait on
+    // that.
     //
     // Lock order: this predicate takes stream->mutex while holding dispatch_mutex_, so the contract
     // is dispatch_mutex_ -> stream.mutex. Nothing may take them in the opposite order. The completion
@@ -178,11 +194,13 @@ Scheduler::~Scheduler() {
     // lock-free (atomic) and takes dispatch_mutex_ only on its own, after releasing ss.mutex, purely
     // to pair with the wait on dispatch_cv_. As in dispatch_loop, the reaped slots are destroyed
     // (join()ing their callback threads) only after the locks are dropped.
+    const auto deadline = std::chrono::steady_clock::now() + kDrainTimeout;
     for (auto &stream : streams_) {
         std::list<InFlight> finished;
+        size_t              abandoned_here = 0;
         {
             std::unique_lock<std::mutex> dlock(dispatch_mutex_);
-            dispatch_cv_.wait(dlock, [&] {
+            const bool drained = dispatch_cv_.wait_until(dlock, deadline, [&] {
                 std::lock_guard<std::mutex> slock(stream->mutex);
                 for (const auto &slot : stream->in_flight) {
                     if (!slot.done) {
@@ -193,6 +211,30 @@ Scheduler::~Scheduler() {
             });
             std::lock_guard<std::mutex> slock(stream->mutex);
             reap(*stream, finished);
+            if (!drained && !stream->in_flight.empty()) {
+                // ABANDON the stragglers, do not destroy them. ~OutputHandle join()s the callback
+                // thread, and the whole reason we are here is that the callback is never going to
+                // run -- joining it would hang the destructor exactly as the unbounded wait did.
+                //
+                // The leak is deliberate and is the lesser evil. It is not free: the callback lambda
+                // captures `this`, so if the hardware ever DID fire it after this returns it would
+                // touch a destroyed Scheduler. That cannot happen for the case this exists for (a
+                // fatal lane's session is gone, no interrupt is coming), and against a hypothetical
+                // late callback stands a process that certainly cannot exit. Documented rather than
+                // hidden: if a late-callback crash is ever seen on teardown, this is where it is.
+                static auto *abandoned = new std::list<InFlight>();
+                abandoned_here         = stream->in_flight.size();
+                abandoned->splice(abandoned->end(), stream->in_flight);
+            }
+        }
+        if (abandoned_here != 0) {
+            libstf::log(libstf::LogLevel::ERROR,
+                        "Scheduler: %zu flow(s) never retired after %llds; abandoning them so "
+                        "teardown can finish. A lane the hardware declared fatal does not fire the "
+                        "completion its slot is waiting for -- look for the lane fatal error above.",
+                        abandoned_here,
+                        static_cast<long long>(
+                            std::chrono::duration_cast<std::chrono::seconds>(kDrainTimeout).count()));
         }
         finished.clear(); // destroy / join with no scheduler lock held
     }
@@ -496,6 +538,110 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const LaneSnapshot &
     return out.stream;
 }
 
+// Report a lane that went fatal with work already dispatched to it.
+//
+// THE HANG THIS EXISTS FOR. handler_multi declares a lane fatal when a read fails in a way it cannot
+// replay -- a head-of-line kill, or a dirty abort where body bytes already reached the decoder -- and
+// then tears the session down and deliberately does NOT reopen it (BR_CLOSE with close_only, which is
+// what holds clear_framing high). Every flow already on that lane is orphaned at that instant: its
+// completion callback fires from the hardware interrupt path and no interrupt is ever coming, so the
+// slot never goes `done`, `enqueued` never comes back down, the splinter's outstanding_sinks never
+// reaches zero, and the channel is never closed.
+//
+// Nothing else notices, and that is the subtle part. throw_lane_fatal() is on the ADMISSION path
+// (await_cfg_ready), which only runs when the host pushes another beat AT that lane -- and
+// PlaceOnLane skips fatal lanes by design, so as long as one healthy lane remains the admission path
+// is never taken for the dead one again. The one place that knows how to report the failure is the
+// one place the scheduler now guarantees it will never reach. The query then blocks forever in
+// SplinterResultChannel::get_next_batch(), which is how a hardware fault the board diagnosed
+// correctly, and printed sticky flags for, became a silent hang with nothing in the log.
+//
+// So it is reported here, off the per-iteration lane sample the dispatcher already takes.
+//
+// ONLY THE CHANNEL IS FAILED. The in-flight slot is deliberately left alone: the callback owns
+// `flow_outstanding`, `outstanding_sinks` and `enqueued`, and retiring the slot from this thread
+// would race a callback that might still fire (after a reprogram, or a late retire) into a double
+// decrement of counters it has no lock on. ~Scheduler bounds its own wait for those slots instead.
+void Scheduler::fail_flows_on_fatal_lanes(const LaneSnapshot &view,
+                                          std::unique_lock<std::mutex> &lock) {
+    if (!view.valid || !http_) {
+        return;
+    }
+
+    // Collect under the lock, act outside it. fail() runs the channel's readiness callback, which
+    // reschedules a consumer task, and throw_lane_fatal() reads CSRs -- neither belongs under
+    // dispatch_mutex_, for exactly the reasons sample_lanes() is taken unlocked.
+    std::vector<std::pair<uint8_t, std::shared_ptr<SplinterResultChannel>>> victims;
+    uint32_t   reporting = 0;
+    const auto span      = std::min<size_t>(view.lanes.count, streams_.size());
+    for (uint8_t s = 0; s < span; ++s) {
+        const uint32_t bit = 1u << s;
+        if (!view.lanes.at(s).fatal) {
+            // Only a reprogram clears a fatal lane, and that builds a new Scheduler -- but clearing
+            // the bit costs nothing and keeps this an edge detector rather than a latch.
+            lane_fatal_reported_ &= ~bit;
+            continue;
+        }
+        if (lane_fatal_reported_ & bit) {
+            continue; // already reported; do not re-walk the list every kLaneRetry
+        }
+        reporting |= bit;
+        std::lock_guard<std::mutex> slock(streams_[s]->mutex);
+        for (auto &slot : streams_[s]->in_flight) {
+            if (!slot.done && slot.completion && slot.completion->channel) {
+                victims.emplace_back(s, slot.completion->channel);
+            }
+        }
+    }
+    if (reporting == 0) {
+        return;
+    }
+    lane_fatal_reported_ |= reporting;
+
+    lock.unlock();
+    // Everything below runs on the dispatcher thread, which has no handler above it: an escaping
+    // exception is std::terminate, i.e. exactly the outcome the rest of this function exists to
+    // prevent. fail() runs a consumer-supplied readiness callback and log() formats -- both are
+    // meant to be safe, and neither is worth betting the process on. The lane is already latched in
+    // lane_fatal_reported_, so a failure here costs the report, not correctness.
+    try {
+        for (uint8_t s = 0; s < HTTP_LANE_SLOTS; ++s) {
+            if ((reporting & (1u << s)) == 0) {
+                continue;
+            }
+            // The decoded diagnosis, not a bare "lane is fatal": whether this was a head-of-line kill
+            // (the batch is gone, reissue it) or an unreplayable read error, plus the sticky causes.
+            // It reads CSRs and can itself throw, which is why it is wrapped rather than called bare.
+            std::exception_ptr err;
+            try {
+                http_->throw_lane_fatal(s, "an in-flight batch");
+            } catch (...) {
+                err = std::current_exception();
+            }
+
+            size_t failed = 0;
+            for (auto &victim : victims) {
+                if (victim.first == s) {
+                    victim.second->fail(err); // idempotent: first close wins
+                    ++failed;
+                }
+            }
+            libstf::log(libstf::LogLevel::ERROR,
+                        "Scheduler: HTTP lane %u went fatal with %zu flow(s) in flight; failing them "
+                        "rather than waiting for a completion the hardware will never send.",
+                        static_cast<unsigned>(s), failed);
+        }
+    } catch (...) {
+        try {
+            libstf::log(libstf::LogLevel::ERROR,
+                        "Scheduler: could not report a fatal HTTP lane; queries already dispatched "
+                        "to it may still wait for a completion that will not come.");
+        } catch (...) { // NOLINT -- nothing useful is left to do, and terminate is not an option
+        }
+    }
+    lock.lock();
+}
+
 void Scheduler::dispatch_loop() {
     std::unique_lock<std::mutex> lock(dispatch_mutex_);
     while (true) {
@@ -531,6 +677,10 @@ void Scheduler::dispatch_loop() {
             view = sample_lanes();
             lock.lock();
         }
+
+        // A lane may have gone fatal since the last iteration with flows already placed on it. They
+        // will never retire, and this is the only thread that looks -- see the function comment.
+        fail_flows_on_fatal_lanes(view, lock);
 
         std::optional<libstf::stream_t> stream;
         // Whether an empty pick means "the hardware has no room" (poll) or "the host has no slot"

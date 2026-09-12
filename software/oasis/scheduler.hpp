@@ -197,6 +197,11 @@ class Scheduler {
     /// So the "more active streams than lanes" warning is printed once, not once per iteration.
     bool lane_span_warned_ = false;
 
+    /// Lanes already reported fatal, one bit per lane. A fatal lane is reported ONCE, not once every
+    /// kLaneRetry: the bit is what makes the report an edge rather than a 100 us log storm.
+    /// Dispatcher thread only.
+    uint32_t lane_fatal_reported_ = 0;
+
     std::mutex              dispatch_mutex_;
     std::condition_variable dispatch_cv_;
     std::deque<Pending>     queue_;
@@ -240,6 +245,16 @@ class Scheduler {
     // stream's in-flight list. Called only by the dispatcher, with a slot already reserved
     // (enqueued atomically bumped).
     void dispatch_to(libstf::stream_t stream, Pending &pending);
+
+    // Fails every in-flight flow on a lane the hardware has just declared FATAL, because those flows
+    // can never complete and nothing else will ever notice: throw_lane_fatal() sits on the ADMISSION
+    // path, and PlaceOnLane deliberately routes work away from a fatal lane, so on a board with any
+    // healthy lane left that path is never taken again.
+    //
+    // Called with `lock` (dispatch_mutex_) HELD. It releases and re-acquires it around the CSR reads
+    // and the channel callbacks, exactly as the sampling window in dispatch_loop does -- neither
+    // belongs under dispatch_mutex_.
+    void fail_flows_on_fatal_lanes(const LaneSnapshot &view, std::unique_lock<std::mutex> &lock);
 
     // Splices in-flight slots whose callback has run into `finished` (without destroying them, so
     // the caller can destroy them outside the locks -- ~OutputHandle join()s the callback thread).
