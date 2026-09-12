@@ -8,4 +8,6 @@
 
 @OASIS_DEF_EN_TCP_MULTI@
 
+@OASIS_DEF_EN_PERF_ILA@
+
 `endif

@@ -515,6 +515,17 @@ always_comb axi_out[BYPASS_ID].tie_off_m();
 
 
 
+// Performance ILA. OFF by default -- see ENABLE_PERF_ILA in hardware/CMakeLists.txt.
+//
+// 42 probes, several of them 512 bits wide, costing ~13.2k LUTs and ~114.5 BRAM of pure debug logic
+// in the user region. That is affordable at one or two decoder lanes and is not at four: build-110
+// (4 lanes, ILA in) missed timing at WNS -7.43 ns, and the congested clusters were HBM shell nets
+// and the decoder -- the HTTP logic never appeared in the failing paths. Freeing this area is the
+// first lever for closing a 4-lane build, so the probes have to be opt-in rather than always paid.
+//
+// Turn it back on with `scripts/synthesize.sh --perf-ila` when a receive-path fault needs the wire
+// view. The probe map is unchanged, so an existing .ltx still matches.
+`ifdef EN_PERF_ILA
 ila_perf_tcp inst_ila_perf_tcp (
     .clk(aclk),
     .probe0  (tcp_open_req.valid),
@@ -560,6 +571,7 @@ ila_perf_tcp inst_ila_perf_tcp (
     .probe40 (dbg_req_hi),
     .probe41 (dbg_req_cnt)
 );
+`endif // EN_PERF_ILA
 
 //always_comb axi_out[BYPASS_ID].tie_off_m();
 `elsif EN_RDMA

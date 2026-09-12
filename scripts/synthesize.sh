@@ -6,11 +6,17 @@ cmake_args=()
 decoders=1
 enable_http_multi=0
 enable_http=0
+enable_perf_ila=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --http) enable_http=1 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
         --multi) enable_http_multi=1 ;;
+        # Add the 42-probe TCP/HTTP performance ILA back. OFF by default since it costs ~13.2k
+        # LUTs and ~114.5 BRAM in the user region -- affordable at 1-2 lanes, not at 4 (build-110
+        # missed timing at WNS -7.43 ns carrying it). Use it to debug the receive path, not to
+        # produce a bitstream anyone will measure.
+        --perf-ila) enable_perf_ila=1 ;;
         --decoders) decoders="$2"; shift ;;
         --decoders=*) decoders="${1#*=}" ;;
         # Make the advertised TCP receive window match the buffer that actually exists.
@@ -40,6 +46,7 @@ fi
 cmake_args+=(-DN_DECODERS="$decoders")
 # One TCP session per decoder lane. Needs --http; the build fails loudly otherwise.
 cmake_args+=(-DENABLE_HTTP_MULTI="$([ "$enable_http_multi" = 1 ] && echo ON || echo OFF)")
+cmake_args+=(-DENABLE_PERF_ILA="$([ "$enable_perf_ila" = 1 ] && echo ON || echo OFF)")
 
 pushd hardware
 
