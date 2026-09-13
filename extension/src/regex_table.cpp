@@ -495,6 +495,17 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 			lstate->target_wire_bytes = bytes;
 		}
 	}
+	// Row cap for batches on a real FSST table. Never below max_accum_count, and bounded by the
+	// same result-FIFO limit oasis_regex_batch_rows is clamped to above.
+	{
+		uint64_t segment_rows = REGEX_FPGA_SEGMENT_ACCUM_COUNT;
+		if (const char *segment_env = std::getenv("OASIS_REGEX_SEGMENT_ROWS")) {
+			segment_rows = std::strtoull(segment_env, nullptr, 10);
+		}
+		const uint64_t fifo_cap = uint64_t(celeris::kRegexMaxStringsPerEngine - 1) * celeris::kRegexEngineCount;
+		segment_rows = MinValue<uint64_t>(segment_rows, fifo_cap);
+		lstate->segment_accum_count = MaxValue<idx_t>(lstate->max_accum_count, idx_t(segment_rows));
+	}
 	auto &storage = bind_data.table.GetStorage();
 	// Push scan filters (e.g. c_nationkey = 7) into the storage scan so the FPGA only sees surviving rows.
 	//
@@ -515,8 +526,9 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	}
 	lstate->scan_state.Initialize(scan_storage_ids, context.client,
 	                              lstate->scan_filter_set ? lstate->scan_filter_set.get() : input.filters.get());
-	lstate->output_cache.Initialize(context.client, lstate->output_types, lstate->max_accum_count);
-	lstate->batch_row_refs.reserve(lstate->max_accum_count);
+	// segment_accum_count, not max_accum_count: a batch on a real FSST table may stage that many.
+	lstate->output_cache.Initialize(context.client, lstate->output_types, lstate->segment_accum_count);
+	lstate->batch_row_refs.reserve(lstate->segment_accum_count);
 	lstate->match_sel_scratch.Initialize(STANDARD_VECTOR_SIZE);
 
 	lstate->rows_in_current_row_group = storage.NextParallelScan(context.client, gstate.parallel_scan, lstate->scan_state);
@@ -809,7 +821,7 @@ static void StartNewStagedBatch(RegexFpgaScanLocalState &lstate, celeris::Celeri
 		lstate.batch_row_refs.clear();
 	} else {
 		lstate.batch_row_refs.clear();
-		lstate.batch_row_refs.reserve(lstate.max_accum_count);
+		lstate.batch_row_refs.reserve(lstate.segment_accum_count);
 	}
 	// The slots those dictionary entries pointed at went with the batch.
 	lstate.dict_stamp++;
@@ -1698,6 +1710,9 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 						WriteSymbolTableHeader(lstate.batch_symbol_header, fsst_decoder);
 						// Pin the decoder for as long as its address identifies this batch's table.
 						lstate.batch_decoder_owner = regex_vector.GetBufferRef();
+						// The segment's end closes this batch, so let it rather than the row cap
+						// decide: see REGEX_FPGA_SEGMENT_ACCUM_COUNT.
+						lstate.accum_cap = lstate.segment_accum_count;
 					}
 				}
 				lstate.batch_fsst_decoder = row_decoder;

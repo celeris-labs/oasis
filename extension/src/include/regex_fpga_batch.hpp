@@ -36,6 +36,20 @@ static constexpr uint64_t REGEX_FPGA_BEAT_BYTES = 64;
 // with oasis_regex_batch_rows.
 static constexpr idx_t REGEX_FPGA_MAX_ACCUM_COUNT = 1ULL << 14;
 
+// Row cap for a batch riding a real FSST symbol table, 16 vectors.
+//
+// Such a batch already closes at its segment's end, because a batch ships one table. With the
+// 8-vector cap above, how many transfers a segment became depended on how many whole 2048-row
+// vectors it held: more than 8 left a 2048-4096-row tail transfer, and exactly 8 could be cut
+// just short by the chunk-boundary close, leaving a <512-row one. Rows per segment are set by
+// compressibility, so same-size tables differed only in transfer count -- selectivity suite,
+// FSST, count(*): sel_0 1180 transfers 43 ms, sel_1 1286 46 ms, sel_25 1512 45.5 ms, sel_50
+// 1609 50 ms; plaintext, which never closes at a segment, sat at 94.5-95 ms on all eight.
+// A 256 KB segment of real text holds well under 16 vectors, so the segment binds instead and
+// every segment is one transfer. Plaintext, identity (straddle) and dictionary batches keep the
+// cap above. OASIS_REGEX_SEGMENT_ROWS overrides it; 0 restores the old behaviour.
+static constexpr idx_t REGEX_FPGA_SEGMENT_ACCUM_COUNT = 1ULL << 15;
+
 // How much wire buffer one scan thread holds. This is a host-memory bound and
 // nothing more: the 1 MiB REGEX_FPGA_RAW_BATCH_LIMIT it replaces was the
 // german_string_decoder Dictionary's BRAM depth showing through into the host,

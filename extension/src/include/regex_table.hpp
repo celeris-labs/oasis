@@ -283,6 +283,9 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	// oasis_regex_wire_buffer_bytes so a sweep does not need a rebuild. A batch ends
 	// when either cap is hit: rows bind for short strings, bytes for long ones.
 	idx_t max_accum_count = REGEX_FPGA_MAX_ACCUM_COUNT;
+	// Row cap for a batch on a real FSST table, >= max_accum_count; see
+	// REGEX_FPGA_SEGMENT_ACCUM_COUNT. Also what the output cache and ref vectors are sized to.
+	idx_t segment_accum_count = REGEX_FPGA_SEGMENT_ACCUM_COUNT;
 	// Row cap for the batch currently being staged, ramped from small to max_accum_count
 	// over the first few batches of the scan.
 	//
