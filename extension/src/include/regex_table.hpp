@@ -12,9 +12,12 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/buffer/buffer_handle.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table/segment_tree.hpp"
 #include "libstf/buffer.hpp"
 
 #include <atomic>
@@ -121,6 +124,12 @@ struct RetainedChunk {
 	// releases it again, dropping a ref that belongs to an outstanding transfer and
 	// freeing a chunk that transfer still has to read rows out of.
 	bool staging_ref = false;
+	// DuckDB batch index of the row group this chunk was scanned from, reported through
+	// get_partition_data for every output chunk built from its rows.
+	idx_t batch_index = 0;
+	// Storage blocks the retained output columns point into. Holding these instead of copying
+	// every string is what lets a projected column stay compressed until its rows match.
+	vector<BufferHandle> pins;
 };
 
 // One transfer submitted to the card and not yet collected.
@@ -223,12 +232,34 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	// Reusable scratch for compacting matched rows, sized once to avoid per-flush allocation.
 	vector<vector<idx_t>> match_indices_scratch;
 	SelectionVector match_sel_scratch;
+	// Stands in for a compressed column while the matched rows are appended to output_cache; the
+	// real values are then decompressed into the cache's own heap. See AppendMatchedRows.
+	Vector empty_string_placeholder {LogicalType::VARCHAR};
 
-	// Filters DuckDB pushed down as "optional": it does not enforce them (their evaluation is a
-	// no-op marker) and keeps a FILTER above us instead. We unwrap them into a real filter set and
-	// hand that to the storage scan, so rows are dropped during column reading and never reach the
-	// FPGA. Must outlive scan_state, which only borrows it.
-	unique_ptr<TableFilterSet> scan_filter_set;
+	// Late materialisation of projected string columns (OASIS_REGEX_LATE_MAT=0 disables it).
+	// A scanned column is retained as DuckDB returned it -- an FSST vector stays compressed --
+	// and the storage blocks it points into are pinned, so only the rows the card matches are
+	// ever decompressed or copied. Retaining meant decompressing and copying every row before
+	// any verdict existed: 60% of thread time projecting one 28 B column at 10% selectivity.
+	bool late_materialize = true;
+	// Per scanned column, the segment the storage scan was positioned in before the last Scan().
+	// A retained chunk's strings lie in that segment and the one it ends in; see RetainOutputColumns.
+	vector<optional_ptr<SegmentNode<ColumnSegment>>> segment_before_scan;
+	// The collection scan and row group those segments belong to. A chunk produced by any other
+	// comes from a different segment tree, where adjacent indices prove nothing.
+	optional_ptr<CollectionScanState> scan_state_before_scan;
+	optional_ptr<SegmentNode<RowGroup>> row_group_before_scan;
+
+	// (first output_cache row, batch index) wherever the batch index of cached rows changes.
+	// Output chunks are cut at these so each carries exactly one batch index.
+	vector<std::pair<idx_t, idx_t>> output_batch_marks;
+	idx_t output_batch_mark_cursor = 0;
+	// Batch index of the last chunk handed to DuckDB, for get_partition_data.
+	idx_t emitted_batch_index = 0;
+	// Highest batch index the count-only path has labelled rows with. The straddle side batch
+	// collects out of scan order, so its raw indices can go backwards; column-less rows have no
+	// order to keep, so they take the running maximum instead.
+	idx_t count_batch_high = 0;
 
 	// Position in retained_chunks of the chunk the staging loop is reading, not an id:
 	// the deque only ever grows at the back and shrinks at the front, and this is
@@ -319,16 +350,15 @@ struct RegexFpgaScanLocalState : public LocalTableFunctionState {
 	// to decide one row.
 	uint64_t outlier_bytes = celeris::kRegexOutlierBytes;
 
-	// oasis_regex_fsst_passthrough: ship FSST-compressed bytes to the card instead of
-	// decompressing them on the host first. Off by default, and it must stay off until the
-	// RTL carries a decompressor -- the engines match whatever bytes arrive, so with a
-	// plaintext bitstream this returns valid-looking wrong answers rather than an error.
+	// oasis_regex_fsst_passthrough: ship FSST-compressed bytes to the card where DuckDB hands
+	// them over, instead of decompressing them on the host first. On by default.
 	//
-	// Enabling it is not sufficient on its own: DuckDB only hands out an FSST_VECTOR when
-	// enable_fsst_vectors is also on, and only for reads that do not straddle a
-	// ColumnSegment boundary. Rows that arrive decompressed anyway fall back to the host
-	// RE2 outlier path, so the setting degrades in throughput, never in correctness.
-	bool fsst_passthrough = false;
+	// It only decides real table vs identity table, never table vs plaintext: the card has no
+	// plaintext path. DuckDB only hands out an FSST_VECTOR when enable_fsst_vectors is on, and
+	// only for reads that do not straddle a ColumnSegment boundary; every other row -- and
+	// every row with this off -- rides the identity table, so the setting degrades in
+	// throughput, never in correctness.
+	bool fsst_passthrough = true;
 
 	// The FSST decoder of the segment whose rows are in the batch being packed, or nullptr
 	// while the batch is empty. It doubles as the segment's identity: DuckDB builds one

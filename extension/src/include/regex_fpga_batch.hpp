@@ -74,6 +74,14 @@ static constexpr uint64_t REGEX_FPGA_WIRE_BUFFER_BYTES = 4ULL << 20;
 // 16/24/32 threads 20.4-23.0. Only plain FSST 72 B text was measured; plaintext is PCIe-bound.
 static constexpr idx_t REGEX_FPGA_DEFAULT_IN_FLIGHT = 4;
 
+// 16 x 4 is also what a scan that emits columns should use, which is not obvious: emitting adds
+// per-row work on the scan threads, so more of them ought to help. Measured on m (72 B FSST,
+// 15.7 M rows), 16x4 against 32x2, it only pays once nearly every row is emitted -- 100%
+// selectivity whole rows to the client 534 -> 380 ms, `sum(id), sum(strlen(c)), sum(strlen(pay))`
+// 145 -> 131 -- and loses everywhere below: at 10% the same projection is 77.0 -> 82.2 ms and
+// `sum(strlen(c))` 53.8 -> 68.8. So the default stays, and a query that really does emit almost
+// everything can SET oasis_regex_max_in_flight = 2.
+
 // Wire bytes a batch aims for, which is what actually decides a transfer's size; the row
 // cap above is a backstop for the result FIFO, not the target.
 //
@@ -404,9 +412,12 @@ void ReleaseRegexTableSlot(const void *decoder);
 //
 // The caller must already hold one arm credit (TryAcquireRegexArmCredit /
 // AcquireRegexArmCredit); CollectRegexBatch releases it.
+//
+// The wire must open with a symbol-table header (RegexStreamPacker::reserve_symbol_header):
+// the card has no plaintext path and always consumes one.
 RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
                                  const celeris::RegexStreamPacker::Plan &plan, idx_t count,
-                                 const std::vector<uint8_t> &regex_blob, bool fsst_compressed = false);
+                                 const std::vector<uint8_t> &regex_blob);
 
 // Blocks until `submission`'s results have landed and returns one verdict per slot,
 // in slot order. Releases the submission's arm credit. Idempotent on an already

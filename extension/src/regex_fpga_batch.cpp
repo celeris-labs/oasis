@@ -437,7 +437,7 @@ void AcquireRegexArmCredit() {
 
 RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
                                  const celeris::RegexStreamPacker::Plan &plan, idx_t count,
-                                 const std::vector<uint8_t> &regex_blob, bool fsst_compressed) {
+                                 const std::vector<uint8_t> &regex_blob) {
 	CALI_CXX_MARK_FUNCTION;
 	if (count == 0) {
 		return {};
@@ -528,10 +528,10 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 	// ahead of its arm -- which happens routinely, since AXI-Lite and DMA are
 	// independent paths -- back-pressures until the count lands rather than being
 	// walked under whatever the array was last doing.
-	// The arm entry's top bit tells the card this transfer's payload opens with a symbol
-	// table and is FSST codes rather than plaintext. It rides here, not in the config
-	// blob, because the blob is 2240 bits with zero slack and is latched once per query
-	// while this varies per transfer. REGEX_ARM_TABLE_BIT in common.sv is the same bit.
+	// The arm entry's top bit says this transfer's payload opens with a symbol table. Every
+	// transfer does -- the card has no plaintext path and consumes a header unconditionally --
+	// so it is always set; RTL simulation flags an arm without it. REGEX_ARM_TABLE_BIT in
+	// common.sv is the same bit.
 	// Diagnostic (OASIS_REGEX_DUMP_WIRE=<dir>): write each transfer exactly as armed, in
 	// submission order (we hold g_fpga_mutex), so celeris's `06_regex --bench-replay` can resend
 	// the real DuckDB wire with no host work. That separates what the host integration costs from
@@ -548,15 +548,14 @@ RegexSubmission SubmitRegexBatch(celeris::CelerisContext &ctx, void *wire_ptr,
 			char path[512];
 			std::snprintf(path, sizeof(path), "%s/xfer_%06llu.bin", dump_dir, (unsigned long long)dump_seq++);
 			if (FILE *f = std::fopen(path, "wb")) {
-				const uint64_t header[4] = {plan.wire_bytes, plan.strings_in_batch, count, fsst_compressed ? 1u : 0u};
+				const uint64_t header[4] = {plan.wire_bytes, plan.strings_in_batch, count, 1u};
 				std::fwrite(header, sizeof(header), 1, f);
 				std::fwrite(wire_ptr, 1, plan.wire_bytes, f);
 				std::fclose(f);
 			}
 		}
 	}
-	config->write_strings_in_batch(plan.strings_in_batch |
-	                               (fsst_compressed ? (uint32_t(1) << 31) : uint32_t(0)));
+	config->write_strings_in_batch(plan.strings_in_batch | (uint32_t(1) << 31));
 	g_csr_ns.fetch_add(NanosSince(t_handle), std::memory_order_relaxed);
 	g_config_ns.fetch_add(NanosSince(t_config), std::memory_order_relaxed);
 	CALI_MARK_END("config_setup");

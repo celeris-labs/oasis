@@ -103,8 +103,9 @@ One entry point:
 
 - **Table function** `regex_fpga_scan('tbl', regex_column := 'c', pattern := '...')` —
   `extension/src/regex_table.cpp`, ~1700 lines and the centre of gravity. It does its own
-  storage scan with projection and filter pushdown, so it replaces the table reference rather
-  than sitting above it.
+  storage scan with projection pushdown, so it replaces the table reference rather than sitting
+  above it. Filter pushdown is deliberately **off**: a pushed filter makes DuckDB fetch the other
+  columns through `FSSTStorage::Select`, which always decompresses, so filters run above the scan.
 
 Pattern → config blob: `NFA(pattern, REGEX_MAX_STATES, REGEX_MAX_TOKENS).dump_binary()`,
 zero-padded to `REGEX_CONFIG_BLOB_BYTES`. The NFA compiler is
@@ -181,6 +182,16 @@ Things worth knowing before editing it:
   `~RegexFpgaScanLocalState`.
 - **`RetainedChunk::staging_ref`** exists because one scanned chunk can span several submits;
   releasing it per-submit double-frees a chunk an outstanding transfer still reads from.
+- **Projected columns are pinned, not copied** (`RetainOutputColumns`). A retained chunk's
+  string columns keep pointing into storage; the chunk holds `BufferHandle` pins on the segment
+  the scan started in and the one it ended in, and an FSST vector stays compressed, so
+  `output_cache.Append` decompresses only matched rows. The pins prove nothing when the scan
+  crossed more than one segment boundary, or moved to another row group or to transaction-local
+  rows, so those chunks fall back to copying every string.
+- **Output chunks carry the row group's batch index** (`get_partition_data`). Without it any
+  order-preserving plan -- every `SELECT` that returns rows -- ran single-threaded. Batch
+  indices are not consecutive per thread, so `output_batch_marks` cut the cache wherever the
+  index changes and no emitted chunk mixes two.
 
 Batch geometry lives in `extension/src/include/regex_fpga_batch.hpp`: 16384 rows per batch
 (`REGEX_FPGA_MAX_ACCUM_COUNT`, lowered from 65536 once streaming cut the round trip from
@@ -205,9 +216,11 @@ threads. Only FSST 72 B was swept; plaintext is PCIe-bound anyway.
 Settings: `oasis_regex_dry_run` (run the whole host pipeline, skip the device — isolates
 scan+pack cost; results are wrong by construction), `oasis_regex_batch_rows`,
 `oasis_regex_wire_buffer_bytes`, `oasis_regex_outlier_bytes`, `oasis_regex_max_in_flight`,
-`oasis_regex_max_threads`, `oasis_regex_fsst_passthrough` (needs `SET GLOBAL
-enable_fsst_vectors = true`, refuses to project the regex column, and is switched off by any
-pushed-down filter).
+`oasis_regex_max_threads`, `oasis_regex_fsst_passthrough` (**on** by default; compression needs
+`SET GLOBAL enable_fsst_vectors = true`; projecting the regex column keeps it compressed until the
+card has matched). The card has no plaintext path: every transfer carries a symbol table, and rows
+not shipped compressed -- straddles, `enable_fsst_vectors` off, or the passthrough off -- ride an
+identity table. Turning the setting off never sends plaintext.
 
 Env switches, all read once per scan:
 
@@ -217,6 +230,7 @@ Env switches, all read once per scan:
 | `OASIS_REGEX_SIDE_BATCH` | on | `0`: straddle rows close the segment batch again |
 | `OASIS_REGEX_FAST_STAGE` | on | `0`: per-row staging loop only |
 | `OASIS_REGEX_CHUNK_RECYCLE` | on | `0`: no chunk pool or early release |
+| `OASIS_REGEX_LATE_MAT` | on | `0`: projected string columns are decompressed and copied for every scanned row again, instead of pinned and decompressed only where the card matched |
 | `OASIS_REGEX_DUMP_WIRE=<dir>` | off | dump each transfer as armed (`OASIS_REGEX_DUMP_WIRE_MAX`, default 4000), for celeris `06_regex --bench-replay DIR N W [PATTERN] [PLAIN_LEN]` |
 
 `regex_fpga_batch_phases()` / `regex_fpga_reset_phases()` accumulate per-phase time summed over
@@ -236,8 +250,8 @@ around their costs from the extension.
 
 ## Benchmark harness — `scripts/`
 
-`regex_report.py` produces the canonical numbers: five suites (`patterns`, `selectivity`,
-`length`, `threads`, `states`), each timed with DuckDB's `benchmark_runner` (warm-up plus N
+`regex_report.py` produces the canonical numbers: four suites (`patterns`, `selectivity`,
+`length`, `threads`), each timed with DuckDB's `benchmark_runner` (warm-up plus N
 timed runs, median), software and FPGA. Results land in `scripts/results/*.csv`. Run from the
 repo root:
 
@@ -252,6 +266,15 @@ generates a matching table at the right geometry automatically on the next run.
 
 `regex_bench.py` compares one `SIMILAR TO` query against its `regex_fpga_scan` rewrite;
 `regex_sweep.py` drives the parameter sweeps in `regex_cases.py`.
+
+`regex_mat_bench.py` is the materialisation question specifically: what the operator pays to
+*emit* rows rather than count them. One table (`m` in `/local/home/vifranz/regex_mat_fsst.duckdb`:
+the 72 B FSST substring data plus an id, a 28 B second string and precomputed match flags), six
+select lists from `count(*)` to whole rows, four selectivities set by pattern so the rows never
+change. Its `oracle` variant filters on the precomputed flag instead of matching, which is what
+DuckDB pays to produce that output once the answer is known, so
+`fpga count(*) + (oracle shape - oracle count)` is an upper bound for the accelerated query.
+(Do not write the 0% oracle as `WHERE false`: the optimiser folds it away and never scans.)
 
 ### Benchmark data: uncompressed by default, one local FSST twin
 
@@ -268,11 +291,34 @@ REGEX_GEN_DB=/local/home/vifranz/regex_gen_fsst.duckdb REGEX_GEN_COMPRESSION=fss
 ```
 
 `REGEX_GEN_COMPRESSION=fsst` is required: without it the script would regenerate the twin as
-plaintext, and it refuses rather than doing that. Under `--fsst` it verifies counts only, so
-"verification: 0/N agree, N not checked" is normal when every case says `ok (count only)`. A
-`--variant fpga` run skips verification entirely. `--exclude 'State explosion'` is there because
-that case's *software* side takes several minutes per run; FPGA-only (`--variant fpga`) is fast.
-The script does not record `OASIS_*` env vars in its CSV, so note them in the file name.
+plaintext, and it refuses rather than doing that. `--variant fpga` measures one side only, so
+its cases read "skipped: one variant measured" rather than being verified against software.
+`--exclude 'State explosion'` is there because that case's *software* side takes several
+minutes per run; FPGA-only (`--variant fpga`) is fast. The script does not record `OASIS_*`
+env vars in its CSV, so note them in the file name.
+
+**`--fsst` is verified twice, and the second check is the one that matters.**
+`check_fsst_storage()` reads `pragma_storage_info` *before* the run and aborts on a table that
+is not FSST. That only proves the passthrough *could* fire. Whether it *did* is a property of
+the run, so the verification pass — which already executes the FPGA query once — wraps it in
+`regex_fpga_reset_phases()` / `regex_fpga_batch_phases()` and records each case's row
+dispositions as the `fsst_*` CSV columns, ending with a summary line:
+
+```
+FSST passthrough: 6/6 case(s) shipped compressed rows to the card, 86.4-89.9% of rows compressed
+```
+
+The remainder of a healthy case is `rows_not_fsst`: the segment straddles DuckDB decompresses
+for us (~10%). A case that shipped **nothing** compressed is only an error when it could have —
+the column is FSST *and* its segments hold at least 2048 rows, since
+`ColumnData::GetVectorScanType` hands over an FSST vector only when a whole vector lies inside
+one segment. So the length sweep's tail is reported, not failed: par_1024 at 1188 rows/segment
+can never compress, and par_2048 is all outliers. A real failure names the disposition
+(`mode0` = the passthrough was off, `not_fsst` = the scan was handed flat vectors), prints
+"this row's FPGA number is a plaintext measurement", and exits non-zero.
+
+Because that check lives in the verification pass, `--fsst --no-verify` cannot tell a
+compressed run from a plaintext one and says so on stderr. Don't quote numbers from one.
 
 ### Row-group count is a real experimental variable — do not change row counts casually
 
@@ -289,9 +335,17 @@ groups. Keep it a multiple of `122880 * threads`. `regex_report.py`'s `check_par
 prints waves and utilisation before a run and warns below 90%.
 
 `customer` from TPC-H sf30 is fixed at 4.5 M rows = 37 row groups and cannot be brought to
-32, so the `states` and `threads` suites will always warn. That is expected, not a
-regression — but it does mean those two are not directly comparable to the synthetic suites
-at 32 threads.
+32, so any suite that scans it warns. That is expected, not a regression — but it does mean
+such a case is not directly comparable to the synthetic suites at 32 threads. The `queries`
+and `projection` suites are the remaining ones that do, since they read sf30 verbatim.
+
+**The `states` suite was removed on 2026-09-12.** `.*a.{n}` over `customer.c_comment` at
+n = 10/14/18/22/26 was supposed to show the FPGA staying flat while software's DFA blew up,
+but all five points sat at 16-17 GB/s on the host ceiling of that column (see "Why a case
+runs below ~25 GB/s"): c_comment compresses only 2.0x and straddles 17% of its rows, so it
+dry-runs at 18.4 GB/s and the array never got to be the variable. The patterns suite's
+"State explosion" case makes the same point at the state cap, on data that is not
+host-bound.
 
 ### Rough expectations on this box (32 logical cores, 16 physical, U55C)
 
@@ -303,6 +357,77 @@ the state cap costs the same as `.*a.{22}`. Software spans three orders of magni
 over the same patterns (16 GB/s where the optimiser rewrites `LIKE` to `contains()`, down to
 0.017 GB/s on a wide class with a long fixed tail). The interesting cases are where software
 has a specialised path and wins; the accelerator's case is the variance, not the peak.
+
+**Emitting rows costs more than counting them, and it is the output that costs, not the match.**
+On `m` (72 B FSST, 15.7 M rows, `scripts/regex_mat_bench.py`) `count(*)` is 43 ms / 26 GB/s at
+every selectivity, while projecting columns costs (ms, 10% / 100%): an 8 B key 55 / 53, the regex
+column itself 54 / 83, a second 28 B string 66 / 94, all three 77 / 145, whole rows to the client
+93 / 534. Software is 200-284 ms for all of those and 471 at 100% emit, so the speed-up runs
+2.8-4.3x at 10% and 1.5-1.8x at 100%, against 5x on `count(*)`. Two costs are structural: the
+projected column is scanned for every row (verdicts arrive after the scan, so DuckDB's own
+late materialisation is unavailable -- 15 ms of the 0% cost for one 28 B column), and the straddle
+side batch is off whenever a column is projected, worth ~8%.
+
+The `selectivity` suite says the same thing on its own data (`--fsst`, FPGA GB/s and speed-up at
+0 / 10 / 50 / 100%): count 26.1 (4.9x) / 25.9 (4.7x) / 22.9 (4.4x) / 25.7 (5.8x), `sum(strlen(c))`
+20.9 (4.0x) / 21.2 (4.0x) / 15.9 (3.1x) / 12.8 (2.6x), whole rows 21.6 (3.9x) / 19.2 (3.8x) /
+8.7 (2.1x) / 4.2 (1.27x); anchored count 26.0 / 25.6 / 25.1 / 25.5. `count(*)` is flat in
+selectivity, as it must be -- only the shapes that *emit* pay for it.
+
+**Those last two columns used to read 9.8 and 3.6, and that was the generator, not the
+operator.** `regex_gen.build` gives whichever side is the *majority* the 65536-string pool,
+so above 50% selectivity the bulk of the column switched from `make_nonmatch` filler (word
+text, FSST 3.2x) to `make_match` (regex expansion, so `.*` came out as random printable
+characters, FSST ~1.2x). sel_75/sel_100 therefore stored 5652 and 4726 rows per FSST segment
+against sel_0's 17515 -- and DuckDB hands the scan an FSST vector only when a whole 2048-row
+vector lies inside one segment, so 35-42% of the rows went through `duckdb_fsst_decompress`
+and onto the wire uncompressed. `splice_match`/`match_pool` (2026-09-12) build the match out
+of filler with a minimal match spliced in at a random position, which keeps one text shape at
+every selectivity; sel_75/sel_100/asel_75/asel_100 were regenerated in both the FSST twin and
+the canonical uncompressed set. Count at 75/100% went 11.4/9.8 -> 25.4/25.7, anchored
+11.6/9.5 -> 25.5/25.5. A residual asymmetry is left on purpose: the *minority* side is still
+one repeated string, so sel_25/sel_50 compress slightly better than sel_0 (20088 vs 17515
+rows/segment) and dip to ~23-24 GB/s.
+
+On the plaintext wire the same suite isolates the partition-data fix, before -> after: count
+11.92 -> 11.94 GB/s at 0% and 10.09 -> 9.97 at 100% (flat, as it must be), `sum(strlen(c))`
+7.87 -> 11.53 and 5.33 -> 6.97, whole rows 0.90 -> 11.53 and 0.32 -> 3.66.
+
+### Why a case runs below ~25 GB/s
+
+Measured 2026-09-12 with `regex_fpga_batch_phases()`, each case paired against its own
+`oasis_regex_dry_run`. Every deficit on the FSST wire is one of four things, and only the
+first was a bug:
+
+- **Segment straddle.** DuckDB hands the scan an FSST vector only when the whole 2048-row
+  vector lies inside one segment (`ColumnData::GetVectorScanType`); otherwise it decompresses
+  into a flat vector, which then travels uncompressed. So the compressed fraction is roughly
+  `1 - 2048/rows_per_segment`, and `rows_per_segment` is set by the 256 KB block -- DuckDB
+  refuses a larger one, so there is no knob. Read it with
+  `pragma_storage_info(tbl)` grouped on `compression`. sel_0 17515, customer c_comment 11084,
+  orders o_comment 15358, par_256 4632, par_512 2089, par_1024 1035. At par_512 and beyond a
+  2048-row vector's *compressed* form already exceeds the block, so no alignment exists and
+  the passthrough is off entirely (5% and 0% compressed): those two sit at the PCIe ceiling,
+  11.97 and 12.12 GB/s of *wire*, and are not improvable from the host.
+- **Host, not device.** Scan+stage costs ~33-35 ns/row nearly independent of string length,
+  so throughput falls with bytes/row. par_16 dry-runs at 5.4 GB/s against 5.0 end to end and
+  par_32 at 11.3 against 10.1 -- the card is free there and nothing device-side will help.
+  Real TPC-H comment columns land here too: orders o_comment averages 48.5 B/row and dry-runs
+  at 22.6 GB/s; customer c_comment is 72.5 B/row but compresses only 2.0x (against the
+  synthetic column's 3.2x) and straddles 17% of its rows, and dry-runs at 18.4 GB/s. The
+  That was the (now removed) `states` suite's 16-17 GB/s: the ceiling, not the array.
+  Sweeping the thread count on it (13/16/19/20/21/24/32 against windows 2-5) moves it by less
+  than run-to-run noise, so the 37-row-group wave story is *not* what capped it.
+- **Per-transfer cost.** A batch closes at every symbol-table change, i.e. at every segment
+  boundary, so `REGEX_FPGA_TARGET_WIRE_BYTES` is not the binding constraint on any real table:
+  measured wire per transfer is 159 KB (par_16) to 709 KB (par_1024) and sweeping the target
+  over 320 KB - 2560 KB changes the transfer count but not the wall (par_64 15.9 vs 15.0 ms,
+  par_128 22.2 vs 22.7). Do not retune it.
+- **Emitting rows.** The `materialise` and `emit` shapes, and the `projection` suite. See above.
+
+`par_2048` (4.8 GB/s) is none of these: at `oasis_regex_outlier_bytes` = 2048 every row is an
+outlier, so the whole table is matched on the host with RE2 and nothing reaches the card. That
+is the intended behaviour of the outlier path, not a deficit.
 
 ## TPC-H data
 

@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Run every benchmark behind the regex operator's report section, in one go.
 
-Five suites, each isolating one variable:
+Four suites, each isolating one variable:
 
-    patterns      pattern shape        (c_comment, sf30, selectivity pinned 9.7-12.4%)
+    patterns      pattern shape        (regex_gen, 15.7M x 72 B, selectivity pinned ~10%)
     selectivity   fraction matched     (regex_sel_rg128, 15.7M x 72 B, pattern fixed)
     length        string length        (regex_par32, 3.93M rows = 32 row groups, threads=32)
     threads       DuckDB thread count  (p_literal_class, 480 row groups so every T
                                        swept divides it, pattern fixed)
-    states        NFA/DFA blow-up      (c_comment, `.*a.{n}` -- n+2 NFA states, 2^n DFA states)
+
+A `states` suite (`.*a.{n}` over sf30 customer.c_comment, n+2 NFA states against 2^n DFA
+states) used to sit here and was removed on 2026-09-12.  It never measured NFA/DFA blow-up:
+c_comment dry-runs at 18.4 GB/s -- it compresses only 2.0x and 17% of its rows straddle an
+FSST segment -- so all five of its points sat on that host ceiling, 16-17 GB/s, and moved
+with neither n nor the thread count.  `.*a.{n}` at the state cap is already covered by the
+patterns suite's "State explosion" case, on data that is not host-bound.
 
 Every case is timed with DuckDB's benchmark_runner (one warm-up plus N timed runs,
 median reported), once as `software` and once as `fpga`.  The huge-page pool is reset
@@ -17,7 +23,7 @@ results and meaningless timings.
 
 Usage
     scripts/regex_report.py                     # everything
-    scripts/regex_report.py -s patterns -s states
+    scripts/regex_report.py -s patterns -s length
     scripts/regex_report.py --list
     scripts/regex_report.py --latex             # also print LaTeX tables
     scripts/regex_report.py --runs 7
@@ -105,7 +111,6 @@ SHAPES = {
     "floor":       "sum(hash(c))",
 }
 
-MB_C_COMMENT = 326.2
 # Regex-column text volumes at sf30, measured on the database itself:
 #   SELECT sum(strlen(o_comment)) FROM orders    -> 2,182,400,324 B over 45,000,000 rows
 #   SELECT sum(strlen(c_address)) FROM customer  ->   143,623,252 B over  4,500,000 rows
@@ -146,8 +151,18 @@ MB_SEL = SEL_ROWS * 72 / 1e6
 # thread count stays the only variable.  It lives in its own database: at 4.25 GB it has
 # no business inside the pattern set, and the two must not be confused for each other.
 # String lengths for the length suite; --lengths narrows it, which is what lets one
-# point be re-measured without paying for the 8 and 16 GB tables again.
-LENGTHS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+# point be re-measured without paying for the 8 and 16 GB tables again -- and widens it
+# again if the two dropped points below ever become measurable.
+#
+# 4096 and 8192 are NOT in the default sweep, because neither can be run as an FSST case:
+# DuckDB's FSSTStorage refuses a string of 4096 B or more and stores the segment
+# Uncompressed however force_compression is set (measured 2026-09-12 on par_4096), and
+# par_8192 does not exist in regex_par32 at all -- the 32 GB table was never built, having
+# been OOM-killed during generation.  check_fsst_storage aborts the *whole* run on one
+# unreadable or non-FSST table, so leaving them in cost every --fsst length run.
+# They remain reachable for a plaintext run with --lengths 4096 against a database that
+# holds them (REGEX_PAR_DB=/scratch/vifranz/regex_par32_uncompressed.duckdb).
+LENGTHS = (16, 32, 64, 128, 256, 512, 1024, 2048)
 
 # 480 = 2^5*3*5 is the smallest count exact at 15 of the 32 thread counts <= 32.
 # A wider box wants a different one -- 768 = 2^8*3 is exact at 1,2,3,4,6,8,12,16,
@@ -158,6 +173,12 @@ THREADS_T = [t for t in range(1, (os.cpu_count() or 32) + 1)
              if THREADS_ROW_GROUPS % t == 0]
 THREADS_PATTERN = replace(next(p for p in PATTERNS if p.label == "Literal + class"),
                           rows=THREADS_ROW_GROUPS * 122_880, db=THREADS_DB)
+
+
+# Column sentinel for a `queries` case whose SQL reads no string column at all, so there is
+# no storage for --fsst to check and no regex column to name.  Not "": an empty column would
+# read as "unset" and invite a caller to fill it in with something plausible.
+kNoRegexColumn = "-"
 
 
 @dataclass
@@ -279,7 +300,11 @@ def check_fsst_storage(cases, existing_only: bool = False) -> bool:
     loss of the benchmark set rather than prevent it.
     """
     ok = True
-    for db, table, column in sorted({(c.db, c.table, c.column) for c in cases}):
+    # A queries case whose SQL touches no string column has nothing to check -- see
+    # kNoRegexColumn.  Skipping it is not a gap in coverage: its sibling cases over the same
+    # database do carry a real column, so a plaintext database is still caught.
+    for db, table, column in sorted({(c.db, c.table, c.column) for c in cases
+                                     if c.column != kNoRegexColumn}):
         got = column_compression(db, table, column)
         if got is None:
             if existing_only:
@@ -475,11 +500,139 @@ def run_sql(root: Path, name: str, db: str, sql: str, settings, reset_pool: bool
     return r.stdout.strip(), ""
 
 
-# Set from --fsst.  The passthrough refuses to project the regex column, so the
-# checksum half of the verification query cannot be computed on the FPGA side and
-# verification degrades to comparing cardinality only.  Kept as module state rather
-# than threaded through verify_sql/verify_case, which are called from one place.
+# Was set from --fsst, back when the passthrough refused to project the regex column and
+# the checksum half of the verification query could not be computed on the FPGA side.  It
+# can now, so nothing sets this and every --fsst case is checked by count *and* checksum,
+# exactly like a plaintext one.  Left in only to check an old build by hand.
 VERIFY_COUNT_ONLY = False
+
+
+# --- did the passthrough actually fire? --------------------------------------------
+#
+# check_fsst_storage() proves only that the storage *could* let it: it reads
+# pragma_storage_info before the run.  Whether compressed bytes reached the card is a
+# property of the run, and it is invisible from timings -- a silent fall back to the
+# NOT_FSST path (regex_table.cpp) reports ordinary FPGA numbers under
+# fsst_passthrough=on, which is exactly the measurement that must never be written to a
+# CSV unlabelled.
+#
+# regex_fpga_batch_phases() counts each row's disposition, so the evidence is already
+# there; what was missing was reading it.  The verify pass executes the FPGA query once
+# anyway, so the probe rides along with it: reset the process-wide counters, run the
+# query, read the counters back.  No extra execution, and the numbers describe the same
+# query the timings describe.
+#
+# Both probe statements tag their row so the reader can strip them back out of the
+# compared answer.  Without that the reset function's own `true` row would land in the
+# text that is diffed against the software side and every --fsst case would MISMATCH.
+FSST_PROBE_TAG = "OASIS_FSST"
+FSST_NOISE_TAG = "OASIS_PROBE"
+FSST_RESET_SQL = f"SELECT '{FSST_NOISE_TAG}' AS tag, reset FROM regex_fpga_reset_phases();"
+FSST_PROBE_SQL = (f"SELECT '{FSST_PROBE_TAG}' AS tag, compressed_pct, rows_compressed, "
+                  f"rows_not_fsst, rows_mode0, rows_outlier "
+                  f"FROM regex_fpga_batch_phases();")
+FSST_EVIDENCE_COLS = ["fsst_passthrough_seen", "fsst_compressed_pct", "fsst_rows_compressed",
+                      "fsst_rows_not_fsst", "fsst_rows_mode0", "fsst_rows_outlier"]
+
+
+def with_fsst_probe(sql: str) -> str:
+    """Wrap one FPGA verification query so the row dispositions come back with it."""
+    return "\n".join([FSST_RESET_SQL, sql.rstrip().rstrip(";") + ";", FSST_PROBE_SQL])
+
+
+def split_fsst_probe(text: str):
+    """Pull the tagged probe row out of a result; returns (answer_text, counters | None).
+
+    Returns the answer with *both* tags removed, so what is compared against the software
+    side is the query's own output and nothing else.
+    """
+    kept, ev = [], None
+    for line in text.splitlines():
+        if line.startswith(FSST_NOISE_TAG + "|"):
+            continue
+        if line.startswith(FSST_PROBE_TAG + "|"):
+            parts = [x.strip() for x in line.split("|")]
+            if len(parts) == 6:
+                try:
+                    ev = {"pct": float(parts[1]), "compressed": int(parts[2]),
+                          "not_fsst": int(parts[3]), "mode0": int(parts[4]),
+                          "outlier": int(parts[5])}
+                except ValueError:
+                    ev = None
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip(), ev
+
+
+def max_rows_per_segment(db: str, table: str, column: str, _cache={}) -> int | None:
+    """Rows in the largest ColumnSegment of `table.column`, or None if unreadable.
+
+    This is the other half of passthrough eligibility, and FSST storage alone does not
+    imply it.  ColumnData::GetVectorScanType hands the scan an FSST vector only when a
+    whole 2048-row vector lies inside one segment, and how many rows a segment holds is
+    set by the 256 KB block.  The *largest* segment is the right one to ask about: it is
+    a necessary condition, so a column whose biggest segment is still short cannot ever
+    hand over a compressed vector.  Measured 2026-09-12 on regex_par32_fsst, both stored
+    FSST: par_512 peaks at 2520 rows per segment and does compress some vectors (5.2%),
+    par_1024 peaks at 1188 and compresses none.  Without this, "stored FSST but nothing
+    compressed" would flag the tail of the length sweep as broken every run -- which is
+    how a check teaches its reader to ignore it.
+    """
+    key = (db, table, column)
+    if key not in _cache:
+        sql = (f"SELECT max(count) FROM pragma_storage_info('{table}') "
+               f"WHERE column_name='{column}' AND compression <> 'Constant';")
+        r = sh(f"{DUCKDB} '{db}' -readonly -noheader -list -c {shlex.quote(sql)}")
+        try:
+            _cache[key] = int(r.stdout.strip())
+        except ValueError:
+            return None          # missing or unreadable; never cached
+    return _cache[key]
+
+
+# ColumnData::GetVectorScanType's threshold: a whole DuckDB vector must fit in one segment.
+FSST_VECTOR_ROWS = 2048
+
+
+def fsst_disposition(c: Case, ev) -> tuple[str, bool]:
+    """Read the counters as a verdict; returns (verdict, is_error).
+
+    An error is reserved for the measurement that is genuinely broken: no row reached the
+    card compressed although this case *could* have compressed -- the column is stored
+    FSST and its segments are big enough for an aligned vector.  That is the silent
+    fall-back --fsst exists to catch, and it is indistinguishable from a good run by
+    timing alone.
+
+    The two shapes that legitimately ship nothing compressed are not errors and must not
+    be reported as such: the tail of the length sweep, where segments hold fewer than
+    2048 rows so no vector can ever be handed over compressed (see max_rows_per_segment),
+    and par_2048, where every string is past oasis_regex_outlier_bytes and is matched on
+    the host by RE2 instead.
+    """
+    if ev is None:
+        return "not probed", False
+    total = ev["compressed"] + ev["not_fsst"] + ev["mode0"] + ev["outlier"]
+    if total == 0:
+        # A queries case whose FPGA side never reaches the operator (kNoRegexColumn).
+        return "not probed (no rows)", False
+    if ev["compressed"]:
+        return f"{ev['pct']:.1f}% compressed", False
+    why = max(("not_fsst", ev["not_fsst"]), ("mode0", ev["mode0"]),
+              ("outlier", ev["outlier"]), key=lambda kv: kv[1])[0]
+    if why == "outlier":
+        return "none: every row an outlier, matched on the host by RE2", False
+    if c.column == kNoRegexColumn:
+        return f"none: {why}", False
+    stored = column_compression(c.db, c.table, c.column)
+    rows_per_seg = max_rows_per_segment(c.db, c.table, c.column)
+    if stored is None or "FSST" not in stored:
+        return f"none: {why} -- not stored FSST", False
+    if rows_per_seg is not None and rows_per_seg < FSST_VECTOR_ROWS:
+        return (f"none: {why} -- {rows_per_seg} rows/segment, too few for an aligned "
+                f"{FSST_VECTOR_ROWS}-row vector"), False
+    reason = ("the scan was handed flat vectors" if why == "not_fsst"
+              else "the passthrough was off for every vector")
+    return f"none: {why} -- {reason}", True
 
 
 def verify_sql(c: Case, variant: str) -> str | None:
@@ -498,11 +651,8 @@ def verify_sql(c: Case, variant: str) -> str | None:
     if c.suite == "queries":
         f = c.sql_software if variant == "software" else c.sql_fpga
         return Path(f).read_text().strip() if f else None
-    # sum(hash(c)) projects the regex column, which regex_fpga_scan rejects under
-    # oasis_regex_fsst_passthrough ("cannot also project the regex column yet").  Asking
-    # for it anyway makes every case report `error (fpga)` and leaves the run with no
-    # correctness check at all, so fall back to cardinality -- weaker, but it is what
-    # caught the lost-result-beat undercount, which was a multiple of 512 rows.
+    # VERIFY_COUNT_ONLY is left in for checking an old build, which refused to project the
+    # regex column under oasis_regex_fsst_passthrough; nothing sets it any more.
     agg = "count(*)" if VERIFY_COUNT_ONLY else f"count(*), sum(hash({c.column}))"
     if variant == "software":
         return f"SELECT {agg} FROM {c.table} WHERE {sw_predicate(c)};"
@@ -510,13 +660,19 @@ def verify_sql(c: Case, variant: str) -> str | None:
             f"regex_column := '{c.column}', pattern := '{c.pattern}');")
 
 
-def verify_case(root: Path, name: str, c: Case, built: dict, rec: dict) -> None:
+def verify_case(root: Path, name: str, c: Case, built: dict, rec: dict,
+                fsst: bool = False) -> None:
     """Run both sides once more and compare their answers; annotates `rec` in place.
 
     Writes `verify` (ok / MISMATCH / a reason it could not run) plus each side's row
     count and checksum, so a disagreement is legible in the CSV rather than only in
     the console.  A mismatch does not abort the run: the remaining cases still carry
     information about how far the disagreement spreads.
+
+    Under --fsst the FPGA side also carries the row-disposition probe, so the same pass
+    records whether the compressed passthrough fired.  That is deliberately bound to the
+    verification and not to the timed runs: benchmark_runner throws query results away,
+    and a counter read after it could not be attributed to a particular case.
     """
     out = {}
     for variant, settings in built.items():
@@ -527,11 +683,24 @@ def verify_case(root: Path, name: str, c: Case, built: dict, rec: dict) -> None:
             rec["verify"] = ("skipped: regex-free baseline, no FPGA twin"
                              if c.shape == "floor" else f"skipped: no {variant} counterpart")
             return
-        text, err = run_sql(root, f"{name}_{variant}", c.db, sql, settings,
+        probed = fsst and variant == "fpga"
+        text, err = run_sql(root, f"{name}_{variant}", c.db,
+                            with_fsst_probe(sql) if probed else sql, settings,
                             reset_pool=(variant == "fpga"))
         if err:
             rec["verify"] = f"error ({variant}): {err}"
             return
+        if probed:
+            text, ev = split_fsst_probe(text)
+            verdict, bad = fsst_disposition(c, ev)
+            rec["fsst_passthrough_seen"] = verdict
+            rec["fsst_passthrough_error"] = bad
+            if ev is not None:
+                rec["fsst_compressed_pct"] = round(ev["pct"], 2)
+                rec["fsst_rows_compressed"] = ev["compressed"]
+                rec["fsst_rows_not_fsst"] = ev["not_fsst"]
+                rec["fsst_rows_mode0"] = ev["mode0"]
+                rec["fsst_rows_outlier"] = ev["outlier"]
         out[variant] = text
         if c.suite != "queries":
             parts = text.split("|")
@@ -554,7 +723,6 @@ def verify_case(root: Path, name: str, c: Case, built: dict, rec: dict) -> None:
 
 def build_cases(shapes=("count", "materialise", "emit")) -> list[Case]:
     cs: list[Case] = []
-    C = dict(db=SF30, table="customer", column="c_comment", mb=MB_C_COMMENT)
 
     # -- patterns -----------------------------------------------------------
     # Sourced from regex_patterns.PATTERNS -- edit that file, not this one.  Any
@@ -564,11 +732,6 @@ def build_cases(shapes=("count", "materialise", "emit")) -> list[Case]:
                        db=pat.db or GEN_DB, table=pat.table_name(),
                        column=pat.column, mb=pat.rows * pat.length / 1e6,
                        like=pat.like, note=pat.note))
-
-    # -- states: DFA blow-up.  `.*a.{n}` costs n+2 NFA states, 2^n DFA states.
-    # n=26 is the current ceiling: n+2=28 states, the hardware's current budget.
-    for n in (10, 14, 18, 22, 26):
-        cs.append(Case("states", f"n={n}", f".*a.{{{n}}}", note=f"2^{n} DFA states", **C))
 
     # -- threads ------------------------------------------------------------
     # THREADS_T, not range(1, 33): every count in it divides the table's 480 row groups,
@@ -593,12 +756,18 @@ def build_cases(shapes=("count", "materialise", "emit")) -> list[Case]:
     # q13 appears twice against the SAME FPGA file: the accelerator does not care
     # whether the software twin was written as LIKE or SIMILAR TO, so one FPGA
     # measurement is the counterpart to both.
+    # The table/column on each row is the regex column the query actually matches, not a
+    # predicate this suite builds -- the SQL comes from the files verbatim.  It is here so
+    # --fsst can check that column's storage like any other case, and so check_parallelism
+    # can report the scan's waves.  kNoRegexColumn marks a query with no string column at
+    # all (q29b aggregates partsupp, q13 cheap filters on o_orderkey % 97); those are
+    # skipped by both checks rather than pointed at a column they never read.
     Q = Path(__file__).resolve().parent.parent / "tcph_regex"
-    for label, sw, fp, mb in (
-            ("q13 (LIKE)",       "queries_software/q13.sql",         "queries_fpga/q13.sql", MB_O_COMMENT),
-            ("q13 (SIMILAR TO)", "queries_software/q13_similar.sql", "queries_fpga/q13.sql", MB_O_COMMENT),
-            ("q27",              "queries_software/q27.sql",         "queries_fpga/q27.sql", MB_C_ADDRESS),
-            ("q29",              "queries_software/q29.sql",         "queries_fpga/q29.sql", MB_O_COMMENT),
+    for label, sw, fp, mb, tbl, col in (
+            ("q13 (LIKE)",       "queries_software/q13.sql",         "queries_fpga/q13.sql", MB_O_COMMENT, "orders", "o_comment"),
+            ("q13 (SIMILAR TO)", "queries_software/q13_similar.sql", "queries_fpga/q13.sql", MB_O_COMMENT, "orders", "o_comment"),
+            ("q27",              "queries_software/q27.sql",         "queries_fpga/q27.sql", MB_C_ADDRESS, "customer", "c_address"),
+            ("q29",              "queries_software/q29.sql",         "queries_fpga/q29.sql", MB_O_COMMENT, "orders", "o_comment"),
             # Sub-claims from section 5.4.5 that had no reproducible source.  Each pairs a
             # software file with an FPGA file so both plan shapes are timed the same way.
             #   q29a / q29b   the two halves of the UNION ALL run alone (254 ms + 145 ms
@@ -608,12 +777,12 @@ def build_cases(shapes=("count", "materialise", "emit")) -> list[Case]:
             #                 same plan, no matching.  Software only.
             #   q13 cheap     the same cheap predicate in both plan shapes, no regex on
             #                 either side, isolating filter-pushdown vs NOT IN anti-join.
-            ("q29a (regex half)",  "queries_software/q29a.sql", "queries_fpga/q29a.sql", MB_O_COMMENT),
-            ("q29b (other half)",  "queries_software/q29b.sql", "queries_fpga/q29b.sql", 0.0),
-            ("q13 floor (strlen)", "queries_software/q13_floor.sql", None, MB_O_COMMENT),
-            ("q13 cheap predicate","queries_software/q13_cheap.sql", "queries_fpga/q13_cheap.sql", MB_O_COMMENT)):
+            ("q29a (regex half)",  "queries_software/q29a.sql", "queries_fpga/q29a.sql", MB_O_COMMENT, "orders", "o_comment"),
+            ("q29b (other half)",  "queries_software/q29b.sql", "queries_fpga/q29b.sql", 0.0, "partsupp", kNoRegexColumn),
+            ("q13 floor (strlen)", "queries_software/q13_floor.sql", None, MB_O_COMMENT, "orders", "o_comment"),
+            ("q13 cheap predicate","queries_software/q13_cheap.sql", "queries_fpga/q13_cheap.sql", MB_O_COMMENT, "orders", kNoRegexColumn)):
         cs.append(Case("queries", label, "(see query file)", db=SF30,
-                       table="tpch_sf30", column="-", mb=mb,
+                       table=tbl, column=col, mb=mb,
                        sql_software=str(Q / sw) if sw else None,
                        # None means "no counterpart": q13 floor is a software-only
                        # baseline, so the FPGA column is left empty rather than filled
@@ -662,24 +831,26 @@ def build_cases(shapes=("count", "materialise", "emit")) -> list[Case]:
     # and it keeps the task count identical at every length so length stays the only
     # variable.
     PAR_ROWS = 3_932_160
-    # Runs to 8192, which is the cliff rather than a data point.
+    # Runs to 2048, which is the cliff rather than a data point.
     #
     # Strings at or above kRegexOutlierBytes are matched on the host by RE2 and never
     # reach the card -- MatchOutlierOnHost in regex_table.cpp, the check is per string
     # and unconditional -- so a table whose strings are *all* that long puts nothing on
-    # the FPGA and reports RE2 against RE2 as an FPGA result.  That constant is 8192
-    # (it was 2048 when this suite stopped at 1024, which is why it did), and
-    # regex_is_outlier tests `>=`, so 8192 is exactly the first length that submits
-    # nothing.  It is kept in the sweep as a labelled control: the point of measuring it
-    # is to show the cliff and to have the batch counters prove it, not to report its
-    # "FPGA" throughput as a device result.
+    # the FPGA and reports RE2 against RE2 as an FPGA result.  That constant is 2048
+    # (oasis_extension.cpp, "default 2 KiB"; this comment claimed 8192 until 2026-09-12
+    # and was simply wrong), and regex_is_outlier tests `>=`, so 2048 is exactly the
+    # first length that submits nothing: measured on par_2048, rows_outlier is all
+    # 3,932,160 rows and batches is 0.  It is kept in the sweep as a labelled control --
+    # the point of measuring it is to show the cliff and to have the batch counters prove
+    # it, not to report its "FPGA" throughput as a device result.  To put 2048 B strings
+    # on the device instead, raise the threshold with --outlier-bytes 4096.
     #
     # Confirm rather than assume, because the failure is silent -- a case at or above the
     # threshold shows batches = 0 and strings = 0 in regex_fpga_batch_phases().
     #
-    # The row count is held at 32 full row groups, so volume grows with length: 8192 B is
-    # 32.2 GB against ~46 GB of RAM once the huge-page pool is subtracted, and the tables
-    # live on NFS, so the runner's warm-up pass is doing a real cold read at that size.
+    # The row count is held at 32 full row groups, so volume grows with length: 2048 B is
+    # 8.1 GB, and the canonical tables live on NFS, so the runner's warm-up pass is doing
+    # a real cold read at that size unless REGEX_PAR_DB points at a local copy.
     for L in LENGTHS:
         for shape in shapes:
             if shape in ("materialise", "emit"):
@@ -726,7 +897,9 @@ def main() -> int:
                          "6.27 at 32 on a 32-core box, so the default costs ~1.2x. Applied "
                          "to both variants so the comparison stays fair.")
     ap.add_argument("--lengths", help="comma-separated subset of the length suite, "
-                                     "e.g. --lengths 8192")
+                                     "e.g. --lengths 2048. 4096 and 8192 are not in the default "
+                                     "sweep: neither can be stored FSST, so an --fsst "
+                                     "run aborts on them")
     ap.add_argument("--thread-list", help="comma-separated subset of the threads suite, "
                                          "e.g. --thread-list 32")
     ap.add_argument("--in-flight", type=int, default=None,
@@ -742,9 +915,13 @@ def main() -> int:
                          "REGEX_GEN_DB at the result; this flag only sets the session settings "
                          "and does not choose a database, so the storage is checked before the "
                          "run and a plaintext table aborts it rather than reporting ordinary "
-                         "FPGA numbers under fsst_passthrough=on. Forces the count shape: the "
-                         "passthrough refuses to project the regex column, so materialise and "
-                         "emit would abort the run.")
+                         "FPGA numbers under fsst_passthrough=on. All shapes work: a projected "
+                         "regex column stays compressed until its rows match. Storage is only "
+                         "half the check: the verification pass also reads each case's row "
+                         "dispositions out of regex_fpga_batch_phases(), records them as the "
+                         "fsst_* columns, and fails the run if a case stored FSST still sent "
+                         "nothing compressed. Pair with --no-verify only when you do not intend "
+                         "to quote the numbers.")
     ap.add_argument("--outlier-bytes", type=int, default=None,
                     help="SET oasis_regex_outlier_bytes on every case. Strings at or above "
                          "the threshold are matched on the host by RE2 and never reach the "
@@ -778,7 +955,10 @@ def main() -> int:
                          "order-independent checksum, so the right number of wrong rows is "
                          "caught too. The queries suite compares whole result sets instead. "
                          "Costs one extra execution per side (~7%% on top of 15 timed runs) "
-                         "and makes the run exit non-zero if any case disagrees.")
+                         "and makes the run exit non-zero if any case disagrees. Under --fsst "
+                         "this pass is also what proves the compressed passthrough fired, so "
+                         "skipping it leaves an --fsst run unable to tell a compressed "
+                         "measurement from a plaintext one.")
     ap.add_argument("--exclude", action="append", default=[],
                     help="drop cases whose label matches (case-insensitive, repeatable). "
                          "Use to skip a case that is slow and not under study, "
@@ -802,19 +982,12 @@ def main() -> int:
     if bad:
         print(f"error: unknown shape(s) {bad}; known: {list(SHAPES)}", file=sys.stderr)
         return 2
-    if a.fsst:
-        # Not a preference: regex_fpga_scan throws on a projected regex column under the
-        # passthrough, so materialise/emit would fail every case rather than measure one.
-        shapes = tuple(x for x in shapes if x == "count") or ("count",)
-        # Same restriction applies to the verification query's checksum.
-        global VERIFY_COUNT_ONLY
-        VERIFY_COUNT_ONLY = True
     cases = build_cases(shapes)
     # "queries" is deliberately not in the default set: it is the only suite that runs
     # whole TPC-H queries rather than a single predicate, it needs the 24 GB sf30
     # database, and it takes far longer per case than the micro-benchmarks.  Ask for it
     # explicitly with -s queries.
-    suites = a.suite or ["patterns", "states", "threads", "selectivity", "length"]
+    suites = a.suite or ["patterns", "threads", "selectivity", "length"]
     cases = [c for c in cases if c.suite in suites]
 
     if a.exclude:
@@ -931,6 +1104,11 @@ def main() -> int:
                 # ordinary scan, decompressing on the host as it always has.
                 case_settings.insert(0, "SET oasis_regex_fsst_passthrough = true")
                 case_settings.insert(0, "SET GLOBAL enable_fsst_vectors = true")
+            elif variant == "fpga":
+                # The passthrough is on by default now. Pin it off so a run without --fsst stays
+                # the uncompressed measurement its fsst_passthrough=off column says it is -- every
+                # row on the identity table, since the card no longer takes plaintext.
+                case_settings.insert(0, "SET oasis_regex_fsst_passthrough = false")
             if a.outlier_bytes is not None and variant == "fpga":
                 case_settings.insert(0, f"SET oasis_regex_outlier_bytes = {a.outlier_bytes}")
             if a.in_flight is not None and variant == "fpga":
@@ -968,7 +1146,7 @@ def main() -> int:
         if a.verify and built:
             cname = f"{c.suite}_{c.label}".replace("%", "pct").replace(" ", "_")
             cname = "".join(ch for ch in cname if ch.isalnum() or ch in "_-").lower()
-            verify_case(TREE, cname, c, built, rec)
+            verify_case(TREE, cname, c, built, rec, fsst=a.fsst)
         rows.append(rec)
         verdict = rec.get("verify", "")
         print(f"  {c.suite:<12}{c.label:<22}"
@@ -980,6 +1158,11 @@ def main() -> int:
                   f"sw {rec.get('software_rows')} rows / check {rec.get('software_check')}, "
                   f"fpga {rec.get('fpga_rows')} rows / check {rec.get('fpga_check')}",
                   flush=True)
+        if rec.get("fsst_passthrough_error"):
+            print(f"  ! {c.suite:<12}{c.label:<22}--fsst: nothing reached the card "
+                  f"compressed ({rec['fsst_passthrough_seen']}) although "
+                  f"{c.table}.{c.column} is stored FSST -- this row's FPGA number is a "
+                  f"plaintext measurement", flush=True)
 
     RESULTS.mkdir(exist_ok=True)
     out = Path(a.csv) if a.csv else RESULTS / f"regex_report_{time.strftime('%Y%m%d_%H%M%S')}.csv"
@@ -994,7 +1177,8 @@ def main() -> int:
              "fpga_min_ms", "fpga_max_ms", "fpga_sd_ms", "fpga_error",
              "speedup", "note",
              "verify", "software_rows", "fpga_rows",
-             "software_check", "fpga_check"] + cfg_cols)
+             "software_check", "fpga_check"]
+            + (FSST_EVIDENCE_COLS if a.fsst else []) + cfg_cols)
     with out.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
@@ -1028,6 +1212,37 @@ def main() -> int:
         for r in skipped:
             print(f"  - {r['suite']:<12}{r['label']:<22}{r['verify']}")
 
+    # The --fsst counterpart of the verification summary.  Storage was checked before the
+    # run; this is what the run itself did, and it is the line to read before quoting any
+    # number from a compressed sweep.
+    fsst_bad = []
+    if a.fsst:
+        seen = [r for r in rows if r.get("fsst_passthrough_seen")]
+        fsst_bad = [r for r in seen if r.get("fsst_passthrough_error")]
+        fired = [r for r in seen if r.get("fsst_rows_compressed")]
+        if seen:
+            pcts = sorted(r["fsst_compressed_pct"] for r in fired)
+            span = (f", {pcts[0]:.1f}-{pcts[-1]:.1f}% of rows compressed"
+                    if pcts else "")
+            print(f"\nFSST passthrough: {len(fired)}/{len(seen)} case(s) shipped "
+                  f"compressed rows to the card{span}"
+                  + (f", {len(fsst_bad)} BROKEN" if fsst_bad else ""))
+            for r in fsst_bad:
+                print(f"  ! {r['suite']:<12}{r['label']:<22}{r['fsst_passthrough_seen']}"
+                      f"  (not_fsst {r.get('fsst_rows_not_fsst')}, "
+                      f"mode0 {r.get('fsst_rows_mode0')}, "
+                      f"outlier {r.get('fsst_rows_outlier')})")
+            for r in seen:
+                if r in fsst_bad or r in fired:
+                    continue
+                print(f"  - {r['suite']:<12}{r['label']:<22}{r['fsst_passthrough_seen']}")
+        elif a.verify:
+            print("\n! --fsst: no case reported its row dispositions; the passthrough was "
+                  "never confirmed to fire", file=sys.stderr)
+        else:
+            print("\n! --fsst with --no-verify: nothing confirms the passthrough fired; "
+                  "these FPGA numbers may be plaintext measurements", file=sys.stderr)
+
     if a.latex:
         for s in suites:
             sub = [r for r in rows if r["suite"] == s and r.get("speedup")]
@@ -1043,7 +1258,7 @@ def main() -> int:
                       f"& {r_['speedup']:.2f}$\\times$ \\\\")
             print(r"\bottomrule")
             print(r"\end{tabular}")
-    return 1 if bad else 0
+    return 1 if bad or fsst_bad else 0
 
 
 if __name__ == "__main__":

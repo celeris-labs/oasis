@@ -9,6 +9,7 @@
 #include "duckdb/common/fsst.hpp"
 #include "duckdb/common/vector/fsst_vector.hpp"
 #include "duckdb/common/vector_size.hpp"
+#include "duckdb/execution/partition_info.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -101,9 +102,6 @@ static LogicalType GetScanColumnType(const DuckTableEntry &table, const ColumnIn
 	}
 	return table.GetColumns().GetColumn(column_index.ToLogical()).Type();
 }
-
-static unique_ptr<TableFilterSet> BuildScanFilterSet(const TableFunctionInitInput &input,
-                                                     const vector<LogicalType> &scan_types);
 
 static void StartNewStagedBatch(RegexFpgaScanLocalState &lstate, celeris::CelerisContext &ctx);
 
@@ -434,33 +432,21 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	    !setting_value.IsNull()) {
 		lstate->fsst_passthrough = BooleanValue::Get(setting_value);
 	}
-	if (lstate->fsst_passthrough) {
-		// enable_fsst_vectors is what makes DuckDB hand back an FSST_VECTOR at all, and it is
-		// GLOBAL_ONLY so this extension cannot turn it on for the user. Without it every vector
-		// arrives flattened, the passthrough silently never fires, and the only visible effect is
-		// that filter pushdown was disabled below -- a pure regression that looks like nothing.
-		Value fsst_vectors;
-		const bool enabled = context.client.TryGetCurrentSetting("enable_fsst_vectors", fsst_vectors) &&
-		                     !fsst_vectors.IsNull() && BooleanValue::Get(fsst_vectors);
-		if (!enabled) {
-			throw InvalidInputException(
-			    "regex_fpga_scan: oasis_regex_fsst_passthrough requires enable_fsst_vectors=true, "
-			    "otherwise every vector arrives decompressed and the passthrough never fires. "
-			    "Run SET GLOBAL enable_fsst_vectors=true, or unset oasis_regex_fsst_passthrough.");
-		}
-		// The regex column is read as compressed bytes and consumed in place. Emitting it too
-		// would need it materialized as plaintext, which is the late-materialization follow-up;
-		// refuse rather than quietly fall back, so a projection does not read as "passthrough on"
-		// while silently shipping plaintext.
-		for (const auto scan_idx : lstate->output_column_map) {
-			if (scan_idx == lstate->scanned_regex_column_idx) {
-				throw InvalidInputException(
-				    "regex_fpga_scan: oasis_regex_fsst_passthrough cannot also project the regex "
-				    "column %s yet -- select other columns, or count(*).",
-				    bind_data.regex_column.c_str());
-			}
-		}
+	// No error when enable_fsst_vectors is off, although the passthrough is on by default. That
+	// setting is GLOBAL_ONLY and defaults to false, so erroring would break every default query.
+	// Without it every vector arrives flattened and every row rides the identity table: correct,
+	// just uncompressed, and compressed_pct in regex_fpga_batch_phases() reads 0.
+	//
+	// Projecting the regex column is fine: RetainOutputColumns keeps its FSST vector compressed,
+	// staging reads the compressed bytes, and AppendMatchedRows decompresses only matched rows.
+	if (const char *late_env = std::getenv("OASIS_REGEX_LATE_MAT")) {
+		lstate->late_materialize = late_env[0] != '0';
 	}
+	// A constant empty string, appended in place of a compressed column whose matched rows are
+	// decompressed into the output cache afterwards. See AppendMatchedRows.
+	lstate->empty_string_placeholder.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(lstate->empty_string_placeholder, false);
+	ConstantVector::GetData<string_t>(lstate->empty_string_placeholder)[0] = string_t(nullptr, 0);
 	if (context.client.TryGetCurrentSetting("oasis_regex_max_in_flight", setting_value) && !setting_value.IsNull()) {
 		const auto depth = setting_value.GetValue<uint64_t>();
 		if (depth > 0) {
@@ -481,6 +467,13 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	// Straddle side batch, on by default; OASIS_REGEX_SIDE_BATCH=0 restores one open batch.
 	if (const char *side_env = std::getenv("OASIS_REGEX_SIDE_BATCH")) {
 		lstate->side_batching = side_env[0] != '0';
+	}
+	// The side batch submits straddle rows after segment rows scanned later, so projected rows
+	// would come out of scan order -- wrong under preserve_insertion_order, and a batch index that
+	// goes backwards. Only a count, whose rows carry nothing, may keep it.
+	//
+	if (!lstate->output_column_map.empty()) {
+		lstate->side_batching = false;
 	}
 	if (const char *fast_env = std::getenv("OASIS_REGEX_FAST_STAGE")) {
 		lstate->fast_staging = fast_env[0] != '0';
@@ -507,25 +500,10 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 		lstate->segment_accum_count = MaxValue<idx_t>(lstate->max_accum_count, idx_t(segment_rows));
 	}
 	auto &storage = bind_data.table.GetStorage();
-	// Push scan filters (e.g. c_nationkey = 7) into the storage scan so the FPGA only sees surviving rows.
-	//
-	// These cannot be dropped: the function sets filter_pushdown, so DuckDB removes the filter
-	// from the plan and the storage scan is the only thing still applying it. A filtered read is
-	// also incompatible with the FSST passthrough -- it routes through ColumnSegment::Select ->
-	// FSSTStorage::Select, which asserts FLAT_VECTOR and calls DecompressString unconditionally,
-	// with no enable_fsst_vectors branch on this tree or on DuckDB main -- so the two features
-	// cannot both apply to one scan.
-	//
-	// Filters win, because they are the side that cannot be given up without returning wrong
-	// rows. The passthrough is switched off for this scan instead, which costs throughput and
-	// nothing else; compressed_pct in regex_fpga_batch_phases() reads 0 when this fires.
-	lstate->scan_filter_set = BuildScanFilterSet(input, lstate->scanned_types);
-	const bool has_filters = lstate->scan_filter_set || (input.filters && input.filters->HasFilters());
-	if (lstate->fsst_passthrough && has_filters) {
-		lstate->fsst_passthrough = false;
-	}
-	lstate->scan_state.Initialize(scan_storage_ids, context.client,
-	                              lstate->scan_filter_set ? lstate->scan_filter_set.get() : input.filters.get());
+	// No table filters: filter_pushdown is off (see RegisterRegexFpgaScanFunction), so DuckDB
+	// applies them above the scan and never hands any to this one.
+	D_ASSERT(!input.filters || !input.filters->HasFilters());
+	lstate->scan_state.Initialize(scan_storage_ids, context.client, nullptr);
 	// segment_accum_count, not max_accum_count: a batch on a real FSST table may stage that many.
 	lstate->output_cache.Initialize(context.client, lstate->output_types, lstate->segment_accum_count);
 	lstate->batch_row_refs.reserve(lstate->segment_accum_count);
@@ -542,19 +520,92 @@ unique_ptr<LocalTableFunctionState> RegexFpgaScanInitLocal(ExecutionContext &con
 	return std::move(lstate);
 }
 
-// Makes the columns listed in @p column_ids self-contained so the chunk can outlive the scan that
-// produced it: flattens dictionary/constant vectors (which otherwise share a selection buffer that
-// later scans overwrite) and copies non-inlined strings into the vector's own string buffer
-// (VARCHAR payloads otherwise point into storage blocks pinned only until the next Scan()).
-// Only these columns need it — the regex column is read through ToUnifiedFormat and consumed
-// immediately, so it stays untouched unless it is also emitted.
-static void MaterializeRetainedColumns(DataChunk &chunk, const vector<idx_t> &column_ids) {
-	for (const auto col_idx : column_ids) {
+// The storage scan state that produced the chunk just scanned: the committed table, or the
+// transaction-local rows once the committed ones are exhausted. Mirrors DataTable::Scan.
+static CollectionScanState &ActiveCollectionScan(RegexFpgaScanLocalState &lstate) {
+	auto &scan = lstate.scan_state;
+	return scan.table_state.row_group ? scan.table_state : scan.local_state;
+}
+
+// Same rule as DuckDB's TableScanGetPartitionData.
+static idx_t ScanBatchIndex(const RegexFpgaScanLocalState &lstate) {
+	const auto &scan = lstate.scan_state;
+	if (scan.table_state.row_group) {
+		return scan.table_state.batch_index;
+	}
+	if (scan.local_state.row_group) {
+		return scan.table_state.batch_index + scan.local_state.batch_index;
+	}
+	return 0;
+}
+
+// Records, per retained output string column, which segment the storage scan is positioned in,
+// so RetainOutputColumns can tell which blocks the next chunk's strings can point into.
+static void NoteSegmentsBeforeScan(RegexFpgaScanLocalState &lstate) {
+	if (!lstate.late_materialize || lstate.output_column_map.empty()) {
+		return;
+	}
+	auto &active = ActiveCollectionScan(lstate);
+	lstate.scan_state_before_scan = &active;
+	lstate.row_group_before_scan = active.row_group;
+	lstate.segment_before_scan.assign(lstate.scanned_types.size(), nullptr);
+	for (const auto col_idx : lstate.output_column_map) {
+		if (col_idx < active.column_scans.size()) {
+			lstate.segment_before_scan[col_idx] = active.column_scans[col_idx].current;
+		}
+	}
+}
+
+// Makes the output columns of a scanned chunk safe to hold across later scans, until every transfer
+// reading its rows has been collected.
+//
+// Dictionary and constant vectors are flattened: their selection buffer is shared with the scan and
+// overwritten by the next one. String payloads point into storage blocks the scan pins only until it
+// moves on, and there are two ways to keep them:
+//
+//   pin      hold the blocks of the segment the scan started in and the one it ended in. Covers
+//            every row of the chunk when those are the same segment or adjacent ones. An FSST vector
+//            stays compressed, so only matched rows are ever decompressed -- in AppendMatchedRows.
+//   copy     decompress and copy every string into the vector's own heap. The fallback when the scan
+//            crossed more than one segment boundary, or with OASIS_REGEX_LATE_MAT=0.
+//
+// Strings DuckDB already placed in the vector's heap (FSST straddle reads, overflow strings) are
+// safe under either.
+static void RetainOutputColumns(ClientContext &context, RegexFpgaScanLocalState &lstate, DataChunk &chunk,
+                                vector<BufferHandle> &pins) {
+	if (lstate.output_column_map.empty()) {
+		return;
+	}
+	optional_ptr<CollectionScanState> active;
+	if (lstate.late_materialize && !lstate.segment_before_scan.empty()) {
+		auto &current = ActiveCollectionScan(lstate);
+		if (&current == lstate.scan_state_before_scan.get() &&
+		    current.row_group.get() == lstate.row_group_before_scan.get()) {
+			active = &current;
+		}
+	}
+	for (const auto col_idx : lstate.output_column_map) {
 		auto &vec = chunk.data[col_idx];
-		vec.Flatten(chunk.size());
 		if (vec.GetType().InternalType() != PhysicalType::VARCHAR) {
+			vec.Flatten(chunk.size());
 			continue;
 		}
+		if (active && col_idx < active->column_scans.size()) {
+			const auto before = lstate.segment_before_scan[col_idx];
+			const auto after = active->column_scans[col_idx].current;
+			if (before && after && (before == after || before->GetIndex() + 1 == after->GetIndex())) {
+				auto &buffer_manager = BufferManager::GetBufferManager(context);
+				if (before != after) {
+					pins.push_back(buffer_manager.Pin(before->GetNode().GetBlockHandle()));
+				}
+				pins.push_back(buffer_manager.Pin(after->GetNode().GetBlockHandle()));
+				if (vec.GetVectorType() != VectorType::FSST_VECTOR) {
+					vec.Flatten(chunk.size());
+				}
+				continue;
+			}
+		}
+		vec.Flatten(chunk.size());
 		auto strings = FlatVector::GetDataMutable<string_t>(vec);
 		auto &validity = FlatVector::Validity(vec);
 		for (idx_t row = 0; row < chunk.size(); row++) {
@@ -600,8 +651,10 @@ static const void *const kRegexIdentityDecoder = &kIdentityDecoderTag;
 // and per-transfer table changes are already safe (double-buffered banks, and xsim passes 12
 // pipelined transfers with a distinct table each). It needs no RTL change.
 //
-// Safe because the data is printable ASCII: code 0 is the terminator and 255 is FSST_ESC under
-// zeroTerminated=1, and neither byte occurs, so nothing needs escaping.
+// Now that the card has no plaintext path, this carries every row that is not shipped compressed,
+// not only straddles. Safe without escaping because code 0 is the terminator and 255 is FSST_ESC
+// under zeroTerminated=1, and neither byte occurs: VARCHAR is valid UTF-8, where 0xFF never
+// appears, and an interior 0x00 already split the string when the card took plaintext.
 static void WriteIdentitySymbolTableHeader(uint8_t *header) {
 	D_ASSERT(header != nullptr);
 	auto *words = reinterpret_cast<uint64_t *>(header);
@@ -670,60 +723,6 @@ static uint8_t ShortestSymbolCode(const void *decoder) {
 	return best;
 }
 
-// Returns the real predicate hidden inside an "optional" filter wrapper, or nullptr if @p expr is
-// not such a wrapper. DuckDB pushes OR/IN/LIKE predicates down wrapped in an internal marker
-// function whose own evaluation is hard-coded to return all-true, parking the actual predicate in
-// the wrapper's bind data. A scan that just evaluates the pushed filter therefore filters nothing;
-// to benefit we have to reach in and take the child expression.
-static optional_ptr<const Expression> UnwrapOptionalFilter(const Expression &expr) {
-	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
-		return nullptr;
-	}
-	auto &func = expr.Cast<BoundFunctionExpression>();
-	if (!func.BindInfo()) {
-		return nullptr;
-	}
-	if (func.Function().GetName() == OptionalFilterScalarFun::NAME) {
-		return func.BindInfo()->Cast<OptionalFilterFunctionData>().child_filter_expr.get();
-	}
-	if (func.Function().GetName() == SelectivityOptionalFilterScalarFun::NAME) {
-		return func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().child_filter_expr.get();
-	}
-	return nullptr;
-}
-
-// Rewrites the pushed-down filter set, replacing every optional wrapper with the real predicate it
-// hides, and returns the result for the storage scan to enforce. The scan applies these while it
-// reads each column, so filtered rows cost no FPGA work and no output materialization -- strictly
-// better than re-filtering the chunk afterwards. Returns nullptr when there is nothing to rewrite,
-// in which case the caller keeps using the filters DuckDB supplied.
-static unique_ptr<TableFilterSet> BuildScanFilterSet(const TableFunctionInitInput &input,
-                                                     const vector<LogicalType> &scan_types) {
-	if (!input.filters || !input.filters->HasFilters()) {
-		return nullptr;
-	}
-	auto rewritten = make_uniq<TableFilterSet>();
-	bool unwrapped_any = false;
-	for (auto &entry : *input.filters) {
-		const auto filter_idx = entry.GetIndex();
-		auto &filter = entry.Filter();
-		if (filter.filter_type != TableFilterType::EXPRESSION_FILTER || filter_idx >= scan_types.size()) {
-			return nullptr; // unfamiliar filter shape - leave the original set untouched
-		}
-		auto &expr_filter = ExpressionFilter::GetExpressionFilter(filter, "regex_fpga_scan");
-		auto child = UnwrapOptionalFilter(*expr_filter.expr);
-		if (child) {
-			// Keep the child's own BOUND_REF placeholder: the scan evaluates a table filter against
-			// a single-column chunk holding just the filtered column.
-			rewritten->PushFilter(filter_idx, make_uniq<ExpressionFilter>(child->Copy()));
-			unwrapped_any = true;
-		} else {
-			rewritten->PushFilter(filter_idx, expr_filter.Copy());
-		}
-	}
-	return unwrapped_any ? std::move(rewritten) : nullptr;
-}
-
 static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindData &bind_data,
                                RegexFpgaScanGlobalState &global_state, RegexFpgaScanLocalState &lstate) {
 	CALI_CXX_MARK_FUNCTION;
@@ -759,25 +758,27 @@ static bool TryRefillScanChunk(ClientContext &context, const RegexFpgaScanBindDa
 			retained->Initialize(context, lstate.scanned_types);
 		}
 		CALI_MARK_BEGIN("table_scan");
+		NoteSegmentsBeforeScan(lstate);
 		const auto t_scan = StageClock::now();
 		storage.Scan(transaction, *retained, lstate.scan_state);
 		AddRegexScanNs(StageNanos(t_scan));
 		CALI_MARK_END("table_scan");
-		// A scanned chunk is only borrowed, but we retain chunks across several scans while an
-		// FPGA batch fills up, so make the columns we will emit self-contained before holding on.
-		CALI_MARK_BEGIN("materialize_chunk");
-		const auto t_mat = StageClock::now();
-		MaterializeRetainedColumns(*retained, lstate.output_column_map);
-		AddRegexMaterializeNs(StageNanos(t_mat));
-		CALI_MARK_END("materialize_chunk");
 		lstate.chunk_offset = 0;
 		if (retained->size() > 0) {
+			// A scanned chunk is only borrowed, but we retain chunks across several scans while an
+			// FPGA batch fills up, so make the columns we will emit safe to hold before holding on.
+			RetainedChunk entry;
+			CALI_MARK_BEGIN("materialize_chunk");
+			const auto t_mat = StageClock::now();
+			RetainOutputColumns(context, lstate, *retained, entry.pins);
+			AddRegexMaterializeNs(StageNanos(t_mat));
+			CALI_MARK_END("materialize_chunk");
 			// One staging ref, covering both the cursor reading this chunk and any rows
 			// it contributes to the batch that is still being packed. It is dropped at
 			// the submit that carries those rows away, by which point the transfer holds
 			// its own ref -- see SubmitStagedBatch.
-			RetainedChunk entry;
 			entry.id = lstate.next_chunk_id++;
+			entry.batch_index = ScanBatchIndex(lstate);
 			entry.chunk = std::move(retained);
 			entry.pending_refs = 1;
 			entry.staging_ref = true;
@@ -843,14 +844,10 @@ static void StartNewStagedBatch(RegexFpgaScanLocalState &lstate, celeris::Celeri
 	// capacity, so a reservation taken earlier would be applied to the previous batch's
 	// buffer and then thrown away -- leaving batch_symbol_header dangling.
 	//
-	// Taken on the first compressed row, not here: it must precede every append because it
-	// moves the packing origin, and that holds because a batch only becomes compressed at its
-	// first compressed row, when accum_count is still 0.
-	//
-	// This is what lets a batch be plaintext while the query is in passthrough mode. Reserving
-	// unconditionally would leave 2304 bytes of never-written header at the head of a plaintext
-	// rectangle -- the shape that feeds header beats to the engines as strings. With deferral
-	// off it is behaviour-identical: every submitted batch has a compressed row.
+	// Taken on the batch's first row, not here: that row decides which table the batch rides
+	// (real or identity), and the reservation must still precede every append because it moves
+	// the packing origin. Every batch that ships has a first row, so every transfer carries a
+	// header -- the card requires one. A batch of nothing but outliers ships no transfer.
 	//
 	// (An earlier note here blamed this line for hanging the default path. That measurement was
 	// taken on a card already poisoned by an earlier wedge, so it was void; the default path
@@ -899,13 +896,47 @@ static inline void PushSlotRun(RegexFpgaScanLocalState &lstate, uint32_t chunk_i
 	refs.push_back({chunk_id, slot, static_cast<uint16_t>(row), static_cast<uint16_t>(count)});
 }
 
+// Notes that output_cache rows appended from here on belong to `batch_index`.
+static void MarkOutputBatch(RegexFpgaScanLocalState &lstate, idx_t batch_index) {
+	auto &marks = lstate.output_batch_marks;
+	const idx_t row = lstate.output_cache.size();
+	if (!marks.empty() && marks.back().first == row) {
+		marks.back().second = batch_index;
+		return;
+	}
+	if (marks.empty() || marks.back().second != batch_index) {
+		marks.emplace_back(row, batch_index);
+	}
+}
+
 static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const InFlightTransfer &transfer,
                               const RegexMatchBitmap &matches) {
 	// Nothing projected: the output is a row count, so count the set bits and never touch a
 	// chunk -- which is also what lets TryRefillScanChunk recycle chunks before collect.
+	// Counted per batch index, because a transfer can span row groups and each output chunk
+	// must carry exactly one.
 	if (lstate.output_column_map.empty()) {
 		idx_t matched = 0;
+		idx_t run_batch = 0;
+		const auto flush = [&]() {
+			if (matched == 0) {
+				return;
+			}
+			MarkOutputBatch(lstate, run_batch);
+			DataChunk no_columns;
+			no_columns.InitializeEmpty(lstate.output_types);
+			lstate.output_cache.Append(no_columns, *FlatVector::IncrementalSelectionVector(), matched);
+			matched = 0;
+		};
 		for (const auto &row_ref : transfer.row_refs) {
+			const idx_t batch = MaxValue<idx_t>(
+			    lstate.retained_chunks[RetainedChunkIndex(lstate, row_ref.chunk_id)].batch_index,
+			    lstate.count_batch_high);
+			lstate.count_batch_high = batch;
+			if (batch != run_batch) {
+				flush();
+				run_batch = batch;
+			}
 			if (row_ref.slot_idx == kCpuResolvedSlot) {
 				matched += row_ref.CpuMatch() ? 1 : 0;
 				continue;
@@ -922,11 +953,7 @@ static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const InFlightTra
 				matched += matches.test(bit);
 			}
 		}
-		if (matched > 0) {
-			DataChunk no_columns;
-			no_columns.InitializeEmpty(lstate.output_types);
-			lstate.output_cache.Append(no_columns, *FlatVector::IncrementalSelectionVector(), matched);
-		}
+		flush();
 		return;
 	}
 
@@ -967,8 +994,49 @@ static void AppendMatchedRows(RegexFpgaScanLocalState &lstate, const InFlightTra
 		for (idx_t i = 0; i < row_indices.size(); i++) {
 			lstate.match_sel_scratch.set_index(i, row_indices[i]);
 		}
-		projected.ReferenceColumns(*lstate.retained_chunks[chunk_idx].chunk, lstate.output_column_map);
+		auto &source_chunk = *lstate.retained_chunks[chunk_idx].chunk;
+		projected.ReferenceColumns(source_chunk, lstate.output_column_map);
+		// A column still compressed here is decompressed straight into the cache's string heap
+		// below, so Append carries an empty placeholder for it. Letting Append flatten the FSST
+		// vector instead costs a second copy of every matched string: it decompresses into a
+		// throwaway arena and then AddBlob()s that into the same heap.
+		bool any_fsst = false;
+		for (idx_t out_idx = 0; out_idx < projected.ColumnCount(); out_idx++) {
+			if (projected.data[out_idx].GetVectorType() == VectorType::FSST_VECTOR) {
+				projected.data[out_idx].Reference(lstate.empty_string_placeholder);
+				any_fsst = true;
+			}
+		}
+		const idx_t cache_offset = lstate.output_cache.size();
+		MarkOutputBatch(lstate, lstate.retained_chunks[chunk_idx].batch_index);
 		lstate.output_cache.Append(projected, lstate.match_sel_scratch, row_indices.size());
+		if (any_fsst) {
+			for (idx_t out_idx = 0; out_idx < projected.ColumnCount(); out_idx++) {
+				auto &source = source_chunk.data[lstate.output_column_map[out_idx]];
+				if (source.GetVectorType() != VectorType::FSST_VECTOR) {
+					continue;
+				}
+				auto *compressed = FSSTVector::GetCompressedData(source);
+				auto *decoder = FSSTVector::GetDecoder(source);
+				auto &source_validity = FSSTVector::Validity(source);
+				auto &target = lstate.output_cache.data[out_idx];
+				auto target_data = FlatVector::GetDataMutable<string_t>(target);
+				auto &target_validity = FlatVector::ValidityMutable(target);
+				auto &allocator = StringVector::GetStringAllocator(target);
+				for (idx_t i = 0; i < row_indices.size(); i++) {
+					const idx_t source_row = row_indices[i];
+					if (!source_validity.RowIsValid(source_row)) {
+						target_validity.SetInvalid(cache_offset + i);
+						continue;
+					}
+					const auto &value = compressed[source_row];
+					target_data[cache_offset + i] =
+					    value.GetSize() == 0
+					        ? string_t(nullptr, 0)
+					        : FSSTPrimitives::DecompressValue(decoder, allocator, value.GetData(), value.GetSize());
+				}
+			}
+		}
 		// Append copies string_t values, which are pointers into the source chunk's string buffer.
 		// The retained chunks are released as soon as this transfer is collected, so hold a reference
 		// to their heaps or the cached strings dangle until the caller drains output_cache.
@@ -1125,7 +1193,7 @@ static void SubmitStagedBatch(const RegexFpgaScanBindData &bind_data, RegexFpgaS
 	if (!transfer.dry_run && lstate.accum_count > 0) {
 		transfer.submission =
 		    SubmitRegexBatch(global_state.ctx, lstate.wire_buffer->ptr, plan, lstate.accum_count,
-		                     bind_data.regex_blob, lstate.batch_fsst_decoder != nullptr);
+		                     bind_data.regex_blob);
 		D_ASSERT(transfer.submission.valid());
 	}
 	lstate.in_flight.push_back(std::move(transfer));
@@ -1464,15 +1532,12 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			regex_validity = &regex_format.validity;
 		}
 
-		// Which symbol table this chunk's rows ride. Under the passthrough a decompressed
-		// (straddling) chunk rides the identity table so that it can still reach the card;
-		// everything else rides its segment's real table. Outside the passthrough there is no
-		// table at all and batches stay plaintext exactly as before.
-		const void *row_decoder = nullptr;
-		if (lstate.fsst_passthrough) {
-			row_decoder = fsst_passthrough ? static_cast<const void *>(fsst_decoder)
-			                               : kRegexIdentityDecoder;
-		}
+		// Which symbol table this chunk's rows ride. Every row rides one: the card has no
+		// plaintext path, so a decompressed chunk -- a segment straddle, a zeroTerminated=0
+		// table, or any chunk at all with the passthrough off -- rides the identity table, and
+		// everything else rides its segment's real table.
+		const void *row_decoder =
+		    fsst_passthrough ? static_cast<const void *>(fsst_decoder) : kRegexIdentityDecoder;
 
 		// Straddle rows ride their own batch rather than closing the segment's; swap to the batch
 		// of this chunk's table kind. Per chunk is enough, since every row of a chunk rides the
@@ -1617,34 +1682,26 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			// 63*L of filler paid to carry it.
 			//
 			// The verdict rides in the row ref, so scan order is preserved with no merge.
-			if (needs_slot && next_length >= lstate.outlier_bytes) {
-				lstate.path_outlier++;
-				// Under the passthrough regex_value is compressed, and RE2 must not see those
-				// bytes -- it would match the symbol codes and quietly return a verdict for a
-				// string that does not exist. Decompress this one value; outliers are rare by
-				// construction, so the copy costs nothing at the scale that matters.
-				bool outlier_match;
-				if (fsst_passthrough) {
-					const string plain = FSSTPrimitives::DecompressValue(
-					    fsst_decoder, regex_value.GetData(), next_length,
-					    FSSTVector::GetDecompressBuffer(regex_vector));
-					outlier_match = MatchOutlierOnHost(bind_data, lstate, string_t(plain));
-				} else {
-					outlier_match = MatchOutlierOnHost(bind_data, lstate, regex_value);
-				}
-				lstate.batch_row_refs.push_back(
-				    {lstate.retained_chunks[lstate.current_retained_chunk_idx].id, kCpuResolvedSlot,
-				     static_cast<uint16_t>(row_idx), static_cast<uint16_t>(1 | (outlier_match ? kRunCpuMatchBit : 0))});
-				lstate.staged_rows++;
-				lstate.chunk_offset++;
-				continue;
-			}
+			//
+			// The row is staged *below* the batch-close check, not here. An outlier takes a
+			// row but no slot and no wire bytes, so the row cap is the only thing that can
+			// close a batch on it -- and staging here with a `continue` skipped that check
+			// entirely. One outlier in ordinary data is harmless, because the next normal row
+			// closes the batch; a table whose strings are *all* at or above the threshold
+			// (the length suite's par_2048, where outlier_bytes is exactly the string length)
+			// never reaches the check at all, so staged_rows grew to the whole row group.
+			// AppendMatchedRows then overran output_cache, which is sized to max_accum_count:
+			// "INTERNAL Error: Can't append to vector without resizing". It surfaced only when
+			// a column was projected -- count(*) appends a chunk with no vectors, so it has no
+			// capacity to overrun and merely retained the row group.
+			const bool is_outlier = needs_slot && next_length >= lstate.outlier_bytes;
 
 			// A single value only has to fit one engine's stream, and the rectangle
-			// is 64 of those, so the bound is the buffer over the engine count. Only
-			// reachable below the outlier threshold now, so it fires solely when the
-			// wire buffer has been configured smaller than 64x that threshold.
-			if (needs_slot && (next_length + 1) * celeris::kRegexEngineCount > lstate.wire_buffer_bytes) {
+			// is 64 of those, so the bound is the buffer over the engine count. Outliers
+			// are exempt: they never go on the wire, so a wire buffer smaller than 64x the
+			// outlier threshold must not reject them.
+			if (needs_slot && !is_outlier &&
+			    (next_length + 1) * celeris::kRegexEngineCount > lstate.wire_buffer_bytes) {
 				throw InvalidInputException(
 				    "regex_fpga_scan: a %llu byte value in column %s does not fit the %llu byte FPGA wire buffer",
 				    (unsigned long long)regex_value.GetSize(), bind_data.regex_column.c_str(),
@@ -1659,11 +1716,15 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 			// moving between real and identity tables closes the batch just like moving
 			// between two real ones. The MODE never changes -- both are compressed batches --
 			// which is the whole point.
-			const bool crosses_symbol_table = lstate.fsst_passthrough &&
-			                                  lstate.batch_fsst_decoder != nullptr &&
+			//
+			// An outlier crosses neither: it carries no symbol table (it never touches the
+			// packer) and claims no slot, so it is passed as needs_slot = false and only the
+			// row cap can bind on it.
+			const bool crosses_symbol_table = !is_outlier && lstate.batch_fsst_decoder != nullptr &&
 			                                  lstate.batch_fsst_decoder != row_decoder;
 			if (lstate.staged_rows > 0 &&
-			    (crosses_symbol_table || WouldExceedFpgaBatch(lstate, next_length, needs_slot))) {
+			    (crosses_symbol_table ||
+			     WouldExceedFpgaBatch(lstate, next_length, needs_slot && !is_outlier))) {
 				AddRegexStageNs(StageNanos(t_stage));
 				CALI_MARK_END("stage_rows_for_fpga_batch");
 				SubmitStagedBatch(bind_data, global_state, lstate);
@@ -1691,17 +1752,44 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 				continue;
 			}
 
-			if (lstate.fsst_passthrough) {
+			// Now that the batch has room, decide the outlier on the host and stage it as a
+			// CPU-resolved run. It reserves no symbol header and never sets batch_fsst_decoder,
+			// because it contributes nothing to the wire -- a batch of nothing but outliers
+			// ships no transfer at all (see the staged_rows check in SubmitStagedBatch).
+			if (is_outlier) {
+				lstate.path_outlier++;
+				// Under the passthrough regex_value is compressed, and RE2 must not see those
+				// bytes -- it would match the symbol codes and quietly return a verdict for a
+				// string that does not exist. Decompress this one value; outliers are rare by
+				// construction, so the copy costs nothing at the scale that matters.
+				bool outlier_match;
+				if (fsst_passthrough) {
+					const string plain = FSSTPrimitives::DecompressValue(
+					    fsst_decoder, regex_value.GetData(), next_length,
+					    FSSTVector::GetDecompressBuffer(regex_vector));
+					outlier_match = MatchOutlierOnHost(bind_data, lstate, string_t(plain));
+				} else {
+					outlier_match = MatchOutlierOnHost(bind_data, lstate, regex_value);
+				}
+				lstate.batch_row_refs.push_back(
+				    {lstate.retained_chunks[lstate.current_retained_chunk_idx].id, kCpuResolvedSlot,
+				     static_cast<uint16_t>(row_idx), static_cast<uint16_t>(1 | (outlier_match ? kRunCpuMatchBit : 0))});
+				lstate.staged_rows++;
+				lstate.chunk_offset++;
+				continue;
+			}
+
+			{
 				D_ASSERT(lstate.batch_fsst_decoder == nullptr || lstate.batch_fsst_decoder == row_decoder);
 				if (lstate.batch_fsst_decoder == nullptr) {
-					// First compressed row of this batch, so take the reservation now.
+					// First row of this batch, so take the reservation now.
 					// accum_count must still be 0: reserve_symbol_header() moves the packing
 					// origin and cannot run after an append.
 					D_ASSERT(lstate.accum_count == 0);
 					lstate.batch_symbol_header = lstate.packer.reserve_symbol_header();
 					// The padding finalize() adds must be codes too, not 0xFF -- that is
 					// FSST_ESC and would eat the filler's own terminator. reset() restores the
-					// plaintext filler for the next batch.
+					// 0xFF filler, so this must run for every batch that ships.
 					if (row_decoder == kRegexIdentityDecoder) {
 						lstate.packer.set_compressed_filler(true);   // every identity code is 1 B
 						WriteIdentitySymbolTableHeader(lstate.batch_symbol_header);
@@ -1765,9 +1853,22 @@ static void AccumulateRows(const RegexFpgaScanBindData &bind_data, RegexFpgaScan
 
 static void EmitFromOutputCache(RegexFpgaScanLocalState &lstate, DataChunk &output) {
 	CALI_CXX_MARK_FUNCTION;
-	const idx_t remaining = lstate.output_cache.size() - lstate.output_cache_read_idx;
-	const idx_t emit_count = MinValue<idx_t>(remaining, STANDARD_VECTOR_SIZE);
-	const idx_t end = lstate.output_cache_read_idx + emit_count;
+	const idx_t start = lstate.output_cache_read_idx;
+	idx_t end = MinValue<idx_t>(lstate.output_cache.size(), start + STANDARD_VECTOR_SIZE);
+	// Stop at the next batch boundary, so the chunk carries a single batch index. A thread's row
+	// groups need not have consecutive indices -- another thread can hold the one in between -- so
+	// labelling a mixed chunk with either index would misorder rows under preserve_insertion_order.
+	auto &marks = lstate.output_batch_marks;
+	auto &cursor = lstate.output_batch_mark_cursor;
+	while (cursor + 1 < marks.size() && marks[cursor + 1].first <= start) {
+		cursor++;
+	}
+	if (cursor < marks.size()) {
+		lstate.emitted_batch_index = marks[cursor].second;
+		if (cursor + 1 < marks.size()) {
+			end = MinValue<idx_t>(end, marks[cursor + 1].first);
+		}
+	}
 	// output_cache is already materialized in output-projection layout, so emit it directly.
 	//
 	// `output` is a *slice over* output_cache's vectors, not a copy. Vector::Slice hands the
@@ -1793,6 +1894,8 @@ static void ResetDrainedOutputCache(RegexFpgaScanLocalState &lstate) {
 	if (DrainedOutputCache(lstate)) {
 		lstate.output_cache.Reset();
 		lstate.output_cache_read_idx = 0;
+		lstate.output_batch_marks.clear();
+		lstate.output_batch_mark_cursor = 0;
 	}
 }
 
@@ -1832,13 +1935,31 @@ void RegexFpgaScanFunction(ClientContext &context, TableFunctionInput &data_p, D
 	output.SetChildCardinality(0);
 }
 
+// Without this DuckDB cannot preserve insertion order across threads, and any plan that needs it --
+// every SELECT returning rows to a client -- ran the whole scan on one thread: 2.2 s against 0.22 s
+// for the same projection at 0% selectivity.
+static OperatorPartitionData RegexFpgaScanGetPartitionData(ClientContext &context,
+                                                           TableFunctionGetPartitionInput &input) {
+	if (input.partition_info.RequiresPartitionColumns()) {
+		throw InternalException("regex_fpga_scan: partition columns are not supported");
+	}
+	return OperatorPartitionData(input.local_state->Cast<RegexFpgaScanLocalState>().emitted_batch_index);
+}
+
 void RegisterRegexFpgaScanFunction(ExtensionLoader &loader) {
 	TableFunction table_function("regex_fpga_scan", {LogicalType::VARCHAR}, RegexFpgaScanFunction, RegexFpgaScanBind,
 	                             RegexFpgaScanInitGlobal, RegexFpgaScanInitLocal);
+	table_function.get_partition_data = RegexFpgaScanGetPartitionData;
 	table_function.named_parameters["regex_column"] = LogicalType::VARCHAR;
 	table_function.named_parameters["pattern"] = LogicalType::VARCHAR;
 	table_function.projection_pushdown = true;
-	table_function.filter_pushdown = true;
+	// Off: DuckDB keeps the filter as an operator above this scan. A pushed filter makes the
+	// storage scan fetch the other columns through ColumnData::Select -> FSSTStorage::Select,
+	// which always decompresses, so every filtered query lost the FSST passthrough -- and the
+	// card has no plaintext path any more. The cost is that filtered-out rows are matched too.
+	table_function.filter_pushdown = false;
+	// Independent of pushdown (RemoveUnusedColumns): it is what populates projection_ids,
+	// which BuildOutputColumnMap relies on to tell count(*) from a projected column.
 	table_function.filter_prune = true;
 	loader.RegisterFunction(table_function);
 }
