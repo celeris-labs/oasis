@@ -112,6 +112,23 @@ make -j
 
 More details can be found in `extension/README.md`.
 
+## Publications
+
+If you use Oasis, please cite:
+
+```
+@article{journals/corr/abs-2608-02268,
+  author       = {Jonas Dann and
+                  Luca Tagliavini and
+                  Gustavo Alonso},
+  title        = {Oasis: Hiding the Cost of Querying Parquet Files in the Datapath},
+  journal      = {CoRR},
+  volume       = {abs/2608.02268},
+  year         = {2026},
+  doi          = {10.48550/ARXIV.2608.02268}
+}
+```
+
 ## License
 The Oasis code is licensed under the terms in 
 [LICENSE.md](https://github.com/celeris-labs/oasis/blob/main/LICENSE.md), which corresponds to the 
