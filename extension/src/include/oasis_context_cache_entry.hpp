@@ -31,7 +31,7 @@ struct OasisContextCacheEntry : public ObjectCacheEntry {
 		// Simulation uses a small buffer to keep sim runtime/memory tractable. Sim test fixtures
 		// must use row groups small enough that a decoded column chunk fits in this single buffer.
 		auto pool = std::make_shared<libstf::SimpleMemoryPool>();
-		oasis::OasisContext::init(std::move(pool), libstf::BYTES_PER_FPGA_TRANSFER);
+		oasis::OasisContext::init(std::move(pool), OBM_BUFFER_CAPACITY);
 #else
 		auto pool = std::make_shared<libstf::HugePageMemoryPool>();
 		oasis::OasisContext::init(std::move(pool), OBM_BUFFER_CAPACITY);
