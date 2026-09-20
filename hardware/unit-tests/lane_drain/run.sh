@@ -1,22 +1,35 @@
 #!/usr/bin/env bash
-# lane_drain -- independent black-box liveness bench for handler_multi and rx_dispatch.
+# lane_drain -- independent black-box liveness bench for the HTTP receive path.
 #
 # The bench models the whole outside world (Coyote TOE, an HTTP/1.1 origin server, the host config
-# port and DMA, and the per-lane decoder sink) and checks four properties continuously: LIVENESS
-# (a readPkg within a bounded number of cycles while a notification is outstanding), ROUTING
-# (byte-exact, to the lane bound to that session), FRAMING (one tlast per response at the
-# Content-Length) and RECOVERY (everything drains once a transient clears).
+# port and DMA, the per-decoder sink, and -- for the slots DUT -- Coyote's card DMA) and checks four
+# properties continuously: LIVENESS (a readPkg within a bounded number of cycles while a
+# notification is outstanding), ROUTING (byte-exact, to the connection bound to that session),
+# FRAMING (one tlast per chunk at the configured byte count) and RECOVERY (everything drains once a
+# transient clears).
 #
-#   ./run.sh                 all scenarios, all lane counts
-#   ./run.sh <scen> [lanes]  one scenario at one lane count (default 2)
-#   ./run.sh p1 1 DEPTH=2 NRESP=100
-#                            ...plus any extra plusargs, forwarded verbatim to xsim. The pipelined
-#                            scenarios take DEPTH (arms outstanding per lane), NRESP, BLEN and MSS;
-#                            without this there was no way to sweep the pipeline depth from here,
-#                            which is the one axis that decides whether the bug under test appears.
+# TWO DUTs
+#   --dut multi   handler_multi, the sealed build-119 baseline. The default for a named scenario, so
+#                 every old invocation means exactly what it meant before.
+#   --dut slots   handler_slots + unit-tests/card_dma/card_dma_model (ADR-5).
+#   --dut both    both, which is what a bare ./run.sh does.
+#
+#   ./run.sh                          everything, both DUTs, N = 1, 2, 4
+#   ./run.sh --dut slots              every slots scenario, N = 1, 2, 4
+#   ./run.sh <scen> [lanes]           one scenario at one lane count on handler_multi (default 2)
+#   ./run.sh --dut slots <scen> [n]   ...on handler_slots
+#   ./run.sh p1 1 DEPTH=2 NRESP=100   ...plus any extra plusargs, forwarded verbatim to xsim
+#
+# Exit status is 1 if any case failed. Cases whose passing verdict is not the word PASS are declared
+# below rather than guessed: `e` and `s_e` measure CONTAINMENT and say so, and `lz1`/`lz2` are
+# EXPECTED TO FAIL on both DUTs for the same reason -- the pinned baseline is build-119, which
+# predates the lazy-open fix (commit a08b100, which shipped in the broken build-120), and
+# handler_slots copies its session side deliberately. They are reported as XFAIL with that reason
+# instead of being hidden or counted.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 HDL="$ROOT/../../src/hdl/http_read"
+MODEL="$ROOT/../card_dma/card_dma_model.sv"
 
 if ! command -v xvlog >/dev/null 2>&1; then
   # shellcheck disable=SC1091
@@ -24,65 +37,188 @@ if ! command -v xvlog >/dev/null 2>&1; then
 fi
 
 cd "$ROOT"
+
+DUT=both
+ONE=""
+LANES=2
+EXTRA=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dut) DUT="$2"; shift 2 ;;
+    *=*)   EXTRA+=("$1"); shift ;;
+    *)
+      if [ -z "$ONE" ]; then ONE="$1"; shift
+      elif [[ "$1" =~ ^[0-9]+$ ]]; then LANES="$1"; shift
+      else EXTRA+=("$1"); shift
+      fi ;;
+  esac
+done
+if [ -n "$ONE" ] && [ "$DUT" = both ]; then DUT=multi; fi
+
 rm -rf xsim.dir xsim.jou xsim.log xvlog.pb xelab.pb webtalk* .Xil 2>/dev/null || true
 
+# axis_skid.sv is instantiated by handler_multi (the build-119 copy pinned in efd5fbb) but is NOT
+# tracked in git, so it can legitimately be absent from a clean checkout -- and then the
+# handler_multi arm cannot be elaborated at all and only the slots arm runs. handler_slots
+# deliberately does not depend on it; it inlines the same two registers.
+SKID=()
+[ -f "$HDL/axis_skid.sv" ] && SKID=("$HDL/axis_skid.sv")
+
 xvlog -sv lynxTypes_stub.sv \
-      "$HDL/http_types.sv" "$HDL/axis_fifo.sv" "$HDL/strip_http.sv" "$HDL/tcp_read.sv" \
+      "$HDL/http_types.sv" "$HDL/axis_fifo.sv" "${SKID[@]}" \
+      "$HDL/strip_http.sv" "$HDL/tcp_read.sv" \
       "$HDL/rx_dispatch.sv" "$HDL/tcp_init.sv" "$HDL/http_req_stream.sv" \
       "$HDL/axis_rewrite_last.sv" "$HDL/tx_arbiter.sv" "$HDL/handler_multi.sv" \
-      rxd_drain_tb.sv lane_drain_tb.sv
+      "$HDL/slot_writer.sv" "$HDL/slot_reader.sv" "$HDL/handler_slots.sv" "$MODEL" \
+      rxd_drain_tb.sv lane_drain_tb.sv > xvlog.log 2>&1 \
+  || { tail -40 xvlog.log; exit 1; }
 
-xelab -debug typical -timescale 1ns/1ps -top rxd_drain_tb -snapshot rxd_snap
-for N in 1 2 4; do
-  xelab -debug typical -timescale 1ns/1ps -top lane_drain_tb \
-        -snapshot "ld${N}_snap" -generic_top "NUM_CONNS=${N}"
-done
-# lz2 has to WAIT for handler_multi's connect watchdog, which defaults to 2^28 cycles -- a second on
-# the board, a week in xsim. Its own snapshot shrinks only that parameter.
-xelab -debug typical -timescale 1ns/1ps -top lane_drain_tb \
-      -snapshot ldto_snap -generic_top "NUM_CONNS=2" -generic_top "STALL_CYCLES=8192"
-
-run_rxd() { echo "=== rx_dispatch : $1 ==="; xsim rxd_snap -R -testplusarg "SCEN=$1" | sed -n '/^rxd_drain_tb /p'; }
-run_hm()  {
-  local scen="$1" lanes="$2"; shift 2
-  local extra=()
-  for p in "$@"; do extra+=(-testplusarg "$p"); done
-  # lz2 waits out the connect watchdog, so it runs on the short-watchdog snapshot.
-  local snap="ld${lanes}_snap"
-  if [ "$scen" = "lz2" ]; then snap="ldto_snap"; fi
-  echo "=== handler_multi[$lanes] : $scen ${*:-} ==="
-  xsim "$snap" -R -testplusarg "SCEN=$scen" "${extra[@]}" \
-    | sed -n '/^lane_drain_tb /p;/STICKY/p'
+elab() { # <snapshot> <generic>...
+  local snap="$1"; shift
+  local g=(); local x; for x in "$@"; do g+=(-generic_top "$x"); done
+  [ -d "xsim.dir/$snap" ] && return 0
+  xelab -debug typical -timescale 1ns/1ps -top lane_drain_tb -snapshot "$snap" "${g[@]}" \
+        > "xelab_$snap.log" 2>&1 || { tail -30 "xelab_$snap.log"; return 1; }
 }
 
-if [ $# -ge 1 ]; then
+FAILS=0
+CASES=0
+
+# Scenarios whose passing verdict is not the word PASS. (e) and (s_e) measure containment.
+expected() {
   case "$1" in
-    r*) run_rxd "$1" ;;
-    *)  scen="$1"; shift; lanes="2"
-        if [ $# -ge 1 ] && [[ "$1" != *=* ]]; then lanes="$1"; shift; fi
-        run_hm "$scen" "$lanes" "$@" ;;
+    e|s_e) echo "CONTAINED" ;;
+    *)     echo "PASS" ;;
   esac
-  exit 0
+}
+is_xfail() { case "$1" in lz1|lz2) return 0 ;; *) return 1 ;; esac; }
+
+run_rxd() {
+  local out
+  CASES=$((CASES + 1))
+  out="$(xsim rxd_snap -R -testplusarg "SCEN=$1" 2>&1)"
+  if echo "$out" | grep -qE "^rxd_drain_tb '$1': (PASS|CONTAINED)"; then
+    echo "PASS  rx_dispatch   $1"
+  else
+    echo "FAIL  rx_dispatch   $1   -- $(echo "$out" | grep -E "^rxd_drain_tb '" | head -1)"
+    FAILS=$((FAILS + 1))
+  fi
+}
+
+run_hm() { # <dut> <scen> <lanes> [plusargs...]
+  local dut="$1" scen="$2" lanes="$3"; shift 3
+  local pfx snap exp out verdict
+  if [ "$dut" = slots ]; then pfx=lds; else pfx=ld; fi
+  snap="${pfx}${lanes}_snap"
+  # lz2 has to WAIT for the connect watchdog, which defaults to 2^28 cycles -- a second on the
+  # board, a week in xsim. Its own snapshot shrinks only that parameter.
+  [ "$scen" = "lz2" ] && snap="${pfx}to_snap"
+  # ovf has to overrun a slot, so it gets a small one rather than half a megabyte of waiting.
+  [ "$scen" = "ovf" ] && snap="${pfx}ovf${lanes}_snap"
+
+  local a=(-testplusarg "SCEN=$scen"); local p
+  for p in "$@"; do a+=(-testplusarg "$p"); done
+  CASES=$((CASES + 1))
+  out="$(xsim "$snap" -R "${a[@]}" 2>&1)"
+  verdict="$(echo "$out" | grep -E "^lane_drain_tb '" | tail -1)"
+  exp="$(expected "$scen")"
+  echo "$out" | grep -E '^  == |^     conn |^     stall bits|^     worst |^  NOTE slots|^  CARD DMA' || true
+  # The RTL's own simulation-only invariants. slot_writer asserts that a connection is never
+  # released with segments of it still in flight -- the thing BR_DRAIN exists to guarantee -- and
+  # card_dma_model asserts Coyote's contract. Either firing is a failure whatever the verdict says.
+  local asserts
+  asserts="$(echo "$out" | grep -cE '^(slot_writer|card_dma_model): FAIL' || true)"
+  if [ "${asserts:-0}" -gt 0 ]; then
+    echo "$out" | grep -E '^(slot_writer|card_dma_model): FAIL' | head -3
+    echo "FAIL  ${dut}[$lanes]  $scen  -- $asserts RTL assertion(s) fired"
+    FAILS=$((FAILS + 1))
+    return
+  fi
+  if echo "$verdict" | grep -q ": $exp"; then
+    echo "PASS  ${dut}[$lanes]  $scen  ${*:-}"
+  elif is_xfail "$scen"; then
+    echo "XFAIL ${dut}[$lanes]  $scen  -- build-119 has no lazy open (a08b100); identical on both DUTs"
+  else
+    echo "FAIL  ${dut}[$lanes]  $scen  ${*:-}  -- ${verdict:-no verdict line}"
+    FAILS=$((FAILS + 1))
+  fi
+}
+
+# ---- single case ---------------------------------------------------------------------------------
+if [ -n "$ONE" ]; then
+  case "$ONE" in
+    r[0-9]*)
+      xelab -debug typical -timescale 1ns/1ps -top rxd_drain_tb -snapshot rxd_snap \
+            > xelab_rxd.log 2>&1 || { tail -30 xelab_rxd.log; exit 1; }
+      run_rxd "$ONE" ;;
+    *)
+      if [ "$DUT" = slots ]; then
+        elab "lds${LANES}_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" || exit 1
+        [ "$ONE" = "lz2" ] && { elab "ldsto_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" "STALL_CYCLES=8192" || exit 1; }
+        [ "$ONE" = "ovf" ] && { elab "ldsovf${LANES}_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" "SLOT_LOG2=16" || exit 1; }
+      else
+        elab "ld${LANES}_snap" "NUM_CONNS=${LANES}" || exit 1
+        [ "$ONE" = "lz2" ] && { elab "ldto_snap" "NUM_CONNS=${LANES}" "STALL_CYCLES=8192" || exit 1; }
+      fi
+      run_hm "$DUT" "$ONE" "$LANES" "${EXTRA[@]}" ;;
+  esac
+  echo "lane_drain: $FAILS failed of $CASES case(s)"
+  exit $(( FAILS > 0 ))
 fi
 
-# rx_dispatch in isolation
+# ---- everything ----------------------------------------------------------------------------------
+xelab -debug typical -timescale 1ns/1ps -top rxd_drain_tb -snapshot rxd_snap \
+      > xelab_rxd.log 2>&1 || { tail -30 xelab_rxd.log; exit 1; }
+
+# rx_dispatch in isolation. UNCHANGED by ADR-5 -- it is the same module on both DUTs, with the same
+# contract -- so it runs once rather than once per handler.
+echo "--- rx_dispatch (shared by both DUTs, unchanged) ---"
 for s in r1 r2 r3 r4 r5 r6 r7; do run_rxd "$s"; done
 
-# handler_multi: the mandated scenarios (a)-(h)
-for s in a b c d e f g h; do run_hm "$s" 2; done
+if [ "$DUT" = multi ] || [ "$DUT" = both ]; then
+  if [ ${#SKID[@]} -eq 0 ]; then
+    echo "SKIP  handler_multi -- axis_skid.sv is missing and the build-119 handler instantiates it"
+  else
+    for N in 1 2 4; do elab "ld${N}_snap" "NUM_CONNS=${N}" || exit 1; done
+    elab ldto_snap "NUM_CONNS=2" "STALL_CYCLES=8192" || exit 1
+    echo "--- handler_multi (build-119 baseline) ---"
+    for s in a b c d e f g h;        do run_hm multi "$s" 2; done
+    for s in a2 a8 a9 a10;           do run_hm multi "$s" 2; done
+    for s in lz1 lz2;                do run_hm multi "$s" 2; done
+    for s in s_base s_g s_d s_e s_f; do run_hm multi "$s" 2; done
+    for N in 1 4; do run_hm multi s_base "$N"; run_hm multi a2 "$N"; done
+  fi
+fi
 
-# handler_multi: probes that localise the pipelining failure
-for s in a2 a8 a9 a10; do run_hm "$s" 2; done
+if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
+  for N in 1 2 4; do
+    elab "lds${N}_snap"    "NUM_CONNS=${N}" "DUT_SLOTS=1" || exit 1
+    elab "ldsovf${N}_snap" "NUM_CONNS=${N}" "DUT_SLOTS=1" "SLOT_LOG2=16" || exit 1
+  done
+  elab ldsto_snap "NUM_CONNS=2" "DUT_SLOTS=1" "STALL_CYCLES=8192" || exit 1
 
-# handler_multi: lazy open -- an idle peer FIN must not reconnect, and a silent open must time out
-for s in lz1 lz2; do run_hm "$s" 2; done
+  echo "--- handler_slots (ADR-5) : the build-119 scenarios ---"
+  for s in a b c d e f g h;        do run_hm slots "$s" 2; done
+  for s in a2 a8 a9 a10;           do run_hm slots "$s" 2; done
+  for s in lz1 lz2;                do run_hm slots "$s" 2; done
+  for s in s_base s_g s_d s_e s_f; do run_hm slots "$s" 2; done
+  for N in 1 4; do run_hm slots s_base "$N"; run_hm slots a2 "$N"; done
 
-# handler_multi: serialised variants -- one response outstanding per lane, which is the
-# configuration the design does work in, so the drain/containment questions can be asked
-for s in s_base s_g s_d s_e s_f; do run_hm "$s" 2; done
+  echo "--- handler_slots : the questions only the slots raise ---"
+  # (a) the host's biggest legal GET, on every connection at once
+  for N in 1 2 4; do run_hm slots big "$N"; done
+  # (b) THE experiment: one decoder throttled to 16 B/cycle, then 4, while the others run flat out
+  for N in 2 4; do
+    run_hm slots thr "$N" THRDIV=4
+    run_hm slots thr "$N" THRDIV=16
+  done
+  # (c) the card path slow and lumpy underneath the full scenario
+  run_hm slots dmabp 4 DMA_WR_BP=50 DMA_RD_GAP=40
+  # (d) one connection overruns its slot; nobody else may notice
+  for N in 2 4; do run_hm slots ovf "$N"; done
+  # (e) a connection dies with a half-written slot, and its next response is byte-exact
+  for N in 2 4; do run_hm slots refatal "$N"; done
+fi
 
-# other lane counts
-for N in 1 4; do
-  run_hm s_base "$N"
-  run_hm a2     "$N"
-done
+echo "lane_drain: $FAILS failed of $CASES case(s)"
+exit $(( FAILS > 0 ))
