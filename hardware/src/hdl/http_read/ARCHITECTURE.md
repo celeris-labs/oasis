@@ -446,6 +446,41 @@ can no longer stall the shared TOE fifo. Depth-1 model: 512 KiB per (2.5 ms tran
    MinIO serialises pipelined GETs anyway and depth was measured to buy nothing (2026-09-12; see
    *Deeper pipelining on one connection is not a lever* below).
 
+### CSR rev 3 — per-connection visibility and the slot base
+
+**Date:** 2026-09-20 · Implemented in `http_config.sv` under `CSR_REV` (**default 2**), driven by
+`handler_slots`. `handler_multi` keeps the exact revision-2 map; at `CSR_REV = 2` the registers
+below are not merely unchanged in meaning, they **do not exist** — the read file still answers
+anything past 20 with `resp_error` and the two new write registers are not instantiated. That is
+what lets build-119 stay the sealed control arm while both handlers live in the same tree.
+
+`INFLIGHT[31:24]` reads **3**, and is still the first thing a host reads.
+
+| id | name | what it carries |
+|---|---|---|
+| **w42/43** | `SLOT_BASE_LO/HI` | card address of slot 0. Written before the first arm; the page must already be offloaded (risk 7 — a first-touch fault here stalls the shared TOE fifo) |
+| 21–24 | `CONN_OCC0..3` | chunk entries per **decoder**, one byte at `[8k+7:8k]` of word *w* for decoder 8w+k |
+| 25–26 | `CONN_READY0..1` | one nibble per **connection** at `[4k+3:4k]` of word *w* for conn 16w+k: `+0` ARM_READY, `+1` ENTRY_READY, `+2` CONN_UP, `+3` FATAL |
+| 27–30 | `CONN_ERR0..3` | sticky causes, one byte per connection at `[8k+7:8k]` of word *w* for conn 8w+k |
+| 31 | `CONN_DRAINED` | `[c]` the depth-1 credit for conn *c*; `[32+c]` conn *c* overflowed its slot |
+| 32 | `SLOT_POLICY` | `[7:0]` rev, `[15:8]` N_CONNS, `[23:16]` N_DECODERS, `[29:24]` SLOT_LOG2, `[35:30]` log2 RD_MAX, `[51:36]` ENTRY_DEPTH, `[57:52]` log2 of the shared writer fifo |
+
+**The stride stays 8, and there are four words instead of a wider slot.** Revision 2 fixed the slot
+width so a host compiled against one bitstream could not silently reinterpret another's fields; the
+same argument at 24 or 32 connections says *more words*, not a stride that moves with `N_CONNS`.
+
+**Two fields changed meaning and both are deliberate.** `ARM_READY` now also carries the **depth-1
+credit**: it is low while the connection's slot still holds an undrained response, so a host that
+tries to arm a second GET is held at the config port instead of quietly corrupting the second
+response. And `CONN_ERR` bit 7, which was `RX_FIFO_STALL` in revision 2, is **`SLOT_OVERFLOW`** —
+there is no per-connection fifo left for the old bit to be about, and the shared writer fifo's
+equivalent is `STALL[25]`, unchanged. `RESP_ERR` (bit 3) now covers two causes, an unframeable
+response and bytes left in a slot at the end of one; `STALL[31]` separates them.
+
+`STALL` gains three bits that were a literal zero in build-119: `[29]` the writer throttled
+rx_dispatch's readPkg issue (**not** a failure — it is the elastic fifo working, and the first sign
+the card path is behind the wire), `[30]` some connection overran its slot, `[31]` residue.
+
 ### What would overturn ADR-5
 
 - **The card path cannot sustain one `sq_wr` per ~4 KiB segment** (8 outstanding, `N_OUTSTANDING` in
