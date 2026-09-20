@@ -24,6 +24,17 @@ option(ENABLE_HTTP_MULTI "One TCP session per decoder lane" OFF)
 # build cannot (build-110 missed timing at WNS -7.43 ns with it in). Enable for a receive-path
 # investigation, not for a build anyone is going to measure.
 option(ENABLE_PERF_ILA "Include the TCP/HTTP performance ILA" OFF)
+# Per-connection receive slots in card memory (HBM) instead of a BRAM fifo per decoder lane:
+# rx_dispatch -> slot_writer -> one 4 MiB slot per TCP connection -> slot_reader per decoder.
+# ARCHITECTURE.md ADR-5. Requires ENABLE_HTTP_MULTI. OFF by default so the tree still configures
+# exactly as build-119, which is the sealed control arm every measurement on record was taken on.
+#
+# Turning it ON is not free in the shell: it sets EN_MEM, which adds N_CARD_AXI cdma engines and
+# that many more HBM crossbar ports (see the N_MEM_CHAN arithmetic in Coyote's FindCoyoteHW.cmake).
+option(ENABLE_HTTP_SLOTS "Per-connection HBM receive slots (handler_slots)" OFF)
+# Number of TCP connections. Stage 1 of ADR-5 pairs one connection with one decoder, and
+# handler_slots errors out at elaboration if they differ; stage 2 (WP5) lifts that to 24.
+set(N_HTTP_CONNS 0 CACHE STRING "TCP connections for handler_slots (0 = same as N_DECODERS)")
 
 if(ENABLE_HTTP AND ENABLE_RDMA)
     message(FATAL_ERROR "ENABLE_HTTP and ENABLE_RDMA are mutually exclusive")
@@ -31,6 +42,21 @@ endif()
 
 if(ENABLE_HTTP_MULTI AND NOT ENABLE_HTTP)
     message(FATAL_ERROR "ENABLE_HTTP_MULTI needs ENABLE_HTTP -- there is no HTTP client to give sessions to")
+endif()
+
+if(ENABLE_HTTP_SLOTS AND NOT ENABLE_HTTP_MULTI)
+    message(FATAL_ERROR "ENABLE_HTTP_SLOTS needs ENABLE_HTTP_MULTI -- handler_slots keeps handler_multi's session side, one TCP connection per slot")
+endif()
+
+if(ENABLE_HTTP_SLOTS)
+    if(N_HTTP_CONNS EQUAL 0)
+        set(N_HTTP_CONNS ${N_DECODERS})
+    endif()
+    # Stage 1 only. handler_slots' conn_of_dec map is the identity and the module $errors otherwise;
+    # catching it in CMake instead means the mistake costs a second, not a Vivado elaboration run.
+    if(NOT N_HTTP_CONNS EQUAL ${N_DECODERS})
+        message(FATAL_ERROR "ADR-5 stage 1 requires N_HTTP_CONNS == N_DECODERS (got ${N_HTTP_CONNS} and ${N_DECODERS}); stage 2 (24 connections) is WP5")
+    endif()
 endif()
 
 # Coyote generates lynx_pkg.sv from its own template, so oasis cannot add a `define there without
@@ -44,6 +70,11 @@ if(ENABLE_PERF_ILA)
     set(OASIS_DEF_EN_PERF_ILA "`define EN_PERF_ILA")
 else()
     set(OASIS_DEF_EN_PERF_ILA "// EN_PERF_ILA off: no performance ILA instantiated (--perf-ila to add it)")
+endif()
+if(ENABLE_HTTP_SLOTS)
+    set(OASIS_DEF_HTTP_SLOTS "`define HTTP_SLOTS\n`define N_HTTP_CONNS ${N_HTTP_CONNS}")
+else()
+    set(OASIS_DEF_HTTP_SLOTS "// HTTP_SLOTS off: build-119's per-lane BRAM fifos, no card memory")
 endif()
 # Generated into src/hdl/, NOT src/ -- Coyote's cr_user.tcl copies `src/hdl/*` and `vfpga_top.svh`
 # into the Vivado project and nothing else, so a header generated one level up never reaches
@@ -66,6 +97,14 @@ if(ENABLE_HTTP)
     set(EN_TCP 1)
     set(N_TCP_AXI 1)
     set(N_STRM_AXI ${N_STREAMS})
+    if(ENABLE_HTTP_SLOTS)
+        # One card AXI stream for slot_writer (dest 0) and one per decoder for the readers
+        # (dest 1+d). EN_MEM is what instantiates them; on the u55c the HBM controller itself is
+        # already in the design because the TCP stack needs a card channel, so what this adds is
+        # N_CARD_AXI+1 more cdma engines and that many more RAMA/HBM crossbar ports.
+        set(EN_MEM 1)
+        math(EXPR N_CARD_AXI "${N_DECODERS} + 1")
+    endif()
 elseif(ENABLE_RDMA)
     math(EXPR N_STREAMS "${N_DECODERS} + 1")
     set(EN_RDMA 1)

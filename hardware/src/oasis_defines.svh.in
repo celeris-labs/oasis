@@ -10,4 +10,6 @@
 
 @OASIS_DEF_EN_PERF_ILA@
 
+@OASIS_DEF_HTTP_SLOTS@
+
 `endif

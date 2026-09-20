@@ -7,11 +7,22 @@ decoders=1
 enable_http_multi=0
 enable_http=0
 enable_perf_ila=0
+enable_http_slots=0
+conns=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --http) enable_http=1 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
         --multi) enable_http_multi=1 ;;
+        # Per-connection receive slots in HBM (ADR-5): rx_dispatch -> slot_writer -> one 4 MiB card
+        # slot per TCP connection -> one slot_reader per decoder. Needs --multi. N is the connection
+        # count; stage 1 requires it to equal --decoders. Giving it turns the mode on, so
+        # `--conns 4` alone is enough -- there is no separate --slots flag to forget.
+        #
+        # This is the flag that sets EN_MEM, which changes the SHELL (N_CARD_AXI+1 more cdma engines
+        # and HBM crossbar ports) and not just the user region. Do not expect build-119's timing.
+        --conns) enable_http_slots=1; conns="$2"; shift ;;
+        --conns=*) enable_http_slots=1; conns="${1#*=}" ;;
         # Add the 42-probe TCP/HTTP performance ILA back. OFF by default since it costs ~13.2k
         # LUTs and ~114.5 BRAM in the user region -- affordable at 1-2 lanes, not at 4 (build-110
         # missed timing at WNS -7.43 ns carrying it). Use it to debug the receive path, not to
@@ -47,6 +58,10 @@ cmake_args+=(-DN_DECODERS="$decoders")
 # One TCP session per decoder lane. Needs --http; the build fails loudly otherwise.
 cmake_args+=(-DENABLE_HTTP_MULTI="$([ "$enable_http_multi" = 1 ] && echo ON || echo OFF)")
 cmake_args+=(-DENABLE_PERF_ILA="$([ "$enable_perf_ila" = 1 ] && echo ON || echo OFF)")
+# Per-connection HBM slots. OFF unless --conns was given, so a plain `--http --multi` build is
+# byte-for-byte the build-119 configuration.
+cmake_args+=(-DENABLE_HTTP_SLOTS="$([ "$enable_http_slots" = 1 ] && echo ON || echo OFF)")
+cmake_args+=(-DN_HTTP_CONNS="$conns")
 
 pushd hardware
 
