@@ -20,6 +20,7 @@
 #include "rdma_file_system.hpp"
 #include "reader/struct_column_reader.hpp"
 #include "filter_pushdown.hpp"
+#include "thrift_tools.hpp" // ThriftFileTransport, for the per-group ClearPrefetch in BeginGroup
 
 #include <algorithm>
 #include <cstring>
@@ -475,6 +476,26 @@ BeginGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalStat
 	// InitializeRead(...) does the page-header parsing / I/O positioning for the CPU/string columns,
 	// then DecodeCpuColumns drains them in full. Both run while the FPGA splinters are in flight.
 	if (gstate.has_cpu_columns) {
+		// DROP THE PREVIOUS GROUP'S PREFETCH FIRST -- otherwise the host re-read is QUADRATIC.
+		//
+		// ThriftFileTransport keeps a list of read heads. A page-header read that lands outside
+		// them falls back to registering a new 1,000,000 byte head (PREFETCH_FALLBACK_BUFFERSIZE)
+		// and then calls ReadAheadBuffer::Prefetch(), which re-reads EVERY head in the list, not
+		// just the new one. Heads are pushed with emplace_front, so that re-read walks backwards
+		// from the current row group to the start of the file.
+		//
+		// Nothing here cleared the list between row groups, so group i re-read groups i-1..0:
+		// sum(1..N) fetches of ~1 MB. Measured at sf1 (49 groups): 1,224 fetches, 1,224 MB off a
+		// 207 MB object, and a projected ~1.07 TB at sf30 -- which is why q1/q10/q12/q19 never
+		// finished there. See oasis-debug/2026-09-20/FINDINGS-2C-reread-mechanism.md.
+		//
+		// DuckDB's own ParquetReader::Scan does exactly this on every row-group switch
+		// (parquet_reader.cpp, "see if we have to switch to the next row group"); this scan drives
+		// InitializeRead directly and so bypassed it.
+		auto &trans =
+		    reinterpret_cast<ThriftFileTransport &>(*lstate.scan_state->thrift_file_proto->getTransport());
+		trans.ClearPrefetch();
+
 		lstate.root_reader->InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns,
 		                                   *lstate.scan_state->thrift_file_proto);
 	}

@@ -510,13 +510,27 @@ timestamp_t OasisHTTPFileSystem::GetLastModifiedTime(FileHandle &handle) {
 // through a 1 MiB window would only add a memcpy and evict useful data.
 void OasisHTTPFileSystem::ReadBuffered(OasisHTTPFileHandle &h, void *dst, size_t size,
                                        uint64_t location) {
+	// Diagnostic only, and off unless OASIS_READBUF_TRACE is set in the environment. Counts the
+	// reads served from the resident window so a fetch line can report how many it covered.
+	static std::atomic<uint64_t> trace_resident_hits {0};
+	const bool trace = HttpFpgaReadTraceEnabled();
+
 	if (size >= OasisHTTPFileHandle::READ_BUFFER_LEN) {
+		if (trace) {
+			std::fprintf(stderr, "[rbtrace] h=%p big loc=%llu size=%llu path=%s\n", (void *)&h,
+			             (unsigned long long)location, (unsigned long long)size, h.path.c_str());
+		}
 		HTTPReadRange(h.path, location, size, dst);
 		return;
 	}
 	const bool resident = h.buffer_end > h.buffer_start && location >= h.buffer_start &&
 	                      location + size <= h.buffer_end;
+	if (trace && resident) {
+		trace_resident_hits.fetch_add(1, std::memory_order_relaxed);
+	}
 	if (!resident) {
+		const uint64_t trace_prev_start = h.buffer_start;
+		const uint64_t trace_prev_end = h.buffer_end;
 		if (!h.read_buffer) {
 			h.read_buffer = duckdb::unique_ptr<data_t[]>(new data_t[OasisHTTPFileHandle::READ_BUFFER_LEN]);
 		}
@@ -543,6 +557,16 @@ void OasisHTTPFileSystem::ReadBuffered(OasisHTTPFileHandle &h, void *dst, size_t
 		}
 		if (fetch < size) {
 			fetch = size; // caller's range is authoritative and already bounds-checked
+		}
+		if (trace) {
+			std::fprintf(stderr,
+			             "[rbtrace] h=%p fetch loc=%llu size=%llu fetch=%llu seq=%d first=%d "
+			             "prev=[%llu,%llu) hits=%llu path=%s\n",
+			             (void *)&h, (unsigned long long)location, (unsigned long long)size,
+			             (unsigned long long)fetch, sequential ? 1 : 0, first_touch ? 1 : 0,
+			             (unsigned long long)trace_prev_start, (unsigned long long)trace_prev_end,
+			             (unsigned long long)trace_resident_hits.exchange(0, std::memory_order_relaxed),
+			             h.path.c_str());
 		}
 		HTTPReadRange(h.path, location, static_cast<size_t>(fetch), h.read_buffer.get());
 		h.buffer_start = location;
