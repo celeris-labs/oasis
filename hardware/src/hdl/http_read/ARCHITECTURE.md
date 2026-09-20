@@ -27,7 +27,7 @@ A third, found 2026-08-26 and relevant to every FPGA-vs-CPU ratio: DuckDB's
 RAM that the FPGA path structurally cannot. Use `scripts/tpch_demo.sh --cache off` for the parity
 number. See `THESIS-MEASUREMENTS.md` in the repo root.
 
-## Status at a glance — 2026-08-26
+## Status at a glance — 2026-08-26 (ADR-5 row added 2026-09-20)
 
 | | decision | status |
 |---|---|---|
@@ -35,6 +35,7 @@ number. See `THESIS-MEASUREMENTS.md` in the repo root.
 | ADR-2 | keep the HTTP parser out of the TOE's back-pressure path | **accepted, shipped** in `b238c4e`, holds |
 | ADR-3 | N connections serialised onto **one** decoder | **superseded by ADR-4, and several of its numbers were wrong** — see the corrections table |
 | ADR-4 | **one TCP session per decode lane** | accepted, implemented in `3edff95`, first bitstream **build-110** (4 lanes, synthesizing 2026-08-26). **Verified in simulation only — no hardware measurement exists yet.** |
+| ADR-5 | **one HBM slot per connection**, drained by per-decoder readers | **accepted 2026-09-20, not built** — no RTL, no bitstream. Replaces ADR-4's per-lane datapath (its session-per-connection side and the arrival-order contract stand) |
 
 ---
 
@@ -342,6 +343,119 @@ Run the A/B on **one** bitstream (`oasis_scheduler_num_streams` 1 vs N, arms int
 build-105 against build-110 across a day. `scripts/util/decoder_ab.sh` exists for this and has never
 completed a multi-lane arm.
 
+---
+
+## ADR-5 — Per-connection receive slots in HBM, drained by per-decoder readers
+
+**Date:** 2026-09-20 · **Status:** **accepted, not built** — no RTL, no bitstream, no simulation.
+Decided by Janos on 2026-09-20; plan `~/.claude/plans/linear-mixing-pinwheel.md`, branch
+`feature/hbm-slots` off `feature/minio`, baseline `efd5fbb` (build-119's `handler_multi.sv`).
+Nothing below has been measured, because nothing below exists yet.
+
+### The measurements that force it
+
+ADR-4's one-session-per-lane datapath is at a structural ceiling. All of these are build-119:
+
+| | result | date · source |
+|---|---|---|
+| 4 lanes, MinIO | 775 MB/s, 3.76x one lane; sf30 `wide` 232 → 664 (2.86x) | 2026-09-12 M8 in `THESIS-MEASUREMENTS.md` · 2026-09-18 R1, hacc-u55c-07 |
+| 1 lane on a fast (sendfile) origin | 750 MB/s vs 206 on MinIO — 3.6x | 2026-09-15, hardware median |
+| **that same origin at 2+ lanes** | **net loss, then fatal**: 1 lane 225–300 vs MinIO 232, 2 lanes error, 3 lanes fatal | 2026-09-20 |
+| 1 lane, 4.9 MiB GETs | 610 MB/s (2.9x) — but **wedges at 2+ lanes** | 2026-09-19 |
+
+The mechanism is *Lanes are coupled head-of-line* below, read off the hardware's own error text on
+2026-09-20: a lane's 128 KiB fifo fills → `conn_space_ok` drops → the head of `rx_dispatch`'s
+arrival-ordered queue blocks → every other lane starves → the watchdog fires (`rx_fifo_stall` →
+`route_stall` → `lane_dead`). **A faster supply makes this design slower**, and both remaining
+levers — more connections (MinIO: 0.46 GB/s on one session, 4.60 across 16, 2026-09-15) and bigger
+GETs — feed the coupling instead of the decoders.
+
+### The decision
+
+Decouple supply from consumption by construction: **every connection gets its own buffer in card
+memory**, a shared writer DMAs each arriving segment into its connection's slot, and **one reader
+per decoder** pulls whole responses out in the order the host queued them, feeding the existing
+`strip_http` → `axis_rewrite_last` → `DataNormalizer` → `ColumnChunkDecoder` chain unchanged. HBM
+through Coyote's card path (`sq_wr`/`sq_rd`, `STRM_CARD`), not `RX_DDR_BYPASS_EN=0`: only the HTTP
+payload pays for HBM and the shell stays ours to build. Connection count and decoder count become
+independent — the connections MinIO needs for 4.6 GB/s no longer cost a parser each.
+
+```
+ TOE notify/rx_meta/rx_data                      card DMA (EN_MEM=1, N_CARD_AXI = 1 + N_DEC)
+   |                                                   ^                    |
+   v                                     sq_wr / axis_card_send[0]   sq_rd / axis_card_recv[1+d]
+ rx_dispatch (NUM_CONNS, contract unchanged) -> slot_writer -+                v
+   demux session -> conn, arrival order,      1 shared 64 KiB fifo,    slot_reader[d] x N_DEC
+   readPkg gated on the SHARED fifo           wr_cursor[c], landed[c]  entry {conn, bytes, last}
+                                                                              |
+                                              strip_http[d] -> rewrite_last[d] -> normalizer -> decoder
+```
+
+**Slot layout.** One card-resident 1 GiB huge page (`cThread::getMem(HPF)`, page size = shell
+`pg_l_bits` = 30, `cThread.cpp:518`), offloaded once with `LOCAL_OFFLOAD` so the card TLB entry
+exists before any traffic — a first-touch fault on the datapath would stall the shared TOE fifo for
+milliseconds. `SLOT_BYTES` = 4 MiB, slot *c* at `base + c*SLOT_BYTES`, one GET per conn of at most
+`SLOT_BYTES − 64 KiB`; larger column chunks split by the existing `chunk_bytes` path.
+
+**`slot_writer`** pushes each packet's beats into one shared elastic fifo and issues
+`sq_wr{LOCAL_WRITE, STRM_CARD, dest 0, vaddr = base + c*SLOT + wr_cursor[c], len, last=1}`.
+`conn_space_ok` becomes room in *that* fifo (the reservation logic of `tcp_read.sv:265-322`, moved
+onto it), so the TOE is never stalled by us while the DMA drains — and it drains at HBM speed.
+`cq_wr` completions return in issue order on one channel (`cdma_u` status fifo), so an in-order
+queue of `{conn, end_cursor}` is enough to maintain `landed[c]`.
+
+**`slot_reader[d]`** owns decoder *d*'s entry queue, widened to `{conn, chunk_bytes, body_last}`.
+While `landed[c] > rd_cursor[c]` and fewer than 2 reads are outstanding it issues
+`sq_rd{LOCAL_READ, STRM_CARD, dest 1+d, len ≤ RD_MAX 64 KiB, last=0}` into `axis_card_recv[1+d]`.
+On `resp_done` the slot is empty (depth 1): pulse `release[c]`, raise the host's `CONN_DRAINED`
+credit, pop the entry. Byte-granular vaddr/len is safe — build-119 already compiles the unaligned
+engine `cdma_u` (`cr_shell.tcl:93`), `dest` selects the card stream (`mmu_top.sv:572`), and `cq_wr`
+fires on the last `bvalid` (`cdma_u/axi_dma_wr.sv:443`), so a read issued after the ack is ordered
+behind its write.
+
+**The rest follows:** `handler_multi` → `handler_slots` (session FSMs per conn, datapath per
+decoder, `tcp_read` leaves the datapath); CSR **revision 3**; `sq_wr` shared with `OutputWriter`
+through a `MetaIntfArbiter`, `cq_wr` duplicated and filtered on `strm`/`dest`; `EN_MEM 1` and
+`N_CARD_AXI = N_DECODERS+1` under `ENABLE_HTTP_MULTI`. Two buildable stages: `N_CONNS = N_DECODERS
+= 4` (datapath only), then `N_CONNS = 24` (fallback knob 16).
+
+**Expected gain**, from the numbers above and the intake table below: MinIO supplies 4.6 GB/s at 16
+conns and each decoder takes 0.53–1.8 GB/s, so this should land at **~2–4 GB/s, decoder- or
+MinIO-bound, 3–5x over 775 MB/s**, with the fast-origin and big-GET wedges gone because a full slot
+can no longer stall the shared TOE fifo. Depth-1 model: 512 KiB per (2.5 ms transfer + 0.4 ms drain
++ ~1.3 ms re-arm) ≈ 120 MB/s per conn, ×24 ≈ 3 GB/s.
+
+### The three conditions it was accepted under
+
+1. **No bitstream until the CMAC licence is fixed.** `write_bitstream` has failed deterministically
+   on a server-side `cmac_usplus` licence check since 2026-09-17 (build-121; reproduced from scratch
+   by build-122, 2026-09-18). Synthesis, P&R, area and WNS are obtainable today; hardware numbers
+   are not. Every stage ends at "routed + simulated", and this is worth doing only if the licence
+   returns inside the thesis window, or a designed-and-simulated chapter stands on its own.
+2. **`EN_MEM=1` changes the shell *and* the driver.** It adds `N_CARD_AXI` cdma engines and HBM
+   crossbar ports — build-110's congestion was HBM shell nets and build-119 closes at −1.474 ns — so
+   the kill-early rule is a post-place estimate worse than ≈ −3 ns or congestion ≥ 6 in the HBM
+   region, fallback `N_CARD_AXI 2`, then `N_DECODERS 3`. On the host side `en_mem` makes the driver
+   shadow **every** mapped buffer in card memory, and upstream's huge-page pool is 4 GiB while OASIS
+   maps `LIBSTF_HUGE_PAGES=10`: raised to 12 GiB by `hardware/patches/0003-driver-card-pool-12g.patch`
+   (2026-09-20). Coyote's card allocator also walks its chunk ring from the last freed chunk without
+   checking `used`, so the slot page is allocated once per process, first, and never unmapped.
+3. **Depth 1 per connection.** `strip_http` keeps mid-beat residue across responses, so a reader may
+   switch connections only when the slot is empty: one outstanding GET per conn, re-armed once its
+   response is drained. Concurrency comes from the *number* of connections, not from pipelining —
+   MinIO serialises pipelined GETs anyway and depth was measured to buy nothing (2026-09-12; see
+   *Deeper pipelining on one connection is not a lever* below).
+
+### What would overturn ADR-5
+
+- **The card path cannot sustain one `sq_wr` per ~4 KiB segment** (8 outstanding, `N_OUTSTANDING` in
+  `cdma`). If the writer's shared fifo backs up in the unit benches, segments have to be coalesced
+  before anything is synthesized.
+- **`rx_perf` at 24 conns below the 4-lane aggregate** (15.7 GB/s, 2026-09-19, `unit-tests/rx_perf`)
+  — then the shared writer is the new head of line and nothing has been won.
+- **Reader head-of-line on a late response costs more than the coupling it replaces.** Expected to
+  be a dip, not a wedge, since the host orders entries by issue time; measure before building
+  out-of-order drain.
 ---
 
 ## Constraints that are not decisions
