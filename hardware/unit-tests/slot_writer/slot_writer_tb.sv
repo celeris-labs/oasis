@@ -66,12 +66,18 @@ module slot_writer_tb #(
         .conn_tdata(conn_tdata), .conn_tkeep(conn_tkeep), .conn_tlast(conn_tlast),
         .conn_pkg_issued(conn_pkg_issued), .conn_space_ok(conn_space_ok),
         .slot_base(SLOT_BASE), .conn_release(conn_release),
+        // Every connection is up for the whole of this bench: the reservation leak that conn_down
+        // exists for is a handler-level teardown, and lane_drain `ovf` / `refatal` are where it is
+        // exercised end to end.
+        .conn_down('0),
         .wr_req_valid(wr_req_valid), .wr_req_ready(wr_req_ready),
         .wr_req_vaddr(wr_req_vaddr), .wr_req_len(wr_req_len), .wr_req_last(wr_req_last),
         .m_axis_tvalid(w_tvalid), .m_axis_tready(w_tready),
         .m_axis_tdata(w_tdata), .m_axis_tkeep(w_tkeep), .m_axis_tlast(w_tlast),
         .wr_ack(wr_ack), .landed(landed),
-        .slot_overflow(slot_overflow), .route_stall(route_stall)
+        .conn_quiet(), .slot_poison(),
+        .slot_overflow(slot_overflow), .route_stall(route_stall),
+        .fifo_stall(), .space_stall()
     );
 
     // ---------------------------------------------------------------------------------------------

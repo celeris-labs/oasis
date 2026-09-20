@@ -57,15 +57,52 @@ import lynxTypes::*;
 // margin is 3 x MSS_BEATS rather than 1 -- 198 of 1024 beats, which buys back a path for 12 KiB of
 // elasticity we do not need.
 //
+// AND THE RESERVATION LEAKS IF THE PACKET IS NEVER DELIVERED
+// ----------------------------------------------------------
+// A reservation is handed back by the segment's tlast ON THE WAY INTO THE FIFO, so a readPkg whose
+// bytes never arrive here keeps its reservation for ever. That happens routinely: rx_dispatch reads
+// and DISCARDS a packet whose session has been released or whose connection the head-of-line
+// watchdog declared dead (`pkt_drop_q`), and those beats are never offered to us. tcp_read has the
+// identical hazard and clears the whole reservation on `clear_framing`; that is not available here,
+// because ONE counter serves every connection and zeroing it would throw away the live ones.
+//
+// So the reservation is tracked per connection as well (`rsv_pkg_q`, one small counter each) and
+// corrected in two places:
+//   * a readPkg issued for a connection that is DOWN charges nothing -- its bytes are going to be
+//     discarded upstream, so there is no room to reserve;
+//   * `conn_release[c]` returns whatever that connection still holds, in one go.
+//
+// Found by lane_drain `ovf` and `refatal`, where a connection is torn down with a dozen announced
+// segments still queued in rx_dispatch: the shared counter climbed past the margin and NO readPkg
+// was ever issued again, for ANY connection. That is a total receive-path wedge on hardware, and it
+// is invisible to a bench that never tears a connection down mid-response.
+//
 // SLOT OVERFLOW
 // -------------
 // A segment whose bytes would run past the end of its 2^SLOT_LOG2 slot is discarded WHOLE -- its
-// beats are drained out of the shared fifo and dropped, no request is issued, `slot_overflow[c]`
+// beats are drained out of the shared fifo and dropped, no request is issued, `slot_poison[c]`
 // latches, and every later segment of that connection is dropped too until the connection is
 // released. Writing a partial segment, or wrapping, would corrupt the neighbouring slot; and a
 // response with a hole in it is not repairable by anything short of the host reissuing, so once the
 // connection is poisoned there is no value in writing the rest. The host's contract
 // (GET <= SLOT_BYTES - 64 KiB) means this should never fire; the sticky bit says whether it did.
+//
+// The POISON and the DIAGNOSTIC are two different bits, and conflating them was a bug in the first
+// version of this module. `slot_poison[c]` is the live "drop everything from c" state and MUST be
+// cleared by `conn_release[c]`, or a connection that overflowed once is silently dead for the rest
+// of the run even after the handler has torn it down and reopened it -- the header claimed "until
+// the connection is released" and nothing implemented it. `slot_overflow[c]` is sticky since reset
+// and is what the host reads, because a teardown must not erase the evidence.
+//
+// QUIET, AND WHY THE HANDLER NEEDS IT
+// -----------------------------------
+// `conn_release[c]` resets that connection's cursors, so it is only safe when nothing of c is still
+// on its way into the slot. On the normal path depth 1 guarantees that. On the ERROR path -- a
+// connection going fatal, or reconnecting, with a half-written response in its slot -- it does not:
+// rx_dispatch may still be mid-packet for c at the moment the session is released. `conn_quiet[c]`
+// is the exported form of the invariant the simulation assertion below checks: no descriptor of c
+// queued, none in the output FSM, none awaiting an ack, and no segment of c part-way into the fifo.
+// handler_slots waits for it before it releases a connection it is tearing down.
 //
 // DESIGN FOR SYNTHESIS
 // --------------------
@@ -113,6 +150,10 @@ module slot_writer #(
     // -- from the readers: this connection's response has drained, reset its cursors.
     input  logic [N_CONNS-1:0]         conn_release,
 
+    // -- this connection holds no session. A readPkg issued for it will be discarded by
+    //    rx_dispatch and its beats will never reach us, so it must not reserve fifo room.
+    input  logic [N_CONNS-1:0]         conn_down,
+
     // -- card DMA write channel (wrapped into metaIntf/req_t{LOCAL_WRITE, STRM_CARD, dest 0} later)
     output logic                       wr_req_valid,
     input  logic                       wr_req_ready,
@@ -132,9 +173,23 @@ module slot_writer #(
     //    nowhere else: it is the only thing that orders a read behind its write.
     output logic [N_CONNS-1:0][SLOT_LOG2:0] landed,
 
+    // -- nothing of this connection is in flight: safe to release it. See the note above.
+    output logic [N_CONNS-1:0]         conn_quiet,
+
+    // -- live: this connection overflowed its slot and everything it sends is being dropped.
+    //    Cleared by conn_release[c]; slot_overflow below is the sticky copy the host reads.
+    output logic [N_CONNS-1:0]         slot_poison,
+
     // -- sticky diagnostics
     output logic [N_CONNS-1:0]         slot_overflow,
-    output logic                       route_stall  // a routed beat was refused: see the note above
+    output logic                       route_stall, // a routed beat was refused: see the note above
+    // The shared fifo refused the producer. Identical in cause to route_stall and kept separate
+    // because it is the fifo's own witness rather than ours.
+    output logic                       fifo_stall,
+    // conn_space_ok was low while the fifo held data, i.e. we throttled rx_dispatch's readPkg issue.
+    // NOT a failure -- it is the design working -- but it is the first sign that the card path is
+    // not keeping up with the wire, which is the thing ADR-5 says would overturn it.
+    output logic                       space_stall
 );
 
     // Space for one maximum segment, in beats. MSS is 4096 on this stack; at 512 bit that is 64
@@ -207,7 +262,7 @@ module slot_writer #(
         .m_axis_tkeep(fifo_m_tkeep),
         .m_axis_tlast(fifo_m_tlast),
         .level(fifo_level),
-        .overflow_stall()
+        .overflow_stall(fifo_stall)
     );
 
     // ---------------------------------------------------------------------------------------------
@@ -215,12 +270,18 @@ module slot_writer #(
     // ---------------------------------------------------------------------------------------------
     logic [OFF_BITS-1:0] wr_cursor_q [N_CONNS];   // next write offset inside slot c
     logic [OFF_BITS-1:0] landed_q    [N_CONNS];   // bytes committed (acked) in slot c
-    logic [N_CONNS-1:0]  overflow_q;
+    logic [N_CONNS-1:0]  overflow_q;              // live poison, cleared by conn_release
+    logic [N_CONNS-1:0]  overflow_sticky_q;       // since reset, for the host
+
+    // Descriptors of connection c pushed and not yet acked or discarded. Max is DESC_DEPTH + the one
+    // in the output FSM + ACKQ_DEPTH, so 8 bits covers every legal parameterisation here.
+    logic [7:0]          infl_q [N_CONNS];
 
     always_comb begin
         for (int c = 0; c < N_CONNS; c++) landed[c] = landed_q[c];
     end
-    assign slot_overflow = overflow_q;
+    assign slot_overflow = overflow_sticky_q;
+    assign slot_poison   = overflow_q;
 
     // ---------------------------------------------------------------------------------------------
     // Segment accounting on the way in. A segment is full beats plus one partial last beat, so the
@@ -231,6 +292,16 @@ module slot_writer #(
     logic [BEAT_BITS-1:0] seg_beats_q;    // beats accepted so far, NOT counting the current one
     logic [OFF_BITS-1:0]  cur_off_q;      // slot offset this segment starts at
     logic [CONN_BITS-1:0] seg_conn_q;
+
+    // Nothing of connection c anywhere between rx_dispatch and the ack: no descriptor outstanding
+    // and no segment part-way into the shared fifo. Registered inputs only, so this is a compare
+    // against zero and a two-term AND -- it feeds handler_slots' teardown sequencer, never a
+    // datapath decision.
+    always_comb begin
+        for (int c = 0; c < N_CONNS; c++)
+            conn_quiet[c] = (infl_q[c] == 8'd0) &&
+                            !(seg_active_q && (seg_conn_q == CONN_BITS'(c)));
+    end
 
     logic [OFF_BITS-1:0]  cursor_mux_w;
     assign cursor_mux_w = wr_cursor_q[in_conn_w];
@@ -276,9 +347,31 @@ module slot_writer #(
     // Reservation and conn_space_ok. One counter for the shared fifo, plus room for the descriptor
     // the same readPkg will eventually produce.
     // ---------------------------------------------------------------------------------------------
-    logic [RSV_BITS-1:0] rsv_beats_q;
-    logic                pkg_issued_w;
+    localparam int RPKG_BITS = 8;   // readPkgs outstanding per conn; space_ok bounds this far below
+
+    logic [RSV_BITS-1:0]  rsv_beats_q;
+    logic [RPKG_BITS-1:0] rsv_pkg_q [N_CONNS];
+    logic                 pkg_issued_w;
+    logic [CONN_BITS-1:0] pkg_conn_w;
+    logic                 charge_w;     // this readPkg is for a live connection, so reserve for it
+
     assign pkg_issued_w = |conn_pkg_issued;
+    always_comb begin
+        pkg_conn_w = '0;
+        for (int c = 0; c < N_CONNS; c++)
+            if (conn_pkg_issued[c]) pkg_conn_w = pkg_conn_w | CONN_BITS'(c);
+    end
+    assign charge_w = pkg_issued_w && !conn_down[pkg_conn_w];
+
+    // What a release hands back. Summed rather than taken from one connection because two readers
+    // may retire in the same cycle; on the normal path both terms are zero (depth 1 means every
+    // announced segment has landed by then) and this only has anything to do on a teardown.
+    logic [RPKG_BITS+4:0] rel_pkgs_w;
+    always_comb begin
+        rel_pkgs_w = '0;
+        for (int c = 0; c < N_CONNS; c++)
+            if (conn_release[c]) rel_pkgs_w = rel_pkgs_w + (RPKG_BITS+5)'(rsv_pkg_q[c]);
+    end
 
     logic space_ok_q;
     assign conn_space_ok = {N_CONNS{space_ok_q}};
@@ -326,8 +419,9 @@ module slot_writer #(
     // ---------------------------------------------------------------------------------------------
     // Sequential
     // ---------------------------------------------------------------------------------------------
-    logic route_stall_q;
+    logic route_stall_q, space_stall_q;
     assign route_stall = route_stall_q;
+    assign space_stall = space_stall_q;
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -350,14 +444,20 @@ module slot_writer #(
             aq_tail_q     <= '0;
             aq_cnt_q      <= '0;
             overflow_q    <= '0;
+            overflow_sticky_q <= '0;
             route_stall_q <= 1'b0;
+            space_stall_q <= 1'b0;
             for (i = 0; i < N_CONNS; i++) begin
                 wr_cursor_q[i] <= '0;
                 landed_q[i]    <= '0;
+                infl_q[i]      <= '0;
+                rsv_pkg_q[i]   <= '0;
             end
         end else begin
             // -- the rule: a routed beat is never refused --------------------------------------
             if (in_tvalid_w && !fifo_s_tready) route_stall_q <= 1'b1;
+            // We held rx_dispatch off while the fifo held data: the card path is not keeping up.
+            if (!space_ok_q && (fifo_level != '0)) space_stall_q <= 1'b1;
 
             // -- segment accounting -------------------------------------------------------------
             if (in_fire_w) begin
@@ -377,21 +477,54 @@ module slot_writer #(
                                    len:     seg_len_w,
                                    drop:    seg_drop_w};
                 dq_tail_q <= (dq_tail_q == DPTR_BITS'(DESC_DEPTH-1)) ? '0 : dq_tail_q + 1'b1;
-                if (seg_ovf_w) overflow_q[conn_sel_w] <= 1'b1;
+                if (seg_ovf_w) overflow_sticky_q[conn_sel_w] <= 1'b1;
             end
 
             // -- per-connection cursors. A release wins over everything: by depth 1 there is
             //    nothing of that connection in flight, which the assertion below proves.
             for (i = 0; i < N_CONNS; i++) begin
+                automatic logic infl_inc = desc_push_w && (conn_sel_w == CONN_BITS'(i));
+                automatic logic infl_dec =
+                    (wr_ack && (aq_cnt_q != '0) && (aq_conn[aq_head_q] == CONN_BITS'(i))) ||
+                    (out_done_w && (ost_q == O_DISCARD) && (req_conn_q == CONN_BITS'(i)));
+
                 if (conn_release[i]) begin
                     wr_cursor_q[i] <= '0;
                     landed_q[i]    <= '0;
+                    // The poison goes with the cursors: the connection is being reopened and the
+                    // slot it is poisoned about no longer holds anything of it.
+                    overflow_q[i]  <= 1'b0;
                 end else begin
                     if (desc_push_w && !seg_drop_w && (conn_sel_w == CONN_BITS'(i)))
                         wr_cursor_q[i] <= end_off_w;
                     if (wr_ack && (aq_cnt_q != '0) && (aq_conn[aq_head_q] == CONN_BITS'(i)))
                         landed_q[i] <= aq_end[aq_head_q];
+                    if (seg_ovf_w && desc_push_w && (conn_sel_w == CONN_BITS'(i)))
+                        overflow_q[i] <= 1'b1;
                 end
+
+                // Announced-but-not-yet-landed segments of this connection. This IS reset by a
+                // release, and the shared counters above give back exactly what it held.
+                if (conn_release[i]) begin
+                    rsv_pkg_q[i] <= '0;
+                end else begin
+                    case ({charge_w && (pkg_conn_w == CONN_BITS'(i)),
+                           desc_push_w && (conn_sel_w == CONN_BITS'(i))})
+                        2'b10: rsv_pkg_q[i] <= (rsv_pkg_q[i] == '1) ? rsv_pkg_q[i]
+                                                                    : rsv_pkg_q[i] + 1'b1;
+                        2'b01: rsv_pkg_q[i] <= (rsv_pkg_q[i] == '0) ? '0 : rsv_pkg_q[i] - 1'b1;
+                        default: ;
+                    endcase
+                end
+
+                // In-flight accounting is NOT reset by a release: handler_slots only releases a
+                // connection that conn_quiet already says is clear, so a release that changed this
+                // count would be hiding the very bug the assertion below exists to find.
+                case ({infl_inc, infl_dec})
+                    2'b10:   infl_q[i] <= infl_q[i] + 8'd1;
+                    2'b01:   infl_q[i] <= (infl_q[i] == '0) ? '0 : infl_q[i] - 8'd1;
+                    default: ;
+                endcase
             end
 
             // -- descriptor queue pointers -------------------------------------------------------
@@ -404,21 +537,34 @@ module slot_writer #(
                 dq_head_q <= (dq_head_q == DPTR_BITS'(DESC_DEPTH-1)) ? '0 : dq_head_q + 1'b1;
             end
 
-            // -- reservations. A readPkg promises one MSS of fifo and one descriptor slot; the
-            //    segment's tlast on the way in hands both back.
-            case ({pkg_issued_w, desc_push_w})
-                2'b10:   rsv_beats_q <= (rsv_beats_q > RSV_BITS'(FIFO_DEPTH))
-                                            ? rsv_beats_q : rsv_beats_q + RSV_BITS'(MSS_BEATS);
-                2'b01:   rsv_beats_q <= (rsv_beats_q >= RSV_BITS'(MSS_BEATS))
-                                            ? rsv_beats_q - RSV_BITS'(MSS_BEATS) : '0;
-                default: ;
-            endcase
-            case ({pkg_issued_w, desc_push_w})
-                2'b10:   dq_rsv_q <= (dq_rsv_q >= DCNT_BITS'(DESC_DEPTH))
-                                        ? dq_rsv_q : dq_rsv_q + 1'b1;
-                2'b01:   dq_rsv_q <= (dq_rsv_q != '0) ? dq_rsv_q - 1'b1 : '0;
-                default: ;
-            endcase
+            // -- reservations. A readPkg for a LIVE connection promises one MSS of fifo and one
+            //    descriptor slot; the segment's tlast on the way in hands both back, and a release
+            //    hands back everything a torn-down connection was still holding. Written as an
+            //    add-then-compare-then-subtract so nothing can wrap to a huge unsigned "yes".
+            begin
+                automatic logic [RSV_BITS+RPKG_BITS+4:0] rsv_up, rsv_dn;
+                automatic logic [DSUM_BITS+RPKG_BITS+4:0] dq_up, dq_dn;
+
+                rsv_up = (RSV_BITS+RPKG_BITS+5)'(rsv_beats_q) +
+                         (charge_w ? (RSV_BITS+RPKG_BITS+5)'(MSS_BEATS) : '0);
+                rsv_dn = (desc_push_w ? (RSV_BITS+RPKG_BITS+5)'(MSS_BEATS) : '0) +
+                         ((RSV_BITS+RPKG_BITS+5)'(rel_pkgs_w) * (RSV_BITS+RPKG_BITS+5)'(MSS_BEATS));
+                if (rsv_up <= rsv_dn)
+                    rsv_beats_q <= '0;
+                else if ((rsv_up - rsv_dn) > (RSV_BITS+RPKG_BITS+5)'(FIFO_DEPTH))
+                    rsv_beats_q <= RSV_BITS'(FIFO_DEPTH);
+                else
+                    rsv_beats_q <= RSV_BITS'(rsv_up - rsv_dn);
+
+                dq_up = (DSUM_BITS+RPKG_BITS+5)'(dq_rsv_q) + (charge_w ? 1 : 0);
+                dq_dn = (desc_push_w ? 1 : 0) + (DSUM_BITS+RPKG_BITS+5)'(rel_pkgs_w);
+                if (dq_up <= dq_dn)
+                    dq_rsv_q <= '0;
+                else if ((dq_up - dq_dn) > (DSUM_BITS+RPKG_BITS+5)'(DESC_DEPTH))
+                    dq_rsv_q <= DCNT_BITS'(DESC_DEPTH);
+                else
+                    dq_rsv_q <= DCNT_BITS'(dq_up - dq_dn);
+            end
 
             // -- the registered space check. Written as an addition, never as a subtraction: level
             //    plus reserved may legitimately exceed the depth for a cycle and the subtraction
