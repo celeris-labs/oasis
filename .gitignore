@@ -1,5 +1,8 @@
 .claude
 build*
+.venv/
+opt/
+extension/vcpkg/
 
 # Generated unit test files
 hardware/unit-tests/diff/**
