@@ -158,6 +158,7 @@ module slot_reader_tb #(
     int           beats  [NRD];
     int           t_first[NRD];
     int           t_last [NRD];
+    logic         sh_body_last [NRD];   // the head entry's body_last, reader -> framer
 
     genvar gd;
     generate
@@ -167,6 +168,13 @@ module slot_reader_tb #(
             ) u_rd (
                 .clk(clk), .rst_n(rst_n),
                 .entry_valid(ent_valid[gd]), .entry_ready(ent_ready[gd]), .entry_conn(ent_conn[gd]),
+                // The entry is {conn, chunk_bytes, body_last} now. Every response in this bench is
+                // a whole decoder stream, so body_last is 1 -- which is what the framer below used
+                // to be told directly, and is now told through the entry queue.
+                .entry_chunk_bytes(32'd0), .entry_body_last(1'b1),
+                // Nothing here tears a connection down mid-response; handler_slots' teardown is
+                // what drives this, and lane_drain's `refatal` is where it is exercised.
+                .flush(1'b0), .flush_busy(),
                 .landed(landed), .slot_base(SLOT_BASE),
                 .rd_req_valid(rd_req_valid[gd]), .rd_req_ready(rd_req_ready[gd]),
                 .rd_req_vaddr(rd_req_vaddr[gd]), .rd_req_len(rd_req_len[gd]),
@@ -175,17 +183,19 @@ module slot_reader_tb #(
                 .s_axis_tdata(rd_tdata[gd]), .s_axis_tkeep(rd_tkeep[gd]), .s_axis_tlast(rd_tlast[gd]),
                 .m_axis_tvalid(fr_tvalid[gd]), .m_axis_tready(fr_tready[gd]),
                 .m_axis_tdata(fr_tdata[gd]), .m_axis_tkeep(fr_tkeep[gd]), .m_axis_tlast(fr_tlast[gd]),
-                .resp_done(sh_done[gd]), .resp_ack(sh_ack[gd]),
+                .resp_done(sh_done[gd]), .resp_ack(sh_ack[gd]), .body_last(sh_body_last[gd]),
                 .conn_release(rd_release[gd]), .entry_done(entry_done[gd]),
-                .residue_err(residue_err[gd])
+                .residue_err(residue_err[gd]),
+                .head_chunk_bytes(), .busy(), .entry_occ(), .state_debug()
             );
 
             strip_http u_sh (
                 .clk(clk), .rst_n(rst_n),
                 .clear(1'b0), .enable(1'b1),
                 // Every response here is a whole decoder stream, so its last body beat carries
-                // tlast -- which is also how the sink counts responses.
-                .body_last(1'b1), .resp_ack(sh_ack[gd]),
+                // tlast -- which is also how the sink counts responses. It comes from the reader's
+                // head entry now, exactly as it does in handler_slots.
+                .body_last(sh_body_last[gd]), .resp_ack(sh_ack[gd]),
                 .s_axis_tvalid(fr_tvalid[gd]), .s_axis_tdata(fr_tdata[gd]),
                 .s_axis_tkeep(fr_tkeep[gd]), .s_axis_tlast(fr_tlast[gd]),
                 .s_axis_tready(fr_tready[gd]),
