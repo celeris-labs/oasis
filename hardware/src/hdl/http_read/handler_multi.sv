@@ -71,13 +71,8 @@ import http_types::*;
 // answer) and opens a fresh one, one lane at a time because there is one tcp_init.
 //
 // The common case is not a fault at all: MinIO closes an idle connection after ~30 s, and with N
-// lanes a lane can easily sit idle that long while its neighbours work. That one is NOT reconnected
-// on the spot. The FIN releases the session and the lane goes down; the bring-up FSM opens a fresh
-// one when the host next arms the lane. Reconnecting immediately raced the dead session's own
-// announcements -- the new reader waited out its ~2 s watchdog for a notification that could never
-// arrive and then aborted, dirtily if body bytes had already gone to the decoder, which killed the
-// lane. It cost a flat ~4.7 s on every TPC-H query that hit it, against one handshake (~100 us) for
-// opening late. PlaceOnLane already admits an idle lane with no session, so the host is unaffected.
+// lanes a lane can easily sit idle that long while its neighbours work. Catching the FIN while the
+// lane is idle turns that into a reconnect nobody notices.
 //
 // Everything else is fatal for that lane -- dirty, or failing with work outstanding. The host holds
 // the request text and reissues the batch; that is the only place a retry can come from.
@@ -308,14 +303,10 @@ module handler_multi #(
     // Reconnect decision wires. The logic is below, after the per-lane signals it reads are
     // declared; only the declarations can live up here, where the bring-up FSM needs them.
     logic [NUM_CONNS-1:0] lane_idle_w, lane_want_reconn_w, lane_must_die_w, lane_want_close_w;
-    logic [NUM_CONNS-1:0] lane_want_open_w;
-    logic                 reconn_pending_w, close_pending_w, open_pending_w;
-    logic [CONN_BITS-1:0] reconn_lane_w, close_lane_w, open_lane_w;
+    logic                 reconn_pending_w, close_pending_w;
+    logic [CONN_BITS-1:0] reconn_lane_w, close_lane_w;
     // A close with no open behind it. Same teardown as a reconnect, stopping one state early.
     logic                 close_only_q, close_only_d;
-    // An open that never got its openStatus. Assigned with conn_cnt_q, which is declared with the
-    // rest of the state below; the declaration lives here because the bring-up FSM reads it.
-    logic                 open_timeout_w;
 
     // =============================================================================================
     // Receive: one dispatcher, N framing lanes.
@@ -511,6 +502,10 @@ module handler_multi #(
         // NUM_DEST is 1 per lane: the lane IS the destination now. The old design had one
         // rewrite_last with an N-way dest because one body stream fed N decoders; here each lane
         // has its own stream and its own decoder, so there is nothing left to select.
+        logic                       rwl_tvalid, rwl_tready, rwl_tlast;
+        logic [AXI_DATA_BITS-1:0]   rwl_tdata;
+        logic [AXI_DATA_BITS/8-1:0] rwl_tkeep;
+
         axis_rewrite_last #(
             .CFG_DEPTH(QUEUE_DEPTH), .NUM_DEST(1), .DEST_BITS(1)
         ) inst_rewrite_last (
@@ -521,11 +516,44 @@ module handler_multi #(
             .cfg_dest (1'b0),
             .s_tvalid(raw_tvalid), .s_tready(raw_tready),
             .s_tdata (raw_tdata),  .s_tkeep (raw_tkeep),
-            .m_tvalid(m_axis_body_tvalid[L]), .m_tready(m_axis_body_tready[L]),
-            .m_tdata (m_axis_body_tdata[L]),  .m_tkeep (m_axis_body_tkeep[L]),
-            .m_tlast (m_axis_body_tlast[L]),
+            .m_tvalid(rwl_tvalid), .m_tready(rwl_tready),
+            .m_tdata (rwl_tdata),  .m_tkeep (rwl_tkeep),
+            .m_tlast (rwl_tlast),
             .m_tdest (),
             .busy(rwl_busy[L]), .starved(rwl_starved[L]), .remaining_dbg()
+        );
+
+        // -- register slice on the body output ----------------------------------------------------
+        //
+        // strip_http's skid register -> axis_rewrite_last -> out used to be ONE combinational cone:
+        // rewrite_last derives tlast from $countones(tkeep) against a 32-bit remaining count
+        // (axis_rewrite_last.sv:98-115), straight off strip_http's skid_keep_q. build-117 (3 lanes,
+        // WNS -0.849 ns) has two clusters of violations starting at skid_keep_q_reg and running
+        // through exactly that popcount + compare (10 logic levels, CARRY8 x2):
+        //   * 45 paths into THIS module's lane_occ_q_reg/CE, worst -0.766 ns -- the chunk-retire
+        //     pop below reads m_axis_body_tlast;
+        //   * 24 paths out through vfpga_top, AXIToNData and into the DataNormalizer's
+        //     offset_reg/R (its "tlast resets the offset"), worst -0.727 ns.
+        // And the decoder's tready came back the same way into strip_http's skid clock enables.
+        //
+        // WHY HERE AND NOT IN vfpga_top. A slice between hm_body and AXIToNData would cut the 24
+        // and leave the 45: lane_occ_q's pop is inside this module and would still see the
+        // unregistered tlast. Here the cone ends at the slice's input register, and everything
+        // that reads the body output -- lane_occ_q below, the port, the normalizer beyond it --
+        // starts from the slice's registers instead. lane_occ_q still counts at the PORT
+        // handshake, so a chunk is retired when the decoder side takes its tlast, as before.
+        //
+        // What the slice may hold -- at most two beats -- is past the framer, so clear_framing does
+        // not flush it, exactly like a beat the decoder has already taken. It never holds anything
+        // when a lane is reconnectable: lane_idle_w needs lane_occ_q == 0, i.e. the last tlast has
+        // left through the port, and nothing of a later chunk can be behind it while rwl_busy is 0.
+        axis_skid #(.DATA_BITS(AXI_DATA_BITS)) inst_body_slice (
+            .clk(ap_clk), .rst_n(ap_rst_n),
+            .s_tvalid(rwl_tvalid), .s_tready(rwl_tready),
+            .s_tdata (rwl_tdata),  .s_tkeep (rwl_tkeep), .s_tlast(rwl_tlast),
+            .m_tvalid(m_axis_body_tvalid[L]), .m_tready(m_axis_body_tready[L]),
+            .m_tdata (m_axis_body_tdata[L]),  .m_tkeep (m_axis_body_tkeep[L]),
+            .m_tlast (m_axis_body_tlast[L])
         );
 
         assign lane_occ_ok[L] = (lane_occ_q[L] < 32'(QUEUE_DEPTH));
@@ -549,52 +577,25 @@ module handler_multi #(
     for (genvar L = 0; L < NUM_CONNS; L++) begin : gen_reconn_want
         assign lane_idle_w[L] = !rwl_busy[L] && !stream_busy[L] && (lane_occ_q[L] == '0);
 
-        // One way a healthy lane wants a NEW SESSION AT ONCE: its read failed cleanly with nothing
-        // owed, so the request can be reissued on a fresh connection and nothing is lost.
-        //
-        // A peer FIN used to be the second way, and it was the expensive one. MinIO closes an idle
-        // connection after ~30 s and with N lanes a lane easily sits idle that long, so this fired
-        // constantly -- and each time the fresh session raced an announcement that belonged to the
-        // session which had just died: the reader waited out its ~2 s watchdog for a notification
-        // that could never arrive, then aborted, and an abort with body bytes already delivered is
-        // dirty, which kills the lane. Measured on TPC-H as a flat ~4.7 s on every query that hit
-        // it. A FIN on an idle lane now only RELEASES the session (lane_want_close_w below); the
-        // lane stays down until the host next gives it work, and BR_DONE opens it then.
+        // Two ways a healthy lane wants a new connection:
+        //   - its read failed cleanly with nothing owed
+        //   - the peer FINed while the lane was idle. MinIO closes an idle connection after ~30 s
+        //     and a lane can easily sit idle that long while other lanes work, so this is the
+        //     normal case rather than a fault. Catching it here turns it into a reconnect nobody
+        //     notices; catching it later, mid-batch, would be fatal.
         assign lane_want_reconn_w[L] = conn_up_q[L] && !lane_fatal_q[L] && lane_idle_w[L] &&
-                                       lane_error[L] && !lane_error_dirty[L];
+                                       ((lane_error[L] && !lane_error_dirty[L]) || conn_closed[L]);
 
         assign lane_must_die_w[L] = lane_error[L] && (lane_error_dirty[L] || !lane_idle_w[L]);
 
-        // A lane that still holds a session it must give up. Two cases.
-        //
-        // Fatal, with no precondition to wait for and deliberately so: the reasons a lane goes
-        // fatal are a failure it cannot replay, or a consumer that has taken nothing for
-        // LANE_STALL_CYCLES -- and in the second case waiting for the lane to be idle, or for its
-        // body output to be quiet, would wait for the very thing that is not going to happen. What
-        // teardown can lose is a beat strip_http was holding out to a sink that never took it;
-        // everything the sink DID take is already past the framer and untouched by clear_framing.
-        // The lane owes the host a reissue either way.
-        //
-        // Or the peer FINed while the lane was idle. The session is worthless from here -- every
-        // notification it can still produce is a FIN, and conn_closed is sticky, so a reader armed
-        // on it would abort the moment it started. Releasing it is what makes the lane honestly
-        // DOWN: conn_up_q falls, clear_framing resets the framer and empties the fifo, rx_dispatch
-        // unbinds the id so a late notification for it is dropped, and nothing reopens the lane
-        // until it has work again.
-        assign lane_want_close_w[L] = conn_up_q[L] &&
-                                      (lane_fatal_q[L] || (lane_idle_w[L] && conn_closed[L]));
-
-        // The LAZY OPEN. A lane the host has armed, with work it cannot start because it has no
-        // session and is not dead. That covers the FIN above once the next batch arrives, and it
-        // also un-deletes a lane whose reconnect open failed: init_error sends that lane to BR_DONE
-        // with conn_up_q low and lane_fatal_q clear, and the only other route into BR_OPEN is
-        // reconn_pending_w, which requires conn_up_q -- so before this the lane was gone for good.
-        //
-        // It must ask for WORK, not merely for lane_armed_q: that bit is sticky from the first arm
-        // this lane ever took, so without !lane_idle_w every released session would be reopened on
-        // the spot and the FIN would be an immediate reconnect again, which is the whole bug.
-        assign lane_want_open_w[L] = lane_armed_q[L] && !conn_up_q[L] && !lane_fatal_q[L] &&
-                                     !lane_idle_w[L];
+        // A fatal lane that still holds a session. There is no precondition to wait for and
+        // deliberately so: the reasons a lane goes fatal are a failure it cannot replay, or a
+        // consumer that has taken nothing for LANE_STALL_CYCLES -- and in the second case waiting
+        // for the lane to be idle, or for its body output to be quiet, would wait for the very
+        // thing that is not going to happen. What teardown can lose is a beat strip_http was
+        // holding out to a sink that never took it; everything the sink DID take is already past
+        // the framer and untouched by clear_framing. The lane owes the host a reissue either way.
+        assign lane_want_close_w[L] = conn_up_q[L] && lane_fatal_q[L];
     end
 
     // First lane asking, lowest index. Reconnects are rare and one at a time is plenty -- the
@@ -604,8 +605,6 @@ module handler_multi #(
         reconn_lane_w    = '0;
         close_pending_w  = 1'b0;
         close_lane_w     = '0;
-        open_pending_w   = 1'b0;
-        open_lane_w      = '0;
         for (int i = NUM_CONNS - 1; i >= 0; i--) begin
             if (lane_want_reconn_w[i]) begin
                 reconn_pending_w = 1'b1;
@@ -614,10 +613,6 @@ module handler_multi #(
             if (lane_want_close_w[i]) begin
                 close_pending_w = 1'b1;
                 close_lane_w    = CONN_BITS'(i);
-            end
-            if (lane_want_open_w[i]) begin
-                open_pending_w = 1'b1;
-                open_lane_w    = CONN_BITS'(i);
             end
         end
     end
@@ -639,9 +634,7 @@ module handler_multi #(
             BR_IDLE: begin
                 // The first arm is what says a server address exists. Open every lane then, not
                 // lazily per lane: a lane whose connection is opened only when it is first used
-                // pays a handshake in the middle of a query instead of before it. BR_DONE does open
-                // lazily, but only to REPLACE a session that is gone -- which is a handshake either
-                // way, and doing it on demand is what keeps it off the heels of the dead session.
+                // pays a handshake in the middle of a query instead of before it.
                 if (any_armed_q && (retry_wait_q == '0)) begin
                     bring_lane_d = '0;
                     br_d         = BR_OPEN;
@@ -658,14 +651,6 @@ module handler_multi #(
                         bind_en_w = 1'b1;
                         br_d      = bringing_up_q ? BR_NEXT : BR_DONE;
                     end
-                end else if (open_timeout_w) begin
-                    // openStatus never came -- the ephemeral-port-reuse failure tcp_init warns
-                    // about does not report an error, it simply never answers. This is the one
-                    // shared bring-up resource, so parking here stops every other lane's reconnect
-                    // AND its teardown, and teardown is what stops a dead lane holding the shared
-                    // receive path. Give the resource back. The lane stays down; BR_DONE's lazy arm
-                    // tries again after retry_wait_q, and conn_stall_q says an open went silent.
-                    br_d = BR_DONE;
                 end
             end
             BR_NEXT: begin
@@ -679,12 +664,10 @@ module handler_multi #(
             // All lanes up. The connect resource is free, so this is where a lane that wants a new
             // connection gets one -- one at a time, because there is only one tcp_init.
             //
-            // Teardown goes FIRST, for a fatal lane or for one whose idle peer FINed. It needs no
-            // tcp_init and it is what unblocks the shared receive path, so making it wait behind a
-            // reconnect -- which does need the tcp_init, and can be held off by retry_wait_q for
-            // 65535 cycles after a failed open -- would leave every other lane starving for the
-            // whole of that backoff. The lazy open goes LAST because it is the one arm that is never
-            // urgent: nothing is stuck behind it except the batch that asked for it.
+            // A fatal lane's teardown goes FIRST. It needs no tcp_init and it is what unblocks the
+            // shared receive path, so making it wait behind a reconnect -- which does need the
+            // tcp_init, and can be held off by retry_wait_q for 65535 cycles after a failed open --
+            // would leave every other lane starving for the whole of that backoff.
             BR_DONE: begin
                 if (close_pending_w) begin
                     bring_lane_d = close_lane_w;
@@ -694,12 +677,6 @@ module handler_multi #(
                     bring_lane_d = reconn_lane_w;
                     close_only_d = 1'b0;
                     br_d         = BR_CLOSE;
-                end else if (open_pending_w && (retry_wait_q == '0)) begin
-                    // The lazy open. No BR_CLOSE on the way: this lane holds no session, so there
-                    // is nothing to release and a close request for a released id would be a lie.
-                    bring_lane_d = open_lane_w;
-                    close_only_d = 1'b0;
-                    br_d         = BR_OPEN;
                 end
             end
 
@@ -708,9 +685,9 @@ module handler_multi #(
             // rather than turned into a readPkg for a session the TOE has forgotten -- which would
             // desynchronise the shared fifo for every other lane.
             //
-            // Then either open a fresh session (a reconnect) or stop here (a fatal lane, or one
-            // whose idle peer FINed). Stopping is the whole difference: the lane stays down, which
-            // is what holds clear_framing high, which is what makes it discard instead of block.
+            // Then either open a fresh session (a reconnect) or stop here (a fatal lane). Stopping
+            // is the whole difference: the lane stays down, which is what holds clear_framing high,
+            // which is what makes it discard instead of block.
             BR_CLOSE: begin
                 m_axis_close_connection_TVALID = 1'b1;
                 if (m_axis_close_connection_TREADY) begin
@@ -746,14 +723,6 @@ module handler_multi #(
     localparam int STALL_BITS = $clog2(STALL_CYCLES) + 1;
     logic [STALL_BITS-1:0] conn_cnt_q;
 
-    // The connect watchdog, re-used as an escape from BR_OPEN. conn_cnt_q already counts cycles
-    // spent in BR_OPEN and saturates at STALL_CYCLES, so this is the same threshold that raises
-    // conn_stall_q -- one flag, one meaning: this open is never going to answer. !init_done is what
-    // makes it exclusive with the answer arriving on exactly the threshold cycle, so the state
-    // machine and the two registers below cannot disagree about which of them happened.
-    assign open_timeout_w = (br_q == BR_OPEN) && !init_done &&
-                            (conn_cnt_q == STALL_BITS'(STALL_CYCLES));
-
     always_ff @(posedge ap_clk) begin
         if (!ap_rst_n) begin
             br_q          <= BR_IDLE;
@@ -786,13 +755,8 @@ module handler_multi #(
             br_q         <= br_d;
             bring_lane_q <= bring_lane_d;
             close_only_q <= close_only_d;
-            // The initial walk ends the first time every lane is up -- or when an open goes silent
-            // and the walk is abandoned. BR_DONE must never be entered with this still set: BR_OPEN
-            // would then return to BR_NEXT and walk on across lanes that already hold a session,
-            // rebinding them and leaking the sessions they had. The lazy arm finishes the job
-            // instead, one armed lane at a time, and it cannot touch a lane that is already up.
-            if ((br_q == BR_NEXT && int'(bring_lane_q) == NUM_CONNS - 1) || open_timeout_w)
-                bringing_up_q <= 1'b0;
+            // The initial walk ends the first time every lane is up.
+            if (br_q == BR_NEXT && int'(bring_lane_q) == NUM_CONNS - 1) bringing_up_q <= 1'b0;
 
             if (cfg_fire && cfg_is_arm_w) begin
                 server_ip_q   <= req_data.server_ip;
@@ -803,12 +767,9 @@ module handler_multi #(
 
             if (release_en_w) begin
                 conn_up_q[release_conn_w] <= 1'b0;
-                // Only a release a lane can come back from is a reconnect. Counting a fatal lane's
-                // teardown here would report a recovery that never happened -- but an idle lane
-                // whose peer FINed is released without an open behind it and still recovers, on its
-                // next batch, so close_only_q no longer separates the two. Not fatal does.
-                if (!lane_fatal_q[release_conn_w] && (reconn_cnt_q != 8'hFF))
-                    reconn_cnt_q <= reconn_cnt_q + 8'd1;
+                // Only a release that a new session follows is a reconnect. Counting a fatal
+                // lane's teardown here would report a recovery that never happened.
+                if (!close_only_q && (reconn_cnt_q != 8'hFF)) reconn_cnt_q <= reconn_cnt_q + 8'd1;
             end
             // Bind after release in source order so a same-cycle pair cannot leave the lane down;
             // they never coincide (BR_CLOSE and BR_OPEN are different states), but the ordering
@@ -823,9 +784,6 @@ module handler_multi #(
                 retry_wait_q               <= '1;
                 lane_init_err_q[bring_lane_q] <= 1'b1;
             end
-            // An open that never answered backs off the same way. conn_stall_q is what says it was
-            // a silence rather than a refusal, so lane_init_err_q is left alone.
-            if (open_timeout_w) retry_wait_q <= '1;
 
             // Per-lane chunk accounting, for the readback and the entry admission test.
             for (int L = 0; L < NUM_CONNS; L++) begin
