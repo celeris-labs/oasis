@@ -270,3 +270,29 @@ SELECT (SELECT sum(c_int32) FROM read_oasis('data/mixed_small.parquet')),
        (SELECT sum(c_int32) FROM read_oasis('data/mixed_small.parquet'));
 ----
 2147450880	2147450880
+
+# ---------------------------------------------------------------------------
+# REQUIRED columns (no repetition/definition-level section)
+#
+# data/not_null.parquet has every column declared NOT NULL, so every leaf has
+# max_definition_level == 0 and max_repetition_level == 0.
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_oasis('data/not_null.parquet'));
+----
+c_int32	INTEGER
+c_int64	BIGINT
+c_float	FLOAT
+c_double	DOUBLE
+
+query I
+SELECT count(*) FROM read_oasis('data/not_null.parquet');
+----
+100
+
+query IIII
+SELECT count(*), count(DISTINCT c_int32), min(c_int32), max(c_int32)
+FROM read_oasis('data/not_null.parquet');
+----
+100	100	0	99
