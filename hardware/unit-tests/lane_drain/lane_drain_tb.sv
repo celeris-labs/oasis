@@ -154,6 +154,11 @@ module lane_drain_tb #(
     logic [AXI_DATA_BITS-1:0]   cw_tdata;
     logic [AXI_DATA_BITS/8-1:0] cw_tkeep;
 
+    // The most one card read may ask for. 16 KiB since 2026-09-22, when the per-decoder card read
+    // channels became one shared one; it also sizes slot_rd_share's receive fifos at 2 x this.
+    localparam int RD_MAX_BYTES = 16384;
+
+    // Reader side: one port per decoder, into slot_rd_share.
     logic                       cr_req_valid [NUM_CONNS];
     logic                       cr_req_ready [NUM_CONNS];
     logic [VADDR_BITS-1:0]      cr_req_vaddr [NUM_CONNS];
@@ -164,7 +169,28 @@ module lane_drain_tb #(
     logic [AXI_DATA_BITS-1:0]   cr_tdata  [NUM_CONNS];
     logic [AXI_DATA_BITS/8-1:0] cr_tkeep  [NUM_CONNS];
     logic                       cr_tlast  [NUM_CONNS];
-    logic                       cr_ack    [NUM_CONNS];
+
+    // Channel side: the one read half of the one card channel.
+    logic                       sh_req_valid, sh_req_ready, sh_req_last;
+    logic [VADDR_BITS-1:0]      sh_req_vaddr;
+    logic [LEN_BITS-1:0]        sh_req_len;
+    logic                       sh_tvalid, sh_tready, sh_tlast;
+    logic [AXI_DATA_BITS-1:0]   sh_tdata;
+    logic [AXI_DATA_BITS/8-1:0] sh_tkeep;
+    logic                       share_order_err, share_fifo_err, share_len_err;
+
+    // ...as the model's one-element port arrays want it.
+    logic                       m_rd_req_valid [1];
+    logic                       m_rd_req_ready [1];
+    logic [VADDR_BITS-1:0]      m_rd_req_vaddr [1];
+    logic [LEN_BITS-1:0]        m_rd_req_len   [1];
+    logic                       m_rd_req_last  [1];
+    logic                       m_rd_tvalid [1];
+    logic                       m_rd_tready [1];
+    logic [AXI_DATA_BITS-1:0]   m_rd_tdata  [1];
+    logic [AXI_DATA_BITS/8-1:0] m_rd_tkeep  [1];
+    logic                       m_rd_tlast  [1];
+    logic                       m_rd_ack    [1];
 
     logic       dma_fail;
     int         dma_errors;
@@ -181,8 +207,11 @@ module lane_drain_tb #(
     generate
     if (DUT_SLOTS == 0) begin : g_multi
 
-    assign dma_fail   = 1'b0;
-    assign dma_errors = 0;
+    assign dma_fail        = 1'b0;
+    assign dma_errors      = 0;
+    assign share_order_err = 1'b0;
+    assign share_fifo_err  = 1'b0;
+    assign share_len_err   = 1'b0;
     assign connOccWord = '0; assign connReadyWord = '0; assign connErrWord = '0;
     assign connDrainedWord = '0; assign slotPolicyWord = '0;
 
@@ -244,7 +273,7 @@ module lane_drain_tb #(
         .ENTRY_DEPTH    (QUEUE_DEPTH),
         .SLOT_LOG2      (SLOT_LOG2),
         .SLOT_FIFO_DEPTH(1024),
-        .RD_MAX         (65536),
+        .RD_MAX         (RD_MAX_BYTES),
         .STALL_CYCLES   (STALL_CYCLES)
     ) dut (
         .ap_clk(clk), .ap_rst_n(rst_n),
@@ -308,11 +337,44 @@ module lane_drain_tb #(
         .connDrainedWord(connDrainedWord), .slotPolicyWord(slotPolicyWord)
     );
 
+    // The REAL topology since 2026-09-22: every decoder's reader reaches ONE card read channel
+    // through slot_rd_share, which holds their receive fifos and the credit. build-123 failed
+    // route_design with five card AXI streams, so this -- and not a channel per decoder -- is what
+    // the black-box scenarios have to be true of. `thr` and `dmabp` are the ones that would notice:
+    // a shared stream back-pressured by a slow decoder is exactly the coupling they test for.
+    slot_rd_share #(
+        .N_RD  (NUM_CONNS),
+        .RD_MAX(RD_MAX_BYTES)
+    ) rdshare (
+        .clk(clk), .rst_n(rst_n),
+        .rd_req_valid(cr_req_valid), .rd_req_ready(cr_req_ready),
+        .rd_req_vaddr(cr_req_vaddr), .rd_req_len(cr_req_len), .rd_req_last(cr_req_last),
+        .rd_tvalid(cr_tvalid), .rd_tready(cr_tready),
+        .rd_tdata (cr_tdata),  .rd_tkeep (cr_tkeep), .rd_tlast(cr_tlast),
+        .ch_req_valid(sh_req_valid), .ch_req_ready(sh_req_ready),
+        .ch_req_vaddr(sh_req_vaddr), .ch_req_len(sh_req_len), .ch_req_last(sh_req_last),
+        .ch_tvalid(sh_tvalid), .ch_tready(sh_tready),
+        .ch_tdata (sh_tdata),  .ch_tkeep (sh_tkeep), .ch_tlast(sh_tlast),
+        .order_err(share_order_err), .fifo_err(share_fifo_err), .len_err(share_len_err),
+        .credit_ok(), .oq_occ()
+    );
+
+    assign m_rd_req_valid[0] = sh_req_valid;
+    assign sh_req_ready      = m_rd_req_ready[0];
+    assign m_rd_req_vaddr[0] = sh_req_vaddr;
+    assign m_rd_req_len[0]   = sh_req_len;
+    assign m_rd_req_last[0]  = sh_req_last;
+    assign sh_tvalid         = m_rd_tvalid[0];
+    assign m_rd_tready[0]    = sh_tready;
+    assign sh_tdata          = m_rd_tdata[0];
+    assign sh_tkeep          = m_rd_tkeep[0];
+    assign sh_tlast          = m_rd_tlast[0];
+
     // Coyote's card path, with its real rules. MEM_BASE/MEM_BYTES bound the window exactly to the
     // slots this configuration owns, so a vaddr that is wrong by a slot is an error rather than a
     // silent write into a neighbour.
     card_dma_model #(
-        .N_RD     (NUM_CONNS),
+        .N_RD     (1),
         .MEM_BASE (SLOT_BASE),
         .MEM_BYTES(longint'(NUM_CONNS) * SLOT_BYTES)
     ) cdma (
@@ -322,11 +384,11 @@ module lane_drain_tb #(
         .wr_tvalid(cw_tvalid), .wr_tready(cw_tready),
         .wr_tdata (cw_tdata),  .wr_tkeep (cw_tkeep), .wr_tlast(cw_tlast),
         .wr_ack(cw_ack),
-        .rd_req_valid(cr_req_valid), .rd_req_ready(cr_req_ready),
-        .rd_req_vaddr(cr_req_vaddr), .rd_req_len(cr_req_len), .rd_req_last(cr_req_last),
-        .rd_tvalid(cr_tvalid), .rd_tready(cr_tready),
-        .rd_tdata (cr_tdata),  .rd_tkeep (cr_tkeep), .rd_tlast(cr_tlast),
-        .rd_ack(cr_ack),
+        .rd_req_valid(m_rd_req_valid), .rd_req_ready(m_rd_req_ready),
+        .rd_req_vaddr(m_rd_req_vaddr), .rd_req_len(m_rd_req_len), .rd_req_last(m_rd_req_last),
+        .rd_tvalid(m_rd_tvalid), .rd_tready(m_rd_tready),
+        .rd_tdata (m_rd_tdata),  .rd_tkeep (m_rd_tkeep), .rd_tlast(m_rd_tlast),
+        .rd_ack(m_rd_ack),
         .model_fail(dma_fail), .model_errors(dma_errors)
     );
 
@@ -1318,6 +1380,12 @@ module lane_drain_tb #(
                 $display("  CARD DMA MODEL reported %0d contract violation(s)", dma_errors);
                 why = {why, $sformatf(" card_dma_model(%0d)", dma_errors)};
             end
+            // The shared read channel's own invariants. None can be true of a correct
+            // configuration: a beat that belonged to no outstanding request, a receive fifo that
+            // refused one (the credit is then wrong), a read longer than RD_MAX.
+            if (share_order_err) why = {why, " share_order_err"};
+            if (share_fifo_err)  why = {why, " share_fifo_err"};
+            if (share_len_err)   why = {why, " share_len_err"};
         end
         if (why != "") begin
             $display("  STICKY stall bits set:%s   (stallWord=0x%08h)", why, stallWord);

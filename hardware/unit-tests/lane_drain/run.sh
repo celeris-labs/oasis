@@ -11,7 +11,10 @@
 # TWO DUTs
 #   --dut multi   handler_multi, the sealed build-119 baseline. The default for a named scenario, so
 #                 every old invocation means exactly what it meant before.
-#   --dut slots   handler_slots + unit-tests/card_dma/card_dma_model (ADR-5).
+#   --dut slots   handler_slots + slot_rd_share + unit-tests/card_dma/card_dma_model (ADR-5).
+#                 The readers share ONE card read channel, which is the topology the bitstream is
+#                 built with since 2026-09-22 -- build-123 failed route_design with five card AXI
+#                 streams -- so the black-box scenarios cover the real thing.
 #   --dut both    both, which is what a bare ./run.sh does.
 #
 #   ./run.sh                          everything, both DUTs, N = 1, 2, 4
@@ -69,7 +72,8 @@ xvlog -sv lynxTypes_stub.sv \
       "$HDL/strip_http.sv" "$HDL/tcp_read.sv" \
       "$HDL/rx_dispatch.sv" "$HDL/tcp_init.sv" "$HDL/http_req_stream.sv" \
       "$HDL/axis_rewrite_last.sv" "$HDL/tx_arbiter.sv" "$HDL/handler_multi.sv" \
-      "$HDL/slot_writer.sv" "$HDL/slot_reader.sv" "$HDL/handler_slots.sv" "$MODEL" \
+      "$HDL/slot_writer.sv" "$HDL/slot_reader.sv" "$HDL/slot_rd_share.sv" \
+      "$HDL/handler_slots.sv" "$MODEL" \
       rxd_drain_tb.sv lane_drain_tb.sv > xvlog.log 2>&1 \
   || { tail -40 xvlog.log; exit 1; }
 
