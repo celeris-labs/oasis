@@ -35,7 +35,7 @@ number. See `THESIS-MEASUREMENTS.md` in the repo root.
 | ADR-2 | keep the HTTP parser out of the TOE's back-pressure path | **accepted, shipped** in `b238c4e`, holds |
 | ADR-3 | N connections serialised onto **one** decoder | **superseded by ADR-4, and several of its numbers were wrong** — see the corrections table |
 | ADR-4 | **one TCP session per decode lane** | accepted, implemented in `3edff95`, first bitstream **build-110** (4 lanes, synthesizing 2026-08-26). **Verified in simulation only — no hardware measurement exists yet.** |
-| ADR-5 | **one HBM slot per connection**, drained by per-decoder readers | **accepted 2026-09-20, not built** — no RTL, no bitstream. Replaces ADR-4's per-lane datapath (its session-per-connection side and the arrival-order contract stand) |
+| ADR-5 | **one HBM slot per connection**, drained by per-decoder readers over **one** shared card channel | accepted 2026-09-20; RTL written and simulated, **no bitstream**. build-123 failed `route_design` at `N_CARD_AXI 5` and the fallback was taken on 2026-09-22 — see the addendum at the end of the ADR. Replaces ADR-4's per-lane datapath (its session-per-connection side and the arrival-order contract stand) |
 
 ---
 
@@ -491,6 +491,65 @@ the card path is behind the wire), `[30]` some connection overran its slot, `[31
 - **Reader head-of-line on a late response costs more than the coupling it replaces.** Expected to
   be a dip, not a wedge, since the host orders entries by issue time; measure before building
   out-of-order drain.
+
+### 2026-09-22 — one card AXI stream, not five; `RD_MAX` is 16 KiB
+
+`N_CARD_AXI = N_DECODERS + 1` above is **dead**. build-123 was built that way, placed at
+WNS −1.53 ns and then **failed `route_design`** — 34,111 unroutable signals. The cause was the
+shell, not us (`oasis-debug/2026-09-22/build-123-postmortem/deltas.txt`):
+
+| | build-119 | build-123 |
+|---|---|---|
+| whole design | 682,155 LUT / 1,035,569 FF | 823,648 / 1,274,036 |
+| `inst_handler` (ours) | 21,255 LUT / 128 RAMB36 | 22,161 / **16** |
+| PR pblock CLB sites | 124,863 (85.5 %) | 140,270 (**96.1 %**) |
+| SLR0 CLB occupancy | 76.2 % | **99.55 %** |
+
+One card AXI stream costs ≈ **25k LUT / 42k FF / 32 RAMB36** of shell: a `cdma`, an
+`inst_int_hbm/path_i`, four 3-stage 577-bit `axis_reg_array`s, `mmu_top` queues and
+`local_credits_card_{rd,wr}`. 79 % of the growth placed in SLR0 next to the HBM controller and
+filled it. `handler_slots` was 906 LUT *larger* than `handler_multi` and 112 RAMB36 *smaller*.
+
+**The decision (2026-09-22): `N_CARD_AXI = 1`.** A Coyote `cdma` has independent read and write
+engines on one channel (`cdma_u/cdma.sv:167,226`), 16 GB/s each way against the 2–4 GB/s this ADR
+targets, so `slot_writer` takes the write half (`axis_card_send[0]`) and **every** reader shares the
+read half (`axis_card_recv[0]`).
+
+**`dest` is now always 0, and that is load-bearing.** `N_CARD_AXI 1` leaves `MULT_CARD_AXI` at 0
+(`FindCoyoteHW.cmake:760,771`). `tlb_fsm` then hardcodes channel 0 and ignores the field
+(`tlb_fsm.sv:575,1019`) — but the user wrapper does not: with `EN_CRED_LOCAL` on,
+`local_credits_card_{rd,wr}` is built at `N_DESTS = 1` behind `dest_req_mux`, whose ready is
+`req_ready[s_req.data.dest]` over a **one-entry array** (`dest_req_mux.sv:68`). A descriptor with
+`dest != 0` indexes it out of range. The ack still echoes the field (`tlb_fsm.sv:1198`), so the
+`cq_wr` filter on `dest == 0 && host == 0` keeps working.
+
+**The hazard the shared stream creates, and the module that removes it.** Read data returns in
+*request* order on one stream, so back-pressuring it because one decoder is slow would put the
+head-of-line coupling this ADR exists to remove back inside the card path. New
+`slot_rd_share.sv` sits between the readers and the channel: a receive fifo of `2 × RD_MAX` per
+decoder (≈ 9 RAMB36 each, ~36 total, against the 112 freed), a **credit** that hands a read to the
+channel only when that decoder's fifo has room for a whole `RD_MAX` beyond everything already
+reserved, a registered round-robin over the readers, and an in-order `{decoder, beats}` queue
+driving the receive demux (`ceil(len/64)` beats per request; there is no `tlast` on a `last=0`
+read). `ch_tready` is a literal `1'b1`: the shared stream is never stalled, by anything.
+
+**`RD_MAX` 64 KiB → 16 KiB.** It is now also the longest one decoder can make another wait for its
+turn — 256 beats, ≈ 1 µs at 250 MHz, instead of 1024 — and it sizes those fifos. It is still
+published in `SLOT_POLICY[35:30]` as `log2`, which now reads **14** instead of 16; a host that
+derives anything from that register sees the change and nothing else moves (the GET clamp is
+`SLOT_BYTES − 64 KiB` from `SLOT_LOG2`, untouched).
+
+**Measured, `unit-tests/slot_reader`, 2026-09-22, through the real `slot_rd_share` on one channel:**
+`rslow` (decoder 0 at 1 beat/16 cycles) puts decoder 1 at **1.0000 beats/cycle** against `rsolo`'s
+**1.0000**, and at a 4 GB/s sink both read **0.2504**. A decoder stopped dead with two reads
+outstanding exhausts its credit and costs its neighbour nothing (`rstall`: 1.0000). `lane_drain`'s
+`thr` at 4 connections: neighbours retain 100–109 % of their solo rate, `route_stall` and
+`rx_fifo_stall` clear.
+
+**What is still true of one channel:** its 16 GB/s is shared. Four decoders at their measured
+0.53–1.8 GB/s intake want ~25 % of it, so this is free at the real operating point; two sinks each
+demanding the whole channel for a response much larger than `2 × RD_MAX` would split it, and no
+one-channel design could do otherwise.
 ---
 
 ## Constraints that are not decisions

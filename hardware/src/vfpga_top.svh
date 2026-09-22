@@ -578,11 +578,19 @@ handler_slots #(
     .slotPolicyWord (http_slot_policy_word)
 );
 
+// ONE card channel since 2026-09-22: build-123 was built with N_CARD_AXI = NUM_DECODERS+1, placed
+// at WNS -1.53 ns and failed route_design on congestion (34,111 unroutable signals; SLR0 at 99.55%
+// CLB). See hardware/CMakeLists.txt and slot_dma_shell.sv. The writer owns the channel's write
+// half, the readers share its read half through slot_rd_share, and both dests are 0 because with
+// MULT_CARD_AXI 0 the shell's credit mux indexes a one-entry array with that field.
 slot_dma_shell #(
     .N_RD        (NUM_DECODERS),
     .N_CARD      (N_CARD_AXI),
     .WR_DEST     (0),
-    .RD_DEST_BASE(1),
+    .RD_DEST     (0),
+    // 16 KiB, matching handler_slots' RD_MAX default: it sizes slot_rd_share's per-decoder receive
+    // fifos (2 x RD_MAX each) and the credit that keeps a slow decoder off the shared stream.
+    .RD_MAX      (16384),
     // Coyote thread id 0: the pid keys the TLB lookup, and it is the id libstf's StreamWriter has
     // always used. The slot page must be mapped by that same cThread. See slot_dma_shell.sv.
     .CARD_PID    (0)
@@ -858,7 +866,8 @@ always_comb axi_out[BYPASS_ID].tie_off_m();
 //
 // The register slices are the reason this is not simply wired straight through: the HBM shell sits
 // physically far from the user region, build-119 already closes at WNS -1.474 ns with 2009 failing
-// paths, and these two descriptor paths plus the five card data streams are the new long ones.
+// paths, and these two descriptor paths plus the card channel's two data streams are the new long
+// ones.
 metaIntf #(.STYPE(req_t)) sq_wr_shared (.aclk(clk), .aresetn(rst_n));
 metaIntf #(.STYPE(ack_t)) cq_wr_shared (.aclk(clk), .aresetn(rst_n));
 metaIntf #(.STYPE(ack_t)) cq_wr_ow     (.aclk(clk), .aresetn(rst_n));

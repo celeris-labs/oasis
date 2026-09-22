@@ -43,8 +43,7 @@ import lynxTypes::*;
 //                worked on hardware on that assumption since build-93, so cpid 0 is what the one
 //                cThread this design creates gets.  Parameterised rather than literal so the day a
 //                second cThread appears this is a port to drive and not a bug to find.
-//   dest    0 for the write, 1+d for reader d.  Selects the card AXI stream (mmu_top.sv:219 ->
-//                the per-dest cdma engines, dynamic_top_tmplt.txt:369-385)
+//   dest    0, ALWAYS, on both the write and the read.  See THE ONE CARD CHANNEL below
 //   last    1 on writes, 0 on reads.  See THE last=0 CONTRACT below
 //   vaddr   the slot cursor handler_slots computed.  Byte granular: build-119 already compiles the
 //                unaligned engine cdma_u (cr_shell.tcl:93)
@@ -87,22 +86,51 @@ import lynxTypes::*;
 // (stream_writer.sv:209) and so does this module.  meta_intf_dup2 at the bottom of this file is the
 // metaIntf twin of libstf's ReadyValidDuplicator and tolerates one side being slow anyway.
 //
-// WHERE THE N_CARD_AXI = 2 FALLBACK WOULD GO
-// -------------------------------------------
-// The plan's fallback is one shared read stream with a dest-tagged mux instead of one per decoder.
-// It lands ENTIRELY inside this module: the per-reader legs already exist, so the fallback makes
-// RD_DEST_BASE + D collapse to a single dest, keeps the same MetaIntfArbiter, and adds an in-order
-// {decoder, bytes} queue in front of a demux on the one `axis_card_recv[1]`.  handler_slots does
-// not change, because it never learns which dest its bytes came from.
+// THE ONE CARD CHANNEL (2026-09-22)
+// ---------------------------------
+// This module was built with N_CARD_AXI = N_DECODERS + 1: one stream for the writer and one per
+// decoder for the readers, each with its own `dest`.  build-123 was synthesized that way, placed at
+// WNS -1.53 ns and then FAILED route_design -- 34,111 unroutable signals.  Each card AXI stream
+// costs ~25k LUT / ~42k FF / ~32 RAMB36 of SHELL (a cdma, an HBM path_i, 3-stage 577-bit register
+// arrays each way, mmu queues, card credits), 79% of the growth placed in SLR0 next to the HBM
+// controller, and SLR0 went from 76.2% to 99.55% CLB occupancy.  Our own logic was not the problem:
+// handler_slots is 22.2k LUT against handler_multi's 21.3k and it FREED 112 RAMB36.  The numbers are
+// in oasis-debug/2026-09-22/build-123-postmortem/deltas.txt.
+//
+// So there is ONE card channel now.  A Coyote `cdma` has independent read and write engines on the
+// same channel (cdma_u/cdma.sv:167,226), 16 GB/s each way against ADR-5's 2-4 GB/s target, so the
+// writer takes its write half (axis_card_send[0]) and every reader shares its read half
+// (axis_card_recv[0]) through `slot_rd_share`, which holds the per-decoder receive fifos and the
+// credit that keeps a slow decoder from ever back-pressuring the shared stream.  Read arbitration
+// lives there, not here: this module no longer has a read leg per decoder and no MetaIntfArbiter on
+// sq_rd.
+//
+// AND EVERY DESCRIPTOR NOW CARRIES dest 0, WHICH IS NOT COSMETIC.
+// N_CARD_AXI 1 makes CMake leave MULT_CARD_AXI at 0 (FindCoyoteHW.cmake:760,771).  Two things follow:
+//   * tlb_fsm stops routing by `dest` at all -- under `ifndef MULT_CARD_AXI it hardcodes channel 0
+//     (tlb_fsm.sv:575,1019) -- so the field no longer selects anything in the shell.  It is still
+//     latched and stamped into the completion (tlb_fsm.sv:1198), which is what keeps the cq_wr
+//     filter below meaningful.
+//   * the user wrapper's credit path does NOT stop using it.  EN_CRED_LOCAL is on (base.tcl,
+//     FindCoyoteHW.cmake:505), so local_credits_card_{rd,wr} is built with N_DESTS = N_CARD_AXI = 1
+//     and fronted by `dest_req_mux`, whose ready is a literal `req_ready[s_req.data.dest]` over a
+//     one-entry array (dest_req_mux.sv:68).  A descriptor with dest != 0 indexes that array out of
+//     range: in simulation an x, in hardware a request that is never granted.
+// dest 0 is therefore a requirement, not a convention, and WR_DEST/RD_DEST are parameters only so
+// that the assertion below can state it.
 // =================================================================================================
 module slot_dma_shell #(
-    // Read channels, one per decoder.
+    // Readers sharing the one read half.  One per decoder.
     parameter int N_RD         = 4,
-    // Card AXI streams the shell was built with; must be N_RD + 1.
-    parameter int N_CARD       = 5,
-    // Card stream carrying slot_writer's data, and the base of the readers'.
+    // Card AXI streams the shell was built with.  One, since 2026-09-22.
+    parameter int N_CARD       = 1,
+    // The dest every card descriptor carries.  Both are 0 and both must be: see THE ONE CARD
+    // CHANNEL above.
     parameter int WR_DEST      = 0,
-    parameter int RD_DEST_BASE = 1,
+    parameter int RD_DEST      = 0,
+    // The most one card read may ask for, in bytes.  Must match the readers' RD_MAX: it sizes
+    // slot_rd_share's per-decoder fifos and the credit that guards them.
+    parameter int RD_MAX       = 16384,
     // Coyote thread id whose page table holds the slot page.  See the field table above.
     parameter int CARD_PID     = 0,
     // Register-slice depth towards the shell.  The HBM crossbar is physically far from the user
@@ -152,9 +180,11 @@ module slot_dma_shell #(
 );
 
 `ASSERT_ELAB(N_RD >= 1)
-`ASSERT_ELAB(N_CARD == N_RD + 1)
-`ASSERT_ELAB(RD_DEST_BASE + N_RD <= (1 << DEST_BITS))
-`ASSERT_ELAB(WR_DEST < RD_DEST_BASE)
+`ASSERT_ELAB(N_CARD == 1)
+// Not style: with MULT_CARD_AXI 0 the shell's credit mux indexes a one-entry array with this field
+// (dest_req_mux.sv:68).  Anything but 0 is an out-of-range select.
+`ASSERT_ELAB(WR_DEST == 0)
+`ASSERT_ELAB(RD_DEST == 0)
 
 // =================================================================================================
 // Write descriptors.  One leg of the shared sq_wr arbiter, registered on the way out.
@@ -199,50 +229,36 @@ assign wr_ack = cq_wr.valid
              && (cq_wr.data.host == 1'b0);
 
 // =================================================================================================
-// Read descriptors.  One leg per decoder, round-robin onto the single sq_rd, registered on the way
-// out.  The arbiter is libstf's, the same one OutputWriter uses for its own sq_wr legs.
+// Read descriptors.  ONE leg: slot_rd_share below has already picked which decoder is asking, and
+// every read carries dest 0 because there is one card channel to carry it.
 // =================================================================================================
-metaIntf #(.STYPE(req_t)) sq_rd_leg [N_RD] (.aclk(clk), .aresetn(rst_n));
+logic                  share_req_valid, share_req_ready, share_req_last;
+logic [VADDR_BITS-1:0] share_req_vaddr;
+logic [LEN_BITS-1:0]   share_req_len;
+
 metaIntf #(.STYPE(req_t)) sq_rd_int (.aclk(clk), .aresetn(rst_n));
 
-for (genvar D = 0; D < N_RD; D++) begin : gen_rd_req
-    always_comb begin
-        sq_rd_leg[D].data        = '0;
-        sq_rd_leg[D].data.opcode = LOCAL_READ;
-        sq_rd_leg[D].data.strm   = STRM_CARD;
-        sq_rd_leg[D].data.mode   = 1'b0;
-        sq_rd_leg[D].data.rdma   = 1'b0;
-        sq_rd_leg[D].data.remote = 1'b0;
-        sq_rd_leg[D].data.vfid   = '0;
-        sq_rd_leg[D].data.pid    = PID_BITS'(CARD_PID);
-        sq_rd_leg[D].data.dest   = DEST_BITS'(RD_DEST_BASE + D);
-        sq_rd_leg[D].data.last   = rd_req_last[D];  // slot_reader holds this at 0
-        sq_rd_leg[D].data.vaddr  = rd_req_vaddr[D];
-        sq_rd_leg[D].data.len    = rd_req_len[D];
-        sq_rd_leg[D].data.actv   = 1'b0;
-        sq_rd_leg[D].data.host   = 1'b0;
-        sq_rd_leg[D].data.offs   = '0;
-        sq_rd_leg[D].data.rsrvd  = '0;
+always_comb begin
+    sq_rd_int.data        = '0;
+    sq_rd_int.data.opcode = LOCAL_READ;
+    sq_rd_int.data.strm   = STRM_CARD;
+    sq_rd_int.data.mode   = 1'b0;
+    sq_rd_int.data.rdma   = 1'b0;
+    sq_rd_int.data.remote = 1'b0;
+    sq_rd_int.data.vfid   = '0;
+    sq_rd_int.data.pid    = PID_BITS'(CARD_PID);
+    sq_rd_int.data.dest   = DEST_BITS'(RD_DEST);
+    sq_rd_int.data.last   = share_req_last;   // slot_reader holds this at 0
+    sq_rd_int.data.vaddr  = share_req_vaddr;
+    sq_rd_int.data.len    = share_req_len;
+    sq_rd_int.data.actv   = 1'b0;
+    sq_rd_int.data.host   = 1'b0;
+    sq_rd_int.data.offs   = '0;
+    sq_rd_int.data.rsrvd  = '0;
 
-        sq_rd_leg[D].valid = rd_req_valid[D];
-    end
-    assign rd_req_ready[D] = sq_rd_leg[D].ready;
+    sq_rd_int.valid = share_req_valid;
 end
-
-// MetaIntfArbiter computes $clog2(N_INTERFACES) and would build a [-1:0] select at N_RD == 1.
-generate if (N_RD == 1) begin : gen_rd_single
-    `META_ASSIGN(sq_rd_leg[0], sq_rd_int)
-end else begin : gen_rd_arb
-    MetaIntfArbiter #(
-        .N_INTERFACES(N_RD),
-        .STYPE(req_t)
-    ) inst_sq_rd_arbiter (
-        .clk(clk),
-        .rst_n(rst_n),
-        .intf_in(sq_rd_leg),
-        .intf_out(sq_rd_int)
-    );
-end endgenerate
+assign share_req_ready = sq_rd_int.ready;
 
 meta_reg_array #(
     .DATA_BITS($bits(req_t)),
@@ -268,12 +284,9 @@ end
 `endif
 
 // =================================================================================================
-// Card data streams.
-//
-// axis_card_send[WR_DEST] <- slot_writer, axis_card_recv[RD_DEST_BASE+d] -> slot_reader[d], every
-// other stream tied off the way vfpga_top ties off the host streams it does not use.  The register
-// slices sit here, i.e. immediately at the user-logic boundary, because that is the crossing the
-// HBM shell is far from.
+// Card data streams.  One channel, both halves used: axis_card_send[0] <- slot_writer,
+// axis_card_recv[0] -> slot_rd_share -> slot_reader[d].  The register slices sit here, i.e.
+// immediately at the user-logic boundary, because that is the crossing the HBM shell is far from.
 // =================================================================================================
 AXI4S wr_axis_in  (.aclk(clk), .aresetn(rst_n));
 AXI4S wr_axis_out (.aclk(clk), .aresetn(rst_n));
@@ -295,31 +308,56 @@ assign axis_card_send[WR_DEST].tvalid = wr_axis_out.tvalid;
 assign axis_card_send[WR_DEST].tid    = '0;   // StreamWriter does the same; the shell ignores it
 assign wr_axis_out.tready             = axis_card_send[WR_DEST].tready;
 
-// Nothing is read from card stream 0 and nothing is written to the read streams.
-always_comb axis_card_recv[WR_DEST].tie_off_s();
+AXI4S rd_axis_in  (.aclk(clk), .aresetn(rst_n));
+AXI4S rd_axis_out (.aclk(clk), .aresetn(rst_n));
 
-for (genvar D = 0; D < N_RD; D++) begin : gen_rd_data
-    AXI4S rd_axis_in  (.aclk(clk), .aresetn(rst_n));
-    AXI4S rd_axis_out (.aclk(clk), .aresetn(rst_n));
+assign rd_axis_in.tdata  = axis_card_recv[RD_DEST].tdata;
+assign rd_axis_in.tkeep  = axis_card_recv[RD_DEST].tkeep;
+assign rd_axis_in.tlast  = axis_card_recv[RD_DEST].tlast;
+assign rd_axis_in.tvalid = axis_card_recv[RD_DEST].tvalid;
+assign axis_card_recv[RD_DEST].tready = rd_axis_in.tready;
 
-    assign rd_axis_in.tdata  = axis_card_recv[RD_DEST_BASE + D].tdata;
-    assign rd_axis_in.tkeep  = axis_card_recv[RD_DEST_BASE + D].tkeep;
-    assign rd_axis_in.tlast  = axis_card_recv[RD_DEST_BASE + D].tlast;
-    assign rd_axis_in.tvalid = axis_card_recv[RD_DEST_BASE + D].tvalid;
-    assign axis_card_recv[RD_DEST_BASE + D].tready = rd_axis_in.tready;
+axis_reg_array #(
+    .N_STAGES(REG_STAGES)
+) inst_card_recv_reg (.aclk(clk), .aresetn(rst_n), .s_axis(rd_axis_in), .m_axis(rd_axis_out));
 
-    axis_reg_array #(
-        .N_STAGES(REG_STAGES)
-    ) inst_card_recv_reg (.aclk(clk), .aresetn(rst_n), .s_axis(rd_axis_in), .m_axis(rd_axis_out));
+// =================================================================================================
+// The shared read half.  Per-decoder receive fifos, a credit that stops a reader asking for more
+// than its fifo can hold, a round-robin over the requests and an in-order demux of the answers.
+// Its `ch_tready` is a constant 1, so a decoder that stops draining can never hold up the stream
+// the other three are being served on -- the coupling this whole redesign exists to remove, which
+// one shared read stream would otherwise have reintroduced inside the card path.
+//
+// It carries no Coyote types on purpose: unit-tests/slot_reader and unit-tests/lane_drain
+// instantiate exactly this module against unit-tests/card_dma/card_dma_model at N_RD 1.
+// =================================================================================================
+slot_rd_share #(
+    .N_RD  (N_RD),
+    .RD_MAX(RD_MAX)
+) inst_slot_rd_share (
+    .clk(clk), .rst_n(rst_n),
 
-    assign rd_tvalid[D]       = rd_axis_out.tvalid;
-    assign rd_tdata[D]        = rd_axis_out.tdata;
-    assign rd_tkeep[D]        = rd_axis_out.tkeep;
-    assign rd_tlast[D]        = rd_axis_out.tlast;
-    assign rd_axis_out.tready = rd_tready[D];
+    .rd_req_valid(rd_req_valid), .rd_req_ready(rd_req_ready),
+    .rd_req_vaddr(rd_req_vaddr), .rd_req_len  (rd_req_len),
+    .rd_req_last (rd_req_last),
 
-    always_comb axis_card_send[RD_DEST_BASE + D].tie_off_m();
-end
+    .rd_tvalid(rd_tvalid), .rd_tready(rd_tready),
+    .rd_tdata (rd_tdata),  .rd_tkeep (rd_tkeep), .rd_tlast(rd_tlast),
+
+    .ch_req_valid(share_req_valid), .ch_req_ready(share_req_ready),
+    .ch_req_vaddr(share_req_vaddr), .ch_req_len  (share_req_len),
+    .ch_req_last (share_req_last),
+
+    .ch_tvalid(rd_axis_out.tvalid), .ch_tready(rd_axis_out.tready),
+    .ch_tdata (rd_axis_out.tdata),  .ch_tkeep (rd_axis_out.tkeep),
+    .ch_tlast (rd_axis_out.tlast),
+
+    // No CSR carries these in revision 3.  They cannot be true of a correct configuration -- the
+    // benches assert all three clear on every case -- and giving them a register would mean
+    // widening handler_slots' port list for a bit that says "this build is wrong".  A revision 4
+    // that has room should fold them into STALL alongside [29..31].
+    .order_err(), .fifo_err(), .len_err(), .credit_ok(), .oq_occ()
+);
 
 endmodule
 

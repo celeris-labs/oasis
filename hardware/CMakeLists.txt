@@ -98,12 +98,29 @@ if(ENABLE_HTTP)
     set(N_TCP_AXI 1)
     set(N_STRM_AXI ${N_STREAMS})
     if(ENABLE_HTTP_SLOTS)
-        # One card AXI stream for slot_writer (dest 0) and one per decoder for the readers
-        # (dest 1+d). EN_MEM is what instantiates them; on the u55c the HBM controller itself is
-        # already in the design because the TCP stack needs a card channel, so what this adds is
-        # N_CARD_AXI+1 more cdma engines and that many more RAMA/HBM crossbar ports.
+        # ONE card AXI stream, shared: slot_writer drives its write half (axis_card_send[0], sq_wr
+        # dest 0) and every decoder's slot_reader shares the read half (axis_card_recv[0], sq_rd)
+        # through slot_rd_share. A Coyote cdma has independent read and write engines on one channel
+        # (cdma_u/cdma.sv:167,226), 16 GB/s per direction, and ADR-5 targets 2-4 GB/s.
+        #
+        # It was N_DECODERS+1 (1 write + 1 read per decoder) until 2026-09-22. build-123 was built
+        # that way, placed at WNS -1.53 ns and then FAILED route_design on congestion (34,111
+        # unroutable signals). One card AXI stream costs ~25k LUT / ~42k FF / ~32 RAMB36 of SHELL
+        # (3-stage 577-bit register arrays, a cdma, an HBM path_i, mmu queues, card credits), 79% of
+        # the growth landed in SLR0 next to the HBM controller, and SLR0 went from 76.2% to 99.6%
+        # CLB occupancy. Our own logic was not the problem: handler_slots is 22.2k LUT against
+        # handler_multi's 21.3k and it FREED 112 RAMB36. See
+        # oasis-debug/2026-09-22/build-123-postmortem/deltas.txt. At 1 stream the prediction is
+        # 727k LUT total against 823.6k and a PR pblock back at ~87% CLB (build-119: 85.5%).
+        #
+        # EN_MEM is what instantiates the stream; on the u55c the HBM controller itself is already in
+        # the design because the TCP stack needs a card channel, so what this adds is one more cdma
+        # engine and one more RAMA/HBM crossbar port. N_CARD_AXI 1 also means MULT_CARD_AXI 0
+        # (FindCoyoteHW.cmake:771), under which the shell ignores a descriptor's `dest` for routing
+        # and the user-side credit mux indexes a one-entry array with it
+        # (dest_req_mux.sv:68) -- so every card descriptor this design issues must carry dest 0.
         set(EN_MEM 1)
-        math(EXPR N_CARD_AXI "${N_DECODERS} + 1")
+        set(N_CARD_AXI 1)
     endif()
 elseif(ENABLE_RDMA)
     math(EXPR N_STREAMS "${N_DECODERS} + 1")
