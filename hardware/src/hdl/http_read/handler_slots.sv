@@ -119,8 +119,11 @@ module handler_slots #(
     parameter int SLOT_LOG2 = 22,
     // The SHARED elastic fifo in front of the card write channel, in 64-byte beats.
     parameter int SLOT_FIFO_DEPTH = 1024,
-    // The most one card read may ask for, in bytes.
-    parameter int RD_MAX = 65536,
+    // The most one card read may ask for, in bytes. 16 KiB since 2026-09-22: every reader now
+    // shares ONE card read channel (build-123 failed route_design at five card AXI streams --
+    // slot_dma_shell.sv), so this is also the longest one decoder can make another wait for its
+    // turn, and it sizes slot_rd_share's per-decoder receive fifo at 2 x RD_MAX.
+    parameter int RD_MAX = 16384,
     parameter int TX_CHUNK_BYTES = 4096,
     parameter int STALL_CYCLES = 268435456,
     // How long one connection may hold up the shared receive path before rx_dispatch declares it
@@ -206,10 +209,10 @@ module handler_slots #(
     output logic [N_DECODERS-1:0]      m_axis_body_tlast,
 
     // =============================================================================================
-    // CARD DMA. Flat ports on purpose: a later work package wraps them in Coyote's metaIntf/req_t
-    // in vfpga_top.svh (one MetaIntfArbiter over {OutputWriter, this} on sq_wr, a cq_wr duplicator
-    // filtered by strm/dest, a sq_rd arbiter and a cq_rd demux by dest). Keeping the shell types out
-    // of here is what lets the whole module run in xsim against unit-tests/card_dma/card_dma_model.
+    // CARD DMA. Flat ports on purpose: slot_dma_shell wraps them in Coyote's metaIntf/req_t (a
+    // MetaIntfArbiter over {OutputWriter, this} on sq_wr in vfpga_top, a cq_wr duplicator filtered
+    // by strm/dest, and slot_rd_share onto the one sq_rd). Keeping the shell types out of here is
+    // what lets the whole module run in xsim against unit-tests/card_dma/card_dma_model.
     // =============================================================================================
     // ONE write channel -> axis_card_send[0], LOCAL_WRITE / STRM_CARD / dest 0 / last=1.
     output logic                       wr_req_valid,
@@ -224,7 +227,11 @@ module handler_slots #(
     output logic                       m_axis_card_tlast,
     input  logic                       wr_ack,          // cq_wr, one per request, in issue order
 
-    // N_DECODERS read channels -> axis_card_recv[1+d], LOCAL_READ / STRM_CARD / dest 1+d / last=0.
+    // N_DECODERS read request ports. They do NOT reach the shell one per decoder any more: since
+    // 2026-09-22 slot_rd_share multiplexes all of them onto the one card read channel
+    // (axis_card_recv[0], LOCAL_READ / STRM_CARD / dest 0 / last=0), giving each decoder a receive
+    // fifo and a credit so a slow one cannot stall the shared stream. Nothing here changes: this
+    // module never learned which stream its bytes came from.
     // There is no ack: a last=0 request draws no cq_rd, and the readers count bytes instead.
     output logic                       rd_req_valid [N_DECODERS],
     input  logic                       rd_req_ready [N_DECODERS],

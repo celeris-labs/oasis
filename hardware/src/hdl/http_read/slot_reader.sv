@@ -65,7 +65,10 @@ import lynxTypes::*;
 // than 2 reads are outstanding, issue one for `min(landed[c] - rd_cursor, RD_MAX)` bytes. Two
 // outstanding is enough to cover the request->data latency of the card path without making the
 // residue check at the end ambiguous; RD_MAX stops a single 4 MiB response from owning the channel
-// for the whole of its transfer.
+// for the whole of its transfer -- which matters far more since 2026-09-22, when the per-decoder
+// card channels became one shared one: RD_MAX is now also the longest another decoder may have to
+// wait for its turn, and the two outstanding reads are exactly what slot_rd_share sizes that
+// decoder's receive fifo against.
 //
 // `landed[c]` is the ONLY thing that orders a read behind the write that produced its bytes: it is
 // advanced by the write channel's ack, and the ack fires when the data is committed
@@ -99,7 +102,11 @@ import lynxTypes::*;
 module slot_reader #(
     parameter int N_CONNS     = 4,
     parameter int SLOT_LOG2   = 22,
-    parameter int RD_MAX      = 65536,   // bytes; the most one read may ask for
+    // Bytes; the most one read may ask for. 16 KiB since 2026-09-22, when the four per-decoder card
+    // channels became one shared one (build-123's route failure; slot_dma_shell.sv). It now also
+    // bounds how long one reader may own the shared channel -- 256 beats, ~1 us at 250 MHz, instead
+    // of 1024 -- and it sizes slot_rd_share's per-decoder receive fifo at 2 x RD_MAX.
+    parameter int RD_MAX      = 16384,
     parameter int ENTRY_DEPTH = 64,
 
     localparam int CONN_BITS  = (N_CONNS > 1) ? $clog2(N_CONNS) : 1,
