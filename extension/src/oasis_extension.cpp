@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "oasis_extension.hpp"
+#include "oasis_optimizer.hpp"
 #include "oasis_profile.hpp"
 #include "oasis_scan.hpp"
 #include "oasis_context_cache_entry.hpp"
@@ -46,6 +47,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
+
+	// Detects read_oasis-to-read_oasis equi-joins and marks the probe-side scan for runtime Bloom
+	// filter pushdown.
+	RegisterOasisOptimizer(loader);
 
 	// Stream profiler readout table function
 	RegisterOasisProfileFunction(loader);

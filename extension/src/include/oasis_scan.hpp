@@ -61,6 +61,13 @@ struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
 	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
+
+	// Set by the Oasis optimizer extension when this scan is the probe side of a read_oasis-to-
+	// read_oasis equi-join.
+	bool runtime_bloom_enabled = false;
+	string runtime_bloom_build_filename;
+	string runtime_bloom_build_key;
+	string runtime_bloom_probe_key;
 };
 
 struct ProjectedColumn {
