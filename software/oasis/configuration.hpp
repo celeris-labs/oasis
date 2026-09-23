@@ -62,6 +62,24 @@ constexpr const uint8_t HTTP_LANE_SLOTS = 8;
 /// HTTP_CSR_REVISION_LANES keeps working on it unchanged; what changes is what the host may ASK for.
 constexpr const uint8_t HTTP_CSR_REVISION_SLOTS = 3;
 
+/// CSR revision at which the slot handler takes PIPELINED GETs (2026-09-23): same register map as
+/// revision 3, but ARM_READY no longer carries a depth-1 credit, several GETs may be armed on one
+/// connection, and their responses land back to back in its slot. The host's rule moves from
+/// "one GET per connection" to a BYTE BUDGET per connection: the responses armed since CONN_DRAINED
+/// was last read set must fit in the slot (slot_budget_bytes()). CONN_DRAINED now means "slot empty
+/// and nothing armed on it". Revision 3 is driven exactly as before.
+constexpr const uint8_t HTTP_CSR_REVISION_PIPE = 4;
+
+/// Lane depth on a revision-4 bitstream when OASIS_HTTP_LANE_DEPTH is not set, and the most it may
+/// be set to. Two already hides the per-request round trip behind the previous transfer (the
+/// build-119 depth sweep: per-GET time 1020 -> 848 -> 822 us at depth 1 -> 2 -> 4).
+constexpr const size_t HTTP_PIPE_DEFAULT_DEPTH = 2;
+constexpr const size_t HTTP_PIPE_MAX_DEPTH     = 4;
+
+/// What the byte budget charges per GET on top of its body: the response header (MinIO ~630 bytes)
+/// plus room for a server that sends a longer one.
+constexpr const uint64_t HTTP_SLOT_GET_OVERHEAD = 4ULL * 1024ULL;
+
 /// Connections the revision-3 per-connection words address at their fixed stride (8 per 64-bit word
 /// for OCC/ERR, 16 per word for READY; 4 + 2 + 4 words). Connections the bitstream lacks read 0.
 constexpr const uint8_t HTTP_CONN_SLOTS = 32;
@@ -257,6 +275,30 @@ class HTTPReadConfig : public libstf::Config {
     /// revision 3, 0 ("no limit") below it.
     uint64_t max_get_bytes();
 
+    // ---- CSR revision 4 (pipelined GETs on the slot handler) ------------------------------------
+
+    /// True on revision >= HTTP_CSR_REVISION_PIPE: several GETs may be armed on one connection.
+    bool slot_pipelined();
+
+    /// The per-connection byte budget: slot size minus HTTP_SLOT_HEADER_SLACK. 0 below revision 4.
+    uint64_t slot_budget_bytes();
+
+    /// Revision 4: block until `body_bytes` (+ HTTP_SLOT_GET_OVERHEAD) more response bytes fit in
+    /// the slot of `lane`'s connection, then charge them. The charge is cleared whenever CONN_DRAINED
+    /// reads set (slot released, nothing armed), which is the only moment the host knows the slot's
+    /// cursor is back at 0. A no-op below revision 4. Throws on a fatal lane or after the credit
+    /// timeout. Must be called by the one thread that arms this lane, immediately before the arm.
+    void reserve_slot_bytes(uint8_t lane, uint64_t body_bytes);
+
+    /// Pure form of reserve_slot_bytes()'s admission: `used` already charged, `need` to add. A need
+    /// larger than the whole budget is admitted only into an empty slot (used == 0) -- it cannot be
+    /// made to fit by waiting, and max_get_bytes() already bounds a single GET below the slot size.
+    static bool SlotBudgetOk(uint64_t used, uint64_t need, uint64_t budget);
+
+    /// The body length a ranged GET asks for, from its "Range: bytes=a-b" header (b - a + 1).
+    /// 0 when the text carries no parsable closed range.
+    static uint64_t RequestRangeBytes(const std::string &request);
+
     /// Write SLOT_BASE_LO/HI (write ids 42/43): the virtual address of slot 0, as the card DMA's TLB
     /// resolves it. Throws below revision 3, where those addresses do not exist.
     void set_slot_base(uint64_t vaddr);
@@ -294,15 +336,19 @@ class HTTPReadConfig : public libstf::Config {
     /// The connection a lane's GETs travel on. Stage 1 (N_CONNS == N_DECODERS): the lane itself.
     uint8_t conn_for_lane(uint8_t lane);
 
-    /// Read id 31 bit `conn`: the depth-1 credit. Revision 3 only.
+    /// Read id 31 bit `conn`: the depth-1 credit on revision 3; "slot empty and nothing armed" on
+    /// revision 4 (the byte budget's reset).
     bool conn_drained(uint8_t conn);
 
     /// Pure form of await_lane_credit()'s admission rule, so it can be checked without a board:
-    /// revision 3 additionally requires the connection's slot to be drained (`drained`).
+    /// revision 3 additionally requires the connection's slot to be drained (`drained`); revision 4
+    /// does not (its slot rule is the byte budget, taken at the arm).
     static bool LaneCreditOk(uint8_t revision, size_t occ, size_t needed, size_t limit, bool drained);
 
     /// Pure form of lane_depth_limit(): `want` (OASIS_HTTP_LANE_DEPTH) clamped to [1, hw]; 1 below
-    /// revision 2 (no per-lane occupancy) AND at revision 3 and above (depth 1 per connection).
+    /// revision 2 (no per-lane occupancy) and at revision 3 (depth 1 per connection); clamped to
+    /// [1, min(hw, HTTP_PIPE_MAX_DEPTH)] at revision 4, where the caller passes
+    /// HTTP_PIPE_DEFAULT_DEPTH as `want` when the variable is unset.
     static size_t LaneDepthFor(uint8_t revision, size_t want, size_t hw);
 
     /// Block until `lane` will accept a beat of this kind, or throw naming the lane and why it will
@@ -774,6 +820,10 @@ class HTTPReadConfig : public libstf::Config {
     /// slot_policy(), cached. `slot_policy_read_` distinguishes "not read yet" from "read, invalid".
     HTTPSlotPolicy slot_policy_ {};
     bool           slot_policy_read_ {false};
+
+    /// Revision 4: response bytes charged against each connection's slot since CONN_DRAINED was
+    /// last seen set. Touched only by the thread that arms (the dispatcher).
+    std::array<uint64_t, HTTP_CONN_SLOTS> slot_used_ {};
 };
 
 } // namespace oasis

@@ -1,5 +1,6 @@
 #include "oasis/oasis_context.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -214,7 +215,12 @@ void OasisContext::setup_http_slots() {
     }
     // Only the slots, not the whole page: the ioctl takes the length as 32 bits and cThread caps it
     // at MAX_TRANSFER_SIZE. The driver migrates the WHOLE mapping that contains the address anyway.
-    cthread_->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{page, region});
+    //
+    // Capped, not just "the slots": since CSR revision 4 the slots fill the whole 1 GiB page (4 x
+    // 256 MiB), and cThread::invoke THROWS on a sync/offload longer than MAX_TRANSFER_SIZE (128 MiB)
+    // rather than truncating it.
+    const uint64_t offload_len = std::min<uint64_t>(region, coyote::MAX_TRANSFER_SIZE);
+    cthread_->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{page, offload_len});
     http_slot_page_ = page;
     http->set_slot_base(reinterpret_cast<uint64_t>(page));
 
@@ -223,9 +229,11 @@ void OasisContext::setup_http_slots() {
     // datapath a run used is exactly what a log has to be able to prove afterwards. Once per process.
     char line[256];
     std::snprintf(line, sizeof(line),
-                  "OasisContext: HBM slot bitstream (CSR rev %u): %u connection slot(s) of %llu KiB "
+                  "OasisContext: HBM slot bitstream (CSR rev %u%s): %u connection slot(s) of %llu KiB "
                   "at %p, offloaded to card memory; GETs capped at %llu KiB",
-                  unsigned(policy.revision), unsigned(policy.n_conns),
+                  unsigned(policy.revision),
+                  http->slot_pipelined() ? ", pipelined GETs" : ", one GET per connection",
+                  unsigned(policy.n_conns),
                   static_cast<unsigned long long>(policy.slot_bytes() >> 10), page,
                   static_cast<unsigned long long>(policy.max_get_bytes() >> 10));
     std::fprintf(stderr, "[oasis] %s\n", line);

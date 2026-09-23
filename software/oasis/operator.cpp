@@ -375,6 +375,10 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
 // own arm, its own DMA and, because the hardware drains its request stream to the DMA's TLAST, its
 // own beat-padded region of the buffer.
 //
+// REVISION 4 (pipelined slots) keeps the one-arm-per-GET shape but drops the drain wait: arm k+1 is
+// taken as soon as GET k's text has gone out, and the slot is metered by bytes (reserve_slot_bytes,
+// charged before each arm) instead of by occupancy. The rest of this note is about revision 3.
+//
 // When there is more than one GET (a column chunk larger than max_get_bytes(), or an
 // OASIS_HTTP_CHUNK_BYTES split), arm k+1 waits inside arm_transfer() for response k to drain, and
 // that wait runs on the dispatcher thread. It is correct and it is slow: other lanes get no NEW work
@@ -433,6 +437,17 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
     const libstf::stream_t req_dest = (lanes > 1) ? static_cast<libstf::stream_t>(lane)
                                                   : static_cast<libstf::stream_t>(0);
     for (size_t i = 0; i < requests.size(); i++) {
+        // Revision 4: charge this GET's response against its connection's slot before arming it
+        // (a no-op on revision 3, where the hardware holds the arm until the slot is empty). A GET
+        // whose range cannot be read back is charged as the largest legal one, which only ever
+        // makes the wait longer.
+        if (config.slot_pipelined()) {
+            uint64_t body = HTTPReadConfig::RequestRangeBytes(requests[i]);
+            if (body == 0) {
+                body = config.max_get_bytes();
+            }
+            config.reserve_slot_bytes(lane, body);
+        }
         // The REAL length, not the padded one: the hardware sends exactly this many bytes and
         // swallows the rest of the transfer up to TLAST.
         config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(lens[i]), lane);

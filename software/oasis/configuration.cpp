@@ -990,6 +990,32 @@ void HTTPReadConfig::await_arm_consumed(uint8_t lane) {
     if (!slot_mode()) {
         return;
     }
+    if (slot_pipelined()) {
+        // REVISION 4: CONN_DRAINED may already be low (earlier GETs still armed), so it proves
+        // nothing. ARM_READY does: it was polled HIGH before the START, and consuming the arm makes
+        // http_req_stream busy, which holds ARM_READY LOW until the request text has been sent --
+        // and this thread sends that text only after this returns. So "ARM_READY low" cannot be
+        // missed between polls. (It also falls if the arm filled the reader's entry queue, which is
+        // equally proof that the arm was taken.)
+        const auto start = std::chrono::steady_clock::now();
+        while (true) {
+            const auto l = lanes().at(lane);
+            if (!l.arm_ready) {
+                return;
+            }
+            if (l.fatal) {
+                throw_lane_fatal(lane, "its arm to be consumed");
+            }
+            if (std::chrono::steady_clock::now() - start > HTTP_CREDIT_TIMEOUT) {
+                std::ostringstream msg;
+                msg << "FPGA HTTP lane " << unsigned(lane) << ": an arm was written but ARM_READY "
+                    << "never fell, i.e. the handler did not take it [" << conns().describe()
+                    << "; " << stall().describe() << "]";
+                throw std::runtime_error(msg.str());
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(2));
+        }
+    }
     const uint8_t conn     = conn_for_lane(lane);
     const auto    start    = std::chrono::steady_clock::now();
     const auto    grace    = std::chrono::seconds(1);
@@ -1403,10 +1429,29 @@ size_t HTTPReadConfig::lane_depth_limit() {
         lane_depth_ = LaneDepthFor(revision(), 1, 1);
         return lane_depth_;
     }
-    const size_t hw   = max_batch_chunks();
-    const size_t want = static_cast<size_t>(HttpLaneDepth());
-    lane_depth_       = LaneDepthFor(revision(), want, hw);
-    if (slot_mode() && want > lane_depth_ && std::getenv("OASIS_HTTP_LANE_DEPTH") != nullptr) {
+    const size_t hw      = max_batch_chunks();
+    const bool   env_set = std::getenv("OASIS_HTTP_LANE_DEPTH") != nullptr &&
+                           *std::getenv("OASIS_HTTP_LANE_DEPTH") != '\0';
+    // Revision 4 has its own default: HttpLaneDepth()'s 4 was chosen for build-119's lanes.
+    const size_t want    = (slot_pipelined() && !env_set) ? HTTP_PIPE_DEFAULT_DEPTH
+                                                          : static_cast<size_t>(HttpLaneDepth());
+    lane_depth_          = LaneDepthFor(revision(), want, hw);
+    if (slot_pipelined()) {
+        char line[200];
+        std::snprintf(line, sizeof(line),
+                      "HTTPReadConfig: CSR revision %u (pipelined HBM slots): lane depth %zu%s, "
+                      "slot byte budget %llu KiB per connection",
+                      unsigned(revision()), lane_depth_,
+                      env_set ? " (OASIS_HTTP_LANE_DEPTH)" : " (default)",
+                      static_cast<unsigned long long>(slot_budget_bytes() >> 10));
+        std::fprintf(stderr, "[oasis-http] %s\n", line);
+        libstf::log(libstf::LogLevel::INFO, "%s", line);
+        if (want > lane_depth_ && env_set) {
+            libstf::log(libstf::LogLevel::WARNING,
+                        "HTTPReadConfig: OASIS_HTTP_LANE_DEPTH=%zu clamped to %zu on a CSR revision-%u "
+                        "bitstream", want, lane_depth_, unsigned(revision()));
+        }
+    } else if (slot_mode() && want > lane_depth_ && env_set) {
         libstf::log(libstf::LogLevel::WARNING,
                     "HTTPReadConfig: OASIS_HTTP_LANE_DEPTH=%zu ignored on a CSR revision-%u (HBM "
                     "slot) bitstream: each connection holds one response at a time, so the lane "
@@ -1425,6 +1470,12 @@ size_t HTTPReadConfig::LaneDepthFor(uint8_t revision, size_t want, size_t hw) {
     // second arm until the first response has left the slot. A host depth above 1 would therefore
     // not pipeline anything -- it would admit a batch whose arm then sits inside the dispatcher
     // thread waiting for that drain, holding up every other lane's placement behind it.
+    if (revision >= HTTP_CSR_REVISION_PIPE) {
+        // Revision 4 pipelines on the connection; the slot's byte budget, not this, is what keeps
+        // a response from overrunning it.
+        const size_t cap = std::min<size_t>(HTTP_PIPE_MAX_DEPTH, hw == 0 ? 1 : hw);
+        return std::max<size_t>(1, std::min<size_t>(want, cap));
+    }
     if (revision >= HTTP_CSR_REVISION_SLOTS) {
         return 1;
     }
@@ -1436,7 +1487,9 @@ bool HTTPReadConfig::LaneCreditOk(uint8_t revision, size_t occ, size_t needed, s
     if (occ + needed > limit) {
         return false;
     }
-    return revision < HTTP_CSR_REVISION_SLOTS || drained;
+    // Only revision 3 keys the credit on the slot: revision 4 admits a second GET onto a busy slot
+    // and meters it by bytes at the arm instead (reserve_slot_bytes()).
+    return revision < HTTP_CSR_REVISION_SLOTS || revision >= HTTP_CSR_REVISION_PIPE || drained;
 }
 
 // ---- CSR revision 3 -------------------------------------------------------------------------------
@@ -1476,6 +1529,85 @@ uint64_t HTTPReadConfig::max_get_bytes() {
                                  "is unusable [" + p.describe() + "]");
     }
     return p.max_get_bytes();
+}
+
+// ---- CSR revision 4 -------------------------------------------------------------------------------
+
+bool HTTPReadConfig::slot_pipelined() { return revision() >= HTTP_CSR_REVISION_PIPE; }
+
+uint64_t HTTPReadConfig::slot_budget_bytes() {
+    if (!slot_pipelined()) {
+        return 0;
+    }
+    return max_get_bytes(); // slot minus HTTP_SLOT_HEADER_SLACK; throws on an unusable policy
+}
+
+bool HTTPReadConfig::SlotBudgetOk(uint64_t used, uint64_t need, uint64_t budget) {
+    if (used == 0) {
+        return true; // an empty slot takes anything max_get_bytes() let through
+    }
+    return need <= budget && used <= budget - need;
+}
+
+uint64_t HTTPReadConfig::RequestRangeBytes(const std::string &request) {
+    static const std::string key = "Range: bytes=";
+    const size_t at = request.find(key);
+    if (at == std::string::npos) {
+        return 0;
+    }
+    const char *p   = request.c_str() + at + key.size();
+    char       *end = nullptr;
+    const unsigned long long a = std::strtoull(p, &end, 10);
+    if (end == p || *end != '-') {
+        return 0;
+    }
+    const char *q = end + 1;
+    const unsigned long long b = std::strtoull(q, &end, 10);
+    if (end == q || b < a) {
+        return 0;
+    }
+    return static_cast<uint64_t>(b - a + 1);
+}
+
+// Revision 4's slot rule, kept by the host because the hardware cannot: a connection's slot is a
+// bump allocator that only resets when the connection runs dry, so the responses armed on it since
+// the last reset must fit. CONN_DRAINED set means exactly "reset, and nothing armed since" (the
+// handler lowers it on every arm and raises it only on a release with no entry queued), so reading
+// it set is the one moment the charge may go back to zero. The wait is short in practice: with a
+// 256 MiB slot it happens once per 256 MiB of responses on a connection, for one round trip.
+void HTTPReadConfig::reserve_slot_bytes(uint8_t lane, uint64_t body_bytes) {
+    if (!slot_pipelined()) {
+        return;
+    }
+    const uint8_t  conn     = conn_for_lane(lane);
+    const uint64_t budget   = slot_budget_bytes();
+    const uint64_t need     = body_bytes + HTTP_SLOT_GET_OVERHEAD;
+    const auto     deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
+    uint64_t      &used     = slot_used_.at(conn);
+    while (true) {
+        if (used != 0 && conn_drained(conn)) {
+            used = 0;
+        }
+        if (SlotBudgetOk(used, need, budget)) {
+            used += need;
+            return;
+        }
+        const auto l = lanes().at(lane);
+        if (l.fatal) {
+            throw_lane_fatal(lane, "room in its connection's slot");
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            std::ostringstream msg;
+            msg << "FPGA HTTP lane " << unsigned(lane) << ": connection " << unsigned(conn)
+                << "'s slot never drained to make room for " << need << " more bytes ("
+                << used << " of " << budget << " charged) within "
+                << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
+                << "s [" << conns().describe() << "; " << stall().describe()
+                << "]. That lane has stopped draining.";
+            throw std::runtime_error(msg.str());
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
 }
 
 void HTTPReadConfig::set_slot_base(uint64_t vaddr) {

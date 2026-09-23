@@ -240,9 +240,81 @@ void placement_at_depth() {
 
 } // namespace
 
+// CSR revision 4 (pipelined GETs on the slot handler): same map, new host rules.
+void rev4_rules() {
+    // build-126-shape policy: rev 4, 4 conns, 4 decoders, 256 MiB slots = the whole 1 GiB page.
+    const auto sp = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(4, 4, 4, 28, 14, 64, 10));
+    CHECK(sp.valid() && sp.revision == 4 && sp.slot_log2 == 28);
+    CHECK(sp.slot_bytes() == (256ULL << 20));
+    CHECK(sp.region_bytes() == (1ULL << 30));          // exactly the one huge page, not more
+    CHECK(sp.max_get_bytes() == (256ULL << 20) - (64ULL << 10));
+    // Stage 2 would publish 25 (24 x 32 MiB = 768 MiB).
+    const auto s2 = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(4, 24, 4, 25, 14, 64, 10));
+    CHECK(s2.region_bytes() == 24ULL * (32ULL << 20) && s2.region_bytes() <= (1ULL << 30));
+
+    // Depth: the caller passes HTTP_PIPE_DEFAULT_DEPTH when the variable is unset.
+    CHECK(oasis::HTTP_PIPE_DEFAULT_DEPTH == 2 && oasis::HTTP_PIPE_MAX_DEPTH == 4);
+    CHECK(HTTPReadConfig::LaneDepthFor(4, oasis::HTTP_PIPE_DEFAULT_DEPTH, 64) == 2);
+    CHECK(HTTPReadConfig::LaneDepthFor(4, 3, 64) == 3);
+    CHECK(HTTPReadConfig::LaneDepthFor(4, 4, 64) == 4);
+    CHECK(HTTPReadConfig::LaneDepthFor(4, 16, 64) == 4);   // clamped to HTTP_PIPE_MAX_DEPTH
+    CHECK(HTTPReadConfig::LaneDepthFor(4, 0, 64) == 1);
+    CHECK(HTTPReadConfig::LaneDepthFor(4, 4, 2) == 2);     // and to the hardware queue
+    CHECK(HTTPReadConfig::LaneDepthFor(3, 4, 64) == 1);    // revision 3 unchanged
+    CHECK(HTTPReadConfig::LaneDepthFor(2, 4, 64) == 4);    // revision 2 unchanged
+
+    // Credit: revision 4 does not wait for the slot; occupancy still bounds it.
+    CHECK(HTTPReadConfig::LaneCreditOk(4, 1, 1, 2, false)); // one GET in the slot, room for another
+    CHECK(!HTTPReadConfig::LaneCreditOk(4, 2, 1, 2, true)); // at depth
+    CHECK(!HTTPReadConfig::LaneCreditOk(3, 0, 1, 1, false)); // revision 3 still keys on drained
+
+    // Byte budget.
+    const uint64_t B = sp.max_get_bytes();
+    CHECK(HTTPReadConfig::SlotBudgetOk(0, 1000, B));
+    CHECK(HTTPReadConfig::SlotBudgetOk(B - 1000, 1000, B));
+    CHECK(!HTTPReadConfig::SlotBudgetOk(B - 999, 1000, B));
+    CHECK(HTTPReadConfig::SlotBudgetOk(0, B + 5, B));         // an empty slot takes an oversize one
+    CHECK(!HTTPReadConfig::SlotBudgetOk(1, B + 5, B));        // ...but only an empty one
+    CHECK(!HTTPReadConfig::SlotBudgetOk(B, 1, B));
+    // 424 KiB GETs (the board's byte-weighted request): ~600 fit before a drain is needed.
+    uint64_t used = 0; int n = 0;
+    while (HTTPReadConfig::SlotBudgetOk(used, (424ULL << 10) + oasis::HTTP_SLOT_GET_OVERHEAD, B)) {
+        used += (424ULL << 10) + oasis::HTTP_SLOT_GET_OVERHEAD;
+        n++;
+    }
+    CHECK(n == 612);
+
+    // Range parsing, off the text the host itself builds.
+    const std::string g = "GET /b/f.parquet HTTP/1.1\r\nHost: 10.253.74.74:9000\r\n"
+                          "Range: bytes=1000-434175\r\nConnection: keep-alive\r\n\r\n";
+    CHECK(HTTPReadConfig::RequestRangeBytes(g) == 433176);
+    CHECK(HTTPReadConfig::RequestRangeBytes("GET / HTTP/1.1\r\n\r\n") == 0);
+    CHECK(HTTPReadConfig::RequestRangeBytes("Range: bytes=5-\r\n") == 0);      // open range
+    CHECK(HTTPReadConfig::RequestRangeBytes("Range: bytes=9-3\r\n") == 0);     // reversed
+    CHECK(HTTPReadConfig::RequestRangeBytes("Range: bytes=0-0\r\n") == 1);
+
+    // Placement at revision-4 depth 2: a lane owing one chunk is still a candidate, one owing two
+    // is not.
+    const uint64_t ready = nib(false, true, true, true) | (nib(false, true, true, true) << 4) |
+                           (nib(false, true, true, true) << 8) | (nib(false, true, true, true) << 12);
+    oasis::Scheduler::LaneInputs in;
+    in.host_depth = 64;
+    in.needed     = 1;
+    in.active     = 4;
+    in.rr         = 0;
+    in.lane_depth = HTTPReadConfig::LaneDepthFor(4, oasis::HTTP_PIPE_DEFAULT_DEPTH, 64);
+    in.lanes      = HTTPReadConfig::DecodeLanes(1ULL | (1ULL << 8) | (1ULL << 16) | (1ULL << 24), ready, 4);
+    auto out      = oasis::Scheduler::PlaceOnLane(in);
+    CHECK(out.stream.has_value() && !out.lane_bound_wait);
+    in.lanes = HTTPReadConfig::DecodeLanes(2ULL | (2ULL << 8) | (2ULL << 16) | (2ULL << 24), ready, 4);
+    out      = oasis::Scheduler::PlaceOnLane(in);
+    CHECK(!out.stream && out.lane_bound_wait);
+}
+
 int main() {
     rev2_decoders();
     rev3_decoders();
+    rev4_rules();
     request_split();
     placement_at_depth();
     std::printf("csr_decode_check: %d passed, %d failed\n", g_pass, g_fail);
