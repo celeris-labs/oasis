@@ -73,6 +73,9 @@ elab srm 1 1 4096
 elab sr2 2 2 16384
 elab sr4x 4 4 16384
 elab sr28 4 4 16384 1 28     # the stage-1 bitstream's geometry: 4 x 256 MiB slots
+elab sr8s 8 1 16384 1 22     # stage 2: eight connections through ONE decoder
+elab sr2s 2 1 16384          # stage 2: two connections through one decoder
+elab sr32s 32 1 16384 1 25   # stage 2 at the build-127 geometry: 32 x 32 MiB slots, one decoder
 
 if [ $# -ge 1 ]; then
   case "$1" in
@@ -87,6 +90,9 @@ if [ $# -ge 1 ]; then
     rslow)  shift; run sr2  rslow  "$@" ;;
     rsolo)  shift; run sr2  rsolo  "$@" ;;
     rstall) shift; run sr2  rstall BODY=262144 RMINP=85 "$@" ;;
+    rswitch)  shift; run sr8s rswitch "$@" ;;
+    roverrun) shift; run sr2s roverrun "$@" ;;
+    rdead)    shift; run sr2s rdead "$@" ;;
     *) echo "usage: $0 [r1|r4|r4x|rmax|rtwo|rpipe|rpipe4|rgap|rslow|rsolo|rstall] [PLUSARG=v ...]"; exit 2 ;;
   esac
   exit $(( FAILS > 0 ))
@@ -140,6 +146,18 @@ run sr2 rsolo FASTDIV=1 RMINP=95
 run sr2 rslow FASTDIV=1 SLOWDIV=16 RMINP=90
 # -- a decoder stopped dead with two reads outstanding: its credit runs out, everyone else flows.
 run sr2 rstall BODY=262144 RMINP=85
+
+# -- STAGE 2 (N_CONNS > N_DECODERS): one decoder serving several connections, switching at the end
+#    of each connection's run of pipelined GETs (mid-beat ends, coalesced segments, read-ahead).
+for n in 1 3; do for h in 0 1; do run sr8s rswitch NPIPE=$n HOLD=$h BODY=5000 MSS=1460; done; done
+run sr8s rswitch NPIPE=2 HOLD=1 BODY=70 MSS=1460 ROUNDS=4
+run sr8s rswitch NPIPE=4 HOLD=0 BODY=20000 DMA_RD_GAP=40 DMA_WR_BP=30 DMA_SEED=3
+run sr32s rswitch NPIPE=2 HOLD=1 BODY=3000 MSS=1460 ROUNDS=2
+# -- a server overrunning its Content-Length right before a switch: reported, and contained.
+run sr2s roverrun BODY=5000
+run sr2s roverrun BODY=64 HDR=300
+# -- a dead connection's queued entries are dropped without reads; the next connection is served.
+run sr2s rdead BODY=7000 MSS=1460
 
 echo "slot_reader: $FAILS failed case(s)"
 exit $(( FAILS > 0 ))

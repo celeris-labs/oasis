@@ -117,7 +117,14 @@ module strip_http (
     output logic [31:0]                    body_remaining, // body bytes still to stream
 
     // Payload start index within the first body beat (0..63)
-    output logic [6:0]                     out_payload_idx
+    output logic [6:0]                     out_payload_idx,
+
+    // Nothing is held: no unconsumed byte in the residue, not in a body, and no byte of a next
+    // header taken yet. Read by slot_reader when it releases a connection (stage 2, 2026-09-23):
+    // anything else at that moment is a byte that belongs to no response the host asked for, and
+    // the reader is about to feed this framer ANOTHER connection's bytes. Purely an output -- the
+    // framing itself is unchanged.
+    output logic                           idle
 );
 
     localparam int BYTE_LANES = AXI_DATA_BITS / 8; // 64
@@ -223,6 +230,7 @@ module strip_http (
     // because it was already latched here; status now is too.
     logic [23:0] status_latched_q;
     logic [1:0]  status_sp_q;  // spaces seen in the status line (saturating)
+    logic        hdr_started_q; // a byte of the current header block has been taken
     logic [1:0]  status_cnt_q; // status digits captured (0..3)
 
     logic [7:0] lower_w;
@@ -343,6 +351,7 @@ module strip_http (
             status_latched_q  <= '0;
             status_sp_q   <= '0;
             status_cnt_q  <= '0;
+            hdr_started_q <= 1'b0;
             resp_done_q   <= 1'b0;
             drain_wait_q  <= 1'b0;
             dirty_q       <= 1'b0;
@@ -374,6 +383,8 @@ module strip_http (
 
             // -- header parser --------------------------------------------------------------------
             if (take_hdr_w) begin
+                // Cleared again below when this byte completes the header block.
+                hdr_started_q <= 1'b1;
                 case (hs_q)
                     HS_STATUS: begin
                         if (cur_byte_w == 8'h0A) begin
@@ -403,7 +414,8 @@ module strip_http (
                     HS_HDR_CR: begin
                         // Only the LF gets here (hdr_block_w holds us off until the previous
                         // response is retired), so the header block is complete.
-                        hs_q         <= HS_STATUS;
+                        hs_q          <= HS_STATUS;
+                        hdr_started_q <= 1'b0;
                         name_pos_q   <= '0;
                         name_is_cl_q <= 1'b0;
                         val_is_cl_q  <= 1'b0;
@@ -528,6 +540,8 @@ module strip_http (
     assign out_w0_valid    = w0_valid_q;
     assign out_w1_valid    = w1_valid_q;
     assign out_payload_idx = payload_idx_q;
+    assign idle            = (!res_valid_q || (avail_w == 7'd0)) && (mode_q == M_HDR) &&
+                             !hdr_started_q;
 
     assign resp_done       = resp_done_q;
     assign resp_dirty      = dirty_q;

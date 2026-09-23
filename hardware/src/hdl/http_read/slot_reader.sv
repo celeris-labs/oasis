@@ -57,22 +57,31 @@ import lynxTypes::*;
 // `residue_err` keeps its meaning: at a release, bytes landed in this slot that belong to no
 // response this reader was told about.
 //
-// FLUSH -- ABANDONING A RESPONSE
-// ------------------------------
-// A connection can die (fatal) or be reconnected while its slot holds half a response. There is then
-// no resp_done coming and the entry at the head will never retire, so handler_slots raises `flush`
-// (it holds it for as long as the connection is down, the same level that holds strip_http in
-// `clear`). Flushing means: issue nothing more, SWALLOW whatever the card path still owes us from
-// reads already issued -- those beats are in flight in the shell and arrive whether we want them or
-// not -- and only when the last of them has landed drop the head entry and zero the cursors.
+// FLUSH -- ABANDONING A RESPONSE, AND DROPPING THE ENTRIES OF A DEAD CONNECTION
+// ---------------------------------------------------------------------------
+// A connection can die (fatal) or be torn down while its slot holds half a response. There is then
+// no resp_done coming and the entry at the head will never retire. The reader FLUSHES its head when
+// the head's connection is down (`conn_up[c]` low) or dead (`conn_dead[c]`, i.e. fatal): issue
+// nothing more, SWALLOW whatever the card path still owes us from reads already issued -- those beats
+// are in flight in the shell and arrive whether we want them or not -- and only when the last of
+// them has landed drop the head entry and zero the cursor. The flush is decided PER HEAD ENTRY from
+// the connection it names (since stage 2, 2026-09-23); in stage 1 that is the same level as the old
+// per-decoder `flush` input, because a decoder only ever named one connection.
 //
-// `flush_busy` is what says the swallow has finished. handler_slots waits for it, AND for
-// slot_writer's `conn_quiet`, before it pulses conn_release: releasing while either side still has
-// bytes moving is what would put the next response at the wrong slot offset.
+// `flush_busy` says a flush is under way. handler_slots waits for the reader to have let go of the
+// connection (no head entry naming it), AND for slot_writer's `conn_quiet`, before it pulses
+// conn_release: releasing while either side still has bytes moving is what would put the next
+// response at the wrong slot offset.
 //
-// Entries QUEUED BEHIND the head are deliberately NOT dropped. That mirrors handler_multi, whose
-// chunk queue in axis_rewrite_last also survives a lane going fatal: the connection is out of the
-// game until the host reissues the batch, and the host is the only thing that knows what to reissue.
+// ENTRIES QUEUED BEHIND THE HEAD. A head entry is only TAKEN once its connection is up -- an entry
+// armed before the first open, or during a reconnect, waits at the front of the queue, which is
+// right: its response cannot arrive earlier, and the decoder's order must be kept. The exception is
+// a DEAD connection: it never comes back (only a reprogram clears fatal), so its entries are taken
+// and dropped one by one through the same flush path, without a single read. Before stage 2 they
+// stayed queued for ever, which cost nothing while a decoder served one connection; once a decoder
+// serves several, a stale entry at the head would block every healthy connection queued behind it.
+// The host learns what was dropped from the connection's FATAL bit and reissues; the decoder that
+// lost a response is marked TAINTED by handler_slots (its byte stream has a hole in it).
 //
 // A head entry whose connection has landed NOTHING yet simply waits. That is the normal case -- the
 // entry is queued when the GET is armed, and the bytes arrive milliseconds later -- and it is not an
@@ -104,13 +113,24 @@ import lynxTypes::*;
 //   CONTINUE  the next queued entry is for the same connection: it becomes the head in the same
 //             cycle (so strip_http sees its body_last before it can emit a byte of its body), and
 //             the cursor, the slot and whatever reads are in flight carry on untouched.
-//   RELEASE   otherwise the slot must be exactly empty: no read outstanding, and every landed byte
-//             asked for. If it is not, there are bytes in the slot that belong to no response -- a
-//             residue -- and `residue_err` latches. `conn_release[c]` pulses either way
-//             (slot_writer zeroes that connection's cursors) and the head is dropped.
+//   RELEASE   otherwise the slot must be exactly empty: no read outstanding, every landed byte
+//             asked for, AND the framer idle (`framer_idle`: no byte left in its residue and no
+//             byte of a next header consumed). If not, there are bytes that belong to no response
+//             -- a residue -- and `residue_err` latches (`residue_ev` pulses beside the release, so
+//             the handler can pin it on the connection). `conn_release[c]` pulses either way
+//             (slot_writer zeroes that connection's cursors), `framer_clear` pulses so no byte can
+//             survive in the framer into ANOTHER connection's response, and the head is dropped.
 // The decision is taken in S_DONE1 from the queue as it is then. An entry pushed after that is for
 // a GET whose request text has not even been sent yet, so nothing of it can have landed, and it is
 // correct for it to start from a released slot at cursor 0.
+//
+// SWITCHING CONNECTIONS (stage 2, N_CONNS > N_DECODERS). A decoder's queue may name different
+// connections, and the reader switches only at a RELEASE, i.e. at an exactly empty slot and an idle
+// framer. That is correct without any per-connection framer state because handler_slots only admits
+// an arm on connection c for decoder d when c is DRAINED (nothing armed, slot released) or c is the
+// TAIL of d's queue: so all of a connection's queued entries are contiguous in one decoder's queue,
+// and "the next entry names another connection" really means "this connection has nothing more
+// armed" -- no byte of it can be in flight into the slot, and nothing of it is in the framer.
 //
 // DESIGN FOR SYNTHESIS
 // --------------------
@@ -150,9 +170,15 @@ module slot_reader #(
     input  logic [31:0]                entry_chunk_bytes,
     input  logic                       entry_body_last,
 
-    // -- abandon the response in progress: the connection is down. See the header.
-    input  logic                       flush,
+    // -- per-connection state from handler_slots: the head entry is flushed when its connection is
+    //    down or dead, and a dead connection's queued entries are dropped. See the header.
+    input  logic [N_CONNS-1:0]         conn_up,
+    input  logic [N_CONNS-1:0]         conn_dead,
     output logic                       flush_busy,
+    // -- strip_http has nothing left of the last response (see "THE END OF A RESPONSE")
+    input  logic                       framer_idle,
+    // -- hold the framer in reset: while a head is flushed, and for one cycle after a release
+    output logic                       framer_clear,
 
     // -- from slot_writer: committed bytes per connection, and the slot base (CSR).
     input  logic [N_CONNS-1:0][SLOT_LOG2:0] landed,
@@ -188,6 +214,11 @@ module slot_reader #(
     output logic [N_CONNS-1:0]         conn_release,  // pulse: slot c is drained, reset its cursors
     output logic                       entry_done,    // pulse: one entry retired
     output logic                       residue_err,   // sticky: the slot was not empty at resp_done
+    output logic                       residue_ev,    // pulse with the conn_release it belongs to
+    output logic [CONN_BITS-1:0]       done_conn,     // the connection entry_done retired
+    output logic                       pop,           // an entry leaves the queue (retired or dropped)
+    output logic                       head_valid,
+    output logic [CONN_BITS-1:0]       head_conn,     // the connection pop / head_valid refer to
 
     // -- visibility
     // There is still something of the head entry to fetch or to receive: bytes have landed that we
@@ -254,6 +285,18 @@ module slot_reader #(
     // ---------------------------------------------------------------------------------------------
     logic swallow_q;
 
+    // The head's connection is down or dead: abandon it (see FLUSH in the header). Combinational
+    // from registers only -- conn_up/conn_dead are handler flops and head_conn_q is ours.
+    logic flush;
+    assign flush = head_valid_q && (!conn_up[head_conn_q] || conn_dead[head_conn_q]);
+
+    // The entry at the front of the queue may become the head: its connection is up (its bytes can
+    // arrive), or dead (it is taken only to be dropped).
+    logic [CONN_BITS-1:0] eq_front_conn_w;
+    logic                 take_ok_w;
+    assign eq_front_conn_w = eq_conn[eq_head_q];
+    assign take_ok_w       = conn_up[eq_front_conn_w] || conn_dead[eq_front_conn_w];
+
     assign m_axis_tvalid = s_axis_tvalid && !swallow_q;
     assign m_axis_tdata  = s_axis_tdata;
     assign m_axis_tkeep  = s_axis_tkeep;
@@ -316,8 +359,14 @@ module slot_reader #(
     logic residue_err_q;
     assign residue_err = residue_err_q;
 
+    logic rel_clear_q, fr_idle_q;
     logic done_ok_w;
-    assign done_ok_w = (n_out_q == 2'd0) && (rd_cursor_q == landed_sel_q);
+    assign done_ok_w = (n_out_q == 2'd0) && (rd_cursor_q == landed_sel_q) && fr_idle_q;
+
+    logic residue_ev_q;
+    logic [CONN_BITS-1:0] done_conn_q;
+    assign residue_ev = residue_ev_q;
+    assign done_conn  = done_conn_q;
 
     // Registered, off `landed_sel_q` rather than off the 32-way `landed` mux: the pipeline refreshes
     // landed_sel_q every few cycles even when it has nothing to issue, so this is at most a handful
@@ -327,13 +376,18 @@ module slot_reader #(
 
     // The flush has finished when nothing of ours is left moving: no read outstanding, no entry
     // being served, and the pipeline back at rest. handler_slots gates conn_release on this.
-    assign flush_busy = (st_q == S_FLUSH) ||
-                        (flush && (head_valid_q || (n_out_q != 2'd0) || (st_q != S_IDLE)));
+    assign flush_busy = (st_q == S_FLUSH) || flush;
+
+    assign framer_clear = flush || (st_q == S_FLUSH) || rel_clear_q;
+    assign head_valid   = head_valid_q;
+    assign head_conn    = head_conn_q;
+
 
     // The queue pops on a normal retire and on the flush that abandons the head.
     logic eq_pop_w;
     assign eq_pop_w = (st_q == S_DONE2) ||
                       ((st_q == S_FLUSH) && (n_out_q == 2'd0) && head_valid_q);
+    assign pop      = eq_pop_w;
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -363,8 +417,14 @@ module slot_reader #(
             nxt_last_q    <= 1'b0;
             swallow_q     <= 1'b0;
             rd_pending_q  <= 1'b0;
+            rel_clear_q   <= 1'b0;
+            fr_idle_q     <= 1'b0;
+            residue_ev_q  <= 1'b0;
+            done_conn_q   <= '0;
         end else begin
             conn_release <= '0;
+            rel_clear_q  <= 1'b0;
+            residue_ev_q <= 1'b0;
             entry_done   <= 1'b0;
             resp_ack     <= 1'b0;
             swallow_q    <= flush || (st_q == S_FLUSH);
@@ -381,7 +441,7 @@ module slot_reader #(
             end
 
             // -- take the head -------------------------------------------------------------------
-            if (!head_valid_q && (eq_cnt_q != '0) && !flush) begin
+            if (!head_valid_q && (eq_cnt_q != '0) && take_ok_w) begin
                 head_conn_q  <= eq_conn[eq_head_q];
                 head_chunk_q <= eq_chunk[eq_head_q];
                 head_last_q  <= eq_last[eq_head_q];
@@ -442,6 +502,7 @@ module slot_reader #(
                 S_DONE0: st_q <= S_DONE1;
                 S_DONE1: begin
                     landed_sel_q <= landed_head_w;
+                    fr_idle_q    <= framer_idle;
                     // eq_cnt_q counts the head too, so "> 1" is "there is an entry behind it".
                     nxt_same_q   <= (eq_cnt_q > ECNT_BITS'(1)) && (eq_conn[eq_next_w] == head_conn_q);
                     nxt_chunk_q  <= eq_chunk[eq_next_w];
@@ -449,8 +510,9 @@ module slot_reader #(
                     st_q         <= S_DONE2;
                 end
                 S_DONE2: begin
-                    entry_done <= 1'b1;
-                    resp_ack   <= 1'b1;
+                    entry_done  <= 1'b1;
+                    resp_ack    <= 1'b1;
+                    done_conn_q <= head_conn_q;
                     eq_head_q  <= eq_next_w;
                     st_q       <= S_ACKW;
                     if (nxt_same_q) begin
@@ -460,8 +522,12 @@ module slot_reader #(
                         head_last_q  <= nxt_last_q;
                     end else begin
                         // RELEASE: the connection has run dry, so its slot must be empty.
-                        if (!done_ok_w) residue_err_q <= 1'b1;
+                        if (!done_ok_w) begin
+                            residue_err_q <= 1'b1;
+                            residue_ev_q  <= 1'b1;
+                        end
                         conn_release[head_conn_q] <= 1'b1;
+                        rel_clear_q               <= 1'b1;
                         head_valid_q              <= 1'b0;
                         rd_cursor_q               <= '0;
                         landed_sel_q              <= '0;

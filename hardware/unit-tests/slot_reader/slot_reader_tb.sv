@@ -243,6 +243,14 @@ module slot_reader_tb #(
     logic                     sh_done   [NRD];
     logic                     sh_ack    [NRD];
     logic                     sh_error  [NRD];
+    logic                     sh_idle   [NRD];
+    logic                     sh_clear  [NRD];
+    logic                     residue_ev[NRD];
+    int                       n_residue [NRD];
+    logic [NCONNS-1:0]        tb_conn_up   = '1;
+    logic [NCONNS-1:0]        tb_conn_dead = '0;
+    // Cases that provoke a residue on purpose (`roverrun`) expect exactly this many.
+    int                       expect_residue = 0;
 
     // The writer's release input is the OR of what the readers pulse: a connection belongs to
     // exactly one decoder, so at most one of them ever drives a given bit.
@@ -278,9 +286,11 @@ module slot_reader_tb #(
                 // a whole decoder stream, so body_last is 1 -- which is what the framer below used
                 // to be told directly, and is now told through the entry queue.
                 .entry_chunk_bytes(32'd0), .entry_body_last(1'b1),
-                // Nothing here tears a connection down mid-response; handler_slots' teardown is
-                // what drives this, and lane_drain's `refatal` is where it is exercised.
-                .flush(1'b0), .flush_busy(),
+                // Connections are up unless a case takes one down (`rdead`); handler_slots' real
+                // teardown is exercised by lane_drain's `refatal` and `s2fatal`.
+                .conn_up(tb_conn_up), .conn_dead(tb_conn_dead), .flush_busy(),
+                .framer_idle(sh_idle[gd]), .framer_clear(sh_clear[gd]),
+                .residue_ev(residue_ev[gd]), .done_conn(), .pop(), .head_valid(), .head_conn(),
                 .landed(landed), .slot_base(SLOT_BASE),
                 .rd_req_valid(rd_req_valid[gd]), .rd_req_ready(rd_req_ready[gd]),
                 .rd_req_vaddr(rd_req_vaddr[gd]), .rd_req_len(rd_req_len[gd]),
@@ -297,7 +307,7 @@ module slot_reader_tb #(
 
             strip_http u_sh (
                 .clk(clk), .rst_n(rst_n),
-                .clear(1'b0), .enable(1'b1),
+                .clear(sh_clear[gd]), .enable(1'b1),
                 // Every response here is a whole decoder stream, so its last body beat carries
                 // tlast -- which is also how the sink counts responses. It comes from the reader's
                 // head entry now, exactly as it does in handler_slots.
@@ -311,8 +321,10 @@ module slot_reader_tb #(
                 .out_w0(), .out_w1(), .out_w0_valid(), .out_w1_valid(),
                 .resp_done(sh_done[gd]), .resp_dirty(), .resp_error(sh_error[gd]),
                 .status_ascii(), .status_ok(), .content_length(), .body_remaining(),
-                .out_payload_idx()
+                .out_payload_idx(), .idle(sh_idle[gd])
             );
+
+            always_ff @(posedge clk) if (rst_n && residue_ev[gd]) n_residue[gd] <= n_residue[gd] + 1;
 
             // Decoder sink: accepts one beat every sink_div cycles and keeps every byte.
             assign sh_tready[gd] = (sink_ph[gd] == 0) && !sink_stop[gd];
@@ -555,13 +567,15 @@ module slot_reader_tb #(
 
     task automatic push_entry(input int d, input int c);
         begin
+            // entry_ready is sampled at the NEGEDGE, i.e. the value the coming posedge acts on.
+            // Sampling it after the posedge (#1) reads the NEXT cycle's value: when the push
+            // filled the queue that reads 0, the bench kept valid high, and the same entry was
+            // pushed a second time on the first pop.
             @(negedge clk);
             ent_valid[d] = 1'b1;
             ent_conn[d]  = CB'(c);
-            forever begin
-                @(posedge clk); #1;
-                if (ent_ready[d]) break;
-            end
+            while (!ent_ready[d]) @(negedge clk);
+            @(posedge clk); #1;
             @(negedge clk);
             ent_valid[d] = 1'b0;
         end
@@ -636,6 +650,7 @@ module slot_reader_tb #(
             sink_stop[d] = 1'b0;
             n_done[d]    = 0;
             n_last[d]    = 0;
+            n_residue[d] = 0;
             beats[d]     = 0;
             t_first[d]   = 0;
             t_last[d]    = 0;
@@ -827,6 +842,98 @@ module slot_reader_tb #(
                     err($sformatf("decoder 0: %0d tlast(s), expected %0d", n_last[0], npipe));
             end
 
+            // -- STAGE 2: ONE DECODER, SEVERAL CONNECTIONS, SWITCHING AT RUN ENDS. Each round queues a
+            //    run of NPIPE pipelined GETs on every connection, in a rotated order, as one decoder
+            //    queue (A A B B C C ..., the contiguity handler_slots enforces at the arm). Each
+            //    connection's responses arrive as one persistent stream: they share segments and
+            //    beats, every response ends mid-beat, and the connections' segments are interleaved
+            //    on the wire. HOLD=1 lets everything land first, so the reader reads ahead across
+            //    every boundary inside a run; at the end of a run it must release, find the framer
+            //    idle, clear it, and start the next connection from a clean framer. A later round
+            //    reuses every connection from offset 0 of its released slot.
+            "rswitch": begin
+                int npipe, hold, rounds, c, nexp;
+                npipe = 2; hold = 1; rounds = 3; nexp = 0;
+                void'($value$plusargs("NPIPE=%d", npipe));
+                void'($value$plusargs("HOLD=%d", hold));
+                void'($value$plusargs("ROUNDS=%d", rounds));
+                for (int r = 0; r < rounds; r++) begin
+                    if (hold) sink_stop[0] = 1'b1;
+                    for (int k = 0; k < NCONNS; k++) begin
+                        c = (k + r) % NCONNS;
+                        for (int j = 0; j < npipe; j++) push_entry(0, c);
+                        queue_stream(c, 0, npipe, body_len + 97*k + 13*r, mss);
+                    end
+                    interleave();
+                    run_traffic();
+                    repeat (100) @(negedge clk);
+                    sink_stop[0] = 1'b0;
+                    nexp = nexp + NCONNS*npipe;
+                    wait_done(0, nexp, 400000);
+                    repeat (50) @(negedge clk);
+                    for (int k = 0; k < NCONNS; k++)
+                        if (landed[k] !== '0)
+                            err($sformatf("round %0d: landed[%0d]=%0d after its run, expected a released slot",
+                                          r, k, landed[k]));
+                end
+                check_body(0);
+                if (n_last[0] != nexp) err($sformatf("decoder 0: %0d tlast(s), expected %0d", n_last[0], nexp));
+                $display("  rswitch: %0d rounds x %0d conns x %0d GETs, %0d body bytes byte-exact",
+                         rounds, NCONNS, npipe, got[0].size());
+            end
+
+            // -- STAGE 2: A SERVER THAT OVERRUNS ITS CONTENT-LENGTH on connection 0, whose run is
+            //    followed by connection 1's. The stray bytes are read (they landed in the slot) and
+            //    end up in the framer; the release must see a non-idle framer, report a residue on
+            //    connection 0, and CLEAR the framer so connection 1's response is byte-exact.
+            "roverrun": begin
+                byte unsigned junk[$];
+                expect_residue = 1;
+                sink_stop[0] = 1'b1;
+                push_entry(0, 0);
+                push_entry(0, 1);
+                queue_response(0, 0, body_len, hdr_len);
+                // 40 bytes past the body, i.e. the start of a response nobody asked for
+                push_str(junk, "HTTP/1.1 206 Partial Content");
+                push_crlf(junk);
+                push_str(junk, "Content-Le");
+                queue_seg(0, junk, 0, junk.size());
+                queue_response(1, 0, body_len + 333, hdr_len);
+                run_traffic();
+                repeat (100) @(negedge clk);
+                sink_stop[0] = 1'b0;
+                wait_done(0, 2, 400000);
+                check_body(0);
+                if (!residue_err[0]) err("the overrun on connection 0 was not reported as a residue");
+            end
+
+            // -- STAGE 2: STALE ENTRIES OF A DEAD CONNECTION. Decoder 0's queue is A A A B B with A
+            //    dead (fatal) before any of its bytes are read: A's three entries must be dropped
+            //    without a single read and B's two responses served byte-exact behind them. Then A
+            //    comes back up (a new connection index would in the handler; here the same one is
+            //    simply revived with a released slot) -- not needed; B's run is the assertion.
+            "rdead": begin
+                expect_residue = 0;
+                tb_conn_dead[0] = 1'b1;
+                for (int j = 0; j < 3; j++) push_entry(0, 0);
+                for (int j = 0; j < 2; j++) push_entry(0, 1);
+                // A's bytes land in its slot anyway -- the writer does not know it is dead -- but
+                // nothing of it may reach the framer, so it is not in exp_body.
+                begin
+                    byte unsigned tmp[$];
+                    int keep; keep = exp_body[0].size();
+                    queue_stream(0, 0, 3, body_len, mss);
+                    while (exp_body[0].size() > keep) void'(exp_body[0].pop_back());
+                end
+                queue_stream(1, 0, 2, body_len + 1001, mss);
+                interleave();
+                run_traffic();
+                wait_done(0, 2, 400000);
+                repeat (100) @(negedge clk);
+                check_body(0);
+                if (n_last[0] != 2) err($sformatf("decoder 0: %0d tlast(s), expected 2", n_last[0]));
+            end
+
             default: err($sformatf("unknown scenario '%s'", scen));
         endcase
 
@@ -837,7 +944,10 @@ module slot_reader_tb #(
         for (int c = 0; c < NCONNS; c++)
             if (slot_overflow[c]) err($sformatf("slot_overflow[%0d] latched", c));
         for (int d = 0; d < NRD; d++) begin
-            if (residue_err[d]) err($sformatf("decoder %0d: residue_err latched", d));
+            if (expect_residue == 0 && residue_err[d])
+                err($sformatf("decoder %0d: residue_err latched", d));
+            if (d == 0 && expect_residue != 0 && n_residue[0] != expect_residue)
+                err($sformatf("decoder 0: %0d residue event(s), expected %0d", n_residue[0], expect_residue));
             if (sh_error[d])    err($sformatf("decoder %0d: strip_http resp_error latched", d));
         end
         // None of these can be true of a correct slot_rd_share: a beat with nothing outstanding, a
