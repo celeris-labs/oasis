@@ -113,7 +113,7 @@ run_hm() { # <dut> <scen> <lanes> [plusargs...]
   local dut="$1" scen="$2" lanes="$3"; shift 3
   local pfx snap exp out verdict
   if [ "$dut" = slots ]; then pfx=lds; else pfx=ld; fi
-  snap="${pfx}${lanes}_snap"
+  snap="${SNAP_OVERRIDE:-${pfx}${lanes}_snap}"
   # lz2 has to WAIT for the connect watchdog, which defaults to 2^28 cycles -- a second on the
   # board, a week in xsim. Its own snapshot shrinks only that parameter.
   [ "$scen" = "lz2" ] && snap="${pfx}to_snap"
@@ -241,6 +241,13 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
   # (g) a connection torn down mid-response with THREE GETs armed on it: fatal, slot released,
   #     nobody else hurt -- the entries stranded behind the head must not leak anywhere.
   for N in 2 4; do run_hm slots refatal "$N" RFN=3 HDEPTH=4; done
+  #     ...and cut in the SECOND of them, after the reader has continued onto it mid-slot.
+  for N in 2 4; do run_hm slots refatal "$N" RFN=3 RFB=20000 RFP=7 HDEPTH=4; done
+  # (h) the stage-1 bitstream's geometry, 4 x 256 MiB slots (SLOT_LOG2 28), pipelined.
+  elab lds4big_snap "NUM_CONNS=4" "DUT_SLOTS=1" "SLOT_LOG2=28" || exit 1
+  SNAP_OVERRIDE=lds4big_snap run_hm slots p3 4 DEPTH=4 NRESP=30 SRVLAT=1000 COALESCE
+  SNAP_OVERRIDE=lds4big_snap run_hm slots refatal 4 RFN=3 HDEPTH=4
+  SNAP_OVERRIDE=lds4big_snap run_hm slots refatal 4 RFN=3 RFB=20000 RFP=7 HDEPTH=4
 fi
 
 echo "lane_drain: $FAILS failed of $CASES case(s)"

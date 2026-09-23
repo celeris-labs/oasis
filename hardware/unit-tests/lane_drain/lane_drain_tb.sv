@@ -2444,7 +2444,7 @@ module lane_drain_tb #(
         //        back (CONN_DRAINED returns), slot_writer's "release with segments in flight"
         //        assertion silent, and the other connections untouched.
         "refatal": begin
-            int sid0, stale, rfn;
+            int sid0, stale, rfn, rfb, rfp;
             if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
             for (int L = 0; L < NUM_CONNS; L++) submit_batch(L, 1, 3000, o);
             wait_drain(400000, ok);
@@ -2491,11 +2491,19 @@ module lane_drain_tb #(
                     b0   = pkt_taken;
                     lane_ignore[0] = 1;              // its response is being cut on purpose
                     net_allow = b0 + 3;
+                    // +RFP puts exactly that many packets on the wire before the cut (net_allow is
+                    // a budget, so the default above lets b0 + 3 through, not 3).
+                    if ($value$plusargs("RFP=%d", rfp)) net_allow = rfp;
                     // +RFN GETs are armed before the cut (revision 4: several outstanding on one
                     // connection when it dies -- the stale entries behind the head must neither
                     // wedge the teardown nor leak into anybody else).
                     if (!$value$plusargs("RFN=%d", rfn)) rfn = 1;
-                    submit_batch(0, rfn, (rfn > 1) ? 100000 : 120000, o);
+                    // +RFB sets their body size and +RFP the packets let through; RFB=20000 RFP=7
+                    // (MSS 4096) completes the first response and cuts the SECOND one: the reader has
+                    // CONTINUEd onto the next entry with its cursor mid-slot, and the flush then
+                    // abandons a head that never started from offset 0.
+                    if (!$value$plusargs("RFB=%d", rfb)) rfb = (rfn > 1) ? 100000 : 120000;
+                    submit_batch(0, rfn, rfb, o);
                     t0 = cyc;
                     while ((cyc - t0) < 200000 && pkt_taken < b0 + 3) @(posedge clk);
                     wait_cycles(2000);
