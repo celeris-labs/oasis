@@ -32,8 +32,8 @@ option(ENABLE_PERF_ILA "Include the TCP/HTTP performance ILA" OFF)
 # Turning it ON is not free in the shell: it sets EN_MEM, which adds N_CARD_AXI cdma engines and
 # that many more HBM crossbar ports (see the N_MEM_CHAN arithmetic in Coyote's FindCoyoteHW.cmake).
 option(ENABLE_HTTP_SLOTS "Per-connection HBM receive slots (handler_slots)" OFF)
-# Number of TCP connections. Stage 1 of ADR-5 pairs one connection with one decoder, and
-# handler_slots errors out at elaboration if they differ; stage 2 (WP5) lifts that to 24.
+# Number of TCP connections. Stage 1 of ADR-5 pairs one connection with one decoder; stage 2 (CSR
+# revision 5) gives the decoders a shared pool of up to 32, placed by the host per GET.
 set(N_HTTP_CONNS 0 CACHE STRING "TCP connections for handler_slots (0 = same as N_DECODERS)")
 
 if(ENABLE_HTTP AND ENABLE_RDMA)
@@ -52,10 +52,12 @@ if(ENABLE_HTTP_SLOTS)
     if(N_HTTP_CONNS EQUAL 0)
         set(N_HTTP_CONNS ${N_DECODERS})
     endif()
-    # Stage 1 only. handler_slots' conn_of_dec map is the identity and the module $errors otherwise;
-    # catching it in CMake instead means the mistake costs a second, not a Vivado elaboration run.
-    if(NOT N_HTTP_CONNS EQUAL ${N_DECODERS})
-        message(FATAL_ERROR "ADR-5 stage 1 requires N_HTTP_CONNS == N_DECODERS (got ${N_HTTP_CONNS} and ${N_DECODERS}); stage 2 (24 connections) is WP5")
+    # 1..32 (the CSR words address 32 connections) and at least one per decoder: a decoder with no
+    # connection of its own to start on would be armable only by stealing a drained one, which works
+    # but is never what was meant. handler_slots checks the same at elaboration; here it costs a
+    # second instead of a Vivado run.
+    if(N_HTTP_CONNS LESS ${N_DECODERS} OR N_HTTP_CONNS GREATER 32)
+        message(FATAL_ERROR "N_HTTP_CONNS must be ${N_DECODERS}..32 (N_DECODERS..32), got ${N_HTTP_CONNS}")
     endif()
 endif()
 

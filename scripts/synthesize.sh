@@ -9,14 +9,16 @@ enable_http=0
 enable_perf_ila=0
 enable_http_slots=0
 conns=0
+build_num=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --http) enable_http=1 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
         --multi) enable_http_multi=1 ;;
-        # Per-connection receive slots in HBM (ADR-5): rx_dispatch -> slot_writer -> one 4 MiB card
-        # slot per TCP connection -> one slot_reader per decoder. Needs --multi. N is the connection
-        # count; stage 1 requires it to equal --decoders. Giving it turns the mode on, so
+        # Per-connection receive slots in HBM (ADR-5): rx_dispatch -> slot_writer -> one card slot
+        # per TCP connection (the 1 GiB slot page split N ways) -> one slot_reader per decoder.
+        # Needs --multi. N is the connection count, --decoders..32: equal to --decoders is stage 1,
+        # more is stage 2 (CSR revision 5, host-placed connections). Giving it turns the mode on, so
         # `--conns 4` alone is enough -- there is no separate --slots flag to forget.
         #
         # This is the flag that sets EN_MEM, which changes the SHELL (N_CARD_AXI+1 more cdma engines
@@ -28,6 +30,11 @@ while [ $# -gt 0 ]; do
         # missed timing at WNS -7.43 ns carrying it). Use it to debug the receive path, not to
         # produce a bitstream anyone will measure.
         --perf-ila) enable_perf_ila=1 ;;
+        # Name the build directory build-N instead of the next free number. For a second checkout
+        # (git worktree) whose hardware/ has no build history, so its build carries the number the
+        # log and the board notes will refer to. Refuses an existing directory like the default.
+        --build-num) build_num="$2"; shift ;;
+        --build-num=*) build_num="${1#*=}" ;;
         --decoders) decoders="$2"; shift ;;
         --decoders=*) decoders="${1#*=}" ;;
         # Make the advertised TCP receive window match the buffer that actually exists.
@@ -82,6 +89,9 @@ for d in build-[0-9][0-9]*; do
     [ "$((10#$num))" -gt "$n" ] && n=$((10#$num))
 done
 build_dir="$PWD/build-$((n + 1))"
+if [ "$build_num" -gt 0 ]; then
+    build_dir="$PWD/build-$build_num"
+fi
 echo Building bitstream in hardware/$build_dir...
 
 # Fatal, not a warning. Continuing past a collision is what overwrote build-100.
