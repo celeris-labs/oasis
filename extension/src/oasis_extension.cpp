@@ -68,11 +68,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Get the OasisContext to establish the connection to the FPGA.
 	Connection conn(instance);
-	GetOrCreateOasisContext(*conn.context);
+	auto &oasis_ctx = GetOrCreateOasisContext(*conn.context);
 
 	// Configure the hardware Bloom filter block, keeping the top-level stream routed through the
 	// bypass path for now -- see oasis_hardware_bloom.cpp.
-	ConfigureOasisHardwareBloom();
+	ConfigureOasisHardwareBloom(oasis_ctx);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {

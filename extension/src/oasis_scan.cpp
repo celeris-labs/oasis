@@ -21,6 +21,9 @@
 #include "reader/struct_column_reader.hpp"
 #include "filter_pushdown.hpp"
 
+#include <coyote/cThread.hpp>
+#include <libstf/configuration.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <limits>
@@ -43,6 +46,56 @@ public:
 
 private:
 	oasis::SplinterResultHandle result;
+};
+
+// Mirrors celeris's StreamConfig (parcore/libstf/hardware/src/hdl/config/stream_config.sv)
+// instantiated with NUM_STREAMS=1 in vfpga_top.svh, selecting whether decoder-stream 0 routes
+// through the Bloom filter (select=0) or bypasses it (select=1).
+class BloomFilterStreamConfig : public libstf::Config {
+public:
+	static constexpr uint64_t ID = 1; // STREAM_CONFIG_ID (parcore/libstf/hardware/src/hdl/common.sv)
+
+	BloomFilterStreamConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset, uint32_t num_regs)
+	    : libstf::Config(std::move(cthread), addr_offset, num_regs) {
+	}
+
+	// Value layout is (select << 3) | data_type, matching stream_conf_t's packed layout (data_type
+	// is 3 bits, unused here).
+	void select(bool bypass) {
+		constexpr uint64_t DATA_TYPE_BITS = 3;
+		write_register(libstf::ConfigRegister(0, (bypass ? uint64_t(1) : uint64_t(0)) << DATA_TYPE_BITS));
+	}
+};
+
+// Pushes one stream-select decision when applied: bypass routes this flow's AXI4S transfer around
+// the Bloom filter, !bypass routes it through the filter (build or probe, depending on where the
+// Bloom filter core's own state machine currently is). Included once per hardware column-chunk
+// decode flow (see PrefetchGroup) so it runs on the scheduler's single dispatcher thread, under
+// the target stream's lock -- exactly like every other operator's hardware configuration -- rather
+// than as a direct call from whichever worker thread happens to be running PrefetchGroup. That's
+// what guarantees this push lands in the Bloom filter's stream-select queue in the same relative
+// order the corresponding AXI4S transfer actually reaches the demultiplexer, even with many
+// worker threads submitting flows concurrently.
+//
+// Only correct while N_DECODERS == 1 (the current build default): with more than one decode
+// stream, the scheduler load-balances flows across them, and a flow that lands on a stream other
+// than 0 never needed this push at all -- there is currently no way to know in advance which
+// stream a flow will land on.
+class BloomFilterStreamSelectOperator final : public oasis::Operator {
+public:
+	explicit BloomFilterStreamSelectOperator(bool bypass) : bypass_(bypass) {
+	}
+
+	void apply(libstf::stream_t, oasis::OasisContext &ctx) override {
+		ctx.config<BloomFilterStreamConfig>()->select(bypass_);
+	}
+
+	void print(std::ostream &os) const override {
+		os << "BloomFilterStreamSelect(" << (bypass_ ? "bypass" : "filtered") << ")";
+	}
+
+private:
+	bool bypass_;
 };
 
 } // namespace
@@ -315,12 +368,14 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		const auto &cc = *pending.hw_chunks[k];
 		auto type = parcore::metadata::to_libstf_type(cc.type);
 
-		// Every hardware column-chunk decode flow lands on a DECODE-capability stream, and stream 0
-		// always routes through the Bloom filter's select-gated demultiplexer, so it needs its own queued bypass decision See
-		// EnqueueOasisHardwareBloomBypass for the current-config caveat (N_DECODERS == 1 only).
-		EnqueueOasisHardwareBloomBypass();
-
 		oasis::OperatorFlow flow;
+
+		// Every hardware column-chunk decode flow lands on a DECODE-capability stream, and stream 0
+		// always routes through the Bloom filter's select-gated demultiplexer, so it needs its own
+		// queued select decision -- pushed first, before the source triggers the transfer, so it's
+		// queued ahead of any data that could reach the demultiplexer.
+		flow.push_back(std::make_unique<BloomFilterStreamSelectOperator>(/*bypass=*/true));
+
 		if (rdma) {
 			flow.push_back(MakeRDMASource(*rdma, cc));
 		} else {
