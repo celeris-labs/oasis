@@ -201,27 +201,46 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
   done
   elab ldsto_snap "NUM_CONNS=2" "DUT_SLOTS=1" "STALL_CYCLES=8192" || exit 1
 
-  echo "--- handler_slots (ADR-5) : the build-119 scenarios ---"
-  for s in a b c d e f g h;        do run_hm slots "$s" 2; done
-  for s in a2 a8 a9 a10;           do run_hm slots "$s" 2; done
-  for s in lz1 lz2;                do run_hm slots "$s" 2; done
-  for s in s_base s_g s_d s_e s_f; do run_hm slots "$s" 2; done
-  for N in 1 4; do run_hm slots s_base "$N"; run_hm slots a2 "$N"; done
+  # Everything runs twice since CSR revision 4: HDEPTH=1 is the host keeping one GET per
+  # connection (what revision 3's hardware enforced by itself), HDEPTH=4 is the pipelined host.
+  # Both keep the slot byte budget (see the feeder).
+  for H in ${SLOTS_HDEPTHS:-1 4}; do
+  echo "--- handler_slots (ADR-5) : the build-119 scenarios, HDEPTH=$H ---"
+  for s in a b c d e f g h;        do run_hm slots "$s" 2 HDEPTH=$H; done
+  for s in a2 a8 a9 a10;           do run_hm slots "$s" 2 HDEPTH=$H; done
+  for s in lz1 lz2;                do run_hm slots "$s" 2 HDEPTH=$H; done
+  for s in s_base s_g s_d s_e s_f; do run_hm slots "$s" 2 HDEPTH=$H; done
+  for N in 1 4; do run_hm slots s_base "$N" HDEPTH=$H; run_hm slots a2 "$N" HDEPTH=$H; done
 
-  echo "--- handler_slots : the questions only the slots raise ---"
+  echo "--- handler_slots : the questions only the slots raise, HDEPTH=$H ---"
   # (a) the host's biggest legal GET, on every connection at once
-  for N in 1 2 4; do run_hm slots big "$N"; done
+  for N in 1 2 4; do run_hm slots big "$N" HDEPTH=$H; done
   # (b) THE experiment: one decoder throttled to 16 B/cycle, then 4, while the others run flat out
   for N in 2 4; do
-    run_hm slots thr "$N" THRDIV=4
-    run_hm slots thr "$N" THRDIV=16
+    run_hm slots thr "$N" THRDIV=4 HDEPTH=$H
+    run_hm slots thr "$N" THRDIV=16 HDEPTH=$H
   done
   # (c) the card path slow and lumpy underneath the full scenario
-  run_hm slots dmabp 4 DMA_WR_BP=50 DMA_RD_GAP=40
+  run_hm slots dmabp 4 DMA_WR_BP=50 DMA_RD_GAP=40 HDEPTH=$H
   # (d) one connection overruns its slot; nobody else may notice
-  for N in 2 4; do run_hm slots ovf "$N"; done
+  for N in 2 4; do run_hm slots ovf "$N" HDEPTH=$H; done
   # (e) a connection dies with a half-written slot, and its next response is byte-exact
-  for N in 2 4; do run_hm slots refatal "$N"; done
+  for N in 2 4; do run_hm slots refatal "$N" HDEPTH=$H; done
+  done
+
+  echo "--- handler_slots : pipelined GETs (CSR revision 4) ---"
+  # (f) arms kept `DEPTH` deep against an origin with a request->response latency (SRVLAT cycles),
+  #     with and without responses sharing TCP segments. Byte-exact, and faster than depth 1.
+  for D in 1 4; do
+    run_hm slots p1 1 DEPTH=$D NRESP=40 BLEN=16384 SRVLAT=2000
+    run_hm slots p1 1 DEPTH=$D NRESP=60 BLEN=5000 SRVLAT=600 COALESCE MSS=1460
+    run_hm slots p3 2 DEPTH=$D NRESP=40 SRVLAT=1000 COALESCE
+    run_hm slots p4 2 DEPTH=$D NRESP=60 SRVLAT=1000
+    run_hm slots p1 4 DEPTH=$D NRESP=30 BLEN=100 SRVLAT=300 COALESCE
+  done
+  # (g) a connection torn down mid-response with THREE GETs armed on it: fatal, slot released,
+  #     nobody else hurt -- the entries stranded behind the head must not leak anywhere.
+  for N in 2 4; do run_hm slots refatal "$N" RFN=3 HDEPTH=4; done
 fi
 
 echo "lane_drain: $FAILS failed of $CASES case(s)"

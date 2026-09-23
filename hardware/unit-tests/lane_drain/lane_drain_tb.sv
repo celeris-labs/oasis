@@ -16,12 +16,14 @@
 //
 // WHAT THE HOST HAS TO DO DIFFERENTLY, AND WHY
 // --------------------------------------------
-// handler_slots is DEPTH 1 PER CONNECTION: strip_http keeps mid-beat residue across responses, so a
-// reader may only switch connections when the slot is empty, so exactly one GET may be outstanding
-// on a connection at a time (ADR-5, condition 3).  The hardware enforces it -- ARM_READY is low
-// until the slot is released -- so the bench's host model enforces it too: in slots mode a batch of
-// N GETs becomes N arms of one GET each, issued by a per-lane FEEDER process that blocks on the
-// hardware credit in between.
+// handler_slots takes ONE GET PER ARM (each arm is one reader entry), so in slots mode a batch of N
+// GETs becomes N arms of one GET each, issued by a per-lane FEEDER process.  Since CSR revision 4
+// the hardware no longer holds a second arm on a connection until its slot is empty (revision 3
+// did, "depth 1"); the feeder therefore keeps the two host rules software keeps: at most +HDEPTH
+// GETs outstanding per connection (4; HDEPTH=1 reproduces revision 3's pacing), and the bytes armed
+// since CONN_DRAINED was last seen set must fit in the slot.  +SRVLAT gives the origin a
+// request->response latency so pipelining has something to hide; +COALESCE lets responses share
+// TCP segments.
 //
 // The feeder is asynchronous on purpose.  submit_batch returns as soon as the work is queued rather
 // than when the last GET has been armed, so a scenario that says "queue six responses on this lane
@@ -199,8 +201,8 @@ module lane_drain_tb #(
     logic [3:0][63:0] connErrWord;
     logic      [63:0] connDrainedWord, slotPolicyWord;
 
-    // The depth-1 credit, revision 3 register 31. The feeder does not need it -- it polls req_ready
-    // like the real host -- but the scenarios assert on it.
+    // CONN_DRAINED, register 31: [c] the slot is empty and nothing is armed on it (revision 4: the
+    // host's byte-budget reset; revision 3: the depth-1 credit). The feeder budgets on it.
     function automatic bit conn_drained(input int c); return connDrainedWord[c]; endfunction
     function automatic bit conn_overflowed(input int c); return connDrainedWord[32 + c]; endfunction
 
@@ -439,6 +441,7 @@ module lane_drain_tb #(
         byte unsigned pending[$];  // response bytes waiting to go on the wire
         int  wr[$];                // sizes of the server's individual send() calls
         int  wr_left;
+        int  last_rel;             // +SRVLAT: cycle the previous response was released
     endclass
 
     class Lane;
@@ -672,6 +675,9 @@ module lane_drain_tb #(
     // =============================================================================================
     // HTTP origin server: parse the GETs, learn the lane from the path, answer with framed 200s
     // =============================================================================================
+    int srv_lat = 0;   // +SRVLAT, cycles; see serve()
+    initial void'($value$plusargs("SRVLAT=%d", srv_lat));
+
     task automatic serve(int sid, int lane, int seq);
         Resp r; string hdr; int len; int i;
         if (ln[lane].plan.size() == 0) begin
@@ -681,10 +687,29 @@ module lane_drain_tb #(
         r = ln[lane].plan.pop_front();
         len = r.len;
         hdr = $sformatf("HTTP/1.1 206 Partial Content\015\012Content-Length: %0d\015\012Connection: keep-alive\015\012\015\012", len);
-        for (i = 0; i < hdr.len(); i++) sess[sid].pending.push_back(byte'(hdr.getc(i)));
-        for (i = 0; i < len; i++) sess[sid].pending.push_back(body_byte(lane, r.seq, i));
-        sess[sid].wr.push_back(hdr.len() + len);
         ln[lane].expq.push_back(r);
+        if (srv_lat == 0) begin
+            for (i = 0; i < hdr.len(); i++) sess[sid].pending.push_back(byte'(hdr.getc(i)));
+            for (i = 0; i < len; i++) sess[sid].pending.push_back(body_byte(lane, r.seq, i));
+            sess[sid].wr.push_back(hdr.len() + len);
+        end else begin
+            // +SRVLAT: a request->response LATENCY, in order per session but not serialised (the
+            // round trip plus the origin's time to first byte). A depth-1 host pays it on every
+            // GET; pipelined GETs overlap it with the transfer of the responses before them.
+            automatic int t_rel = ((cyc + srv_lat) > sess[sid].last_rel) ? (cyc + srv_lat)
+                                                                          : (sess[sid].last_rel + 1);
+            automatic int a_sid = sid, a_lane = lane, a_seq = r.seq, a_len = len;
+            automatic string a_hdr = hdr;
+            sess[sid].last_rel = t_rel;
+            fork begin
+                while (cyc < t_rel) @(posedge clk);
+                if (sess.exists(a_sid)) begin
+                    for (int q = 0; q < a_hdr.len(); q++) sess[a_sid].pending.push_back(byte'(a_hdr.getc(q)));
+                    for (int q = 0; q < a_len; q++) sess[a_sid].pending.push_back(body_byte(a_lane, a_seq, q));
+                    sess[a_sid].wr.push_back(a_hdr.len() + a_len);
+                end
+            end join_none
+        end
     endtask
 
     // Scan a session's received bytes for complete request header blocks.
@@ -748,6 +773,8 @@ module lane_drain_tb #(
     bit  net_paced = 1'b1;
     int  net_allow = 1000000000;   // packets the network may still put on the wire
     bit  net_coalesce = 1'b0;   // 1 = let one TCP segment carry the tail of one response and the head of the next
+    // +COALESCE turns it on for any scenario: pipelined responses then share segments and beats.
+    initial if ($test$plusargs("COALESCE")) net_coalesce = 1'b1;
     initial begin : net_engine
         Pkt p; Notif nn; int i, k, sid, n, tries;
         forever begin
@@ -1016,6 +1043,18 @@ module lane_drain_tb #(
     endclass
 
     Work feed_q [NUM_CONNS][$];
+    // Host-side pipelining state for the slots DUT (CSR revision 4). +HDEPTH=1 reproduces what the
+    // revision-3 hardware enforced by itself.
+    localparam int HDR_ALLOW = 256;
+    bit  allow_overflow = 0;   // `ovf`: a slot is overrun on purpose
+    int  hdepth = 4;
+    int  armed_n     [NUM_CONNS];
+    int  ent_n_lane  [NUM_CONNS];   // chunk entries pushed
+    int  armed_bytes [NUM_CONNS];
+    initial begin
+        void'($value$plusargs("HDEPTH=%d", hdepth));
+        for (int c = 0; c < NUM_CONNS; c++) begin armed_n[c] = 0; armed_bytes[c] = 0; ent_n_lane[c] = 0; end
+    end
     int  feed_busy [NUM_CONNS];   // work items queued or in progress, for all_drained()
 
     // THE CONFIG PORT IS ONE PORT, AND NOW THERE ARE N WRITERS.
@@ -1098,21 +1137,66 @@ module lane_drain_tb #(
                     @(posedge clk);
                     if (rst_n && DUT_SLOTS != 0 && feed_q[gl].size() > 0 && !cfg_stalled) begin
                         w    = feed_q[gl].pop_front();
+                        if ($test$plusargs("FDBG")) $display("  [cyc=%0d] FDBG lane %0d pops work (%0d GETs), %0d queued", cyc, gl, w.nreq, feed_q[gl].size());
                         seq0 = ln[gl].feed_seq;
                         // Chunk-length entries first: one per COLUMN CHUNK, which is not the same
                         // number as the GETs (a10 fetches one 6000-byte chunk as two 3000-byte
                         // GETs, and that is the case axis_rewrite_last exists for).
                         o = 1'b1;
+                        // The host's lane depth, in CHUNKS as software counts it
+                        // (await_lane_credit: occ + needed <= max(depth, needed)); the sink's
+                        // resp_done counts chunk tlasts, so it retires the same unit.
+                        begin
+                            int tw0; tw0 = 0;
+                            forever begin
+                                bit full;
+                                full = (ent_n_lane[gl] - ln[gl].resp_done + w.nchunk) >
+                                       ((hdepth > w.nchunk) ? hdepth : w.nchunk);
+                                if (!full || tw0 >= CFG_BOUND) break;
+                                @(posedge clk);
+                                tw0 = tw0 + 1;
+                            end
+                        end
                         for (int i = 0; i < w.nchunk; i++) begin
                             push_cfg_mt(mk_cfg(w.chunk_len, gl, 0), gl, 1'b0, o);
                             if (!o) break;
+                            ent_n_lane[gl] = ent_n_lane[gl] + 1;
                         end
-                        // Then one arm per GET. The arm waits on ARM_READY, which is where the
-                        // depth-1 credit lives, so this loop is paced by the hardware.
+                        // Then one arm per GET. The arm waits on ARM_READY (request text gone out,
+                        // entry-queue room). Since CSR revision 4 the hardware no longer holds a
+                        // second arm on a connection, so the two host rules software keeps are
+                        // kept HERE, exactly as configuration.cpp keeps them:
+                        //   * at most `hdepth` CHUNKS outstanding on the lane (+HDEPTH, 4; checked
+                        //     before the entries, above), and at HDEPTH=1 one GET per slot;
+                        //   * the bytes armed since the slot was last seen empty (CONN_DRAINED)
+                        //     plus this GET's must fit in the slot. HDR_ALLOW covers the origin's
+                        //     response header. `ovf` overruns a slot on purpose and skips it.
                         for (int i = 0; i < w.nreq && o !== 1'b0; i++) begin
+                            int need, tw;
+                            need = w.body_len + HDR_ALLOW;
+                            tw   = 0;
+                            forever begin
+                                bit too_deep, too_big;
+                                // HDEPTH=1 is revision 3's pacing exactly: the next GET waits for
+                                // the slot to be empty (a chunk split into several GETs retires
+                                // only one tlast, so counting chunks cannot pace it).
+                                too_deep = (hdepth == 1) && !conn_drained(gl);
+                                too_big  = !allow_overflow && !conn_drained(gl) &&
+                                           ((longint'(armed_bytes[gl]) + longint'(need)) > longint'(SLOT_BYTES));
+                                if (!(too_deep || too_big) || tw >= CFG_BOUND) break;
+                                @(posedge clk);
+                                tw = tw + 1;
+                            end
+                            if ($test$plusargs("FDBG")) $display("  [cyc=%0d] FDBG lane %0d host wait %0d cyc before arm", cyc, gl, tw);
+                            if (conn_drained(gl)) armed_bytes[gl] = 0;
                             build_text(gl, 1, seq0 + i, txt);
                             push_cfg_mt(mk_cfg(w.chunk_len, gl, txt.size()), gl, 1'b1, o);
                             if (!o) break;
+                            armed_n[gl]     = armed_n[gl] + 1;
+                            if ($test$plusargs("FDBG"))
+                                $display("  [cyc=%0d] FDBG lane %0d arm #%0d accepted, %0d outstanding, %0d bytes budgeted",
+                                         cyc, gl, armed_n[gl], armed_n[gl] - ln[gl].resp_done, armed_bytes[gl] + need);
+                            armed_bytes[gl] = armed_bytes[gl] + need;
                             bl = new(); bl.d = txt;
                             ln[gl].txq.push_back(bl);
                         end
@@ -1362,7 +1446,7 @@ module lane_drain_tb #(
     //                      connection). Reported, never fatal.
     //   [30] slot_overflow expected, and asserted on, only in `ovf`.
     //   [31] residue_err   bytes in a slot belonging to no response. Always a failure.
-    bit allow_overflow = 0;
+    // (allow_overflow is declared with the feeder, which reads it.)
 
     task automatic check_sticky();
         string why;
@@ -2360,7 +2444,7 @@ module lane_drain_tb #(
         //        back (CONN_DRAINED returns), slot_writer's "release with segments in flight"
         //        assertion silent, and the other connections untouched.
         "refatal": begin
-            int sid0, stale;
+            int sid0, stale, rfn;
             if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
             for (int L = 0; L < NUM_CONNS; L++) submit_batch(L, 1, 3000, o);
             wait_drain(400000, ok);
@@ -2407,7 +2491,11 @@ module lane_drain_tb #(
                     b0   = pkt_taken;
                     lane_ignore[0] = 1;              // its response is being cut on purpose
                     net_allow = b0 + 3;
-                    submit_batch(0, 1, 120000, o);
+                    // +RFN GETs are armed before the cut (revision 4: several outstanding on one
+                    // connection when it dies -- the stale entries behind the head must neither
+                    // wedge the teardown nor leak into anybody else).
+                    if (!$value$plusargs("RFN=%d", rfn)) rfn = 1;
+                    submit_batch(0, rfn, (rfn > 1) ? 100000 : 120000, o);
                     t0 = cyc;
                     while ((cyc - t0) < 200000 && pkt_taken < b0 + 3) @(posedge clk);
                     wait_cycles(2000);
