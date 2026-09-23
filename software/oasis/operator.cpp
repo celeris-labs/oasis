@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -178,6 +179,25 @@ void HTTPBatchSourceOperator::build_chunk(HTTPReadConfig &config, const Chunk &c
     config.read_streamed(server_ip_, server_port_, path_, c.offset, c.offset + c.size - 1, batch);
 }
 
+// Per-lane host-side traffic counters for the exit/stall dump. File-local on purpose (no header or
+// class-layout change): GETs armed and body bytes requested, per lane, since the process started.
+namespace {
+std::atomic<uint64_t> g_lane_gets[16];
+std::atomic<uint64_t> g_lane_bytes[16];
+} // namespace
+
+std::string HttpLaneTrafficSummary() {
+    std::ostringstream o;
+    o << "host traffic per lane (since process start):";
+    for (int l = 0; l < 16; l++) {
+        const auto g = g_lane_gets[l].load();
+        if (g != 0) {
+            o << " [lane " << l << ": " << g << " GETs, " << g_lane_bytes[l].load() << " body bytes]";
+        }
+    }
+    return o.str();
+}
+
 namespace {
 
 // A batch carries ONE lane for all its chunks, so every chunk in it must belong to the stream
@@ -271,6 +291,10 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
 
     lane_.store(lane);
     gets_total_.fetch_add(batch.request_bytes.empty() ? 1 : batch.request_bytes.size());
+    g_lane_gets[lane & 15].fetch_add(batch.request_bytes.empty() ? 1 : batch.request_bytes.size());
+    for (const auto b : batch.chunk_bytes) {
+        g_lane_bytes[lane & 15].fetch_add(b);
+    }
     config->submit_batch(server_ip_, server_port_, batch, lane);
     gets_armed_.fetch_add(batch.request_bytes.empty() ? 1 : batch.request_bytes.size());
 
@@ -398,6 +422,10 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
 
     lane_.store(lane);
     gets_total_.fetch_add(requests.size());
+    g_lane_gets[lane & 15].fetch_add(requests.size());
+    for (const auto b : batch.chunk_bytes) {
+        g_lane_bytes[lane & 15].fetch_add(b);
+    }
     config.push_entries(batch, lane);
 
     // The request-text sink is the lane on a multi-connection bitstream (see emit_batch).

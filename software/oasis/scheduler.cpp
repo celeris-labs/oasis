@@ -180,6 +180,8 @@ Scheduler::Scheduler(OasisContext &ctx)
     }
 }
 
+std::string HttpLaneTrafficSummary(); // operator.cpp: per-lane host traffic, for the dumps
+
 void Scheduler::note_progress() {
     last_progress_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -284,8 +286,13 @@ void Scheduler::watchdog_loop() {
 
 std::string Scheduler::describe_stall(double stalled_s) {
     std::ostringstream o;
-    o << "\n===== [oasis] NO PROGRESS for " << stalled_s
-      << " s (no flow retired or dispatched) -- state dump, pid " << getpid() << " =====\n";
+    if (stalled_s < 0) {
+        o << "\n===== [oasis] EXIT state dump, pid " << getpid() << " =====\n";
+    } else {
+        o << "\n===== [oasis] NO PROGRESS for " << stalled_s
+          << " s (no flow retired or dispatched) -- state dump, pid " << getpid() << " =====\n";
+    }
+    o << HttpLaneTrafficSummary() << "\n";
     {
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         o << "host: " << queue_.size() << " flow(s) queued, not yet placed; lane-aware="
@@ -338,6 +345,15 @@ void Scheduler::set_pipeline_depth(size_t depth) {
 }
 
 Scheduler::~Scheduler() {
+    // OASIS_EXIT_DUMP: the same state dump the watchdog prints on a stall, once, at teardown -- the
+    // per-query measurement hook (lane traffic, CSR stall/error words, decoder counters) for runs
+    // that did NOT stall. Diagnostics only; any revision.
+    if (const char *e = std::getenv("OASIS_EXIT_DUMP"); e != nullptr && *e != '\0' && *e != '0') {
+        try {
+            std::fprintf(stderr, "%s", describe_stall(-1.0).c_str());
+        } catch (...) {
+        }
+    }
     if (watchdog_.joinable()) {
         {
             std::lock_guard<std::mutex> lk(watchdog_mutex_);
