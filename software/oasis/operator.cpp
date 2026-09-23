@@ -441,16 +441,26 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
         // (a no-op on revision 3, where the hardware holds the arm until the slot is empty). A GET
         // whose range cannot be read back is charged as the largest legal one, which only ever
         // makes the wait longer.
+        //
+        // Revision 5 (stage 2): the host PLACES the GET -- pick_conn() chooses a free connection (or
+        // pipelines on this decoder's tail) and charges it the same way -- and the arm names it.
+        // The request text still goes to the decoder's stream: one streamer per decoder sends it on
+        // whichever connection the arm named.
+        uint8_t conn = lane;
         if (config.slot_pipelined()) {
             uint64_t body = HTTPReadConfig::RequestRangeBytes(requests[i]);
             if (body == 0) {
                 body = config.max_get_bytes();
             }
-            config.reserve_slot_bytes(lane, body);
+            if (config.conn_placement()) {
+                conn = config.pick_conn(lane, body);
+            } else {
+                config.reserve_slot_bytes(lane, body);
+            }
         }
         // The REAL length, not the padded one: the hardware sends exactly this many bytes and
         // swallows the rest of the transfer up to TLAST.
-        config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(lens[i]), lane);
+        config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(lens[i]), lane, conn);
         // Proof the arm was taken before anything else is written -- the next GET's arm, or the
         // next flow's entries, would otherwise rewrite the registers it is sampled from.
         config.await_arm_consumed(lane);

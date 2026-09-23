@@ -153,6 +153,10 @@ constexpr const uint32_t HTTP_CONN_READY0      = 25; // 25..26, nibble per conne
 constexpr const uint32_t HTTP_CONN_ERR0        = 27; // 27..30, byte per connection, 8 per word
 constexpr const uint32_t HTTP_CONN_DRAINED     = 31; // [c] depth-1 credit, [32+c] slot overflowed
 constexpr const uint32_t HTTP_SLOT_POLICY      = 32;
+// CSR revision 5 (stage 2). See the map in http_config.sv.
+constexpr const uint32_t HTTP_DEC_STATE        = 33; // byte per DECODER: arm/entry/tainted/stream_busy
+constexpr const uint32_t HTTP_CONN_MAP0        = 34; // 34..37, byte per connection: dec/tail/pending
+constexpr const uint32_t HTTP_CONN_CAUSE       = 38; // [c] residue at release, [32+c] tainted its decoder
 constexpr const uint32_t HTTP_SLOT_BASE_LO     = 42; // write
 constexpr const uint32_t HTTP_SLOT_BASE_HI     = 43; // write
 
@@ -682,8 +686,10 @@ void HTTPReadConfig::await_cfg_ready(const char *what, uint8_t lane, LaneAdmit a
 
     const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
     while (true) {
-        const auto ready_word = read_register(HTTP_LANE_READY).value();
-        const auto l          = DecodeLanes(0, ready_word, lane_count()).at(lane);
+        // Revision 5: the lane is a decoder and its admission bits are DEC_STATE's.
+        const auto l = conn_placement()
+                           ? DecodeDecState(0, read_register(HTTP_DEC_STATE).value(), lane_count()).at(lane)
+                           : DecodeLanes(0, read_register(HTTP_LANE_READY).value(), lane_count()).at(lane);
         if (l.fatal) {
             throw_lane_fatal(lane, what);
         }
@@ -717,6 +723,29 @@ void HTTPReadConfig::await_cfg_ready(const char *what, uint8_t lane, LaneAdmit a
 // were being starved behind, and the batch is simply gone; a read error means this lane's request
 // cannot be replayed by the hardware, and the host holds the only copy of the text.
 void HTTPReadConfig::throw_lane_fatal(uint8_t lane, const char *what) {
+    if (conn_placement()) {
+        // Revision 5: the lane is a DECODER, and it is fatal because it is TAINTED -- a connection
+        // went fatal while responses for this decoder were queued on it, so the decoder's byte
+        // stream has a hole. Name the connection(s) and why they died.
+        const auto cs = conns();
+        std::ostringstream msg;
+        msg << "FPGA HTTP decoder " << unsigned(lane) << " is fatal (TAINTED) while waiting for "
+            << what << ": a connection went fatal with responses for this decoder still queued, so "
+            << "its byte stream has a hole and its output was cut off. Every flow on it must be "
+            << "reissued; the other decoders and connections are unaffected. Tainted by:";
+        bool any = false;
+        for (uint8_t c = 0; c < cs.count; c++) {
+            if (cs.conn[c].tainter) {
+                msg << " [conn " << unsigned(c) << ": " << cs.conn[c].describe() << "]";
+                any = true;
+            }
+        }
+        if (!any) {
+            msg << " <no connection recorded>";
+        }
+        msg << " [" << stall().describe() << "]";
+        throw std::runtime_error(msg.str());
+    }
     const auto errs       = lane_errors();
     const auto state_word = lane_csrs_available() ? read_register(HTTP_LANE_STATE).value() : 0ULL;
     const auto e          = errs.at(lane);
@@ -773,7 +802,8 @@ void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed, const char *
     // on an empty slot), and the hardware enforces it by holding ARM_READY low until the slot has
     // been released. Admitting a batch whose arm would then sit on that wait is the one thing this
     // path exists to avoid, so the slot has to be free before the entries go in, not after.
-    const bool   slots    = slot_mode();
+    // Revision 5 has no lane-to-connection map: connections are chosen per GET at the arm.
+    const bool   slots    = slot_mode() && !conn_placement();
     const uint8_t conn    = slots ? conn_for_lane(lane) : lane;
     while (true) {
         const auto l = lanes().at(lane);
@@ -890,6 +920,9 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
         if (lane_csrs_available()) {
             std::fprintf(stderr, "[oasis-http]   %s\n", lanes().describe().c_str());
         }
+        if (conn_placement()) {
+            std::fprintf(stderr, "[oasis-http]   %s\n", conns().describe().c_str());
+        }
         // Name the status the moment it goes bad. It is a live register, so it must be read while
         // the failure is on the board -- by the time the run ends it may have been overwritten.
         if (st.status_bad) {
@@ -945,7 +978,22 @@ void HTTPReadConfig::push_entries(const RequestBatch &batch, uint8_t lane) {
 
 void HTTPReadConfig::arm_transfer(uint32_t server_ip, uint16_t server_port, uint32_t text_bytes,
                                   uint8_t lane) {
-    const uint64_t lane_field = static_cast<uint64_t>(lane & 0xF) << 32;
+    arm_transfer(server_ip, server_port, text_bytes, lane, lane);
+}
+
+void HTTPReadConfig::arm_transfer(uint32_t server_ip, uint16_t server_port, uint32_t text_bytes,
+                                  uint8_t lane, uint8_t conn) {
+    // Revision 5 names the CONNECTION in bits [44:40] beside the decoder in [35:32]. Below it those
+    // bits are not decoded and the connection is the lane's own; writing them anyway would be
+    // harmless, but a mismatch there is a caller bug worth refusing.
+    uint64_t lane_field = static_cast<uint64_t>(lane & 0xF) << 32;
+    if (conn_placement()) {
+        lane_field |= static_cast<uint64_t>(conn & 0x1F) << 40;
+    } else if (conn != lane) {
+        throw std::logic_error("HTTPReadConfig::arm_transfer: connection " + std::to_string(conn) +
+                               " named for lane " + std::to_string(lane) +
+                               " on a bitstream below CSR revision 5 (conn == lane there)");
+    }
 
     // 2. The arm: server address plus the byte count, which is what opens the connection.
     //    The length announced here is the PADDED one -- see PadRequestTextToBeat.
@@ -1316,6 +1364,16 @@ uint8_t HTTPReadConfig::lane_count() {
     // Clamped to HTTP_LANE_SLOTS because that is how far the per-lane registers reach: a bitstream
     // with more lanes than the CSR stride addresses is one this library cannot meter, and pretending
     // otherwise would admit batches against lane windows that are not there.
+    // REVISION 5: a lane is a DECODER. Connections are a separate, host-placed pool (pick_conn()).
+    if (conn_placement()) {
+        const auto sp = slot_policy();
+        if (sp.n_decoders > 0 && sp.n_decoders <= HTTP_LANE_SLOTS) {
+            lane_count_cached_ = sp.n_decoders;
+            return lane_count_cached_;
+        }
+        throw std::runtime_error("FPGA reports CSR revision 5 but SLOT_POLICY names " +
+                                 std::to_string(sp.n_decoders) + " decoders [" + sp.describe() + "]");
+    }
     if (lane_csrs_available()) {
         const auto p = policy();
         if (p.num_conns > 0 && p.num_conns <= HTTP_LANE_SLOTS) {
@@ -1401,6 +1459,9 @@ HTTPReadConfig::HTTPLanes HTTPReadConfig::lanes() {
     // TWO reads, and the admission bits come out of ONE of them on purpose -- both are monotone in
     // the host's favour, so a nibble read here is still true when the write it admits lands.
     const auto occ   = read_register(HTTP_LANE_OCC).value();
+    if (conn_placement()) {
+        return DecodeDecState(occ, read_register(HTTP_DEC_STATE).value(), lane_count());
+    }
     const auto ready = read_register(HTTP_LANE_READY).value();
     return DecodeLanes(occ, ready, lane_count());
 }
@@ -1433,17 +1494,24 @@ size_t HTTPReadConfig::lane_depth_limit() {
     const bool   env_set = std::getenv("OASIS_HTTP_LANE_DEPTH") != nullptr &&
                            *std::getenv("OASIS_HTTP_LANE_DEPTH") != '\0';
     // Revision 4 has its own default: HttpLaneDepth()'s 4 was chosen for build-119's lanes.
-    const size_t want    = (slot_pipelined() && !env_set) ? HTTP_PIPE_DEFAULT_DEPTH
-                                                          : static_cast<size_t>(HttpLaneDepth());
+    // Revision 5: a lane (decoder) serves several connections, so its default depth keeps each of
+    // its share of the active connections conn_depth() deep.
+    const size_t per_dec = conn_placement()
+                               ? (static_cast<size_t>(active_conns()) + lane_count() - 1) / lane_count()
+                               : 1;
+    const size_t want    = (slot_pipelined() && !env_set)
+                               ? (conn_placement() ? conn_depth() * per_dec : HTTP_PIPE_DEFAULT_DEPTH)
+                               : static_cast<size_t>(HttpLaneDepth());
     lane_depth_          = LaneDepthFor(revision(), want, hw);
     if (slot_pipelined()) {
         char line[200];
         std::snprintf(line, sizeof(line),
                       "HTTPReadConfig: CSR revision %u (pipelined HBM slots): lane depth %zu%s, "
-                      "slot byte budget %llu KiB per connection",
+                      "slot byte budget %llu KiB per connection%s",
                       unsigned(revision()), lane_depth_,
                       env_set ? " (OASIS_HTTP_LANE_DEPTH)" : " (default)",
-                      static_cast<unsigned long long>(slot_budget_bytes() >> 10));
+                      static_cast<unsigned long long>(slot_budget_bytes() >> 10),
+                      conn_placement() ? conn_line().c_str() : "");
         std::fprintf(stderr, "[oasis-http] %s\n", line);
         libstf::log(libstf::LogLevel::INFO, "%s", line);
         if (want > lane_depth_ && env_set) {
@@ -1470,6 +1538,10 @@ size_t HTTPReadConfig::LaneDepthFor(uint8_t revision, size_t want, size_t hw) {
     // second arm until the first response has left the slot. A host depth above 1 would therefore
     // not pipeline anything -- it would admit a batch whose arm then sits inside the dispatcher
     // thread waiting for that drain, holding up every other lane's placement behind it.
+    if (revision >= HTTP_CSR_REVISION_CONNS) {
+        // Revision 5: the lane is a decoder over several connections; only its queue bounds it.
+        return std::max<size_t>(1, std::min<size_t>(want, hw == 0 ? 1 : hw));
+    }
     if (revision >= HTTP_CSR_REVISION_PIPE) {
         // Revision 4 pipelines on the connection; the slot's byte budget, not this, is what keeps
         // a response from overrunning it.
@@ -1677,8 +1749,16 @@ HTTPReadConfig::HTTPConns HTTPReadConfig::conns() {
     for (uint32_t w = 0; w < 2; w++) {
         ready[w] = read_register(HTTP_CONN_READY0 + w).value();
     }
-    return DecodeConns(occ, ready, err, read_register(HTTP_CONN_DRAINED).value(),
-                       slot_policy().n_conns);
+    auto c = DecodeConns(occ, ready, err, read_register(HTTP_CONN_DRAINED).value(),
+                         slot_policy().n_conns);
+    if (conn_placement()) {
+        std::array<uint64_t, 4> map {};
+        for (uint32_t w = 0; w < 4; w++) {
+            map[w] = read_register(HTTP_CONN_MAP0 + w).value();
+        }
+        DecodeConnMap(map, read_register(HTTP_CONN_CAUSE).value(), c);
+    }
+    return c;
 }
 
 const HTTPReadConfig::HTTPConn &HTTPReadConfig::HTTPConns::at(uint8_t c) const {
@@ -1697,6 +1777,10 @@ std::string HTTPReadConfig::HTTPConn::describe() const {
         << (drained ? " drained" : " busy") << (arm_ready ? " arm" : "")
         << (entry_ready ? " entry" : "") << (fatal ? " FATAL" : "")
         << (overflow ? " SLOT_OVERFLOW" : "");
+    if (pend != 0 || is_tail) {
+        oss << " pend=" << unsigned(pend) << "@dec" << unsigned(cur_dec) << (is_tail ? "(tail)" : "");
+    }
+    oss << (residue ? " RESIDUE" : "") << (tainter ? " TAINTED_ITS_DECODER" : "");
     if (err_raw != 0) {
         oss << " err=0x" << std::hex << unsigned(err_raw) << std::dec;
     }
@@ -2072,6 +2156,180 @@ uint64_t HTTPReadConfig::read_stream_register(libstf::stream_t /*stream*/, uint3
 }
 
 
+// ---- CSR revision 5 -------------------------------------------------------------------------------
+
+bool HTTPReadConfig::conn_placement() { return revision() >= HTTP_CSR_REVISION_CONNS; }
+
+uint8_t HTTPReadConfig::active_conns() {
+    if (active_conns_ != 0) {
+        return active_conns_;
+    }
+    const uint8_t n = slot_policy().n_conns;
+    unsigned      want = n;
+    if (const char *env = std::getenv("OASIS_HTTP_CONNS"); env != nullptr && *env != '\0') {
+        want = static_cast<unsigned>(std::strtoul(env, nullptr, 10));
+    }
+    if (want == 0 || want > n) {
+        if (want > n) {
+            libstf::log(libstf::LogLevel::WARNING,
+                        "HTTPReadConfig: OASIS_HTTP_CONNS=%u clamped to the bitstream's %u connections",
+                        want, unsigned(n));
+        }
+        want = n;
+    }
+    active_conns_ = static_cast<uint8_t>(want);
+    return active_conns_;
+}
+
+size_t HTTPReadConfig::conn_depth() {
+    if (conn_depth_ != 0) {
+        return conn_depth_;
+    }
+    size_t d = HTTP_PIPE_DEFAULT_DEPTH;
+    if (const char *env = std::getenv("OASIS_HTTP_CONN_DEPTH"); env != nullptr && *env != '\0') {
+        d = static_cast<size_t>(std::strtoul(env, nullptr, 10));
+    }
+    conn_depth_ = std::max<size_t>(1, std::min<size_t>(d, HTTP_PIPE_MAX_DEPTH));
+    return conn_depth_;
+}
+
+std::string HTTPReadConfig::conn_line() {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "; %u of %u connections over %u decoders, %zu GET(s) deep per "
+                  "connection when none is free (OASIS_HTTP_CONNS / OASIS_HTTP_CONN_DEPTH)",
+                  unsigned(active_conns()), unsigned(slot_policy().n_conns),
+                  unsigned(slot_policy().n_decoders), conn_depth());
+    return buf;
+}
+
+// THE PLACEMENT RULE, pure. The hardware admits an arm for connection c on decoder `lane` only if c
+// is FREE (drained, nothing pending, not fatal) or `lane`'s TAIL (and then its GETs queue behind
+// the ones already there, on the same slot); see handler_slots.sv "STAGE 2". Within that:
+//   1. a FREE connection, round robin from the cursor -- a GET on a connection of its own is a
+//      transfer that runs in parallel with every other one, which is the point of stage 2 (MinIO
+//      serves ~210 MB/s per connection, so the aggregate is the number of connections in flight);
+//   2. otherwise the lane's tail, if the host armed it last on this lane, it is still the tail in
+//      hardware, it has fewer than conn_depth GETs pending, and the byte budget of its slot takes
+//      this one (pipelining hides the request round trip, as on revision 4);
+//   3. otherwise nothing: poll.
+HTTPReadConfig::ConnPick HTTPReadConfig::PickConn(const ConnPickInputs &in) {
+    ConnPick out;
+    out.next_rr = in.rr;
+    const unsigned n = std::min<unsigned>(in.active, HTTP_CONN_SLOTS);
+    for (unsigned k = 0; k < n; k++) {
+        const unsigned c = (in.rr + k) % n;
+        if (in.drained[c] && in.pend[c] == 0 && !in.fatal[c]) {
+            out.conn    = static_cast<int>(c);
+            out.free    = true;
+            out.next_rr = static_cast<uint8_t>((c + 1) % n);
+            return out;
+        }
+    }
+    const int t = in.host_tail;
+    if (t >= 0 && t < static_cast<int>(HTTP_CONN_SLOTS) && !in.fatal[t] && in.pend[t] != 0 &&
+        in.cur_dec[t] == in.lane && in.is_tail[t] && in.pend[t] < in.conn_depth &&
+        SlotBudgetOk(in.used[t], in.need, in.budget)) {
+        out.conn = t;
+    }
+    return out;
+}
+
+uint8_t HTTPReadConfig::pick_conn(uint8_t lane, uint64_t body_bytes) {
+    if (!conn_placement()) {
+        throw std::logic_error("HTTPReadConfig::pick_conn below CSR revision 5");
+    }
+    if (lane >= HTTP_LANE_SLOTS) {
+        throw std::out_of_range("HTTPReadConfig::pick_conn: lane " + std::to_string(lane));
+    }
+    ConnPickInputs in;
+    in.lane       = lane;
+    in.active     = active_conns();
+    in.conn_depth = conn_depth();
+    in.budget     = slot_budget_bytes();
+    in.need       = body_bytes + HTTP_SLOT_GET_OVERHEAD;
+    const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
+    while (true) {
+        // Three reads find a free connection: DRAINED (set only with nothing pending) and the
+        // two READY words for FATAL. The tail path needs its CONN_MAP word as well.
+        const uint64_t drained = read_register(HTTP_CONN_DRAINED).value();
+        const uint64_t ready0  = read_register(HTTP_CONN_READY0).value();
+        const uint64_t ready1  = read_register(HTTP_CONN_READY0 + 1).value();
+        for (unsigned c = 0; c < HTTP_CONN_SLOTS; c++) {
+            const uint64_t rw = (c < 16) ? ready0 : ready1;
+            in.drained[c] = ((drained >> c) & 1ULL) != 0;
+            in.fatal[c]   = ((rw >> (4u * (c % 16) + HTTP_LANE_FATAL)) & 1ULL) != 0;
+            in.pend[c]    = 0;
+            in.used[c]    = slot_used_[c];
+        }
+        in.rr        = conn_rr_;
+        in.host_tail = host_tail_[lane];
+        if (in.host_tail >= 0) {
+            const unsigned t  = static_cast<unsigned>(in.host_tail);
+            const uint64_t mw = read_register(HTTP_CONN_MAP0 + t / 8).value();
+            const auto     b  = static_cast<uint8_t>((mw >> (8u * (t % 8))) & 0xFFu);
+            in.cur_dec[t] = b & 0x7u;
+            in.is_tail[t] = (b & 0x8u) != 0;
+            in.pend[t]    = static_cast<uint8_t>(b >> 4);
+        }
+        // A drained connection may still show a stale DRAINED for the tail we armed a moment ago --
+        // never: DRAINED falls on the arm itself, and the arm was proven consumed before this call.
+        const ConnPick p = PickConn(in);
+        if (p.conn >= 0) {
+            const auto c = static_cast<uint8_t>(p.conn);
+            if (p.free) {
+                slot_used_[c] = 0;
+                conn_rr_      = p.next_rr;
+            }
+            slot_used_[c] += in.need;
+            host_tail_[lane] = p.conn;
+            return c;
+        }
+        const auto l = lanes().at(lane);
+        if (l.fatal) {
+            throw_lane_fatal(lane, "a connection to place a GET on");
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            std::ostringstream msg;
+            msg << "FPGA HTTP decoder " << unsigned(lane) << ": no connection could take a GET of "
+                << body_bytes << " bytes within "
+                << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
+                << "s (" << unsigned(in.active) << " active connections, none free, tail "
+                << in.host_tail << ") [" << conns().describe() << "; " << stall().describe()
+                << "]. The connections have stopped draining.";
+            throw std::runtime_error(msg.str());
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
+HTTPReadConfig::HTTPLanes HTTPReadConfig::DecodeDecState(uint64_t occ_word, uint64_t dec_state_word,
+                                                        uint8_t count) {
+    HTTPLanes l {};
+    l.count = (count > HTTP_LANE_SLOTS) ? HTTP_LANE_SLOTS : count;
+    for (uint8_t i = 0; i < l.count; i++) {
+        const auto b     = static_cast<unsigned>((dec_state_word >> (8u * i)) & 0xFFu);
+        l.lane[i].occ         = static_cast<uint8_t>((occ_word >> (8u * i)) & 0xFFu);
+        l.lane[i].arm_ready   = (b & 0x1u) != 0;
+        l.lane[i].entry_ready = (b & 0x2u) != 0;
+        l.lane[i].fatal       = (b & 0x4u) != 0; // TAINTED
+        l.lane[i].conn_up     = true;
+    }
+    return l;
+}
+
+void HTTPReadConfig::DecodeConnMap(const std::array<uint64_t, 4> &map_words, uint64_t cause_word,
+                                   HTTPConns &conns) {
+    for (uint8_t i = 0; i < conns.count; i++) {
+        const auto b = static_cast<uint8_t>((map_words[i / 8] >> (8u * (i % 8))) & 0xFFu);
+        auto &x      = conns.conn[i];
+        x.cur_dec    = b & 0x7u;
+        x.is_tail    = (b & 0x8u) != 0;
+        x.pend       = static_cast<uint8_t>(b >> 4);
+        x.residue    = ((cause_word >> i) & 1ULL) != 0;
+        x.tainter    = ((cause_word >> (32u + i)) & 1ULL) != 0;
+    }
+}
+
 std::string HTTPReadConfig::debug_dump() {
     std::ostringstream o;
     const auto hex = [](uint64_t v) {
@@ -2080,7 +2338,8 @@ std::string HTTPReadConfig::debug_dump() {
         return h.str();
     };
     const uint8_t rev   = revision();
-    const int     last  = rev >= HTTP_CSR_REVISION_SLOTS ? int(HTTP_SLOT_POLICY)
+    const int     last  = rev >= HTTP_CSR_REVISION_CONNS ? int(HTTP_CONN_CAUSE)
+                          : rev >= HTTP_CSR_REVISION_SLOTS ? int(HTTP_SLOT_POLICY)
                           : rev >= HTTP_CSR_REVISION_LANES ? int(HTTP_LANE_POLICY)
                                                            : int(HTTP_QUEUE_DEPTH);
     o << "HTTP CSR dump (revision " << unsigned(rev) << ", read ids 0.." << last << "):\n";
@@ -2115,7 +2374,17 @@ std::string HTTPReadConfig::debug_dump() {
         }
         const auto p = DecodeSlotPolicy(w[HTTP_SLOT_POLICY]);
         o << "  " << p.describe() << "\n";
-        o << "  " << DecodeConns(occ, ready, err, w[HTTP_CONN_DRAINED], p.n_conns).describe() << "\n";
+        auto cs = DecodeConns(occ, ready, err, w[HTTP_CONN_DRAINED], p.n_conns);
+        if (rev >= HTTP_CSR_REVISION_CONNS) {
+            std::array<uint64_t, 4> map {};
+            for (int k = 0; k < 4; k++) {
+                map[k] = w[HTTP_CONN_MAP0 + k];
+            }
+            DecodeConnMap(map, w[HTTP_CONN_CAUSE], cs);
+            o << "  decoders: " << DecodeDecState(w[HTTP_LANE_OCC], w[HTTP_DEC_STATE], p.n_decoders).describe()
+              << "\n";
+        }
+        o << "  " << cs.describe() << "\n";
         o << "  (the RTL exports no slot write/read cursors or landed counts; per-decoder reader "
              "state is the read_state nibble above)\n";
     }

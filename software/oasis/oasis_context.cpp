@@ -213,14 +213,17 @@ void OasisContext::setup_http_slots() {
             "/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages -- and the driver's card "
             "pool must hold pool + 1 pages (patch 0003).");
     }
-    // Only the slots, not the whole page: the ioctl takes the length as 32 bits and cThread caps it
-    // at MAX_TRANSFER_SIZE. The driver migrates the WHOLE mapping that contains the address anyway.
-    //
-    // Capped, not just "the slots": since CSR revision 4 the slots fill the whole 1 GiB page (4 x
-    // 256 MiB), and cThread::invoke THROWS on a sync/offload longer than MAX_TRANSFER_SIZE (128 MiB)
-    // rather than truncating it.
-    const uint64_t offload_len = std::min<uint64_t>(region, coyote::MAX_TRANSFER_SIZE);
-    cthread_->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{page, offload_len});
+    // Only the slots, not the whole page, and in MAX_TRANSFER_SIZE (128 MiB) pieces: the ioctl takes
+    // the length as 32 bits and cThread::invoke THROWS on a sync/offload longer than that rather than
+    // truncating it. Since CSR revision 4 the slots fill the whole 1 GiB page (4 x 256 MiB; 32 x
+    // 32 MiB on revision 5), and one capped offload left every slot above the first 128 MiB to be
+    // page-faulted in by the first segment the writer DMAs into it -- on the shared receive path.
+    // So every piece is offloaded, first to last.
+    for (uint64_t off = 0; off < region; off += coyote::MAX_TRANSFER_SIZE) {
+        const uint64_t len = std::min<uint64_t>(region - off, coyote::MAX_TRANSFER_SIZE);
+        cthread_->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD,
+                         coyote::syncSg{static_cast<char *>(page) + off, len});
+    }
     http_slot_page_ = page;
     http->set_slot_base(reinterpret_cast<uint64_t>(page));
 
@@ -232,7 +235,8 @@ void OasisContext::setup_http_slots() {
                   "OasisContext: HBM slot bitstream (CSR rev %u%s): %u connection slot(s) of %llu KiB "
                   "at %p, offloaded to card memory; GETs capped at %llu KiB",
                   unsigned(policy.revision),
-                  http->slot_pipelined() ? ", pipelined GETs" : ", one GET per connection",
+                  http->conn_placement() ? ", host-placed connections"
+                  : http->slot_pipelined() ? ", pipelined GETs" : ", one GET per connection",
                   unsigned(policy.n_conns),
                   static_cast<unsigned long long>(policy.slot_bytes() >> 10), page,
                   static_cast<unsigned long long>(policy.max_get_bytes() >> 10));

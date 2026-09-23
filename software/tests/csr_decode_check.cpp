@@ -311,10 +311,122 @@ void rev4_rules() {
     CHECK(!out.stream && out.lane_bound_wait);
 }
 
+// Revision 5 (stage 2): words as handler_slots packs them -- DEC_STATE byte per decoder
+// {rdr_state[3:0], stream_busy, tainted, entry_ready, arm_ready}; CONN_MAP byte per connection
+// {pend[3:0], tail, cur_dec[2:0]}; CONN_CAUSE [c] residue, [32+c] tainter.
+uint64_t dec_byte(bool arm, bool entry, bool tainted, bool busy, unsigned st) {
+    return uint64_t(arm) | (uint64_t(entry) << 1) | (uint64_t(tainted) << 2) | (uint64_t(busy) << 3) |
+           (uint64_t(st & 0xF) << 4);
+}
+uint64_t map_byte(unsigned dec, bool tail, unsigned pend) {
+    return uint64_t(dec & 7) | (uint64_t(tail) << 3) | (uint64_t(pend & 0xF) << 4);
+}
+
+void rev5_rules() {
+    // build-127 shape: rev 5, 32 connections, 4 decoders, 2^25 = 32 MiB slots = the 1 GiB page.
+    const auto sp = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(5, 32, 4, 25, 14, 64, 10));
+    CHECK(sp.valid() && sp.revision == 5 && sp.n_conns == 32 && sp.n_decoders == 4);
+    CHECK(sp.slot_bytes() == (32ULL << 20) && sp.region_bytes() == (1ULL << 30));
+    CHECK(sp.max_get_bytes() == (32ULL << 20) - (64ULL << 10));
+    CHECK(oasis::HTTP_CSR_REVISION_CONNS == 5);
+    // 24 connections also take 25 (30 - clog2(24)): 768 MiB of the page.
+    const auto s24 = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(5, 24, 4, 25, 14, 64, 10));
+    CHECK(s24.region_bytes() == 24ULL * (32ULL << 20));
+
+    // DEC_STATE: decoder 0 armable, 1 only entries, 2 TAINTED, 3 busy sending.
+    const uint64_t ds = dec_byte(true, true, false, false, 0) | (dec_byte(false, true, false, false, 3) << 8) |
+                        (dec_byte(false, true, true, false, 0) << 16) | (dec_byte(false, false, false, true, 4) << 24);
+    const uint64_t occ = 1ULL | (5ULL << 8) | (9ULL << 16) | (64ULL << 24);
+    const auto l = HTTPReadConfig::DecodeDecState(occ, ds, 4);
+    CHECK(l.count == 4);
+    CHECK(l.at(0).arm_ready && l.at(0).entry_ready && !l.at(0).fatal && l.at(0).occ == 1);
+    CHECK(!l.at(1).arm_ready && l.at(1).entry_ready && !l.at(1).fatal && l.at(1).occ == 5);
+    CHECK(l.at(2).fatal && l.at(2).occ == 9);                 // tainted = the host's fatal lane
+    CHECK(!l.at(3).arm_ready && !l.at(3).entry_ready && l.at(3).occ == 64);
+    CHECK(l.at(0).conn_up && l.at(3).conn_up);                // a decoder is never "connecting"
+
+    // CONN_MAP / CONN_CAUSE, including connections 8, 17 and 31 (other words, top slot).
+    std::array<uint64_t, 4> map {};
+    map[0] = map_byte(2, true, 3) | (map_byte(1, false, 0) << 8);
+    map[1] = map_byte(3, false, 15);                          // conn 8, saturated
+    map[2] = map_byte(0, true, 1) << 8;                       // conn 17
+    map[3] = map_byte(3, true, 2) << 56;                      // conn 31
+    const uint64_t cause = (1ULL << 1) | (1ULL << (32 + 17));
+    std::array<uint64_t, 4> o4 {}, e4 {};
+    std::array<uint64_t, 2> r2 {};
+    auto cs = HTTPReadConfig::DecodeConns(o4, r2, e4, 0, 32);
+    HTTPReadConfig::DecodeConnMap(map, cause, cs);
+    CHECK(cs.at(0).cur_dec == 2 && cs.at(0).is_tail && cs.at(0).pend == 3);
+    CHECK(cs.at(1).cur_dec == 1 && !cs.at(1).is_tail && cs.at(1).pend == 0 && cs.at(1).residue);
+    CHECK(cs.at(8).cur_dec == 3 && cs.at(8).pend == 15);
+    CHECK(cs.at(17).is_tail && cs.at(17).pend == 1 && cs.at(17).tainter && !cs.at(17).residue);
+    CHECK(cs.at(31).cur_dec == 3 && cs.at(31).is_tail && cs.at(31).pend == 2);
+    CHECK(!cs.at(30).tainter && cs.at(30).pend == 0);
+
+    // Lane depth at revision 5: only the decoder's queue bounds it (no HTTP_PIPE_MAX_DEPTH cap).
+    CHECK(HTTPReadConfig::LaneDepthFor(5, 16, 64) == 16);
+    CHECK(HTTPReadConfig::LaneDepthFor(5, 100, 64) == 64);
+    CHECK(HTTPReadConfig::LaneDepthFor(5, 0, 64) == 1);
+    CHECK(HTTPReadConfig::LaneCreditOk(5, 10, 1, 16, false)); // no slot key, occupancy only
+
+    // PLACEMENT (PickConn). 8 active connections; 0..2 busy on other decoders, 3 free.
+    HTTPReadConfig::ConnPickInputs in;
+    in.lane = 1; in.active = 8; in.rr = 0; in.conn_depth = 2;
+    in.budget = sp.max_get_bytes(); in.need = 500000;
+    for (int c = 0; c < 32; c++) { in.drained[c] = true; in.pend[c] = 0; }
+    for (int c = 0; c < 3; c++) { in.drained[c] = false; in.pend[c] = 1; in.cur_dec[c] = 0; }
+    auto p = HTTPReadConfig::PickConn(in);
+    CHECK(p.conn == 3 && p.free && p.next_rr == 4);           // first free from the cursor
+    in.rr = 6;
+    p = HTTPReadConfig::PickConn(in);
+    CHECK(p.conn == 6 && p.free && p.next_rr == 7);           // round robin
+    in.rr = 7; in.fatal[7] = true;
+    p = HTTPReadConfig::PickConn(in);
+    CHECK(p.conn == 3);                                       // a fatal connection is never free
+    in.fatal[7] = false;
+    // Nothing free: the lane's tail may pipeline -- only if it is really this lane's tail.
+    for (int c = 0; c < 32; c++) { in.drained[c] = false; in.pend[c] = 1; in.cur_dec[c] = 0; }
+    in.host_tail = 5; in.cur_dec[5] = 1; in.is_tail[5] = true; in.used[5] = 600000;
+    p = HTTPReadConfig::PickConn(in);
+    CHECK(p.conn == 5 && !p.free);
+    in.pend[5] = 2;                                           // at conn_depth
+    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
+    in.pend[5] = 1; in.is_tail[5] = false;                    // another lane armed since: not tail
+    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
+    in.is_tail[5] = true; in.cur_dec[5] = 2;                  // its entries are on decoder 2
+    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
+    in.cur_dec[5] = 1; in.used[5] = in.budget - 1000;         // slot budget exhausted
+    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
+    in.used[5] = 0; in.fatal[5] = true;
+    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
+    in.fatal[5] = false; in.host_tail = -1;
+    CHECK(HTTPReadConfig::PickConn(in).conn == -1);           // no tail recorded: wait
+    // A connection beyond `active` is never used even when free (OASIS_HTTP_CONNS).
+    in.drained[20] = true; in.pend[20] = 0;
+    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
+    in.active = 32;
+    CHECK(HTTPReadConfig::PickConn(in).conn == 20);
+    // active = 4 of 32: the cursor wraps inside the first four.
+    in.active = 4; in.rr = 3;
+    for (int c = 0; c < 32; c++) { in.drained[c] = true; in.pend[c] = 0; }
+    p = HTTPReadConfig::PickConn(in);
+    CHECK(p.conn == 3 && p.next_rr == 0);
+
+    // Scheduler placement over DECODER lanes: decoder 2 tainted, the rest by occupancy.
+    oasis::Scheduler::LaneInputs li;
+    li.host_depth = 64; li.needed = 1; li.active = 4; li.rr = 0; li.lane_depth = 16;
+    const uint64_t ds2 = dec_byte(true, true, false, false, 0) | (dec_byte(true, true, false, false, 0) << 8) |
+                         (dec_byte(false, true, true, false, 0) << 16) | (dec_byte(true, true, false, false, 0) << 24);
+    li.lanes = HTTPReadConfig::DecodeDecState(9ULL | (3ULL << 8) | (0ULL << 16) | (7ULL << 24), ds2, 4);
+    auto po = oasis::Scheduler::PlaceOnLane(li);
+    CHECK(po.stream.has_value() && *po.stream == 1);          // least loaded healthy decoder, not 2
+}
+
 int main() {
     rev2_decoders();
     rev3_decoders();
     rev4_rules();
+    rev5_rules();
     request_split();
     placement_at_depth();
     std::printf("csr_decode_check: %d passed, %d failed\n", g_pass, g_fail);

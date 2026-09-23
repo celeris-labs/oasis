@@ -70,6 +70,14 @@ constexpr const uint8_t HTTP_CSR_REVISION_SLOTS = 3;
 /// and nothing armed on it". Revision 3 is driven exactly as before.
 constexpr const uint8_t HTTP_CSR_REVISION_PIPE = 4;
 
+/// CSR revision at which the slot handler has MORE CONNECTIONS THAN DECODERS (stage 2, 2026-09-23).
+/// The host places every GET on a connection of its choice: the ARM names it (REQ_CHUNK_BYTES
+/// [44:40]) beside the decoder ([35:32]). A "lane" is then a DECODER (lane_count() = N_DECODERS, and
+/// the per-lane admission/fatal bits come from DEC_STATE, read id 33), and a connection is admitted
+/// for decoder d only while it is FREE (CONN_DRAINED, nothing pending) or d's TAIL (the last
+/// connection d took an arm for) -- see pick_conn(). Revisions 2..4 are driven exactly as before.
+constexpr const uint8_t HTTP_CSR_REVISION_CONNS = 5;
+
 /// Lane depth on a revision-4 bitstream when OASIS_HTTP_LANE_DEPTH is not set, and the most it may
 /// be set to. Two already hides the per-request round trip behind the previous transfer (the
 /// build-119 depth sweep: per-GET time 1020 -> 848 -> 822 us at depth 1 -> 2 -> 4).
@@ -231,6 +239,10 @@ class HTTPReadConfig : public libstf::Config {
     /// until the previous response on that connection has been drained out of its slot -- which is
     /// what makes one-GET-per-connection a hardware guarantee instead of a host convention.
     void arm_transfer(uint32_t server_ip, uint16_t server_port, uint32_t text_bytes, uint8_t lane);
+    /// Revision 5: the same, on connection `conn` (from pick_conn()). Below revision 5 `conn` must
+    /// be the lane's own connection and is not written.
+    void arm_transfer(uint32_t server_ip, uint16_t server_port, uint32_t text_bytes, uint8_t lane,
+                      uint8_t conn);
 
     /// Revision 3 only: block until the arm just written has been CONSUMED, i.e. CONN_DRAINED for
     /// the lane's connection has fallen. START does not back-pressure and the handler samples the
@@ -316,6 +328,12 @@ class HTTPReadConfig : public libstf::Config {
         bool    drained     = false; // CONN_DRAINED[c]: slot empty, will accept an arm
         bool    overflow    = false; // CONN_DRAINED[32+c]: sticky slot overflow (= err bit 7)
         uint8_t err_raw     = 0;     // CONN_ERR byte: bits 0..6 as LANE_ERR, bit 7 SLOT_OVERFLOW
+        // Revision 5 (CONN_MAP, read ids 34..37; CONN_CAUSE, 38). Zero below it.
+        uint8_t pend        = 0;     // entries armed on this connection, not yet retired (sat. 15)
+        uint8_t cur_dec     = 0;     // the decoder they are queued on (its home decoder before)
+        bool    is_tail     = false; // it is its decoder's tail: another arm there pipelines on it
+        bool    residue     = false; // CONN_CAUSE[c]: bytes left in its slot at a release
+        bool    tainter     = false; // CONN_CAUSE[32+c]: went fatal with entries pending
         std::string describe() const;
     };
     struct HTTPConns {
@@ -335,6 +353,57 @@ class HTTPReadConfig : public libstf::Config {
 
     /// The connection a lane's GETs travel on. Stage 1 (N_CONNS == N_DECODERS): the lane itself.
     uint8_t conn_for_lane(uint8_t lane);
+
+    // ---- CSR revision 5 (stage 2: the host places GETs on connections) --------------------------
+
+    /// True on revision >= HTTP_CSR_REVISION_CONNS.
+    bool conn_placement();
+
+    /// Connections this process spreads GETs over: OASIS_HTTP_CONNS clamped to [1, N_CONNS]
+    /// (default all of them). The bitstream opens every connection it has either way; the unused
+    /// ones simply stay idle -- so a 32-connection bitstream measures 4, 8, 16, 24 and 32 without a
+    /// rebuild.
+    uint8_t active_conns();
+
+    /// GETs one connection may have armed at once when the host pipelines on it (only when no
+    /// connection is free): OASIS_HTTP_CONN_DEPTH, default HTTP_PIPE_DEFAULT_DEPTH, at most
+    /// HTTP_PIPE_MAX_DEPTH.
+    size_t conn_depth();
+
+    /// Revision 5: choose the connection the next GET of `lane` (a decoder) goes on, charge its
+    /// `body_bytes` (+ HTTP_SLOT_GET_OVERHEAD) to that connection's slot, and return it. Blocks until
+    /// one can take it; throws on a tainted decoder or after the credit timeout. Prefers a FREE
+    /// connection (round robin over active_conns() -- more connections in flight is the whole point
+    /// of stage 2), and otherwise pipelines on the lane's tail up to conn_depth() GETs within the
+    /// slot's byte budget. Must be called by the one thread that arms, immediately before the arm.
+    uint8_t pick_conn(uint8_t lane, uint64_t body_bytes);
+
+    /// Everything pick_conn() decides on, so the rule can be checked without a board.
+    struct ConnPickInputs {
+        uint8_t  lane        = 0;
+        uint8_t  active      = 0;       // connections to use, 0..active-1
+        uint8_t  rr          = 0;       // round-robin cursor
+        int      host_tail   = -1;      // the connection the host last armed on this lane
+        size_t   conn_depth  = 1;
+        uint64_t budget      = 0;       // slot byte budget
+        uint64_t need        = 0;       // this GET's charge
+        std::array<bool, HTTP_CONN_SLOTS>     drained {};
+        std::array<bool, HTTP_CONN_SLOTS>     fatal {};
+        std::array<uint8_t, HTTP_CONN_SLOTS>  pend {};
+        std::array<uint8_t, HTTP_CONN_SLOTS>  cur_dec {};
+        std::array<bool, HTTP_CONN_SLOTS>     is_tail {};
+        std::array<uint64_t, HTTP_CONN_SLOTS> used {};
+    };
+    struct ConnPick {
+        int     conn    = -1;     // -1: nothing can take it now (poll)
+        bool    free    = false;  // a free connection (its byte charge restarts at 0)
+        uint8_t next_rr = 0;
+    };
+    static ConnPick PickConn(const ConnPickInputs &in);
+
+    /// Pure decoder of CONN_MAP (34..37) + CONN_CAUSE (38) into `conns` (revision 5).
+    static void DecodeConnMap(const std::array<uint64_t, 4> &map_words, uint64_t cause_word,
+                              HTTPConns &conns);
 
     /// Read id 31 bit `conn`: the depth-1 credit on revision 3; "slot empty and nothing armed" on
     /// revision 4 (the byte budget's reset).
@@ -506,6 +575,10 @@ class HTTPReadConfig : public libstf::Config {
         std::string describe() const;
     };
     HTTPLanes lanes();
+    /// Revision 5 (pure): lanes are DECODERS -- occupancy from LANE_OCC (16, per decoder) and the
+    /// admission/fatal bits from DEC_STATE (33): ARM_READY +0, ENTRY_READY +1, fatal = TAINTED +2.
+    /// conn_up reads true: a decoder has no session of its own.
+    static HTTPLanes DecodeDecState(uint64_t occ_word, uint64_t dec_state_word, uint8_t count);
 
     /**
      * One lane's STICKY failure causes, from read id 19. Sticky since reset -- a reconnect does not
@@ -824,6 +897,15 @@ class HTTPReadConfig : public libstf::Config {
     /// Revision 4: response bytes charged against each connection's slot since CONN_DRAINED was
     /// last seen set. Touched only by the thread that arms (the dispatcher).
     std::array<uint64_t, HTTP_CONN_SLOTS> slot_used_ {};
+
+    /// Revision 5 placement state (the arming thread only): the connection last armed per lane,
+    /// the round-robin cursor, and the cached OASIS_HTTP_CONNS / OASIS_HTTP_CONN_DEPTH.
+    std::array<int, HTTP_LANE_SLOTS> host_tail_ {-1, -1, -1, -1, -1, -1, -1, -1};
+    uint8_t conn_rr_ {0};
+    /// "; N of M connections over D decoders ..." for the revision-5 startup line.
+    std::string conn_line();
+    uint8_t active_conns_ {0};
+    size_t  conn_depth_ {0};
 };
 
 } // namespace oasis
