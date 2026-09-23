@@ -87,6 +87,11 @@ typedef struct packed {
     // traps (moving anything shifts every later parameter silently), and a chunk length has never
     // needed more than 32 bits.
     logic [3:0]  req_chunk_dest;
+    // CSR revision 5 (stage 2): the CONNECTION an arm is sent on, from bits [44:40] of the same
+    // register. Ignored below revision 5, where the connection is the decoder. Zero on every beat
+    // that does not set it, so a host that predates it arms connection 0 -- which a revision-5
+    // bitstream then admits only when connection 0 is free, never as a silent misroute.
+    logic [4:0]  req_conn;
 } http_config_t;
 
 endpackage

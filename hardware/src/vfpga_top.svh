@@ -193,6 +193,7 @@ logic [3:0][63:0]              http_conn_err_word;
 logic [63:0]                   http_conn_drained_word;
 logic [63:0]                   http_slot_policy_word;
 logic [63:0]                   http_slot_base_w;
+logic [5:0][63:0]              http_conn_ext_word;   // revision 5: read ids 33..38
 `endif
 
 // 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
@@ -206,7 +207,7 @@ logic [63:0]                   http_slot_base_w;
 HttpConfig #(
     .NUM_PARAM_REGS(44),
     .START_ADDR    (39),
-    .CSR_REV       (4)
+    .CSR_REV       (5)
 ) inst_http_config (
     .clk         (clk),
     .rst_n       (rst_n),
@@ -232,6 +233,7 @@ HttpConfig #(
     .conn_err_word       (http_conn_err_word),
     .conn_drained_word   (http_conn_drained_word),
     .slot_policy_word    (http_slot_policy_word),
+    .conn_ext_word       (http_conn_ext_word),
     .slot_base           (http_slot_base_w)
 );
 `else
@@ -449,9 +451,9 @@ end
 // table and for why a last=0 read draws no completion.
 // -------------------------------------------------------------------------------------------------
 localparam int NUM_HTTP_CONNS = `N_HTTP_CONNS;
-// log2 of one connection's slot. 22 = 4 MiB, so the host's largest legal GET is 4 MiB - 64 KiB.
-// The host does not guess this: handler_slots publishes it in SLOT_POLICY[29:24].
-localparam int HTTP_SLOT_LOG2 = 28;
+// log2 of one connection's slot: the slots fill the one 1 GiB slot page -- 28 (256 MiB) at 4
+// connections, 25 (32 MiB) at 24 or 32. The host does not guess it: SLOT_POLICY[29:24].
+localparam int HTTP_SLOT_LOG2 = 30 - $clog2(NUM_HTTP_CONNS);
 
 logic                       hs_wr_req_valid, hs_wr_req_ready, hs_wr_req_last;
 logic [VADDR_BITS-1:0]      hs_wr_req_vaddr;
@@ -482,7 +484,7 @@ handler_slots #(
     .N_DECODERS (NUM_DECODERS),
     .QUEUE_DEPTH(HTTP_QUEUE_DEPTH),
     .SLOT_LOG2  (HTTP_SLOT_LOG2),
-    .CSR_REV    (4)
+    .CSR_REV    (5)
 ) inst_handler (
     .ap_clk  (clk),
     .ap_rst_n(rst_n),
@@ -575,7 +577,8 @@ handler_slots #(
     .connReadyWord  (http_conn_ready_word),
     .connErrWord    (http_conn_err_word),
     .connDrainedWord(http_conn_drained_word),
-    .slotPolicyWord (http_slot_policy_word)
+    .slotPolicyWord (http_slot_policy_word),
+    .connExtWord    (http_conn_ext_word)
 );
 
 // ONE card channel since 2026-09-22: build-123 was built with N_CARD_AXI = NUM_DECODERS+1, placed

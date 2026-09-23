@@ -62,11 +62,34 @@ import http_types::*;
 // nothing is armed on it. Overrunning the slot
 // is caught, not corrupting: slot_writer drops the segment and the connection goes fatal.
 //
-// STAGE 1: N_CONNS == N_DECODERS
-// ------------------------------
-// Connection c feeds decoder c. The map is `conn_of_dec` and nothing else, and it is the ONLY place
-// stage 1 is assumed -- the parameters, the ports, the CSR map and the entry queues are all already
-// the general shape, so WP5 generalises the map and the request-text prefix and renames nothing.
+// STAGE 2: N_CONNS > N_DECODERS (CSR revision 5, 2026-09-23)
+// ------------------------------------------------------------
+// Stage 1 fixed connection c to decoder c. Since revision 5 the ARM beat names its connection
+// (REQ_CHUNK_BYTES[44:40], `req_conn`) as well as its decoder, and any connection can feed any
+// decoder; revision 4 and below take conn = decoder, which is stage 1 exactly (CSR_REV < 5 requires
+// N_CONNS == N_DECODERS). Everything per DECODER stays per decoder -- request streamer, reader,
+// framer, chunk queue -- so an extra connection costs only its session state and its slot cursors.
+//
+// THE ONE RULE THAT MAKES A SHARED FRAMER CORRECT. strip_http keeps mid-beat residue across the
+// responses of one connection (that is how pipelined GETs are framed), so a reader may only switch
+// connections where that residue is provably empty. The hardware guarantees it at the config port:
+// an arm on connection c for decoder d is admitted only if
+//     c is DRAINED   (nothing armed on it, slot released -- CONN_DRAINED[c]), or
+//     c is the TAIL  of d's entry queue (the last arm d accepted named c, and c still has entries),
+// so a connection's entries are always contiguous in ONE decoder's queue, and the reader's "next
+// entry names another connection" means "this connection has nothing more armed". slot_reader then
+// releases the slot, checks the framer is idle and clears it. No per-connection framer state, no
+// re-reads. The admission is monotone in the host's favour as before (only the host arms; the reader
+// only ever drains), so poll-then-write stays race free. `cur_dec_q[c]`, `pend_q[c]` (entries armed
+// and not yet retired or dropped) and `tail_conn_q[d]` are the state behind it.
+//
+// A FATAL CONNECTION IN STAGE 2. Its queued entries are dropped as they reach the head (slot_reader,
+// "FLUSH"), so they cannot block the healthy connections behind them. But a fatal with entries still
+// pending means a response the decoder's chunk queue is counting on will never come -- the decoder's
+// byte stream has a hole -- so that decoder is TAINTED: its body output is cut off after the framer
+// (responses of healthy connections still queued on it are framed and retired, so those connections
+// drain and stay usable on the other decoders), arms for it are refused, and the host sees it as a
+// fatal lane (DEC_STATE, read id 33). In stage 1 that is exactly the old "fatal lane".
 //
 // ERROR SEMANTICS
 // ---------------
@@ -148,9 +171,10 @@ module handler_slots #(
     // Cycles of continuous quiet on both sides before a torn-down connection's slot is released.
     // One TCP segment is 66 beats; this is four of them.
     parameter int RELEASE_SETTLE = 256,
-    // 3 here. Parameterised so the value is stated once and reaches both the readback words and
-    // HttpConfig, which gates its register map on it.
-    parameter int CSR_REV = 4,
+    // 5 here (stage 2); 4 keeps revision 4's conn == decoder arm decoding. Parameterised so the
+    // value is stated once and reaches both the readback words and HttpConfig, which gates its
+    // register map on it.
+    parameter int CSR_REV = 5,
 
     localparam int CONN_BITS = (N_CONNS    > 1) ? $clog2(N_CONNS)    : 1,
     localparam int DEC_BITS  = (N_DECODERS > 1) ? $clog2(N_DECODERS) : 1
@@ -278,7 +302,13 @@ module handler_slots #(
     output logic [1:0][63:0] connReadyWord,    // one nibble per connection
     output logic [3:0][63:0] connErrWord,      // one byte per connection
     output logic      [63:0] connDrainedWord,  // [c] drained credit, [32+c] slot overflowed
-    output logic      [63:0] slotPolicyWord
+    output logic      [63:0] slotPolicyWord,
+
+    // -- CSR revision 5, read ids 33..38 (see http_config.sv) --------------------------------------
+    //   [0]    DEC_STATE   one byte per decoder
+    //   [1..4] CONN_MAP    one byte per connection, 8 per word
+    //   [5]    CONN_CAUSE  [c] residue at a release, [32+c] went fatal with entries pending
+    output logic [5:0][63:0] connExtWord
 );
 
     initial begin
@@ -286,19 +316,15 @@ module handler_slots #(
             $error("handler_slots: N_CONNS must be 1..32");
         if (N_DECODERS < 1 || N_DECODERS > 32)
             $error("handler_slots: N_DECODERS must be 1..32");
-        // STAGE 1. The only thing that assumes it is conn_of_dec below; WP5 lifts both together.
-        if (N_CONNS != N_DECODERS)
-            $error("handler_slots: stage 1 requires N_CONNS == N_DECODERS (got %0d and %0d)",
-                   N_CONNS, N_DECODERS);
+        // Below revision 5 the arm carries no connection and conn == decoder is assumed.
+        if (CSR_REV < 5 && N_CONNS != N_DECODERS)
+            $error("handler_slots: CSR_REV %0d requires N_CONNS == N_DECODERS (got %0d and %0d)",
+                   CSR_REV, N_CONNS, N_DECODERS);
+        if (N_DECODERS > 8)
+            $error("handler_slots: DEC_STATE/CONN_MAP address at most 8 decoders");
         if (CSR_REV < 3)
             $error("handler_slots: CSR_REV must be >= 3 (the slot registers do not exist below it)");
     end
-
-    // The connection decoder d drains. Identity in stage 1; WP5 makes it a host-written table and
-    // nothing else in this file has to know.
-    function automatic logic [CONN_BITS-1:0] conn_of_dec(input int d);
-        conn_of_dec = CONN_BITS'(d);
-    endfunction
 
     localparam logic [7:0] CSR_REVISION = 8'(CSR_REV);
 
@@ -312,32 +338,78 @@ module handler_slots #(
     assign cfg_is_arm_w   = req_valid && (req_data.req_total_bytes != 32'd0);
     assign cfg_is_entry_w = req_valid && (req_data.req_total_bytes == 32'd0);
 
+    // The connection an ARM names. Revision 5 carries it in REQ_CHUNK_BYTES[44:40]; below that the
+    // decoder IS the connection. An index past N_CONNS is never admitted (req_ready stays low), which
+    // is the same answer the host gets for a decoder that does not exist.
+    logic [CONN_BITS-1:0] cfg_conn;
+    logic                 cfg_conn_ok;
+    generate
+        if (CSR_REV >= 5) begin : g_cfg_conn
+            assign cfg_conn    = req_data.req_conn[CONN_BITS-1:0];
+            assign cfg_conn_ok = (32'(req_data.req_conn) < 32'(N_CONNS));
+        end else begin : g_cfg_conn_dec
+            assign cfg_conn    = CONN_BITS'(cfg_dec);
+            assign cfg_conn_ok = 1'b1;
+        end
+    endgenerate
+
     logic [N_DECODERS-1:0] rwl_cfg_ready, rwl_busy, rwl_starved;
     logic [N_DECODERS-1:0] stream_busy, stream_refused, stream_bus_req, stream_bus_grant;
     logic [N_DECODERS-1:0] dec_occ_ok;
     logic [N_DECODERS-1:0] dec_arm_ready_w, dec_entry_ready_w;
 
-    // THE TWO ADMISSION CONDITIONS, PER DECODER -- build-119's.
+    // Per-connection and per-decoder placement state (stage 2). See "STAGE 2" in the header.
+    localparam int PEND_BITS = $clog2(ENTRY_DEPTH + 1);
+    logic [N_CONNS-1:0]    conn_fatal_q, conn_drained_q;
+    logic [PEND_BITS-1:0]  pend_q      [N_CONNS];   // entries armed on c, not yet retired/dropped
+    logic [DEC_BITS-1:0]   cur_dec_q   [N_CONNS];   // the decoder c's entries are queued on
+    logic [CONN_BITS-1:0]  tail_conn_q [N_DECODERS];// the connection d's last accepted arm named
+    logic [N_DECODERS-1:0] dec_tainted_q;
+
+    // THE ADMISSION CONDITIONS.
     //
-    // An ENTRY waits for that decoder's chunk queue to have room. An ARM waits for two things: the
-    // previous request text to have gone out, and room in the reader's entry queue. (Revision 3 had
-    // a third, the target connection's slot being free, which made depth 1 a hardware property;
-    // revision 4 dropped it -- see "PIPELINED GETs" above.)
+    // An ENTRY waits for that decoder's chunk queue to have room (build-119's rule). An ARM waits
+    // for the decoder -- the previous request text gone out, room in the reader's entry queue, not
+    // tainted -- and for the CONNECTION: not fatal, and either drained or the tail of this decoder's
+    // queue (the rule that keeps a shared framer correct; see "STAGE 2").
     //
-    // Both are MONOTONE IN THE HOST'S FAVOUR -- nothing but a config beat the host itself writes can
-    // clear either -- so "poll, then write" is race free and needs no retry.
+    // All of it is MONOTONE IN THE HOST'S FAVOUR -- nothing but a config beat the host itself writes
+    // can clear any of it (fatal and tainted never clear, and a host polls them first) -- so "poll,
+    // then write" is race free and needs no retry. The one non-monotone instant is the cycle between
+    // a connection's last entry retiring and CONN_DRAINED rising, where neither half is true; a beat
+    // presented then simply waits one cycle.
+    logic [N_CONNS-1:0] conn_free_w;       // drained with nothing pending: any decoder may take it
+    always_comb begin
+        for (int c = 0; c < N_CONNS; c++)
+            conn_free_w[c] = conn_drained_q[c] && (pend_q[c] == '0) && !conn_fatal_q[c];
+    end
+
+    function automatic logic conn_arm_ok(input logic [CONN_BITS-1:0] c, input logic [DEC_BITS-1:0] d);
+        conn_arm_ok = conn_free_w[c] ||
+                      (!conn_fatal_q[c] && (pend_q[c] != '0) && (cur_dec_q[c] == d) &&
+                       (tail_conn_q[d] == c));
+    endfunction
+
+    // always_comb and NOT a continuous assign: an `assign` calling a function is only sensitive to
+    // the function's ARGUMENTS, so it would miss every change of the state the function reads (in
+    // xsim it stayed at its time-0 X until the beat's decoder changed). always_comb follows the
+    // function body's reads.
+    logic arm_conn_ok_w;
+    always_comb arm_conn_ok_w = cfg_conn_ok && conn_arm_ok(cfg_conn, cfg_dec);
+
     always_comb begin
         req_ready = 1'b0;
         for (int d = 0; d < N_DECODERS; d++) begin
             if (cfg_dec == DEC_BITS'(d)) begin
-                req_ready = (req_data.req_total_bytes != 32'd0) ? dec_arm_ready_w[d]
+                req_ready = (req_data.req_total_bytes != 32'd0) ? (dec_arm_ready_w[d] && arm_conn_ok_w)
                                                                 : dec_entry_ready_w[d];
             end
         end
     end
 
-    logic cfg_fire;
-    assign cfg_fire = req_valid && req_ready;
+    logic cfg_fire, arm_fire_w;
+    assign cfg_fire   = req_valid && req_ready;
+    assign arm_fire_w = cfg_fire && cfg_is_arm_w;
 
     // =============================================================================================
     // Connection bring-up. ONE tcp_init, sequenced across connections, plus BR_DRAIN.
@@ -511,35 +583,54 @@ module handler_slots #(
     logic [31:0]           sh_body_remain  [N_DECODERS];
 
     logic [N_DECODERS-1:0] rdr_busy, rdr_flush_busy, rdr_entry_done, rdr_residue_err, rdr_entry_ready;
-    logic [N_DECODERS-1:0] rdr_rd_pending;
+    logic [N_DECODERS-1:0] rdr_rd_pending, rdr_residue_ev, rdr_pop, rdr_head_valid, rdr_fr_clear;
+    logic [CONN_BITS-1:0]  rdr_head_conn [N_DECODERS];
+    logic [CONN_BITS-1:0]  rdr_done_conn [N_DECODERS];
     logic [3:0]            rdr_state [N_DECODERS];
     logic [7:0]            rdr_entry_occ [N_DECODERS];
     logic [3:0]            dec_tx_state [N_DECODERS];
     logic [N_DECODERS-1:0] rdr_progress_w;
     logic [N_CONNS-1:0]    rdr_release [N_DECODERS];
+    logic [N_DECODERS-1:0] sh_idle;
 
-    logic [N_DECODERS-1:0] conn_fatal_for_dec_w;
-    logic [N_DECODERS-1:0] dec_flush_w;
     logic [31:0]           dec_occ_q [N_DECODERS];
 
-    // Per-connection state the decoder loop reads. Declared here because the generate needs them.
-    logic [N_CONNS-1:0] conn_fatal_q, conn_drained_q;
+    // The connection whose request text decoder d's streamer is sending (latched on the arm; the
+    // streamer takes no second arm until the text is out, so it cannot change under a transfer).
+    logic [CONN_BITS-1:0]  stream_conn_q [N_DECODERS];
+
+    // head_is[d][c]: decoder d's reader is serving an entry of connection c right now. Everything a
+    // decoder observes about a response -- framing errors, the watchdog, dirtiness -- belongs to
+    // THIS connection, and nothing else.
+    logic [N_CONNS-1:0]    head_is [N_DECODERS];
+    always_comb begin
+        for (int d = 0; d < N_DECODERS; d++)
+            for (int c = 0; c < N_CONNS; c++)
+                head_is[d][c] = rdr_head_valid[d] && (rdr_head_conn[d] == CONN_BITS'(c));
+    end
+
+    // What the readers need to know about every connection. `dead` is fatal: never comes back, so
+    // its entries are dropped. `up` is a live session; a head entry on a connection that is neither
+    // waits (bring-up / reconnect in progress).
+    logic [N_CONNS-1:0] rdr_conn_up_w;
+    assign rdr_conn_up_w = conn_up_q & ~conn_fatal_q;
 
     for (genvar d = 0; d < N_DECODERS; d++) begin : gen_dec
-        localparam int C = d;   // conn_of_dec(d), fixed at elaboration in stage 1
-
-        // A decoder's framer and reader follow the state of the connection they drain: `clear` and
-        // `flush` are the SAME level, which is what makes the teardown orderable at all.
-        assign dec_flush_w[d] = !conn_up_q[C];
-        assign conn_fatal_for_dec_w[d] = conn_fatal_q[C];
 
         // -- request text out ---------------------------------------------------------------------
+        //
+        // One streamer per DECODER. Its session is the one the arm named; the text of one arm is
+        // sent to completion before the next arm for this decoder is admitted (stream_busy), so
+        // the latched connection is stable for the whole transfer.
+        logic [CONN_BITS-1:0] sc;
+        assign sc = stream_conn_q[d];
+
         http_req_stream #(.CHUNK_BYTES(TX_CHUNK_BYTES)) inst_req_stream (
             .clk(ap_clk), .rst_n(ap_rst_n),
-            .conn_up   (conn_up_q[C] && !conn_fatal_q[C]),
-            .session_id(conn_sid_q[C]),
+            .conn_up   (conn_up_q[sc] && !conn_fatal_q[sc]),
+            .session_id(conn_sid_q[sc]),
             .req_total_bytes(req_data.req_total_bytes),
-            .req_start      (cfg_fire && cfg_is_arm_w && (cfg_dec == DEC_BITS'(d))),
+            .req_start      (arm_fire_w && (cfg_dec == DEC_BITS'(d))),
 
             .s_axis_req_TVALID(s_axis_req_TVALID[d]),
             .s_axis_req_TREADY(s_axis_req_TREADY[d]),
@@ -580,14 +671,17 @@ module handler_slots #(
             .clk(ap_clk), .rst_n(ap_rst_n),
             // One entry per ARM. The arm is the host saying "a GET is on its way out for this
             // decoder": exactly one response, in the slot named here, behind any still queued.
-            .entry_valid      (cfg_fire && cfg_is_arm_w && (cfg_dec == DEC_BITS'(d))),
+            .entry_valid      (arm_fire_w && (cfg_dec == DEC_BITS'(d))),
             .entry_ready      (rdr_entry_ready[d]),
-            .entry_conn       (conn_of_dec(d)),
+            .entry_conn       (cfg_conn),
             .entry_chunk_bytes(req_data.req_chunk_bytes),
             .entry_body_last  (req_data.req_flags[0]),
 
-            .flush     (dec_flush_w[d]),
-            .flush_busy(rdr_flush_busy[d]),
+            .conn_up    (rdr_conn_up_w),
+            .conn_dead  (conn_fatal_q),
+            .flush_busy (rdr_flush_busy[d]),
+            .framer_idle(sh_idle[d]),
+            .framer_clear(rdr_fr_clear[d]),
 
             .landed   (landed),
             .slot_base(slot_base),
@@ -609,6 +703,11 @@ module handler_slots #(
             .conn_release(rdr_release[d]),
             .entry_done  (rdr_entry_done[d]),
             .residue_err (rdr_residue_err[d]),
+            .residue_ev  (rdr_residue_ev[d]),
+            .done_conn   (rdr_done_conn[d]),
+            .pop         (rdr_pop[d]),
+            .head_valid  (rdr_head_valid[d]),
+            .head_conn   (rdr_head_conn[d]),
             .rd_pending  (rdr_rd_pending[d]),
             .head_chunk_bytes(),
             .busy       (rdr_busy[d]),
@@ -630,9 +729,11 @@ module handler_slots #(
 
         strip_http inst_strip_http (
             .clk(ap_clk), .rst_n(ap_rst_n),
-            // Only on a NEW CONNECTION. Between responses the residue holds the next header, and on
-            // this datapath the reader guarantees the bytes are contiguous across that boundary.
-            .clear (dec_flush_w[d]),
+            // While the reader flushes a head whose connection went away, and for one cycle after
+            // every slot release, so no byte of one connection can survive in the framer into the
+            // next connection's response. Between the responses of ONE connection it is NOT
+            // cleared: there the residue holds the next header (pipelined GETs).
+            .clear (rdr_fr_clear[d]),
             .enable(1'b1),
             .body_last(rdr_body_last),
             .resp_ack (rdr_resp_ack),
@@ -653,8 +754,25 @@ module handler_slots #(
             .status_ok    (sh_status_ok[d]),
             .content_length(sh_content_len[d]),
             .body_remaining(sh_body_remain[d]),
-            .out_payload_idx()
+            .out_payload_idx(),
+            .idle(sh_idle[d])
         );
+
+        // -- a TAINTED decoder's output is cut here -------------------------------------------------
+        //
+        // Its byte stream lost a response (see "STAGE 2" in the header), so nothing more of it may
+        // reach the decoder: the framer keeps running -- responses of healthy connections queued on
+        // this decoder must still be framed and retired so those connections drain -- and its body
+        // beats are dropped. The flop keeps the new term out of the framer's ready path.
+        logic taint_cut_q;
+        always_ff @(posedge ap_clk) begin
+            if (!ap_rst_n) taint_cut_q <= 1'b0;
+            else           taint_cut_q <= dec_tainted_q[d];
+        end
+
+        logic rwl_s_tvalid, rwl_s_tready;
+        assign rwl_s_tvalid = raw_tvalid && !taint_cut_q;
+        assign raw_tready   = taint_cut_q ? 1'b1 : rwl_s_tready;
 
         // -- chunk boundaries by byte count, unchanged ----------------------------------------------
         logic                       rwl_tvalid, rwl_tready, rwl_tlast;
@@ -669,7 +787,7 @@ module handler_slots #(
             .cfg_ready(rwl_cfg_ready[d]),
             .cfg_len  (req_data.req_chunk_bytes),
             .cfg_dest (1'b0),
-            .s_tvalid(raw_tvalid), .s_tready(raw_tready),
+            .s_tvalid(rwl_s_tvalid), .s_tready(rwl_s_tready),
             .s_tdata (raw_tdata),  .s_tkeep (raw_tkeep),
             .m_tvalid(rwl_tvalid), .m_tready(rwl_tready),
             .m_tdata (rwl_tdata),  .m_tkeep (rwl_tkeep),
@@ -729,26 +847,21 @@ module handler_slots #(
         assign dec_occ_ok[d] = (dec_occ_q[d] < 32'(QUEUE_DEPTH));
 
         assign dec_entry_ready_w[d] = rwl_cfg_ready[d] && dec_occ_ok[d];
-        // No slot term since revision 4: see "PIPELINED GETs" in the header.
-        assign dec_arm_ready_w[d]   = !stream_busy[d] && rdr_entry_ready[d];
+        // The DECODER half of an arm's admission; the connection half is conn_arm_ok().
+        assign dec_arm_ready_w[d]   = !stream_busy[d] && rdr_entry_ready[d] && !dec_tainted_q[d];
     end
 
-    // Every reader's release, folded per connection. In stage 1 exactly one decoder can ever name a
-    // given connection, so this OR is a wire; WP5 needs it to be an OR and it costs nothing now.
-    //
-    // `rdr_release_idle_w` is the subset that may raise CONN_DRAINED: a release from a reader with
-    // NOTHING queued behind it. A reader also releases when an entry arrived after it had looked at
-    // its queue (S_DONE1) -- correct for the slot, since that GET's bytes cannot have landed yet --
-    // but then an arm IS outstanding, and CONN_DRAINED must never say "empty, nothing armed" while
-    // one is: the host resets its byte budget on it. conn_release is registered, so entry_occ in
-    // the pulse cycle already excludes the retired head and includes any entry pushed meanwhile.
-    logic [N_CONNS-1:0] rdr_release_any_w, rdr_release_idle_w;
+    // Every reader's release, folded per connection. A connection's entries live in one decoder's
+    // queue at a time, so at most one reader drives a given bit; the OR is a wire per bit.
+    logic [N_CONNS-1:0] rdr_release_any_w, rdr_residue_conn_w, rdr_pop_conn_w;
     always_comb begin
         rdr_release_any_w  = '0;
-        rdr_release_idle_w = '0;
+        rdr_residue_conn_w = '0;
+        rdr_pop_conn_w     = '0;
         for (int d = 0; d < N_DECODERS; d++) begin
             rdr_release_any_w = rdr_release_any_w | rdr_release[d];
-            if (rdr_entry_occ[d] == 8'd0) rdr_release_idle_w = rdr_release_idle_w | rdr_release[d];
+            if (rdr_residue_ev[d]) rdr_residue_conn_w = rdr_residue_conn_w | rdr_release[d];
+            if (rdr_pop[d]) rdr_pop_conn_w[rdr_head_conn[d]] = 1'b1;
         end
     end
 
@@ -762,7 +875,7 @@ module handler_slots #(
     //
     // build-119's shape: an abort that is CLEAN and leaves nothing outstanding is a reconnect; an
     // abort that is dirty, or one with work the hardware cannot replay, is fatal and the host
-    // reissues. The only thing that changes is what can abort.
+    // reissues. What a decoder observes is attributed to the connection at its reader's head.
     // =============================================================================================
     logic [N_CONNS-1:0] conn_abort_q, conn_abort_dirty_q;
     logic [N_CONNS-1:0] conn_err_now_w, conn_err_dirty_now_w;
@@ -778,8 +891,10 @@ module handler_slots #(
     // would abort responses that are about to complete out of bytes already in the slot.
     //
     // So it counts only while EVERYTHING is quiet -- no announcement queued for this connection, no
-    // segment of it in the writer, no movement on its reader, and no response waiting to retire --
-    // and any of those restarts it.
+    // segment of it in the writer, its decoder's reader AT this connection with no movement, and no
+    // response waiting to retire -- and any of those restarts it. A connection whose entries are
+    // still queued behind another connection's on its decoder does not count at all yet: its bytes
+    // are in the slot, unread, and the judgement waits until the reader gets there.
     localparam int CLOSE_SETTLE = 1024;
     localparam int CDRAIN_BITS  = $clog2(CLOSE_SETTLE + 1);
     logic [CDRAIN_BITS-1:0] close_drain_q [N_CONNS];
@@ -787,9 +902,10 @@ module handler_slots #(
     logic [N_CONNS-1:0]     close_quiet_w;
 
     always_comb begin
-        for (int d = 0; d < N_DECODERS; d++) begin
-            automatic int c = d;   // conn_of_dec(d)
-            close_quiet_w[c] = conn_up_q[c] && conn_closed[c] && rdr_busy[d] &&
+        for (int c = 0; c < N_CONNS; c++) begin
+            automatic logic [DEC_BITS-1:0] d = cur_dec_q[c];
+            close_quiet_w[c] = conn_up_q[c] && conn_closed[c] && (pend_q[c] != '0) &&
+                               head_is[d][c] &&
                                !rxd_has_pending[c] && conn_quiet_w[c] &&
                                !rdr_progress_w[d] && !sh_resp_done[d] &&
                                // ...and nothing left in the slot to read and no read in flight.
@@ -809,31 +925,38 @@ module handler_slots #(
     always_comb begin
         conn_err_now_w       = '0;
         conn_err_dirty_now_w = '0;
-        for (int d = 0; d < N_DECODERS; d++) begin
-            automatic int c = d;   // conn_of_dec(d)
-            // Five ways a response on this connection cannot be completed. All of them are levels
-            // that hold until the connection is torn down, which is what makes latching them into
-            // conn_abort_q below idempotent.
-            conn_err_now_w[c] = sh_resp_error[d]      // no Content-Length: unframeable
-                              | rdr_residue_err[d]    // bytes in the slot belonging to no response
-                              | rd_timeout_q[d]       // nothing arrived for READ_WDOG_BITS cycles
-                              | close_abort_q[c]      // the peer FINed with a response still owed
-                              | slot_poison_w[c];     // a segment ran past the end of the slot
+        for (int c = 0; c < N_CONNS; c++) begin
+            automatic logic [DEC_BITS-1:0] d = cur_dec_q[c];
+            automatic logic at_head = head_is[d][c];
+            // Five ways a response on this connection cannot be completed. The decoder-side ones
+            // count only while this connection is at its reader's head. All of them hold until the
+            // connection is torn down (or, for the residue, are latched by conn_abort_q), which is
+            // what makes latching them into conn_abort_q below idempotent.
+            conn_err_now_w[c] = (at_head && sh_resp_error[d])   // no Content-Length: unframeable
+                              | rdr_residue_conn_w[c]           // bytes in the slot belonging to no response
+                              | (at_head && rd_timeout_q[d])    // nothing arrived for READ_WDOG_BITS cycles
+                              | close_abort_q[c]                // the peer FINed with a response still owed
+                              | slot_poison_w[c];               // a segment ran past the end of the slot
             // Dirty means body bytes of THIS response already reached the decoder, so a replay
             // would duplicate them. A slot overflow needs no help from this bit to be fatal: the
             // entry is still outstanding, so conn_idle_w is low and conn_must_die_w fires anyway.
-            conn_err_dirty_now_w[c] = conn_err_now_w[c] && sh_resp_dirty[d];
+            conn_err_dirty_now_w[c] = conn_err_now_w[c] && at_head && sh_resp_dirty[d];
         end
     end
 
-    for (genvar c = 0; c < N_CONNS; c++) begin : gen_reconn_want
-        localparam int D = c;   // the decoder this connection feeds, stage 1
+    // Whether any decoder's streamer is sending (or about to send) this connection's request text.
+    logic [N_CONNS-1:0] conn_tx_busy_w;
+    always_comb begin
+        conn_tx_busy_w = '0;
+        for (int d = 0; d < N_DECODERS; d++)
+            if (stream_busy[d]) conn_tx_busy_w[stream_conn_q[d]] = 1'b1;
+    end
 
-        // Nothing to replay: no chunk part-way through, no entry queued in the reader, the transmit
-        // side idle and the slot credit back. rdr_busy is the term build-119 did not need -- there
-        // the reader held no queue of its own.
-        assign conn_idle_w[c] = !rwl_busy[D] && !stream_busy[D] && (dec_occ_q[D] == '0) &&
-                                !rdr_busy[D] && conn_drained_q[c];
+    for (genvar c = 0; c < N_CONNS; c++) begin : gen_reconn_want
+        // Nothing to replay: no GET of this connection armed and unretired, none of its request text
+        // in flight, and the slot credit back. (build-119 asked the lane's chunk queue as well;
+        // chunk entries belong to a DECODER now and say nothing about one connection.)
+        assign conn_idle_w[c] = (pend_q[c] == '0) && !conn_tx_busy_w[c] && conn_drained_q[c];
 
         assign conn_want_reconn_w[c] = conn_up_q[c] && !conn_fatal_q[c] && conn_idle_w[c] &&
                                        ((conn_abort_q[c] && !conn_abort_dirty_q[c]) || conn_closed[c]);
@@ -868,9 +991,18 @@ module handler_slots #(
     logic                   drain_quiet_w;
 
     // Both sides of the connection being torn down have stopped moving bytes. conn_quiet is
-    // slot_writer's (nothing of c between rx_dispatch and the ack); flush_busy is slot_reader's
-    // (nothing left of the read it abandoned).
-    assign drain_quiet_w = conn_quiet_w[bring_conn_q] && !rdr_flush_busy[bring_conn_q];
+    // slot_writer's (nothing of c between rx_dispatch and the ack); on the read side no reader may
+    // still hold an entry of c at its head -- a head of a down or dead connection is being flushed,
+    // and it is let go only once the last beat of its outstanding reads has been swallowed.
+    // (Entries of a dead connection further back in a queue are dropped without a read, so they
+    // do not have to be waited for.)
+    logic rdr_holds_bring_w;
+    always_comb begin
+        rdr_holds_bring_w = 1'b0;
+        for (int d = 0; d < N_DECODERS; d++)
+            if (head_is[d][bring_conn_q]) rdr_holds_bring_w = 1'b1;
+    end
+    assign drain_quiet_w = conn_quiet_w[bring_conn_q] && !rdr_holds_bring_w;
 
     always_comb begin
         br_d          = br_q;
@@ -888,10 +1020,14 @@ module handler_slots #(
         m_axis_close_connection_TDATA  = conn_sid_q[bring_conn_q][TCP_CLOSE_CONN_REQ_BITS-1:0];
 
         case (br_q)
+            // The first arm starts the bring-up at connection 0. An open that FAILS during the
+            // bring-up comes back here and, after the backoff, retries THE SAME connection:
+            // bring_conn_q is left where it is. (It used to restart at 0, which re-opened every
+            // connection already bound -- a second session for the same conn, the first one leaked
+            // in the TOE; with 32 opens in a row a failure somewhere is no longer unlikely.)
             BR_IDLE: begin
                 if (any_armed_q && (retry_wait_q == '0)) begin
-                    bring_conn_d = '0;
-                    br_d         = BR_OPEN;
+                    br_d = BR_OPEN;
                 end
             end
             BR_OPEN: begin
@@ -958,6 +1094,8 @@ module handler_slots #(
     logic [N_CONNS-1:0]    conn_init_err_q, conn_resp_err_q, conn_status_bad_q;
     logic [N_CONNS-1:0]    conn_dead_q, conn_dirty_q, conn_ovf_q;
     logic [N_DECODERS-1:0] residue_seen_q;
+    logic [N_CONNS-1:0]    conn_rd_timeout_q, conn_tx_refused_q, conn_residue_q, conn_taint_q;
+    logic [N_DECODERS-1:0] stream_refused_prev_q;
     logic                  conn_stall_q;
     localparam int STALL_BITS = $clog2(STALL_CYCLES) + 1;
     logic [STALL_BITS-1:0] conn_cnt_q;
@@ -994,10 +1132,24 @@ module handler_slots #(
             for (int c = 0; c < N_CONNS; c++) close_drain_q[c] <= CDRAIN_BITS'(CLOSE_SETTLE);
             conn_stall_q  <= 1'b0;
             conn_cnt_q    <= '0;
-            for (int c = 0; c < N_CONNS; c++) conn_sid_q[c] <= 16'd0;
+            for (int c = 0; c < N_CONNS; c++) begin
+                conn_sid_q[c] <= 16'd0;
+                pend_q[c]     <= '0;
+                // A connection's "home" decoder until its first arm: c mod N_DECODERS, which is c
+                // itself in stage 1. CONN_READY's arm/entry bits describe this decoder.
+                cur_dec_q[c]  <= DEC_BITS'(c % N_DECODERS);
+            end
+            conn_rd_timeout_q     <= '0;
+            conn_tx_refused_q     <= '0;
+            conn_residue_q        <= '0;
+            conn_taint_q          <= '0;
+            dec_tainted_q         <= '0;
+            stream_refused_prev_q <= '0;
             for (int d = 0; d < N_DECODERS; d++) begin
-                dec_occ_q[d] <= '0;
-                rd_wdog_q[d] <= '0;
+                dec_occ_q[d]     <= '0;
+                rd_wdog_q[d]     <= '0;
+                tail_conn_q[d]   <= '0;
+                stream_conn_q[d] <= '0;
             end
         end else begin
             br_q         <= br_d;
@@ -1010,7 +1162,7 @@ module handler_slots #(
             if ((br_q == BR_DRAIN) && drain_quiet_w && (settle_q != '0)) settle_q <= settle_q - 1'b1;
             else if (br_q != BR_DRAIN || !drain_quiet_w) settle_q <= SETTLE_BITS'(RELEASE_SETTLE);
 
-            if (cfg_fire && cfg_is_arm_w) begin
+            if (arm_fire_w) begin
                 server_ip_q   <= req_data.server_ip;
                 server_port_q <= req_data.server_port;
                 any_armed_q   <= 1'b1;
@@ -1033,17 +1185,34 @@ module handler_slots #(
 
             // -- the slot-drained bit, and the abort latch, per connection ----------------------
             for (int c = 0; c < N_CONNS; c++) begin
+                // PLACEMENT. An arm charges its connection one pending entry and records which
+                // decoder it is queued on; a reader retiring or dropping an entry of c returns one.
+                automatic logic arm_c = arm_fire_w && (cfg_conn == CONN_BITS'(c));
+                automatic logic pop_c = rdr_pop_conn_w[c];
+                if (arm_c && !pop_c)      pend_q[c] <= pend_q[c] + 1'b1;
+                else if (!arm_c && pop_c) pend_q[c] <= pend_q[c] - 1'b1;
+                if (arm_c) cur_dec_q[c] <= cfg_dec;
+
                 // A release -- the reader's when the connection ran dry, or the teardown's -- says
                 // the slot is empty. An ARM on this connection says it is not, and WINS a tie: the
                 // bit must never read "empty, nothing armed" while an arm is outstanding, because
-                // that is when the host resets its byte budget for the slot. (A release in the same
-                // cycle as an arm is correct for the slot -- the new GET's bytes cannot have landed
-                // yet -- so the only cost of the tie rule is a budget that stays conservative.)
-                if (cfg_fire && cfg_is_arm_w && (conn_of_dec(int'(cfg_dec)) == CONN_BITS'(c)))
+                // that is when the host resets its byte budget for the slot. A reader's release
+                // counts only when no entry of c is left (pend_q already reflects the pop that
+                // came with the release, a cycle earlier): an arm that slipped in after the reader
+                // decided to release is queued behind it and starts from the empty slot.
+                if (arm_c)
                     conn_drained_q[c] <= 1'b0;
-                else if (rdr_release_idle_w[c] ||
+                else if ((rdr_release_any_w[c] && (pend_q[c] == '0)) ||
                          (slot_rel_en_w && (slot_rel_conn_w == CONN_BITS'(c))))
                     conn_drained_q[c] <= 1'b1;
+
+                // A connection that goes fatal with entries still pending leaves a hole in the byte
+                // stream of the decoder they are queued on: that decoder is TAINTED for good.
+                if (conn_fatal_q[c] && (pend_q[c] != '0)) begin
+                    dec_tainted_q[cur_dec_q[c]] <= 1'b1;
+                    conn_taint_q[c]             <= 1'b1;
+                end
+                if (rdr_residue_conn_w[c]) conn_residue_q[c] <= 1'b1;
 
                 // The abort latch is cleared by the SLOT release rather than by the session
                 // release: slot_poison[c] lives until the slot goes, so clearing it at BR_CLOSE
@@ -1087,37 +1256,49 @@ module handler_slots #(
             end
 
             // -- per-decoder accounting ----------------------------------------------------------
+            stream_refused_prev_q <= stream_refused;
             for (int d = 0; d < N_DECODERS; d++) begin
-                automatic int c = d;   // conn_of_dec(d)
                 automatic logic push = cfg_fire && cfg_is_entry_w && (cfg_dec == DEC_BITS'(d));
                 automatic logic pop  = m_axis_body_tvalid[d] && m_axis_body_tready[d]
                                        && m_axis_body_tlast[d];
+                automatic logic [CONN_BITS-1:0] h = rdr_head_conn[d];
                 case ({push, pop})
                     2'b10: dec_occ_q[d] <= dec_occ_q[d] + 1'b1;
                     2'b01: dec_occ_q[d] <= (dec_occ_q[d] == '0) ? '0 : dec_occ_q[d] - 1'b1;
                     default: ;
                 endcase
 
-                if (sh_resp_error[d] || rdr_residue_err[d]) conn_resp_err_q[c] <= 1'b1;
-                if (rdr_residue_err[d])                     residue_seen_q[d]  <= 1'b1;
+                if (arm_fire_w && (cfg_dec == DEC_BITS'(d))) begin
+                    tail_conn_q[d]   <= cfg_conn;
+                    stream_conn_q[d] <= cfg_conn;
+                end
+
+                if (rdr_head_valid[d] && sh_resp_error[d]) conn_resp_err_q[h] <= 1'b1;
+                if (rdr_residue_err[d])                    residue_seen_q[d]  <= 1'b1;
+                if (stream_refused[d] && !stream_refused_prev_q[d])
+                    conn_tx_refused_q[stream_conn_q[d]] <= 1'b1;
 
                 // Status is only meaningful while the framer that produced it still exists, and it
                 // is sampled on the RETIREMENT of a response (entry_done) rather than on a level:
                 // strip_http latches status at the header LF of the response it is about to frame,
                 // so this is provably that response's code and not the next one's.
-                if (conn_up_q[c] && rdr_entry_done[d] && !sh_status_ok[d])
-                    conn_status_bad_q[c] <= 1'b1;
+                if (conn_up_q[rdr_done_conn[d]] && rdr_entry_done[d] && !sh_status_ok[d])
+                    conn_status_bad_q[rdr_done_conn[d]] <= 1'b1;
 
-                // Progress watchdog, per decoder. Counts only while an entry is outstanding on a
-                // healthy connection; any movement on the read path reloads it.
-                if (!rdr_busy[d] || !conn_up_q[c] || conn_fatal_q[c] || rdr_progress_w[d]) begin
+                // Progress watchdog, per decoder. Counts only while the reader holds an entry of a
+                // healthy connection at its head; any movement on the read path reloads it. The
+                // timeout is pinned on that connection (conn_err_now_w) and cleared again once the
+                // reader has let go of the head -- by then the connection is fatal and flushed, and
+                // the next head is somebody else's.
+                if (!rdr_head_valid[d] || !conn_up_q[h] || conn_fatal_q[h] || rdr_progress_w[d]) begin
                     rd_wdog_q[d] <= '0;
                 end else if (rd_wdog_q[d] != '1) begin
                     rd_wdog_q[d] <= rd_wdog_q[d] + 1'b1;
                 end else begin
                     rd_timeout_q[d] <= 1'b1;
                 end
-                if (dec_flush_w[d]) rd_timeout_q[d] <= 1'b0;
+                if (rd_timeout_q[d] && rdr_head_valid[d]) conn_rd_timeout_q[h] <= 1'b1;
+                if (rdr_flush_busy[d] || !rdr_head_valid[d]) rd_timeout_q[d] <= 1'b0;
             end
 
             if (br_q == BR_OPEN) begin
@@ -1146,7 +1327,10 @@ module handler_slots #(
                         6'd0,
                         rdr_state[0], init_state_debug, 4'd0};
 
-    assign inflightWord = {CSR_REVISION, 4'(N_CONNS), req_ready, (&conn_up_q),
+    // [23:20] is four bits wide (revision 1): 15 means "15 or more", and read id 20 / 32 carry the
+    // real count.
+    localparam logic [3:0] N_CONNS_NIB = (N_CONNS > 15) ? 4'd15 : 4'(N_CONNS);
+    assign inflightWord = {CSR_REVISION, N_CONNS_NIB, req_ready, (&conn_up_q),
                            |conn_closed, |rxd_has_pending,
                            depth_sat, occ_sat};
 
@@ -1210,9 +1394,15 @@ module handler_slots #(
             conn_tx_nib[d]   = dec_tx_state[d];
         end
         for (int c = 0; c < N_CONNS; c++) begin
+            // ARM/ENTRY describe the connection's CURRENT decoder (cur_dec_q: where its entries
+            // are queued, or its home decoder c mod N_DECODERS before its first arm) -- which in
+            // stage 1 is decoder c, exactly revision 3/4's meaning. A drained connection may also
+            // be armed on any other decoder; DEC_STATE (read id 33) has their halves.
+            automatic logic [DEC_BITS-1:0] d = cur_dec_q[c];
             conn_ready_nib[c] = {conn_fatal_q[c], conn_up_q[c],
-                                 dec_entry_ready_w[c], dec_arm_ready_w[c]};
-            conn_err_byte[c]  = {conn_ovf_q[c], rd_timeout_q[c], stream_refused[c],
+                                 dec_entry_ready_w[d],
+                                 dec_arm_ready_w[d] && conn_arm_ok(CONN_BITS'(c), d)};
+            conn_err_byte[c]  = {conn_ovf_q[c], conn_rd_timeout_q[c], conn_tx_refused_q[c],
                                  conn_status_bad_q[c], conn_resp_err_q[c], conn_init_err_q[c],
                                  conn_dirty_q[c], conn_dead_q[c]};
             drained_vec_w[c]  = conn_drained_q[c];
@@ -1231,6 +1421,20 @@ module handler_slots #(
             for (int k = 0; k < 16; k++) connReadyWord[w][4*k +: 4] <= conn_ready_nib[16*w + k];
         end
         connDrainedWord <= {overflow_vec_w, drained_vec_w};
+
+        // Revision 5, read ids 33..38.
+        connExtWord <= '0;
+        for (int d = 0; d < N_DECODERS; d++)
+            connExtWord[0][8*d +: 8] <= {rdr_state[d], stream_busy[d], dec_tainted_q[d],
+                                         dec_entry_ready_w[d], dec_arm_ready_w[d]};
+        for (int c = 0; c < N_CONNS; c++) begin
+            connExtWord[1 + c/8][8*(c%8) +: 8] <=
+                {(pend_q[c] > PEND_BITS'(15)) ? 4'd15 : 4'(pend_q[c]),
+                 (pend_q[c] != '0) && (tail_conn_q[cur_dec_q[c]] == CONN_BITS'(c)),
+                 3'(cur_dec_q[c])};
+            connExtWord[5][c]      <= conn_residue_q[c];
+            connExtWord[5][32 + c] <= conn_taint_q[c];
+        end
 
         laneOccWord   <= connOccWord[0];
         laneErrWord   <= connErrWord[0];
@@ -1254,7 +1458,7 @@ module handler_slots #(
     assign lanePolicyWord = {2'd0, 6'(POLICY_STALL_LOG2), POLICY_STALL_CYC,
                              POLICY_QDEPTH, 8'(N_CONNS), CSR_REVISION};
 
-    //   [7:0]   CSR revision (3)     [15:8]  N_CONNS             [23:16] N_DECODERS
+    //   [7:0]   CSR revision (3..5)  [15:8]  N_CONNS             [23:16] N_DECODERS
     //   [29:24] SLOT_LOG2            [35:30] log2(RD_MAX)        [51:36] ENTRY_DEPTH
     //   [63:52] log2(SLOT_FIFO_DEPTH), zero above
     assign slotPolicyWord = {6'd0, 6'($clog2(SLOT_FIFO_DEPTH)), POLICY_EDEPTH,

@@ -462,6 +462,25 @@ can no longer stall the shared TOE fifo. Depth-1 model: 512 KiB per (2.5 ms tran
    Stage-2 caveat: a decoder that serves several connections must not have a same-connection GET
    queued behind another connection's entry, or that slot is released under the later response.
 
+   **Stage 2 — CSR revision 5 (2026-09-23): more connections than decoders.** The arm names its
+   connection (`REQ_CHUNK_BYTES[44:40]`) beside its decoder, and any connection may feed any
+   decoder. The caveat above is enforced at the config port instead of trusted to the host: an arm
+   for connection *c* on decoder *d* is admitted only if *c* is **free** (`CONN_DRAINED`, nothing
+   pending) or *d*'s **tail** (the last arm *d* took named *c*). A connection's entries are therefore
+   contiguous in one decoder's queue, the reader switches connections only where the slot is empty,
+   and it additionally checks that `strip_http` holds nothing (`idle`) and clears it on every
+   release — so one framer serves several connections with no per-connection framer state and no
+   re-reads. A **fatal** connection's queued entries are dropped as they reach the head (they would
+   otherwise block the healthy connections behind them), and because its decoder's byte stream now
+   has a hole, that decoder is **tainted**: its output is cut after the framer, arms for it are
+   refused, and the host treats it as a fatal lane; the connections that were queued on it still
+   drain and are reused elsewhere. `SLOT_LOG2 = 30 − clog2(N_CONNS)` (25 at 24 or 32). New reads
+   33–38: `DEC_STATE` (per decoder: arm, entry, tainted, stream busy, reader state), `CONN_MAP`
+   (per connection: decoder, tail, pending) and `CONN_CAUSE`. The host places GETs
+   (`HTTPReadConfig::pick_conn`: a free connection round robin, else pipeline on the tail),
+   `OASIS_HTTP_CONNS` limits how many of the bitstream's connections it uses. Benches:
+   `unit-tests/slot_reader` `rswitch`/`roverrun`/`rdead`, `unit-tests/lane_drain --dut s2`.
+
 ### CSR rev 3 — per-connection visibility and the slot base
 
 **Date:** 2026-09-20 · Implemented in `http_config.sv` under `CSR_REV` (**default 2**), driven by

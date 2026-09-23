@@ -258,12 +258,44 @@ import http_types::*;
 //     bit set must fit in 2^SLOT_LOG2 (the slot is a bump allocator that resets when drained).
 //   * SLOT_POLICY [29:24] SLOT_LOG2 is 28 in stage 1 (256 MiB x 4 connections = the 1 GiB page).
 //   RESP_ERR's residue cause now reads "bytes left in the slot when the connection ran dry".
+//
+// CSR REVISION 5 -- MORE CONNECTIONS THAN DECODERS (handler_slots stage 2, 2026-09-23)
+// ---------------------------------------------------------------------------------
+// Everything of revision 4 stays where it is. Additions:
+//   WRITE REQ_CHUNK_BYTES (41) [44:40] REQ_CONN: the connection an ARM beat is sent on ([35:32]
+//        is still the decoder). Entry beats ignore it. Below revision 5 the connection is the
+//        decoder and these bits are not decoded.
+//   An ARM for connection c on decoder d is admitted only when d can take one (DEC_STATE +0) and c
+//   is either FREE (CONN_DRAINED[c] and nothing pending on it) or the TAIL of d's entry queue (the
+//   last arm d took named c, and c still has entries). That keeps each connection's GETs
+//   contiguous in one decoder's queue, which is what lets one framer serve several connections.
+//   A fatal connection or a tainted decoder is never admitted: poll them first.
+//   CONN_READY (25..26) nibble +0/+1 now describe the connection's CURRENT decoder (where its
+//   entries are queued; before its first arm, decoder c mod N_DECODERS) -- decoder c in stage 1.
+//   CONN_ERR (27..30) +5/+6 (TX_REFUSED / READ_TIMEOUT) are pinned on the connection that was being
+//   served, not on a decoder index.
+//   33     DEC_STATE      one byte per DECODER d at [8d+7:8d]:
+//                           +0 ARM_READY    request text of the last arm gone out, entry queue room,
+//                                           not tainted (the decoder half of an arm's admission)
+//                           +1 ENTRY_READY  the chunk queue has room
+//                           +2 TAINTED      a connection went fatal with a response still queued on
+//                                           this decoder: its stream has a hole and its output is
+//                                           cut for good. The host's "fatal lane".
+//                           +3 STREAM_BUSY  request text in flight
+//                           [7:4]           slot_reader state
+//   34..37 CONN_MAP       one byte per CONNECTION c at [8(c%8)+7:8(c%8)] of word 34 + c/8:
+//                           [2:0] current decoder, [3] c is its decoder's TAIL (and has entries),
+//                           [7:4] entries pending on c (armed, not retired or dropped; saturates 15)
+//   38     CONN_CAUSE     [c] residue at a release (RESP_ERR's second cause, per connection),
+//                         [32+c] c went fatal with entries pending, i.e. it tainted its decoder.
+//   INFLIGHT[23:20] saturates at 15 connections; SLOT_POLICY [15:8] has the real count.
 // =================================================================================================
 module HttpConfig #(
     parameter integer NUM_PARAM_REGS = 42,
     parameter integer START_ADDR     = 39,
-    // 2 = the sealed build-119 map (handler_multi). 3 = the per-connection map above
-    // (handler_slots). Nothing but this parameter distinguishes them.
+    // 2 = the sealed build-119 map (handler_multi). 3/4 = the per-connection map above
+    // (handler_slots); 5 = that plus read ids 33..38 and REQ_CONN (stage 2). Nothing but this
+    // parameter distinguishes them.
     parameter integer CSR_REV        = 2
 ) (
     input  logic clk,
@@ -307,6 +339,9 @@ module HttpConfig #(
     input  logic [3:0][63:0] conn_err_word,
     input  logic      [63:0] conn_drained_word,
     input  logic      [63:0] slot_policy_word,
+
+    // -- CSR revision 5 (stage 2): read ids 33..38, see the map above. Unconnected below it.
+    input  logic [5:0][63:0] conn_ext_word,
 
     // -- CSR revision 3: base of the connection slot array in card memory, from SLOT_BASE_LO/HI.
     //    Zero at revision 2, where the registers that would drive it are not instantiated.
@@ -484,6 +519,7 @@ always_comb begin
     cfg.req_total_bytes = reg_req_total_bytes[31:0];
     cfg.req_chunk_bytes = reg_req_chunk_bytes[31:0];
     cfg.req_chunk_dest  = reg_req_chunk_bytes[35:32];
+    cfg.req_conn        = reg_req_chunk_bytes[44:40];
     cfg.range_begin_len = reg_range_begin_len[7:0];
     cfg.range_begin_w0  = reg_range_begin_w0 [31:0];
     cfg.range_begin_w1  = reg_range_begin_w1 [31:0];
@@ -527,7 +563,7 @@ assign start_raw.ready = start_cfg.ready;
 // 21 at revision 2 (0..20). Revision 3 appends 21..32; the read register file answers anything
 // above NUM_READ_REGS-1 with resp_error, which is the whole compatibility scheme -- a host that
 // reads register 21 off a revision-2 bitstream gets an error, not a plausible zero.
-localparam int NUM_READ_REGS = (CSR_REV >= 3) ? 33 : 21;
+localparam int NUM_READ_REGS = (CSR_REV >= 5) ? 39 : (CSR_REV >= 3) ? 33 : 21;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -597,6 +633,11 @@ generate
         end
         assign read_registers[31] = conn_drained_word;
         assign read_registers[32] = slot_policy_word;
+    end
+    if (CSR_REV >= 5) begin : gen_rev5_reads
+        for (genvar w = 0; w < 6; w++) begin : gen_conn_ext
+            assign read_registers[33 + w] = conn_ext_word[w];
+        end
     end
 endgenerate
 
