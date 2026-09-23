@@ -82,8 +82,9 @@ class LocalSourceOperator final : public SourceOperator {
 class DecodeColumnChunkOperator final : public Operator {
   public:
     DecodeColumnChunkOperator(parcore::metadata::Compression compression, uint64_t num_values,
-                              libstf::type_t type)
-        : compression_(compression), num_values_(num_values), type_(type) {}
+                              libstf::type_t type, bool has_def_levels, bool has_rep_levels)
+        : compression_(compression), num_values_(num_values), type_(type),
+          has_def_levels_(has_def_levels), has_rep_levels_(has_rep_levels) {}
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
@@ -92,6 +93,8 @@ class DecodeColumnChunkOperator final : public Operator {
     parcore::metadata::Compression compression_;
     uint64_t                       num_values_;
     libstf::type_t                 type_;
+    bool                           has_def_levels_;
+    bool                           has_rep_levels_;
 };
 
 /**

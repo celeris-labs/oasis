@@ -320,7 +320,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		} else {
 			flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 		}
-		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
+		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
+		                                                                 cc.has_def_levels, cc.has_rep_levels));
 		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(type));
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
 		splinter.streams.push_back(std::move(flow));
