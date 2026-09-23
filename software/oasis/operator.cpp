@@ -7,13 +7,16 @@
 #include <coyote/cDefs.hpp>
 #include <coyote/cOps.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace oasis {
 
@@ -104,6 +107,8 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
             batch.text += probe.text;
             batch.chunk_bytes.insert(batch.chunk_bytes.end(), probe.chunk_bytes.begin(),
                                      probe.chunk_bytes.end());
+            batch.request_bytes.insert(batch.request_bytes.end(), probe.request_bytes.begin(),
+                                       probe.request_bytes.end());
             chunk_hi++;
         }
         // A single column chunk that alone exceeds the queue would loop forever otherwise.
@@ -115,7 +120,18 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
                 " queue entries, more than the hardware holds (" + std::to_string(max_per_batch) +
                 ").");
         }
-        oasis::PadRequestTextToBeat(batch.text);
+        // Revision 3 pads every GET on its own in emit_batch_slots(): there each GET is a transfer
+        // of its own, and padding only the last one would leave the others with a DMA tail that the
+        // hardware's drain would swallow together with the start of the next request.
+        if (!config->slot_mode()) {
+            const size_t before = batch.text.size();
+            oasis::PadRequestTextToBeat(batch.text);
+            // Keep the per-request lengths adding up to the text: the padding is inserted into
+            // the LAST request.
+            if (!batch.request_bytes.empty()) {
+                batch.request_bytes.back() += static_cast<uint32_t>(batch.text.size() - before);
+            }
+        }
         emit_batch(stream, ctx, batch);
 
         // The decoder's handshake counters alongside every batch line. Without them a trace shows
@@ -162,12 +178,49 @@ void HTTPBatchSourceOperator::build_chunk(HTTPReadConfig &config, const Chunk &c
     config.read_streamed(server_ip_, server_port_, path_, c.offset, c.offset + c.size - 1, batch);
 }
 
+namespace {
+
+// A batch carries ONE lane for all its chunks, so every chunk in it must belong to the stream
+// this operator runs on. That holds when each flow submits its own chunk (OASIS_HTTP_BATCH=0):
+// the decode config and the request are applied on the same stream by construction.
+//
+// It does NOT hold for a row-group batch, whose chunks come from sibling flows the scheduler
+// may have placed on other streams. With one decoder that was harmless -- every stream was 0.
+// With more than one it would route a column's bytes to a decoder configured for a different
+// column, which corrupts silently. Refuse rather than corrupt.
+void RefuseCrossStreamBatch(OasisContext &ctx, const HTTPReadConfig::RequestBatch &batch) {
+    if (batch.chunk_bytes.size() > 1) {
+        const auto decoders = ctx.config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
+        if (decoders > 1) {
+            throw std::runtime_error(
+                "HTTPBatchSourceOperator: a multi-chunk batch cannot target " +
+                std::to_string(decoders) +
+                " decoders -- its chunks may belong to different streams. Run with "
+                "OASIS_HTTP_BATCH=0 (one request per column chunk), or give the batch a per-chunk "
+                "lane before enabling multi-decoder batching. This is also the required mode on a "
+                "multi-session bitstream (--multi): there each lane owns its own TCP connection and "
+                "its own request-text stream, so a batch spanning lanes has no single destination "
+                "to be DMA'd to.");
+        }
+    }
+}
+
+} // namespace
+
 void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &ctx,
                                          const HTTPReadConfig::RequestBatch &batch) {
     if (batch.chunk_bytes.empty()) {
         return;
     }
     auto config = ctx.config<HTTPReadConfig>();
+    RefuseCrossStreamBatch(ctx, batch);
+
+    // CSR revision 3 (HBM slots): one arm per GET, each waiting for its connection's slot to be
+    // drained. Everything below this branch is the revision-2 path, unchanged.
+    if (config->slot_mode()) {
+        emit_batch_slots(ctx, *config, batch, config->lane_for_stream(stream));
+        return;
+    }
 
     // Into a Coyote-visible buffer. LOCAL_READ needs a 64 B-aligned source or it emits databeats
     // with a broken keep signal, which the memory pool guarantees.
@@ -207,35 +260,15 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
 
     // Tell the hardware what is coming: one bit per expected response, then the arm. This must
     // precede the DMA -- the arm is what opens the connection, and the queue entries have to be in
-    // place before any response can arrive.
-    // A batch carries ONE lane for all its chunks, so every chunk in it must belong to the stream
-    // this operator runs on. That holds when each flow submits its own chunk (OASIS_HTTP_BATCH=0):
-    // the decode config and the request are applied on the same stream by construction.
-    //
-    // It does NOT hold for a row-group batch, whose chunks come from sibling flows the scheduler
-    // may have placed on other streams. With one decoder that was harmless -- every stream was 0.
-    // With more than one it would route a column's bytes to a decoder configured for a different
-    // column, which corrupts silently. Refuse rather than corrupt.
-    if (batch.chunk_bytes.size() > 1) {
-        const auto decoders = ctx.config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
-        if (decoders > 1) {
-            throw std::runtime_error(
-                "HTTPBatchSourceOperator: a multi-chunk batch cannot target " +
-                std::to_string(decoders) +
-                " decoders -- its chunks may belong to different streams. Run with "
-                "OASIS_HTTP_BATCH=0 (one request per column chunk), or give the batch a per-chunk "
-                "lane before enabling multi-decoder batching. This is also the required mode on a "
-                "multi-session bitstream (--multi): there each lane owns its own TCP connection and "
-                "its own request-text stream, so a batch spanning lanes has no single destination "
-                "to be DMA'd to.");
-        }
-    }
+    // place before any response can arrive. (The cross-stream refusal that used to sit here runs
+    // at the top of this function now, before anything is allocated.)
     // ONE lane for the whole batch, decided here and passed to everything that needs it. It used to
     // be re-derived at each use -- submit_batch from `stream & 0xF`, the DMA sink from
     // `stream % lanes` -- which are the same number only while the scheduler keeps its stream count
     // at or below the bitstream's lane count. When they disagreed, a batch's queue entries and its
     // request text went to DIFFERENT lanes, and nothing on either side could notice.
     const uint8_t lane = config->lane_for_stream(stream);
+
     config->submit_batch(server_ip_, server_port_, batch, lane);
 
     // Then the text itself.
@@ -301,6 +334,105 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     // lane's answer to a different question. The wait would then end early and the buffer be freed
     // under a DMA still reading it.
     config->await_cfg_ready("request text to finish sending", lane, HTTPReadConfig::LaneAdmit::Arm);
+}
+
+// CSR revision 3 (HBM slots, handler_slots): the same protocol as the revision-2 path above, one GET
+// at a time.
+//
+// WHY ONE ARM PER GET. A connection's slot in card memory holds ONE response: the reader drains it
+// into the decoder's framer and may only move on once the slot is empty (strip_http keeps mid-beat
+// residue across responses). The hardware enforces that by giving each arm exactly one reader entry
+// and by holding ARM_READY low until the slot is released. So a text announcing several GETs under
+// one arm -- which is all the revision-2 path ever does -- would land several responses in a slot the
+// reader drains as one, and the connection would go FATAL on the residue. Each GET is therefore its
+// own arm, its own DMA and, because the hardware drains its request stream to the DMA's TLAST, its
+// own beat-padded region of the buffer.
+//
+// When there is more than one GET (a column chunk larger than max_get_bytes(), or an
+// OASIS_HTTP_CHUNK_BYTES split), arm k+1 waits inside arm_transfer() for response k to drain, and
+// that wait runs on the dispatcher thread. It is correct and it is slow: other lanes get no NEW work
+// placed while it lasts. At the default row-group sizes every chunk is one GET, so this path is the
+// exception; the fix, if it ever matters, is host-side splitting into separate flows (stage 2, WP6).
+//
+// The chunk-length entries go first, all of them, exactly as on revision 2: one per COLUMN CHUNK,
+// however many GETs it was split into, because axis_rewrite_last marks tlast by byte count.
+void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig &config,
+                                               const HTTPReadConfig::RequestBatch &batch,
+                                               uint8_t lane) {
+    auto requests = HTTPReadConfig::SplitRequests(batch);
+    if (requests.empty()) {
+        return;
+    }
+
+    // Pad every GET to a whole beat on its own (see PadRequestTextToBeat), and lay them out at
+    // 64-byte aligned offsets in ONE buffer: LOCAL_READ needs an aligned source, and each GET is a
+    // separate transfer ending in its own TLAST.
+    constexpr size_t beat = 64;
+    std::vector<size_t> offs, lens;
+    size_t              total = 0;
+    for (auto &r : requests) {
+        oasis::PadRequestTextToBeat(r);
+        offs.push_back(total);
+        lens.push_back(r.size());
+        total += ((r.size() + beat - 1) / beat) * beat;
+    }
+    libstf::Status status;
+    auto           buf = libstf::make_buffer(ctx.memory_pool(), total, status);
+    if (!buf) {
+        throw std::runtime_error("HTTPBatchSourceOperator: could not allocate " +
+                                 std::to_string(total) + " bytes for request text");
+    }
+    auto *byte_ptr = static_cast<std::byte *>(buf->ptr);
+    std::memset(byte_ptr, 0, total);
+    for (size_t i = 0; i < requests.size(); i++) {
+        std::memcpy(byte_ptr + offs[i], requests[i].data(), requests[i].size());
+    }
+    buf->size = total;
+    ctx.tlb_manager()->ensure_tlb_mapping(buf->ptr, buf->capacity);
+    // Lives as long as this operator, i.e. until the flow retires -- which needs every response,
+    // which needs every GET to have been sent. So the DMA can never outlive its source.
+    text_buffers_.push_back(buf);
+
+    config.push_entries(batch, lane);
+
+    // The request-text sink is the lane on a multi-connection bitstream (see emit_batch).
+    const uint8_t          lanes    = config.lane_count();
+    const libstf::stream_t req_dest = (lanes > 1) ? static_cast<libstf::stream_t>(lane)
+                                                  : static_cast<libstf::stream_t>(0);
+    for (size_t i = 0; i < requests.size(); i++) {
+        // The REAL length, not the padded one: the hardware sends exactly this many bytes and
+        // swallows the rest of the transfer up to TLAST.
+        config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(lens[i]), lane);
+        // Proof the arm was taken before anything else is written -- the next GET's arm, or the
+        // next flow's entries, would otherwise rewrite the registers it is sampled from.
+        config.await_arm_consumed(lane);
+
+        const size_t padded = ((lens[i] + beat - 1) / beat) * beat;
+        for (size_t off = 0; off < padded; off += coyote::MAX_TRANSFER_SIZE) {
+            coyote::localSg sg;
+            sg.addr   = reinterpret_cast<void *>(byte_ptr + offs[i] + off);
+            sg.len    = std::min(padded - off, coyote::MAX_TRANSFER_SIZE);
+            sg.stream = coyote::STRM_HOST;
+            sg.dest   = req_dest;
+            // TLAST on every GET's final beat: http_req_stream drains to TLAST after the
+            // announced length, so a transfer spanning two GETs would lose the second.
+            const bool last = off + coyote::MAX_TRANSFER_SIZE >= padded;
+            ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last);
+        }
+    }
+
+    // No wait for "the text has gone out" here, unlike the revision-2 path. There that wait is
+    // ARM_READY, which is !stream_busy on handler_multi. On handler_slots ARM_READY also carries the
+    // depth-1 credit, so the same wait would block this (dispatcher) thread until the whole
+    // RESPONSE had been drained, serialising every lane behind this one. And it is not needed: the
+    // arm was proven consumed above, and the buffer lives until the flow retires (see above).
+    if (http_debug_enabled()) {
+        std::fprintf(stderr,
+                     "[oasis-http] slot batch: lane %u, %zu column chunk(s), %zu GET(s), %zu bytes of "
+                     "request text | %s\n",
+                     unsigned(lane), batch.chunk_bytes.size(), requests.size(), total,
+                     config.conns().describe().c_str());
+    }
 }
 
 void HTTPBatchSourceOperator::print(std::ostream &os) const {

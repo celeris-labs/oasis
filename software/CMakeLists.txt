@@ -54,6 +54,14 @@ find_package(Threads REQUIRED)
 target_link_libraries(oasis PRIVATE Coyote libstf parcore Threads::Threads)
 target_include_directories(oasis PRIVATE ${COYOTE_INCLUDE_DIRS} ${LIBSTF_INCLUDE_DIRS} ${PARCORE_INCLUDE_DIRS})
 
+# Board-free check of the HttpConfig readback decoders (CSR revisions 2 and 3). Off by default; it
+# is a developer gate, not part of the installed library.
+option(OASIS_BUILD_TESTS "Build the board-free CSR decode check" OFF)
+if(OASIS_BUILD_TESTS)
+    add_executable(csr_decode_check tests/csr_decode_check.cpp)
+    target_link_libraries(csr_decode_check PRIVATE oasis Coyote libstf)
+endif()
+
 include(GNUInstallDirs)
 
 # Install the library

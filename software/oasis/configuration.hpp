@@ -51,6 +51,27 @@ constexpr const uint8_t HTTP_CSR_REVISION_LANES = 2;
 /// swapped for a 4-lane one. See the read map in hardware/src/hdl/http_read/http_config.sv.
 constexpr const uint8_t HTTP_LANE_SLOTS = 8;
 
+/// CSR revision at which the bitstream is the HBM-SLOT handler (handler_slots, ADR-5): every
+/// connection owns a slot in card memory, the host must hand the hardware that memory
+/// (SLOT_BASE_LO/HI, write ids 42/43) before the first arm, and each connection holds ONE
+/// outstanding GET at a time (read ids 21..32 exist). Reported in inflightWord[31:24] like revision 2.
+///
+/// Everything revision 3 needs is gated on this at RUN TIME, never at build time: the same library
+/// must drive a revision-2 bitstream (build-119, build-125) exactly as it did before. Revision 3 keeps
+/// read ids 16..20 in their revision-2 shape (connections 0..7), so everything gated on
+/// HTTP_CSR_REVISION_LANES keeps working on it unchanged; what changes is what the host may ASK for.
+constexpr const uint8_t HTTP_CSR_REVISION_SLOTS = 3;
+
+/// Connections the revision-3 per-connection words address at their fixed stride (8 per 64-bit word
+/// for OCC/ERR, 16 per word for READY; 4 + 2 + 4 words). Connections the bitstream lacks read 0.
+constexpr const uint8_t HTTP_CONN_SLOTS = 32;
+
+/// Header slack the host leaves in a connection's slot: one GET's BODY may be at most
+/// 2^SLOT_LOG2 - this, so the response headers (~630 bytes from MinIO) always fit behind it. The
+/// hardware's rule, stated in http_config.sv's SLOT_POLICY field; a response that overruns its slot
+/// is dropped whole and the connection goes FATAL (CONN_ERR bit 7).
+constexpr const uint64_t HTTP_SLOT_HEADER_SLACK = 64ULL * 1024ULL;
+
 /**
  * Configues a hardware RDMARead module to properly process the next page
  */
@@ -130,11 +151,28 @@ class HTTPReadConfig : public libstf::Config {
         /// last arbitrary limit in the design. A row group has a handful of chunks however finely
         /// each is split.
         std::vector<uint32_t> chunk_bytes;
+        /// One entry per GET: its length in bytes within `text`, in order, so that the requests can
+        /// be told apart again. A revision-2 bitstream never needs this -- the whole text is one arm
+        /// -- but a revision-3 one takes ONE ARM PER GET (depth 1 per connection), so each request
+        /// has to be armed, padded and DMA'd on its own. Empty means "the text is one request".
+        std::vector<uint32_t> request_bytes;
     };
 
-    /// Append one column chunk's GETs to `batch`, splitting at chunk_bytes() exactly as read() does.
+    /// Append one column chunk's GETs to `batch`, splitting at split_bytes() -- chunk_bytes(), and on
+    /// a revision-3 bitstream never more than max_get_bytes().
     void read_streamed(uint32_t server_ip, uint16_t server_port, const std::string &path,
                        uint64_t range_begin, uint64_t range_end, RequestBatch &batch);
+
+    /// The GETs of `batch` as separate strings, in order, using request_bytes (the whole text if it
+    /// is empty). Pure; exposed so the split can be checked without a board.
+    static std::vector<std::string> SplitRequests(const RequestBatch &batch);
+
+    /// Largest byte range one GET may ask for on `split_cfg` (chunk_bytes(), 0 = never split) and a
+    /// per-GET hardware cap `max_get` (0 = none): the smaller of the two non-zero values. Pure.
+    static uint64_t EffectiveSplit(uint64_t split_cfg, uint64_t max_get);
+
+    /// Byte range split this bitstream needs, see EffectiveSplit(). Reads the revision once.
+    uint64_t split_bytes();
 
     /// COLUMN CHUNKS a single batch may carry, from the hardware queue depth. Larger batches must
     /// be split: the host pushes every entry before arming, so one that does not fit cannot drain.
@@ -156,8 +194,116 @@ class HTTPReadConfig : public libstf::Config {
     /// here while operator.cpp derived the DMA sink from the same stream a different way, so the two
     /// could disagree; and the arm carried no lane of its own at all, inheriting whatever the last
     /// entry left in the register. Both are now one explicit parameter.
+    ///
+    /// On a revision-3 bitstream this is legal only for a batch of ONE request: every GET needs its
+    /// own arm there (see arm_transfer()), and one arm announcing several GETs would put several
+    /// responses into a slot the hardware drains as one. It throws rather than corrupt; the operator
+    /// drives revision 3 through push_entries() + arm_transfer() per request instead.
     void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch,
                       uint8_t lane);
+
+    /// The first half of submit_batch(): reserve credit for, and push, the batch's chunk-length
+    /// entries on `lane`. Nothing is armed.
+    void push_entries(const RequestBatch &batch, uint8_t lane);
+
+    /// The second half: arm ONE transfer of `text_bytes` bytes of request text on `lane` (write the
+    /// arm registers, wait for ARM_READY, pulse START). The caller DMAs the text afterwards.
+    ///
+    /// On a revision-3 bitstream ARM_READY includes the connection's DEPTH-1 CREDIT, so this blocks
+    /// until the previous response on that connection has been drained out of its slot -- which is
+    /// what makes one-GET-per-connection a hardware guarantee instead of a host convention.
+    void arm_transfer(uint32_t server_ip, uint16_t server_port, uint32_t text_bytes, uint8_t lane);
+
+    /// Revision 3 only: block until the arm just written has been CONSUMED, i.e. CONN_DRAINED for
+    /// the lane's connection has fallen. START does not back-pressure and the handler samples the
+    /// LIVE registers, so writing the next beat's registers before the arm is consumed would change
+    /// what it arms. A no-op below revision 3.
+    void await_arm_consumed(uint8_t lane);
+
+    // ---- CSR revision 3 (HBM slots) ----------------------------------------------------------
+
+    /// True when the programmed bitstream is the slot handler (revision >= HTTP_CSR_REVISION_SLOTS).
+    /// Read once and cached with revision(); nothing below revision 3 changes behaviour.
+    bool slot_mode();
+
+    /**
+     * Read id 32 (SLOT_POLICY), revision 3 only: what handler_slots was elaborated with.
+     */
+    struct HTTPSlotPolicy {
+        uint8_t  revision     = 0; // [7:0]
+        uint8_t  n_conns      = 0; // [15:8]
+        uint8_t  n_decoders   = 0; // [23:16]
+        uint8_t  slot_log2    = 0; // [29:24], one slot is 2^this bytes
+        uint8_t  rd_max_log2  = 0; // [35:30], largest single card read
+        uint16_t entry_depth  = 0; // [51:36], armed GETs queued per decoder
+        uint8_t  wr_fifo_log2 = 0; // [57:52], shared writer fifo, in 64-byte beats
+
+        bool     valid() const { return revision >= HTTP_CSR_REVISION_SLOTS && slot_log2 != 0; }
+        uint64_t slot_bytes() const { return valid() ? (1ULL << slot_log2) : 0; }
+        /// Bytes of card memory the slot array spans: n_conns slots, back to back.
+        uint64_t region_bytes() const { return slot_bytes() * n_conns; }
+        /// Largest legal GET body: slot minus HTTP_SLOT_HEADER_SLACK. 0 when not valid.
+        uint64_t max_get_bytes() const {
+            return slot_bytes() > HTTP_SLOT_HEADER_SLACK ? slot_bytes() - HTTP_SLOT_HEADER_SLACK : 0;
+        }
+        std::string describe() const;
+    };
+    /// Cached after the first read. Empty (invalid) below revision 3 -- read id 32 is a resp_error
+    /// there, so it is never read.
+    HTTPSlotPolicy slot_policy();
+    static HTTPSlotPolicy DecodeSlotPolicy(uint64_t word);
+
+    /// Largest byte range one GET may ask for, from the bitstream: slot_policy().max_get_bytes() on
+    /// revision 3, 0 ("no limit") below it.
+    uint64_t max_get_bytes();
+
+    /// Write SLOT_BASE_LO/HI (write ids 42/43): the virtual address of slot 0, as the card DMA's TLB
+    /// resolves it. Throws below revision 3, where those addresses do not exist.
+    void set_slot_base(uint64_t vaddr);
+
+    /**
+     * One connection's view from the revision-3 words (read ids 21..31). In stage 1 connection c is
+     * decoder c, so `occ` is the chunk occupancy of decoder c (CONN_OCC is indexed by DECODER).
+     */
+    struct HTTPConn {
+        uint8_t occ         = 0;     // CONN_OCC, chunk entries of the decoder with this index
+        bool    arm_ready   = false; // CONN_READY +0, INCLUDES the depth-1 credit
+        bool    entry_ready = false; // CONN_READY +1
+        bool    conn_up     = false; // CONN_READY +2
+        bool    fatal       = false; // CONN_READY +3
+        bool    drained     = false; // CONN_DRAINED[c]: slot empty, will accept an arm
+        bool    overflow    = false; // CONN_DRAINED[32+c]: sticky slot overflow (= err bit 7)
+        uint8_t err_raw     = 0;     // CONN_ERR byte: bits 0..6 as LANE_ERR, bit 7 SLOT_OVERFLOW
+        std::string describe() const;
+    };
+    struct HTTPConns {
+        uint8_t                                count = 0;
+        std::array<HTTPConn, HTTP_CONN_SLOTS>  conn {};
+        bool empty() const { return count == 0; }
+        const HTTPConn &at(uint8_t c) const;
+        std::string describe() const;
+    };
+    /// All eleven revision-3 readback words, decoded. Empty below revision 3. Diagnostics only --
+    /// the admission paths read the one or two words they need.
+    HTTPConns conns();
+    static HTTPConns DecodeConns(const std::array<uint64_t, 4> &occ_words,
+                                 const std::array<uint64_t, 2> &ready_words,
+                                 const std::array<uint64_t, 4> &err_words, uint64_t drained_word,
+                                 uint8_t count);
+
+    /// The connection a lane's GETs travel on. Stage 1 (N_CONNS == N_DECODERS): the lane itself.
+    uint8_t conn_for_lane(uint8_t lane);
+
+    /// Read id 31 bit `conn`: the depth-1 credit. Revision 3 only.
+    bool conn_drained(uint8_t conn);
+
+    /// Pure form of await_lane_credit()'s admission rule, so it can be checked without a board:
+    /// revision 3 additionally requires the connection's slot to be drained (`drained`).
+    static bool LaneCreditOk(uint8_t revision, size_t occ, size_t needed, size_t limit, bool drained);
+
+    /// Pure form of lane_depth_limit(): `want` (OASIS_HTTP_LANE_DEPTH) clamped to [1, hw]; 1 below
+    /// revision 2 (no per-lane occupancy) AND at revision 3 and above (depth 1 per connection).
+    static size_t LaneDepthFor(uint8_t revision, size_t want, size_t hw);
 
     /// Block until `lane` will accept a beat of this kind, or throw naming the lane and why it will
     /// not. See the definition for why skipping this loses whole batches without raising anything,
@@ -334,7 +480,13 @@ class HTTPReadConfig : public libstf::Config {
         bool status_bad    = false; // [8L+4] a response retired with neither 200 nor 206
         bool tx_refused    = false; // [8L+5] the TOE refused a transmit reservation (informational)
         bool read_timeout  = false; // [8L+6] the read watchdog expired -- nothing arrived at all
-        bool rx_fifo_stall = false; // [8L+7] this lane's decoupling fifo back-pressured the stack
+        /// [8L+7] on REVISION 2: this lane's decoupling fifo back-pressured the stack. Revision 3
+        /// REDEFINES bit 7 (there is no per-lane fifo any more) -- see slot_overflow.
+        bool rx_fifo_stall = false;
+        /// [8L+7] on REVISION 3: a segment would have run past the end of this connection's slot and
+        /// was dropped whole; the connection is FATAL. Exactly one of rx_fifo_stall / slot_overflow
+        /// is decoded from bit 7, by the revision passed to DecodeLaneErrors().
+        bool slot_overflow = false;
         /// The byte exactly as read, for comparing a condition already reported against a new one.
         uint8_t raw        = 0;
 
@@ -397,7 +549,8 @@ class HTTPReadConfig : public libstf::Config {
     /// Pure decoders for the per-lane registers, exposed so a caller that already has the words --
     /// a pre-flight dump, a test -- can decode without a board. `count` is lane_count().
     static HTTPLanes       DecodeLanes(uint64_t occ_word, uint64_t ready_word, uint8_t count);
-    static HTTPLaneErrors  DecodeLaneErrors(uint64_t err_word, uint8_t count);
+    static HTTPLaneErrors  DecodeLaneErrors(uint64_t err_word, uint8_t count,
+                                            uint8_t revision = HTTP_CSR_REVISION_LANES);
     static HTTPLanePolicy  DecodePolicy(uint64_t policy_word);
 
     /**
@@ -485,6 +638,16 @@ class HTTPReadConfig : public libstf::Config {
         /// the stack, this one says the ROUTER was blocked behind it, which is what starves the
         /// other lanes.
         bool route_stall = false;
+        /// REVISION 3 ONLY (bits 29..31 were a literal 0 before it, so these decode as false on an
+        /// older bitstream without any gating).
+        /// [29] the slot writer throttled readPkg issue because the shared fifo was filling. NOT a
+        /// failure -- it is the design working -- so it is not part of any().
+        bool space_stall = false;
+        /// [30] some connection's response ran past the end of its slot (dropped, connection fatal).
+        bool slot_overflow = false;
+        /// [31] some decoder found bytes in a slot that belong to no response it was told about:
+        /// two GETs armed on one connection, or a server overrunning its Content-Length.
+        bool residue_err = false;
         /// The stallWord exactly as read, so a caller can tell a condition it has already reported
         /// from a new one. The named bools above are for reading; this is for comparing.
         uint32_t raw = 0;
@@ -492,7 +655,8 @@ class HTTPReadConfig : public libstf::Config {
         bool any() const {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
                    || resp_unframeable || dirty_abort || status_bad || notify_overflow
-                   || rx_fifo_stall || read_timeout || align_starved || route_stall;
+                   || rx_fifo_stall || read_timeout || align_starved || route_stall
+                   || slot_overflow || residue_err;
         }
         std::string describe() const;
     };
@@ -599,6 +763,10 @@ class HTTPReadConfig : public libstf::Config {
 
     /// -1 until the first inflight() read; then the bitstream's slot count.
     int num_slots_ = -1;
+
+    /// slot_policy(), cached. `slot_policy_read_` distinguishes "not read yet" from "read, invalid".
+    HTTPSlotPolicy slot_policy_ {};
+    bool           slot_policy_read_ {false};
 };
 
 } // namespace oasis

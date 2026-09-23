@@ -5,7 +5,10 @@
 #include "oasis/configuration.hpp"
 #include "parcore/configuration.hpp"
 
+#include <libstf/logging.hpp>
 #include <libstf/profiling.hpp>
+
+#include <coyote/cOps.hpp>
 
 #include <sstream>
 #include <stdexcept>
@@ -102,6 +105,12 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
         throw std::runtime_error(msg.str());
     }
 
+    // BEFORE anything else is mapped: on an HBM-slot bitstream the slot page must be the first
+    // buffer this process maps. See setup_http_slots().
+    if (isHTTPEnabled()) {
+        setup_http_slots();
+    }
+
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());
     if (huge_pool) {
@@ -129,6 +138,81 @@ void OasisContext::shutdown() {
     delete instance_;
     instance_ = nullptr;
     libstf::Profiler::flush();
+}
+
+// CSR revision 3 (handler_slots, ADR-5): give the hardware its connection slots in card memory.
+//
+// Every TCP segment the board receives is DMA'd by slot_writer into its connection's slot, at
+// SLOT_BASE + (conn << SLOT_LOG2), over the CARD stream; the per-decoder readers pull responses back
+// out of the same addresses. Those are VIRTUAL addresses, translated by the vFPGA's TLB, so the slot
+// array has to be a real mapped buffer of this process -- and several facts about how Coyote maps it
+// decide how:
+//
+//   * It is its OWN 1 GiB huge page (getMem HPF: the shell's pg_l_bits = 30), never a piece of the
+//     libstf pool. A CARD-stream access migrates the whole page and flips its TLB entry to card
+//     memory; a pool page shared with output buffers would be migrated away under the host.
+//   * It is mapped by THIS cThread. The slot DMA descriptors carry pid 0 hardcoded (CARD_PID in
+//     slot_dma_shell.sv) and the pid keys the TLB lookup, so the page must be in ctid 0's table --
+//     the same assumption OutputWriter has made since build-93. A process that is not ctid 0 is
+//     refused rather than allowed to have the board write into another process's memory.
+//   * It is mapped FIRST, before the pool, and never freed while the context lives. With EN_MEM the
+//     driver allocates a card shadow for every mapped buffer, and its allocator walks a static ring
+//     without checking `used`: map/unmap/map can overlap. First-and-forever is the mitigation.
+//   * It is OFFLOADED to the card once, here (LOCAL_OFFLOAD). Otherwise the first segment the
+//     writer DMAs takes a page fault on the datapath, which stalls the shared TOE receive fifo for
+//     milliseconds (ADR-5 risk 7).
+//
+// Then SLOT_BASE_LO/HI are written, before any arm can be. On a bitstream below revision 3 none of
+// this runs and nothing is allocated.
+void OasisContext::setup_http_slots() {
+    auto http = config<HTTPReadConfig>();
+    if (!http->slot_mode()) {
+        return;
+    }
+    const auto policy = http->slot_policy();
+    if (!policy.valid() || policy.n_conns == 0) {
+        throw std::runtime_error("FPGA reports CSR revision 3 (HBM slots) but its SLOT_POLICY is "
+                                 "unusable [" + policy.describe() + "]");
+    }
+
+    constexpr uint64_t SLOT_PAGE_BYTES = 1ULL << 30; // shell pg_l_bits, the HPF page size
+    const uint64_t     region          = policy.region_bytes();
+    if (region > SLOT_PAGE_BYTES) {
+        std::ostringstream msg;
+        msg << "FPGA slot array is " << region << " bytes (" << policy.describe()
+            << "), more than the one 1 GiB huge page this library maps for it";
+        throw std::runtime_error(msg.str());
+    }
+    if (cthread_->getCtid() != 0) {
+        std::ostringstream msg;
+        msg << "HBM slot bitstream: this process's Coyote thread is ctid " << cthread_->getCtid()
+            << ", but the slot DMA descriptors use pid 0 (slot_dma_shell.sv CARD_PID). The board would "
+               "look the slot addresses up in another thread's page table. Run one Oasis process "
+               "per vFPGA.";
+        throw std::runtime_error(msg.str());
+    }
+
+    void *page = cthread_->getMem({coyote::CoyoteAllocType::HPF, SLOT_PAGE_BYTES});
+    if (page == nullptr) {
+        throw std::runtime_error(
+            "HBM slot bitstream: could not allocate the 1 GiB huge page for the connection slots. "
+            "It comes on top of the libstf pool (LIBSTF_HUGE_PAGES, default 4), so the system needs "
+            "one more free 1 GiB page than the pool takes -- check "
+            "/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages -- and the driver's card "
+            "pool must hold pool + 1 pages (patch 0003).");
+    }
+    // Only the slots, not the whole page: the ioctl takes the length as 32 bits and cThread caps it
+    // at MAX_TRANSFER_SIZE. The driver migrates the WHOLE mapping that contains the address anyway.
+    cthread_->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{page, region});
+    http_slot_page_ = page;
+    http->set_slot_base(reinterpret_cast<uint64_t>(page));
+
+    libstf::log(libstf::LogLevel::INFO,
+                "OasisContext: HBM slot bitstream (CSR rev %u): %u connection slot(s) of %llu KiB "
+                "at %p, offloaded to card memory; GETs capped at %llu KiB",
+                unsigned(policy.revision), unsigned(policy.n_conns),
+                static_cast<unsigned long long>(policy.slot_bytes() >> 10), page,
+                static_cast<unsigned long long>(policy.max_get_bytes() >> 10));
 }
 
 OasisContext &OasisContext::ctx() {

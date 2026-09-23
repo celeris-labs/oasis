@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 
+#include <libstf/logging.hpp>
 #include <libstf/profiling.hpp>
 #include <oasis/configuration.hpp>
 
@@ -141,6 +142,17 @@ constexpr const uint32_t HTTP_LANE_READY       = 17; // nibble per lane: arm/ent
 constexpr const uint32_t HTTP_LANE_STATE       = 18; // tcp_read nibble low, http_req_stream high
 constexpr const uint32_t HTTP_LANE_ERR         = 19; // sticky byte per lane at [8L+7:8L]
 constexpr const uint32_t HTTP_LANE_POLICY      = 20; // revision / NUM_CONNS / depths, at elaboration
+
+// PER-CONNECTION READBACK + SLOT BASE -- CSR REVISION 3 ONLY (handler_slots). Same rule as above,
+// one level up: read ids 21..32 are a resp_error on a revision-2 bitstream, and write ids 42/43 are
+// not instantiated there at all. Gated on HTTP_CSR_REVISION_SLOTS via slot_mode().
+constexpr const uint32_t HTTP_CONN_OCC0        = 21; // 21..24, byte per DECODER, 8 per word
+constexpr const uint32_t HTTP_CONN_READY0      = 25; // 25..26, nibble per connection, 16 per word
+constexpr const uint32_t HTTP_CONN_ERR0        = 27; // 27..30, byte per connection, 8 per word
+constexpr const uint32_t HTTP_CONN_DRAINED     = 31; // [c] depth-1 credit, [32+c] slot overflowed
+constexpr const uint32_t HTTP_SLOT_POLICY      = 32;
+constexpr const uint32_t HTTP_SLOT_BASE_LO     = 42; // write
+constexpr const uint32_t HTTP_SLOT_BASE_HI     = 43; // write
 
 // Bit positions inside a lane's nibble in HTTP_LANE_READY, at 4L.
 constexpr const unsigned HTTP_LANE_ARM_READY   = 0;
@@ -481,7 +493,11 @@ void HTTPReadConfig::read_streamed(uint32_t server_ip, uint16_t server_port,
                                    const std::string &path, uint64_t range_begin,
                                    uint64_t range_end, RequestBatch &batch) {
     const auto     host  = IpToAscii(server_ip);
-    const uint64_t chunk = chunk_bytes();
+    // chunk_bytes(), capped on a revision-3 bitstream at what one connection's slot can hold. There a
+    // GET whose response overruns the slot is not slow, it is FATAL: the writer drops the segment
+    // whole and the connection goes down (CONN_ERR bit 7). So a column chunk larger than the cap is
+    // split exactly like an OASIS_HTTP_CHUNK_BYTES split -- one entry, several GETs.
+    const uint64_t chunk = split_bytes();
 
     // Same split as read(): only the LAST GET of the chunk ends the decoder stream, because the
     // DataNormalizer resets its running byte offset on tlast and an extra one mid-chunk would
@@ -490,15 +506,65 @@ void HTTPReadConfig::read_streamed(uint32_t server_ip, uint16_t server_port,
     // counting these bytes, so the split is invisible to it.
     batch.chunk_bytes.push_back(static_cast<uint32_t>(range_end - range_begin + 1));
 
+    // Record every GET's length so a revision-3 path can arm them one at a time. A batch that was
+    // built before this existed (text but no lengths) is normalised to "all of it is one request"
+    // first, so the lengths always add up to the text.
+    const auto append = [&](uint64_t b, uint64_t e) {
+        if (batch.request_bytes.empty() && !batch.text.empty()) {
+            batch.request_bytes.push_back(static_cast<uint32_t>(batch.text.size()));
+        }
+        const auto get = BuildGet(host, server_port, path, b, e);
+        batch.text += get;
+        batch.request_bytes.push_back(static_cast<uint32_t>(get.size()));
+    };
+
     if (chunk == 0 || (range_end - range_begin + 1) <= chunk) {
-        batch.text += BuildGet(host, server_port, path, range_begin, range_end);
+        append(range_begin, range_end);
         return;
     }
     for (uint64_t begin = range_begin; begin <= range_end; begin += chunk) {
         const uint64_t end = std::min(begin + chunk - 1, range_end);
-        batch.text += BuildGet(host, server_port, path, begin, end);
+        append(begin, end);
     }
 }
+
+std::vector<std::string> HTTPReadConfig::SplitRequests(const RequestBatch &batch) {
+    std::vector<std::string> out;
+    if (batch.request_bytes.empty()) {
+        if (!batch.text.empty()) {
+            out.push_back(batch.text);
+        }
+        return out;
+    }
+    size_t off = 0;
+    for (const uint32_t n : batch.request_bytes) {
+        if (off + n > batch.text.size()) {
+            throw std::runtime_error("HTTP request batch: request lengths (" +
+                                     std::to_string(off + n) + " bytes so far) overrun the text (" +
+                                     std::to_string(batch.text.size()) + " bytes)");
+        }
+        out.push_back(batch.text.substr(off, n));
+        off += n;
+    }
+    if (off != batch.text.size()) {
+        throw std::runtime_error("HTTP request batch: request lengths add up to " +
+                                 std::to_string(off) + " bytes but the text is " +
+                                 std::to_string(batch.text.size()));
+    }
+    return out;
+}
+
+uint64_t HTTPReadConfig::EffectiveSplit(uint64_t split_cfg, uint64_t max_get) {
+    if (max_get == 0) {
+        return split_cfg;
+    }
+    if (split_cfg == 0) {
+        return max_get;
+    }
+    return std::min(split_cfg, max_get);
+}
+
+uint64_t HTTPReadConfig::split_bytes() { return EffectiveSplit(chunk_bytes(), max_get_bytes()); }
 
 // Pad the batch's request text to a whole 64-byte beat, using a header the server ignores.
 //
@@ -700,6 +766,13 @@ void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed, const char *
 
     const size_t limit    = std::max<size_t>(lane_depth_limit(), needed);
     const auto   deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
+    // REVISION 3: the credit is also keyed on CONN_DRAINED. One connection holds one GET at a time
+    // (strip_http keeps mid-beat residue across responses, so a reader may only switch connections
+    // on an empty slot), and the hardware enforces it by holding ARM_READY low until the slot has
+    // been released. Admitting a batch whose arm would then sit on that wait is the one thing this
+    // path exists to avoid, so the slot has to be free before the entries go in, not after.
+    const bool   slots    = slot_mode();
+    const uint8_t conn    = slots ? conn_for_lane(lane) : lane;
     while (true) {
         const auto l = lanes().at(lane);
         // Before the arithmetic: a dead lane never retires anything, so its occupancy never falls
@@ -707,7 +780,8 @@ void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed, const char *
         if (l.fatal) {
             throw_lane_fatal(lane, what);
         }
-        if (static_cast<size_t>(l.occ) + needed <= limit) {
+        const bool drained = slots ? conn_drained(conn) : true;
+        if (LaneCreditOk(revision(), l.occ, needed, limit, drained)) {
             return;
         }
         if (std::chrono::steady_clock::now() > deadline) {
@@ -715,8 +789,13 @@ void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed, const char *
             msg << "FPGA HTTP lane " << unsigned(lane) << " never freed room for " << needed
                 << " more chunk entries (limit " << limit << ") for " << what << " within "
                 << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
-                << "s [" << l.describe() << "; " << lane_errors().describe() << "; "
-                << stall().describe() << "]. That lane has stopped draining.";
+                << "s [" << l.describe();
+            if (slots) {
+                msg << "; conn " << unsigned(conn) << (drained ? " drained" : " slot NOT drained")
+                    << "; " << conns().describe();
+            }
+            msg << "; " << lane_errors().describe() << "; " << stall().describe()
+                << "]. That lane has stopped draining.";
             throw std::runtime_error(msg.str());
         }
         std::this_thread::sleep_for(std::chrono::microseconds(20));
@@ -776,6 +855,52 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
     if (batch.chunk_bytes.empty()) {
         return;
     }
+    // One arm announces the WHOLE text. On a slot bitstream that arm becomes one reader entry and
+    // exactly one response is drained out of the slot for it; a second GET in the same text would
+    // land behind it, be found at resp_done as residue, and take the connection FATAL (RESP_ERR +
+    // STALL[31]). Refuse before touching the hardware.
+    if (slot_mode() && batch.request_bytes.size() > 1) {
+        std::ostringstream msg;
+        msg << "HTTP batch of " << batch.request_bytes.size() << " GETs cannot be submitted as one "
+            << "arm on a CSR revision-3 (HBM slot) bitstream: each connection holds one response at "
+            << "a time, so every GET needs its own arm. Use push_entries() + arm_transfer() per "
+            << "request (HTTPBatchSourceOperator does).";
+        throw std::runtime_error(msg.str());
+    }
+    push_entries(batch, lane);
+    arm_transfer(server_ip, server_port, static_cast<uint32_t>(batch.text.size()), lane);
+
+    if (http_debug_enabled()) {
+        // Print the handler's state with EVERY batch, not just the sizes.
+        //
+        // The state registers cannot be read while a query is stuck: that query holds vfid 0, so a
+        // second process cannot attach, and a process blocked in the driver often cannot be killed
+        // to release it. scripts/util/http_state.sh therefore returns nothing in exactly the case
+        // it exists for. Printing here means the LAST line before a hang carries the state going
+        // into the batch that hung, which is the reading that was otherwise unobtainable.
+        const auto f = inflight();
+        const auto st = stall();
+        std::fprintf(stderr,
+                     "[oasis-http] batch: lane %u, %zu column chunks, %zu bytes of request text | "
+                     "%s | %s\n",
+                     unsigned(lane), batch.chunk_bytes.size(), batch.text.size(),
+                     f.describe().c_str(), st.any() ? st.describe().c_str() : "no stalls");
+        if (lane_csrs_available()) {
+            std::fprintf(stderr, "[oasis-http]   %s\n", lanes().describe().c_str());
+        }
+        // Name the status the moment it goes bad. It is a live register, so it must be read while
+        // the failure is on the board -- by the time the run ends it may have been overwritten.
+        if (st.status_bad) {
+            std::fprintf(stderr, "[oasis-http]   HTTP status from the server: %s\n",
+                         last_http_status().c_str());
+        }
+    }
+}
+
+void HTTPReadConfig::push_entries(const RequestBatch &batch, uint8_t lane) {
+    if (batch.chunk_bytes.empty()) {
+        return;
+    }
     // The caller must have split to the queue depth already -- see max_batch_chunks(). Pushing more
     // entries than the queue holds deadlocks rather than back-pressuring: the host blocks on
     // req_ready waiting for the queue to drain, and it cannot drain because the arm that starts the
@@ -814,6 +939,11 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
         await_cfg_ready("chunk-length entry", lane, LaneAdmit::Entry);
         write_register(libstf::ConfigRegister(HTTP_START, 1));
     }
+}
+
+void HTTPReadConfig::arm_transfer(uint32_t server_ip, uint16_t server_port, uint32_t text_bytes,
+                                  uint8_t lane) {
+    const uint64_t lane_field = static_cast<uint64_t>(lane & 0xF) << 32;
 
     // 2. The arm: server address plus the byte count, which is what opens the connection.
     //    The length announced here is the PADDED one -- see PadRequestTextToBeat.
@@ -831,36 +961,53 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
     // chunk queue only when req_total_bytes == 0, and this beat is about to set it non-zero.
     write_register(libstf::ConfigRegister(HTTP_REQ_CHUNK_BYTES, lane_field));
     write_register(
-        libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, static_cast<uint64_t>(batch.text.size())));
+        libstf::ConfigRegister(HTTP_REQ_TOTAL_BYTES, static_cast<uint64_t>(text_bytes)));
     // Only now does req_ready describe an ARM. Before this write it still described whatever the
     // last beat was, and an arm polled against an entry's condition gets written into a refusal.
+    // On a revision-3 bitstream the same bit also carries the connection's depth-1 credit, so this
+    // is where a second GET on a connection waits for the first response to leave the slot.
     await_cfg_ready("transfer arm", lane, LaneAdmit::Arm);
     write_register(libstf::ConfigRegister(HTTP_START, 1));
+}
 
-    if (http_debug_enabled()) {
-        // Print the handler's state with EVERY batch, not just the sizes.
-        //
-        // The state registers cannot be read while a query is stuck: that query holds vfid 0, so a
-        // second process cannot attach, and a process blocked in the driver often cannot be killed
-        // to release it. scripts/util/http_state.sh therefore returns nothing in exactly the case
-        // it exists for. Printing here means the LAST line before a hang carries the state going
-        // into the batch that hung, which is the reading that was otherwise unobtainable.
-        const auto f = inflight();
-        const auto st = stall();
-        std::fprintf(stderr,
-                     "[oasis-http] batch: lane %u, %zu column chunks, %zu bytes of request text | "
-                     "%s | %s\n",
-                     unsigned(lane), batch.chunk_bytes.size(), batch.text.size(),
-                     f.describe().c_str(), st.any() ? st.describe().c_str() : "no stalls");
-        if (lane_csrs_available()) {
-            std::fprintf(stderr, "[oasis-http]   %s\n", lanes().describe().c_str());
+// Revision 3: wait until the arm just written has been taken.
+//
+// ConfigWriteReadyRegister does not back-pressure and HttpConfig hands the handler the LIVE register
+// values, not a snapshot taken at the START write. So until the handler has consumed this arm, the
+// next register write -- the next GET's arm, or the next flow's chunk entry -- rewrites what this arm
+// means. await_cfg_ready() cannot see that: it polled ARM_READY BEFORE the START, and ARM_READY stays
+// high until the arm is consumed, so polling it again afterwards proves nothing.
+//
+// CONN_DRAINED can. It falls on exactly one event, the handler accepting an arm for that connection,
+// and it rises again only when that response has been drained out of the slot (or the connection is
+// torn down) -- a network round trip plus the server's time later, far longer than this poll. So
+// "drained went low" is proof of consumption. The only way to miss it is a response that completes
+// between two polls, which is why an arm not seen within a second is reported, not
+// thrown: a lost arm is caught by the credit timeout on the next batch anyway, with a full diagnosis.
+void HTTPReadConfig::await_arm_consumed(uint8_t lane) {
+    if (!slot_mode()) {
+        return;
+    }
+    const uint8_t conn     = conn_for_lane(lane);
+    const auto    start    = std::chrono::steady_clock::now();
+    const auto    grace    = std::chrono::seconds(1);
+    while (true) {
+        if (!conn_drained(conn)) {
+            return;
         }
-        // Name the status the moment it goes bad. It is a live register, so it must be read while
-        // the failure is on the board -- by the time the run ends it may have been overwritten.
-        if (st.status_bad) {
-            std::fprintf(stderr, "[oasis-http]   HTTP status from the server: %s\n",
-                         last_http_status().c_str());
+        const auto l = lanes().at(lane);
+        if (l.fatal) {
+            throw_lane_fatal(lane, "its arm to be consumed");
         }
+        if (std::chrono::steady_clock::now() - start > grace) {
+            libstf::log(libstf::LogLevel::WARNING,
+                        "HTTPReadConfig: arm on lane %u (conn %u) not seen consumed after 1 s: "
+                        "CONN_DRAINED never fell. Either the response already came and went (fine) or "
+                        "the START was lost (the next batch's credit wait will time out naming it). %s",
+                        unsigned(lane), unsigned(conn), conns().describe().c_str());
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(5));
     }
 }
 
@@ -1187,7 +1334,8 @@ HTTPReadConfig::HTTPLanes HTTPReadConfig::DecodeLanes(uint64_t occ_word, uint64_
     return l;
 }
 
-HTTPReadConfig::HTTPLaneErrors HTTPReadConfig::DecodeLaneErrors(uint64_t err_word, uint8_t count) {
+HTTPReadConfig::HTTPLaneErrors HTTPReadConfig::DecodeLaneErrors(uint64_t err_word, uint8_t count,
+                                                                uint8_t revision) {
     HTTPLaneErrors e {};
     e.count = (count > HTTP_LANE_SLOTS) ? HTTP_LANE_SLOTS : count;
     for (uint8_t i = 0; i < e.count; i++) {
@@ -1200,7 +1348,10 @@ HTTPReadConfig::HTTPLaneErrors HTTPReadConfig::DecodeLaneErrors(uint64_t err_wor
         e.lane[i].status_bad    = (byte & (1u << 4)) != 0;
         e.lane[i].tx_refused    = (byte & (1u << 5)) != 0;
         e.lane[i].read_timeout  = (byte & (1u << 6)) != 0;
-        e.lane[i].rx_fifo_stall = (byte & (1u << 7)) != 0;
+        // Bit 7 is the one field revision 3 redefines rather than extends (http_config.sv).
+        const bool bit7 = (byte & (1u << 7)) != 0;
+        e.lane[i].rx_fifo_stall = (revision < HTTP_CSR_REVISION_SLOTS) && bit7;
+        e.lane[i].slot_overflow = (revision >= HTTP_CSR_REVISION_SLOTS) && bit7;
     }
     return e;
 }
@@ -1230,7 +1381,7 @@ HTTPReadConfig::HTTPLaneErrors HTTPReadConfig::lane_errors() {
     if (!lane_csrs_available()) {
         return {};
     }
-    return DecodeLaneErrors(read_register(HTTP_LANE_ERR).value(), lane_count());
+    return DecodeLaneErrors(read_register(HTTP_LANE_ERR).value(), lane_count(), revision());
 }
 
 HTTPReadConfig::HTTPLanePolicy HTTPReadConfig::policy() {
@@ -1247,13 +1398,196 @@ size_t HTTPReadConfig::lane_depth_limit() {
     if (!lane_csrs_available()) {
         // No per-lane occupancy to meter against, so there is no per-lane depth either: the shared
         // queue is what admits a batch, exactly as it did before this existed.
-        lane_depth_ = 1;
+        lane_depth_ = LaneDepthFor(revision(), 1, 1);
         return lane_depth_;
     }
     const size_t hw   = max_batch_chunks();
     const size_t want = static_cast<size_t>(HttpLaneDepth());
-    lane_depth_       = std::max<size_t>(1, std::min<size_t>(want, hw == 0 ? 1 : hw));
+    lane_depth_       = LaneDepthFor(revision(), want, hw);
+    if (slot_mode() && want > lane_depth_ && std::getenv("OASIS_HTTP_LANE_DEPTH") != nullptr) {
+        libstf::log(libstf::LogLevel::WARNING,
+                    "HTTPReadConfig: OASIS_HTTP_LANE_DEPTH=%zu ignored on a CSR revision-%u (HBM "
+                    "slot) bitstream: each connection holds one response at a time, so the lane "
+                    "depth is 1",
+                    want, unsigned(revision()));
+    }
     return lane_depth_;
+}
+
+size_t HTTPReadConfig::LaneDepthFor(uint8_t revision, size_t want, size_t hw) {
+    if (revision < HTTP_CSR_REVISION_LANES) {
+        return 1;
+    }
+    // DEPTH 1 PER CONNECTION on the slot handler, whatever OASIS_HTTP_LANE_DEPTH says. A lane is a
+    // connection there (stage 1), a connection's slot holds one response, and the hardware refuses a
+    // second arm until the first response has left the slot. A host depth above 1 would therefore
+    // not pipeline anything -- it would admit a batch whose arm then sits inside the dispatcher
+    // thread waiting for that drain, holding up every other lane's placement behind it.
+    if (revision >= HTTP_CSR_REVISION_SLOTS) {
+        return 1;
+    }
+    return std::max<size_t>(1, std::min<size_t>(want, hw == 0 ? 1 : hw));
+}
+
+bool HTTPReadConfig::LaneCreditOk(uint8_t revision, size_t occ, size_t needed, size_t limit,
+                                  bool drained) {
+    if (occ + needed > limit) {
+        return false;
+    }
+    return revision < HTTP_CSR_REVISION_SLOTS || drained;
+}
+
+// ---- CSR revision 3 -------------------------------------------------------------------------------
+
+bool HTTPReadConfig::slot_mode() { return revision() >= HTTP_CSR_REVISION_SLOTS; }
+
+HTTPReadConfig::HTTPSlotPolicy HTTPReadConfig::DecodeSlotPolicy(uint64_t w) {
+    HTTPSlotPolicy p {};
+    p.revision     = static_cast<uint8_t>(w & 0xFFu);
+    p.n_conns      = static_cast<uint8_t>((w >> 8) & 0xFFu);
+    p.n_decoders   = static_cast<uint8_t>((w >> 16) & 0xFFu);
+    p.slot_log2    = static_cast<uint8_t>((w >> 24) & 0x3Fu);
+    p.rd_max_log2  = static_cast<uint8_t>((w >> 30) & 0x3Fu);
+    p.entry_depth  = static_cast<uint16_t>((w >> 36) & 0xFFFFu);
+    p.wr_fifo_log2 = static_cast<uint8_t>((w >> 52) & 0x3Fu);
+    return p;
+}
+
+HTTPReadConfig::HTTPSlotPolicy HTTPReadConfig::slot_policy() {
+    if (!slot_policy_read_) {
+        slot_policy_read_ = true;
+        slot_policy_      = slot_mode() ? DecodeSlotPolicy(read_register(HTTP_SLOT_POLICY).value())
+                                        : HTTPSlotPolicy {};
+    }
+    return slot_policy_;
+}
+
+uint64_t HTTPReadConfig::max_get_bytes() {
+    if (!slot_mode()) {
+        return 0;
+    }
+    const auto p = slot_policy();
+    if (!p.valid() || p.max_get_bytes() == 0) {
+        // A revision-3 bitstream whose policy word does not describe a usable slot. Guessing a size
+        // would turn every oversized response into a FATAL connection, so refuse outright.
+        throw std::runtime_error("FPGA reports CSR revision 3 (HBM slots) but its SLOT_POLICY word "
+                                 "is unusable [" + p.describe() + "]");
+    }
+    return p.max_get_bytes();
+}
+
+void HTTPReadConfig::set_slot_base(uint64_t vaddr) {
+    if (!slot_mode()) {
+        throw std::runtime_error("HTTPReadConfig::set_slot_base on a bitstream below CSR revision 3: "
+                                 "SLOT_BASE_LO/HI do not exist there");
+    }
+    // LO then HI. Nothing samples them until the first arm, which the caller has not written yet.
+    write_register(libstf::ConfigRegister(HTTP_SLOT_BASE_LO, vaddr & 0xFFFFFFFFULL));
+    write_register(libstf::ConfigRegister(HTTP_SLOT_BASE_HI, vaddr >> 32));
+}
+
+uint8_t HTTPReadConfig::conn_for_lane(uint8_t lane) {
+    // STAGE 1: conn c <-> decoder c, fixed in handler_slots (conn_of_dec). A bitstream with more
+    // connections than decoders is stage 2, which needs host placement this library does not have
+    // yet (WP6); refuse rather than arm the wrong connection.
+    const auto p = slot_policy();
+    if (p.n_conns != p.n_decoders) {
+        std::ostringstream msg;
+        msg << "FPGA HTTP bitstream has " << unsigned(p.n_conns) << " connections for "
+            << unsigned(p.n_decoders) << " decoders (" << p.describe() << "); this library only "
+            << "drives stage 1 of the slot design, one connection per decoder";
+        throw std::runtime_error(msg.str());
+    }
+    return lane;
+}
+
+bool HTTPReadConfig::conn_drained(uint8_t conn) {
+    if (conn >= HTTP_CONN_SLOTS) {
+        throw std::out_of_range("HTTP connection " + std::to_string(conn) + " is past the " +
+                                std::to_string(HTTP_CONN_SLOTS) + " the CSRs address");
+    }
+    return ((read_register(HTTP_CONN_DRAINED).value() >> conn) & 1ULL) != 0;
+}
+
+HTTPReadConfig::HTTPConns HTTPReadConfig::DecodeConns(const std::array<uint64_t, 4> &occ_words,
+                                                     const std::array<uint64_t, 2> &ready_words,
+                                                     const std::array<uint64_t, 4> &err_words,
+                                                     uint64_t drained_word, uint8_t count) {
+    HTTPConns c {};
+    c.count = (count > HTTP_CONN_SLOTS) ? HTTP_CONN_SLOTS : count;
+    for (uint8_t i = 0; i < c.count; i++) {
+        auto &x      = c.conn[i];
+        x.occ        = static_cast<uint8_t>((occ_words[i / 8] >> (8u * (i % 8))) & 0xFFu);
+        const auto n = static_cast<unsigned>((ready_words[i / 16] >> (4u * (i % 16))) & 0xFu);
+        x.arm_ready   = (n & (1u << HTTP_LANE_ARM_READY)) != 0;
+        x.entry_ready = (n & (1u << HTTP_LANE_ENTRY_READY)) != 0;
+        x.conn_up     = (n & (1u << HTTP_LANE_CONN_UP)) != 0;
+        x.fatal       = (n & (1u << HTTP_LANE_FATAL)) != 0;
+        x.err_raw     = static_cast<uint8_t>((err_words[i / 8] >> (8u * (i % 8))) & 0xFFu);
+        x.drained     = ((drained_word >> i) & 1ULL) != 0;
+        x.overflow    = ((drained_word >> (32u + i)) & 1ULL) != 0;
+    }
+    return c;
+}
+
+HTTPReadConfig::HTTPConns HTTPReadConfig::conns() {
+    if (!slot_mode()) {
+        return {};
+    }
+    std::array<uint64_t, 4> occ {}, err {};
+    std::array<uint64_t, 2> ready {};
+    for (uint32_t w = 0; w < 4; w++) {
+        occ[w] = read_register(HTTP_CONN_OCC0 + w).value();
+        err[w] = read_register(HTTP_CONN_ERR0 + w).value();
+    }
+    for (uint32_t w = 0; w < 2; w++) {
+        ready[w] = read_register(HTTP_CONN_READY0 + w).value();
+    }
+    return DecodeConns(occ, ready, err, read_register(HTTP_CONN_DRAINED).value(),
+                       slot_policy().n_conns);
+}
+
+const HTTPReadConfig::HTTPConn &HTTPReadConfig::HTTPConns::at(uint8_t c) const {
+    if (c >= count) {
+        std::ostringstream msg;
+        msg << "HTTP connection " << unsigned(c) << " does not exist: this bitstream has "
+            << unsigned(count) << " connection(s)";
+        throw std::out_of_range(msg.str());
+    }
+    return conn[c];
+}
+
+std::string HTTPReadConfig::HTTPConn::describe() const {
+    std::ostringstream oss;
+    oss << "occ=" << unsigned(occ) << (conn_up ? " conn=up" : " conn=down")
+        << (drained ? " drained" : " busy") << (arm_ready ? " arm" : "")
+        << (entry_ready ? " entry" : "") << (fatal ? " FATAL" : "")
+        << (overflow ? " SLOT_OVERFLOW" : "");
+    if (err_raw != 0) {
+        oss << " err=0x" << std::hex << unsigned(err_raw) << std::dec;
+    }
+    return oss.str();
+}
+
+std::string HTTPReadConfig::HTTPConns::describe() const {
+    if (empty()) {
+        return "conns=<unsupported: bitstream predates CSR revision 3>";
+    }
+    std::ostringstream oss;
+    oss << "conns=" << unsigned(count);
+    for (uint8_t i = 0; i < count; i++) {
+        oss << " [" << unsigned(i) << ": " << conn[i].describe() << "]";
+    }
+    return oss.str();
+}
+
+std::string HTTPReadConfig::HTTPSlotPolicy::describe() const {
+    std::ostringstream oss;
+    oss << "slot policy: rev=" << unsigned(revision) << " conns=" << unsigned(n_conns)
+        << " decoders=" << unsigned(n_decoders) << " slot=2^" << unsigned(slot_log2)
+        << " rd_max=2^" << unsigned(rd_max_log2) << " entry_depth=" << entry_depth
+        << " wr_fifo=2^" << unsigned(wr_fifo_log2) << " beats";
+    return oss.str();
 }
 
 const HTTPReadConfig::HTTPLane &HTTPReadConfig::HTTPLanes::at(uint8_t l) const {
@@ -1309,6 +1643,7 @@ std::string HTTPReadConfig::HTTPLaneError::describe() const {
     if (tx_refused)    oss << " tx_refused";
     if (read_timeout)  oss << " read_timeout";
     if (rx_fifo_stall) oss << " rx_fifo_stall";
+    if (slot_overflow) oss << " slot_overflow";
     return oss.str();
 }
 
@@ -1376,6 +1711,10 @@ HTTPReadConfig::HTTPStall HTTPReadConfig::stall() {
     s.read_timeout     = (word & (1u << 26)) != 0;
     s.align_starved    = (word & (1u << 27)) != 0;
     s.route_stall      = (word & (1u << 28)) != 0;
+    // 29..31: revision 3. A literal 0 on every older bitstream, so no gating is needed.
+    s.space_stall      = (word & (1u << 29)) != 0;
+    s.slot_overflow    = (word & (1u << 30)) != 0;
+    s.residue_err      = (word & (1u << 31)) != 0;
     return s;
 }
 
@@ -1400,6 +1739,9 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     if (read_timeout)     oss << " read_timeout";
     if (align_starved)    oss << " align_starved";
     if (route_stall)      oss << " route_stall";
+    if (slot_overflow)    oss << " slot_overflow";
+    if (residue_err)      oss << " slot_residue";
+    if (space_stall)      oss << " (space_stall)";
     if (reconnects)       oss << " reconnects=" << static_cast<unsigned>(reconnects);
 
     // One explanation per line. These are sticky bits and several latch together over a long query,
@@ -1446,6 +1788,20 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
                "what the dispatcher exists to prevent -- so the other lanes are starving behind it. "
                "Either the space check is wrong or that lane's RX_FIFO_DEPTH is too small for its "
                "traffic. lane_errors() says which lane: it is the one with rx_fifo_stall set.";
+    }
+
+    if (slot_overflow) {
+        oss << "\n    slot_overflow: a response ran past the end of its connection's slot in card "
+               "memory (2^SLOT_LOG2 bytes, slot_policy()). The segment was dropped whole, so the "
+               "response has a hole in it and that connection is FATAL. The host asked for more than "
+               "max_get_bytes() in one GET, or the server sent more than it was asked for.";
+    }
+    if (residue_err) {
+        oss << "\n    slot_residue: at the end of a response the reader found bytes left in the slot "
+               "that belong to no response it was told about -- two GETs armed on one connection "
+               "(one arm announcing several requests), or a server overrunning its Content-Length. "
+               "Those bytes would have been spliced into the next response, so the connection is "
+               "FATAL. Reported as RESP_ERR on the connection; STALL[31] tells the two causes apart.";
     }
 
     if (resp_unframeable) {
