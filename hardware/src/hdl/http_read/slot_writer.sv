@@ -97,7 +97,8 @@ import lynxTypes::*;
 // QUIET, AND WHY THE HANDLER NEEDS IT
 // -----------------------------------
 // `conn_release[c]` resets that connection's cursors, so it is only safe when nothing of c is still
-// on its way into the slot. On the normal path depth 1 guarantees that. On the ERROR path -- a
+// on its way into the slot. On the normal path the reader guarantees that: it releases only when
+// its connection has run dry (every armed response framed, every landed byte read). On the ERROR path -- a
 // connection going fatal, or reconnecting, with a half-written response in its slot -- it does not:
 // rx_dispatch may still be mid-packet for c at the moment the session is released. `conn_quiet[c]`
 // is the exported form of the invariant the simulation assertion below checks: no descriptor of c
@@ -364,8 +365,8 @@ module slot_writer #(
     assign charge_w = pkg_issued_w && !conn_down[pkg_conn_w];
 
     // What a release hands back. Summed rather than taken from one connection because two readers
-    // may retire in the same cycle; on the normal path both terms are zero (depth 1 means every
-    // announced segment has landed by then) and this only has anything to do on a teardown.
+    // may retire in the same cycle; on the normal path both terms are zero (a reader releases only a
+    // connection that has run dry, so every announced segment has landed by then) and this only has anything to do on a teardown.
     logic [RPKG_BITS+4:0] rel_pkgs_w;
     always_comb begin
         rel_pkgs_w = '0;
@@ -480,8 +481,8 @@ module slot_writer #(
                 if (seg_ovf_w) overflow_sticky_q[conn_sel_w] <= 1'b1;
             end
 
-            // -- per-connection cursors. A release wins over everything: by depth 1 there is
-            //    nothing of that connection in flight, which the assertion below proves.
+            // -- per-connection cursors. A release wins over everything: a connection is only
+            //    released once it has run dry, so nothing of it is in flight, which the assertion below proves.
             for (i = 0; i < N_CONNS; i++) begin
                 automatic logic infl_inc = desc_push_w && (conn_sel_w == CONN_BITS'(i));
                 automatic logic infl_dec =

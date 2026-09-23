@@ -243,6 +243,21 @@ import http_types::*;
 //                            [51:36] ENTRY_DEPTH, armed GETs queued per decoder
 //                            [57:52] log2 of the shared writer fifo, in 64-byte beats
 //   LANE_POLICY (20) keeps its revision-2 fields and reads revision 3 in [7:0].
+//
+// CSR REVISION 4 -- PIPELINED GETs PER CONNECTION (handler_slots, 2026-09-23)
+// ---------------------------------------------------------------------------
+// The SAME register map as revision 3; CSR_REV >= 3 instantiates it here, and the number is what
+// tells the host which rules apply. What changed is behaviour behind three fields:
+//   * CONN_READY +0 ARM_READY no longer includes the depth-1 credit: it is "the previous request
+//     text has gone out and the decoder's entry queue has room". Several GETs may be armed on one
+//     connection; their responses land back to back in its slot and the reader frames them as one
+//     stream.
+//   * CONN_DRAINED [c] means "slot c is empty and NOTHING is armed on it": raised when the reader
+//     releases the slot with no entry queued behind it, or by a teardown; lowered by an ARM. The
+//     host's rule becomes a BYTE BUDGET: the bytes of every response armed since it last read this
+//     bit set must fit in 2^SLOT_LOG2 (the slot is a bump allocator that resets when drained).
+//   * SLOT_POLICY [29:24] SLOT_LOG2 is 28 in stage 1 (256 MiB x 4 connections = the 1 GiB page).
+//   RESP_ERR's residue cause now reads "bytes left in the slot when the connection ran dry".
 // =================================================================================================
 module HttpConfig #(
     parameter integer NUM_PARAM_REGS = 42,

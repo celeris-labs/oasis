@@ -446,6 +446,22 @@ can no longer stall the shared TOE fifo. Depth-1 model: 512 KiB per (2.5 ms tran
    MinIO serialises pipelined GETs anyway and depth was measured to buy nothing (2026-09-12; see
    *Deeper pipelining on one connection is not a lever* below).
 
+   **Condition 3 lifted by CSR revision 4 (2026-09-23).** Measured on build-124 against MinIO, depth
+   1 cost −26 %…−15 % wall MB/s at 1–4 lanes against build-119's depth-4 lanes (173/328/453/554 vs
+   234/411/537/652): a connection idles through every request round trip. The premise above was
+   wrong for stage 1, where connection *c* only ever feeds decoder *c*: `strip_http` frames
+   back-to-back responses on ONE stream correctly (it did so for build-119's depth-4 lanes); the
+   residue only matters when a reader *switches* connections. Revision 4 therefore lets several
+   GETs be armed per connection: `slot_reader` treats one connection's slot as a continuous stream,
+   pops an entry and carries on with the same cursor when the next entry names the same connection,
+   and releases the slot (with the residue check) only when the connection runs dry.
+   `handler_slots` drops the slot term from ARM_READY; `CONN_DRAINED` now means "slot empty and
+   nothing armed" and is the reset of a HOST byte budget (the slot is a bump allocator, not a ring),
+   and the slot grows to `SLOT_LOG2 = 28` (4 × 256 MiB = the 1 GiB page; stage 2 wants 25). Benches:
+   `unit-tests/slot_reader` `rpipe`/`rpipe4`, `unit-tests/lane_drain` `HDEPTH`/`SRVLAT`/`COALESCE`/`RFN`.
+   Stage-2 caveat: a decoder that serves several connections must not have a same-connection GET
+   queued behind another connection's entry, or that slot is released under the later response.
+
 ### CSR rev 3 — per-connection visibility and the slot base
 
 **Date:** 2026-09-20 · Implemented in `http_config.sv` under `CSR_REV` (**default 2**), driven by

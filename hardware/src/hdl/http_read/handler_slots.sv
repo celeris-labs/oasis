@@ -44,14 +44,23 @@ import http_types::*;
 // for good now costs exactly its own connection: its slot fills, its reader stops, and nothing it
 // does reaches rx_dispatch at all. lane_drain's `thr` scenario is that claim, measured.
 //
-// DEPTH 1 PER CONNECTION, ENFORCED IN HARDWARE
-// --------------------------------------------
-// strip_http keeps mid-beat residue across responses, so a reader may only switch connections when
-// the slot is empty -- which means one outstanding GET per connection, re-armed once its response
-// has drained (ADR-5, condition 3). That is not merely a host convention here: ARM_READY for a
-// connection is low until its slot has been released, so a host that tries to arm a second GET is
-// held at the config port instead of quietly corrupting the second response. `conn_drained` is the
-// same bit, exported for the host to poll.
+// PIPELINED GETs PER CONNECTION (CSR revision 4, 2026-09-23)
+// ---------------------------------------------------------
+// Revision 3 held ARM_READY low until the connection's slot had been released, i.e. one GET per
+// connection in flight, and every connection idled through each request round trip (MinIO ~0.7 ms;
+// build-124 measured -26%..-15% against build-119's depth-4 lanes). Since revision 4 an arm only
+// needs room in the reader's entry queue: slot_reader treats one connection's slot as a continuous
+// byte stream and only releases it when the connection runs dry (see its header, "PIPELINED GETs").
+// strip_http keeps mid-beat residue across responses, which is exactly what makes that correct on
+// ONE connection; it is also why a reader still only switches connections at a released slot.
+//
+// The one rule that moves to the host: the bytes armed on a connection since its slot was last
+// released (response headers included) must fit in 2^SLOT_LOG2, because the slot is a bump
+// allocator, not a ring. `conn_drained` (CONN_DRAINED[c]) is that release, exported for the host:
+// it falls when an arm is accepted and rises when the slot is released with no entry queued and no
+// arm in that cycle (or by a teardown), so a host that READS it set knows the slot is empty and
+// nothing is armed on it. Overrunning the slot
+// is caught, not corrupting: slot_writer drops the segment and the connection goes fatal.
 //
 // STAGE 1: N_CONNS == N_DECODERS
 // ------------------------------
@@ -72,9 +81,10 @@ import http_types::*;
 //     still drained out of the shared fifo (slot_writer's O_DISCARD), so it costs the other
 //     connections a fifo slot for a few cycles and nothing else.
 //
-//   * RESIDUE (slot_reader `residue_err`) -- at resp_done the slot was not exactly empty, i.e.
-//     bytes landed that belong to no response this decoder was told about. Either the host armed
-//     two GETs on one connection or a server sent more than its Content-Length. Those bytes would
+//   * RESIDUE (slot_reader `residue_err`) -- when the connection ran dry (its last queued response
+//     was framed) the slot was not exactly empty, i.e. bytes landed that belong to no response this
+//     decoder was told about. Either the host sent more GETs than it armed (two in one arm's request
+//     text) or a server sent more than its Content-Length. Those bytes would
 //     be spliced into the front of the next response, so c goes FATAL. Reported as ERR bit 3
 //     (RESP_ERR) -- same class, same host action, reissue -- with `residue` also OR-folded into
 //     stallWord[31] so the two causes are still distinguishable from one register.
@@ -115,8 +125,10 @@ module handler_slots #(
     parameter int QUEUE_DEPTH = 64,
     // Armed GETs queued ahead of the data, per DECODER (slot_reader's entry queue).
     parameter int ENTRY_DEPTH = 64,
-    // log2 of one connection's slot in card memory. 22 = 4 MiB.
-    parameter int SLOT_LOG2 = 22,
+    // log2 of one connection's slot in card memory. 28 = 256 MiB, so N_CONNS = 4 fills the 1 GiB
+    // slot page; stage 2 (24 connections) wants 25. The host reads it back from SLOT_POLICY[29:24]
+    // and budgets the bytes it arms per connection against it.
+    parameter int SLOT_LOG2 = 28,
     // The SHARED elastic fifo in front of the card write channel, in 64-byte beats.
     parameter int SLOT_FIFO_DEPTH = 1024,
     // The most one card read may ask for, in bytes. 16 KiB since 2026-09-22: every reader now
@@ -138,7 +150,7 @@ module handler_slots #(
     parameter int RELEASE_SETTLE = 256,
     // 3 here. Parameterised so the value is stated once and reaches both the readback words and
     // HttpConfig, which gates its register map on it.
-    parameter int CSR_REV = 3,
+    parameter int CSR_REV = 4,
 
     localparam int CONN_BITS = (N_CONNS    > 1) ? $clog2(N_CONNS)    : 1,
     localparam int DEC_BITS  = (N_DECODERS > 1) ? $clog2(N_DECODERS) : 1
@@ -305,17 +317,15 @@ module handler_slots #(
     logic [N_DECODERS-1:0] dec_occ_ok;
     logic [N_DECODERS-1:0] dec_arm_ready_w, dec_entry_ready_w;
 
-    // THE TWO ADMISSION CONDITIONS, PER DECODER -- build-119's, plus the depth-1 credit.
+    // THE TWO ADMISSION CONDITIONS, PER DECODER -- build-119's.
     //
-    // An ENTRY waits for that decoder's chunk queue to have room. An ARM waits for three things:
-    // the previous request text to have gone out, room in the reader's entry queue, and THE TARGET
-    // CONNECTION'S SLOT TO BE FREE. The third is new and it is what makes depth 1 a property of the
-    // hardware rather than a rule the host is trusted to keep.
+    // An ENTRY waits for that decoder's chunk queue to have room. An ARM waits for two things: the
+    // previous request text to have gone out, and room in the reader's entry queue. (Revision 3 had
+    // a third, the target connection's slot being free, which made depth 1 a hardware property;
+    // revision 4 dropped it -- see "PIPELINED GETs" above.)
     //
-    // All three are MONOTONE IN THE HOST'S FAVOUR -- nothing but a config beat the host itself
-    // writes can clear any of them -- so "poll, then write" is race free and needs no retry.
-    // conn_drained_q only falls on an ARM this module accepted; rwl_cfg_ready, dec_occ_ok and the
-    // reader's entry_ready only fall on a beat it accepted.
+    // Both are MONOTONE IN THE HOST'S FAVOUR -- nothing but a config beat the host itself writes can
+    // clear either -- so "poll, then write" is race free and needs no retry.
     always_comb begin
         req_ready = 1'b0;
         for (int d = 0; d < N_DECODERS; d++) begin
@@ -503,6 +513,7 @@ module handler_slots #(
     logic [N_DECODERS-1:0] rdr_busy, rdr_flush_busy, rdr_entry_done, rdr_residue_err, rdr_entry_ready;
     logic [N_DECODERS-1:0] rdr_rd_pending;
     logic [3:0]            rdr_state [N_DECODERS];
+    logic [7:0]            rdr_entry_occ [N_DECODERS];
     logic [3:0]            dec_tx_state [N_DECODERS];
     logic [N_DECODERS-1:0] rdr_progress_w;
     logic [N_CONNS-1:0]    rdr_release [N_DECODERS];
@@ -568,7 +579,7 @@ module handler_slots #(
         ) inst_slot_reader (
             .clk(ap_clk), .rst_n(ap_rst_n),
             // One entry per ARM. The arm is the host saying "a GET is on its way out for this
-            // decoder"; with depth 1 that is exactly one response, in the slot named here.
+            // decoder": exactly one response, in the slot named here, behind any still queued.
             .entry_valid      (cfg_fire && cfg_is_arm_w && (cfg_dec == DEC_BITS'(d))),
             .entry_ready      (rdr_entry_ready[d]),
             .entry_conn       (conn_of_dec(d)),
@@ -601,7 +612,7 @@ module handler_slots #(
             .rd_pending  (rdr_rd_pending[d]),
             .head_chunk_bytes(),
             .busy       (rdr_busy[d]),
-            .entry_occ  (),
+            .entry_occ  (rdr_entry_occ[d]),
             .state_debug(rdr_state[d])
         );
 
@@ -718,17 +729,27 @@ module handler_slots #(
         assign dec_occ_ok[d] = (dec_occ_q[d] < 32'(QUEUE_DEPTH));
 
         assign dec_entry_ready_w[d] = rwl_cfg_ready[d] && dec_occ_ok[d];
-        // The depth-1 credit is the third term. See the admission note above.
-        assign dec_arm_ready_w[d]   = !stream_busy[d] && rdr_entry_ready[d] &&
-                                      conn_drained_q[conn_of_dec(d)];
+        // No slot term since revision 4: see "PIPELINED GETs" in the header.
+        assign dec_arm_ready_w[d]   = !stream_busy[d] && rdr_entry_ready[d];
     end
 
     // Every reader's release, folded per connection. In stage 1 exactly one decoder can ever name a
     // given connection, so this OR is a wire; WP5 needs it to be an OR and it costs nothing now.
-    logic [N_CONNS-1:0] rdr_release_any_w;
+    //
+    // `rdr_release_idle_w` is the subset that may raise CONN_DRAINED: a release from a reader with
+    // NOTHING queued behind it. A reader also releases when an entry arrived after it had looked at
+    // its queue (S_DONE1) -- correct for the slot, since that GET's bytes cannot have landed yet --
+    // but then an arm IS outstanding, and CONN_DRAINED must never say "empty, nothing armed" while
+    // one is: the host resets its byte budget on it. conn_release is registered, so entry_occ in
+    // the pulse cycle already excludes the retired head and includes any entry pushed meanwhile.
+    logic [N_CONNS-1:0] rdr_release_any_w, rdr_release_idle_w;
     always_comb begin
-        rdr_release_any_w = '0;
-        for (int d = 0; d < N_DECODERS; d++) rdr_release_any_w = rdr_release_any_w | rdr_release[d];
+        rdr_release_any_w  = '0;
+        rdr_release_idle_w = '0;
+        for (int d = 0; d < N_DECODERS; d++) begin
+            rdr_release_any_w = rdr_release_any_w | rdr_release[d];
+            if (rdr_entry_occ[d] == 8'd0) rdr_release_idle_w = rdr_release_idle_w | rdr_release[d];
+        end
     end
 
     always_comb begin
@@ -957,7 +978,7 @@ module handler_slots #(
             retry_wait_q  <= '0;
             settle_q      <= SETTLE_BITS'(RELEASE_SETTLE);
             conn_fatal_q  <= '0;
-            // Every slot starts free: the host may arm one GET per connection straight away.
+            // Every slot starts empty and nothing is armed.
             conn_drained_q <= '1;
             conn_abort_q       <= '0;
             conn_abort_dirty_q <= '0;
@@ -1010,13 +1031,19 @@ module handler_slots #(
                 conn_init_err_q[bring_conn_q] <= 1'b1;
             end
 
-            // -- the depth-1 credit, and the abort latch, per connection -------------------------
+            // -- the slot-drained bit, and the abort latch, per connection ----------------------
             for (int c = 0; c < N_CONNS; c++) begin
-                // A release -- the reader's after a drained response, or the teardown's -- hands the
-                // slot back. An ARM on this connection takes it.
-                if (conn_release_w[c]) conn_drained_q[c] <= 1'b1;
-                else if (cfg_fire && cfg_is_arm_w && (conn_of_dec(int'(cfg_dec)) == CONN_BITS'(c)))
+                // A release -- the reader's when the connection ran dry, or the teardown's -- says
+                // the slot is empty. An ARM on this connection says it is not, and WINS a tie: the
+                // bit must never read "empty, nothing armed" while an arm is outstanding, because
+                // that is when the host resets its byte budget for the slot. (A release in the same
+                // cycle as an arm is correct for the slot -- the new GET's bytes cannot have landed
+                // yet -- so the only cost of the tie rule is a budget that stays conservative.)
+                if (cfg_fire && cfg_is_arm_w && (conn_of_dec(int'(cfg_dec)) == CONN_BITS'(c)))
                     conn_drained_q[c] <= 1'b0;
+                else if (rdr_release_idle_w[c] ||
+                         (slot_rel_en_w && (slot_rel_conn_w == CONN_BITS'(c))))
+                    conn_drained_q[c] <= 1'b1;
 
                 // The abort latch is cleared by the SLOT release rather than by the session
                 // release: slot_poison[c] lives until the slot goes, so clearing it at BR_CLOSE

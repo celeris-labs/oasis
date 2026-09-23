@@ -31,10 +31,31 @@ import lynxTypes::*;
 // This module serves the HEAD ENTRY ONLY, and it serves it to completion: the framer keeps mid-beat
 // residue across responses (strip_http's res_data_q/res_cur_q), so switching connections mid-response
 // would splice one connection's bytes into another's parse -- the corruption class that killed builds
-// 90/91/92 on the TOE side. Depth 1 per connection is what makes "serve the head to completion"
-// sufficient: there is never a second response queued behind the first in the same slot. If the host
-// breaks that rule the residue check below catches it -- `residue_err` is exactly "bytes landed in
-// this slot that belong to no response I was told about".
+// 90/91/92 on the TOE side.
+//
+// PIPELINED GETs -- SEVERAL ENTRIES FOR ONE CONNECTION (CSR revision 4, 2026-09-23)
+// ------------------------------------------------------------------------------------
+// The host may arm several GETs on one connection before the first response has drained. Their
+// responses then land back to back in the slot, exactly as they arrive on the TCP stream: response
+// k's last body bytes and response k+1's status line usually share a segment and a beat. That is
+// the stream strip_http was built for (it framed build-119's depth-4 lanes the same way), so the
+// reader treats one connection's slot as ONE CONTINUOUS BYTE STREAM:
+//
+//   * it reads ahead freely -- `landed[c] - rd_cursor` may include bytes of the next response;
+//   * when the head entry's response is framed and the NEXT entry is for the SAME connection, the
+//     entry is popped and the next one becomes the head WITHOUT touching the cursor, the slot or
+//     the framer's residue ("continue");
+//   * only when there is no next entry for this connection -- the queue is empty, or (stage 2)
+//     the next entry names another connection -- is the slot required to be exactly empty (the
+//     residue check), released (both cursors back to 0), and the head dropped.
+//
+// So the slot is a bump allocator that resets whenever its connection runs dry, and the host keeps
+// the bytes it has armed since the last reset below the slot size (2^SLOT_LOG2; the reset is what
+// CONN_DRAINED reports). At depth 1 every response is followed by an empty queue, so this is
+// cycle for cycle the revision-3 behaviour.
+//
+// `residue_err` keeps its meaning: at a release, bytes landed in this slot that belong to no
+// response this reader was told about.
 //
 // FLUSH -- ABANDONING A RESPONSE
 // ------------------------------
@@ -78,12 +99,18 @@ import lynxTypes::*;
 //
 // THE END OF A RESPONSE
 // ---------------------
-// strip_http raises `resp_done` when the body has reached its Content-Length and drained. At that
-// moment, by depth 1, the slot must be exactly empty: no read outstanding, and every landed byte
-// asked for. If it is not, there are bytes in the slot that belong to no response -- a residue --
-// and `residue_err` latches. Otherwise `conn_release[c]` pulses (slot_writer zeroes that
-// connection's cursors), `resp_ack` retires the framer's resp_done, `entry_done` pulses for the
-// host's credit accounting, and the entry is popped.
+// strip_http raises `resp_done` when the body has reached its Content-Length and drained. `resp_ack`
+// retires it, `entry_done` pulses for the host's credit accounting, and the entry is popped. Then:
+//   CONTINUE  the next queued entry is for the same connection: it becomes the head in the same
+//             cycle (so strip_http sees its body_last before it can emit a byte of its body), and
+//             the cursor, the slot and whatever reads are in flight carry on untouched.
+//   RELEASE   otherwise the slot must be exactly empty: no read outstanding, and every landed byte
+//             asked for. If it is not, there are bytes in the slot that belong to no response -- a
+//             residue -- and `residue_err` latches. `conn_release[c]` pulses either way
+//             (slot_writer zeroes that connection's cursors) and the head is dropped.
+// The decision is taken in S_DONE1 from the queue as it is then. An entry pushed after that is for
+// a GET whose request text has not even been sent yet, so nothing of it can have landed, and it is
+// correct for it to start from a released slot at cursor 0.
 //
 // DESIGN FOR SYNTHESIS
 // --------------------
@@ -198,6 +225,15 @@ module slot_reader #(
     logic [31:0]          head_chunk_q;
     logic                 head_last_q;
 
+    // The entry behind the head, sampled in S_DONE1: is it for the same connection (CONTINUE), and
+    // what does it carry. Registered so that neither the queue memory nor the compare is in the
+    // S_DONE2 path.
+    logic                 nxt_same_q;
+    logic [31:0]          nxt_chunk_q;
+    logic                 nxt_last_q;
+    logic [EPTR_BITS-1:0] eq_next_w;
+    assign eq_next_w = (eq_head_q == EPTR_BITS'(ENTRY_DEPTH-1)) ? '0 : eq_head_q + 1'b1;
+
     assign head_chunk_bytes = head_chunk_q;
     assign body_last        = head_last_q;
     assign busy             = head_valid_q || (eq_cnt_q != '0);
@@ -251,7 +287,8 @@ module slot_reader #(
                            S_DONE0 = 4'd5,
                            S_DONE1 = 4'd6,
                            S_DONE2 = 4'd7,
-                           S_FLUSH = 4'd8;
+                           S_FLUSH = 4'd8,
+                           S_ACKW  = 4'd9;
     logic [3:0] st_q;
     assign state_debug = st_q;
 
@@ -321,6 +358,9 @@ module slot_reader #(
             residue_err_q <= 1'b0;
             head_chunk_q  <= '0;
             head_last_q   <= 1'b0;
+            nxt_same_q    <= 1'b0;
+            nxt_chunk_q   <= '0;
+            nxt_last_q    <= 1'b0;
             swallow_q     <= 1'b0;
             rd_pending_q  <= 1'b0;
         end else begin
@@ -402,19 +442,38 @@ module slot_reader #(
                 S_DONE0: st_q <= S_DONE1;
                 S_DONE1: begin
                     landed_sel_q <= landed_head_w;
+                    // eq_cnt_q counts the head too, so "> 1" is "there is an entry behind it".
+                    nxt_same_q   <= (eq_cnt_q > ECNT_BITS'(1)) && (eq_conn[eq_next_w] == head_conn_q);
+                    nxt_chunk_q  <= eq_chunk[eq_next_w];
+                    nxt_last_q   <= eq_last[eq_next_w];
                     st_q         <= S_DONE2;
                 end
                 S_DONE2: begin
-                    if (!done_ok_w) residue_err_q <= 1'b1;
-                    conn_release[head_conn_q] <= 1'b1;
-                    entry_done                <= 1'b1;
-                    resp_ack                  <= 1'b1;
-                    head_valid_q              <= 1'b0;
-                    rd_cursor_q               <= '0;
-                    landed_sel_q              <= '0;
-                    eq_head_q <= (eq_head_q == EPTR_BITS'(ENTRY_DEPTH-1)) ? '0 : eq_head_q + 1'b1;
-                    st_q      <= S_IDLE;
+                    entry_done <= 1'b1;
+                    resp_ack   <= 1'b1;
+                    eq_head_q  <= eq_next_w;
+                    st_q       <= S_ACKW;
+                    if (nxt_same_q) begin
+                        // CONTINUE: the next response is already streaming into the same slot
+                        // behind this one. New head, same cursor, no release.
+                        head_chunk_q <= nxt_chunk_q;
+                        head_last_q  <= nxt_last_q;
+                    end else begin
+                        // RELEASE: the connection has run dry, so its slot must be empty.
+                        if (!done_ok_w) residue_err_q <= 1'b1;
+                        conn_release[head_conn_q] <= 1'b1;
+                        head_valid_q              <= 1'b0;
+                        rd_cursor_q               <= '0;
+                        landed_sel_q              <= '0;
+                    end
                 end
+
+                // resp_ack is on the wire THIS cycle and strip_http drops resp_done at its end, so
+                // resp_done is still high here. On a CONTINUE the head is still valid, and S_IDLE
+                // would take that stale level for the NEXT response's end and retire it unframed.
+                // strip_http cannot raise resp_done again this soon: it holds one byte short of
+                // the next body until it has seen the ack.
+                S_ACKW: st_q <= S_IDLE;
 
                 // Swallow what the card path still owes us, then abandon the head entry. No
                 // conn_release from here: on this path handler_slots owns the release, because it
