@@ -175,17 +175,8 @@ switch branches / update the `parcore`, `celeris`, or `libstf` submodule pins**,
 command chain to ensure all libraries and the DuckDB binary are completely up to date:
 
 ```bash
-# 1. Purge any previously installed Coyote/libstf/parcore/oasis artifacts. These sit on
-#    $HOME/opt/include, which is a PUBLIC include dir of the `libstf` CMake target (via
-#    JEMALLOC_INCLUDE_DIRS) and therefore leaks into every downstream target's include path.
-#    If left behind, stale headers here can silently shadow the fresh ones checked out below,
-#    even though the library itself gets rebuilt and reinstalled correctly.
-rm -rf $HOME/opt/include/coyote $HOME/opt/include/libstf $HOME/opt/include/parcore $HOME/opt/include/oasis \
-       $HOME/opt/lib/libcoyote.so $HOME/opt/lib/liblibstf.so $HOME/opt/lib/libparcore.so $HOME/opt/lib/liboasis.so \
-       $HOME/opt/lib/cmake/Coyote $HOME/opt/lib/cmake/libstf $HOME/opt/lib/cmake/parcore $HOME/opt/lib/cmake/oasis
-
-# 2. Rebuild and reinstall the simulation-configured software stack
 scripts/full_rebuild_for_simulation.sh
+scripts/setup_simulation.sh
 ```
 
 ---
@@ -270,9 +261,12 @@ FROM read_oasis('/tmp/oasis_bf_test/probe.parquet') p
 JOIN read_oasis('/tmp/oasis_bf_test/build.parquet') b
 ON p.key = b.key;
 
-SELECT * FROM read_oasis('/tmp/oasis_bf_test/probe.parquet');
+SELECT s_suppkey FROM read_oasis('extension/tpch_parquet/supplier.parquet');
 
-SELECT s_suppkey FROM read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/supplier.parquet');
+SELECT *
+FROM read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/lineitem.parquet') l
+JOIN read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/orders.parquet') o
+ON l.l_orderkey = o.o_orderkey;
 ```
 
 ---

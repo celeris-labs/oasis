@@ -2,6 +2,8 @@
 
 import oasis::*;
 import parcore::*;
+import libstf::*;
+import common::*;
 
 // -- Tie-off unused interfaces and signals --------------------------------------------------------
 always_comb cq_rd.tie_off_s();
@@ -28,12 +30,17 @@ localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
 // MemConfig write side needs NUM_STREAMS+1 regs, read side needs 3 (ID, num_streams, max_enqueued).
 localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
 
-localparam NUM_CONFIGS   = 3;
+localparam NUM_CONFIGS   = 6;
 `ifdef EN_RDMA
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `else
 localparam NUM_DECODERS  = NUM_STREAMS;
 `endif
+
+// BFConfig (materialization settings) + a 1-stream StreamConfig selecting whether decoder-stream
+// 0's output is routed through the Bloom filter or bypasses it. Software currently always
+// configures the bypass path -- see ConfigureOasisHardwareBloom.
+localparam STREAM_CFG_REGS = 2;
 
 // -- Fix clock and reset names --------------------------------------------------------------------
 logic clk;
@@ -50,6 +57,8 @@ ready_valid_i #(read_req_t)          read_conf[NUM_STREAMS](.*);
 logic [PID_BITS-1:0]                 read_ctid[NUM_STREAMS];
 ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
 decoder_profile_i                    decoder_profiles[NUM_DECODERS]();
+bloomfilter_config_i                 bloomfilter_conf();
+stream_config_i                      bf_stream_conf[1](.*);
 
 GlobalConfig #(
     .SYSTEM_ID(OASIS_SYSTEM_ID),
@@ -57,7 +66,10 @@ GlobalConfig #(
     .ADDR_SPACE_SIZES({
         MEM_CONFIG_NUM_REGS,
         COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS),
-        NUM_READ_REQ_CONFIG_REGS * NUM_STREAMS
+        NUM_READ_REQ_CONFIG_REGS * NUM_STREAMS,
+        BLOOMFILTER_NUM_CONFIG_REGS,
+        STREAM_CFG_REGS,
+        NUM_BF_LAST_INJECT_CONFIG_REGS
     }),
     .READ_CONFIG_SKID_DEPTH(2)
 ) inst_config (
@@ -109,6 +121,46 @@ ReadReqConfig #(
     .ctid(read_ctid)
 );
 
+bloomfilter_perf_counters_t bf_perf_counters;
+BFConfig inst_bf_config (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .write_config(write_configs[3]),
+    .read_config(read_configs[3]),
+
+    .out(bloomfilter_conf),
+
+    .perf_counters(bf_perf_counters)
+);
+
+StreamConfig #(
+    .NUM_STREAMS(1)
+) inst_bf_stream_config (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .write_config(write_configs[4]),
+    .read_config(read_configs[4]),
+
+    .out(bf_stream_conf)
+);
+
+logic        bf_last_inject_enable;
+logic [31:0] bf_last_inject_first_beat;
+logic [31:0] bf_last_inject_second_beat;
+BFLastInjectorConfig inst_bf_last_injector_config (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .write_config(write_configs[5]),
+    .read_config(read_configs[5]),
+
+    .enable(bf_last_inject_enable),
+    .first_beat(bf_last_inject_first_beat),
+    .second_beat(bf_last_inject_second_beat)
+);
+
 // -- Arbiter the read send queue ------------------------------------------------------------------
 metaIntf #(.STYPE(req_t)) sq_rd_strm [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 
@@ -125,6 +177,7 @@ MetaIntfArbiter #(
 
 // -- Data path ------------------------------------------------------------------------------------
 AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S decoded_axi[NUM_DECODERS](.aclk(clk), .aresetn(rst_n));
 for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
     ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in(.*);
@@ -191,9 +244,135 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .rst_n(rst_n),
 
         .in(out),
-        .out(axi_out[I])
+        .out(decoded_axi[I])
     );
 end : gen_decoders
+
+// -- Bloom filter on decoder-stream 0 (currently configured to bypass only) -----------------------
+// The stream config's `select` chooses between the bloom-filtered path (0) and the bypass path
+// (1). Software currently always configures select=1 (bypass) -- see
+// ConfigureOasisHardwareBloom -- so decoded_axi[0] flows straight to axi_out[0] unchanged for now.
+// Sequencing real build/probe chunks through the filter and feeding real materialization columns
+// is follow-up work.
+ready_valid_i #(select_t) bf_select();
+ready_valid_i #(select_t) bf_demux_select();
+ready_valid_i #(select_t) bf_mux_select();
+
+`CONFIG_SIGNALS_TO_INTF(bf_stream_conf[0].select, bf_select)
+assign bf_stream_conf[0].data_type_ready = 1'b1; // unused
+
+`READY_DUPLICATE(2, bf_select, {bf_demux_select, bf_mux_select})
+
+AXI4S axi_bf_in_raw(.aclk(clk), .aresetn(rst_n));
+AXI4S axi_bf_in    (.aclk(clk), .aresetn(rst_n));
+AXI4S axi_bf_out   (.aclk(clk), .aresetn(rst_n));
+AXI4S axi_bf_bypass(.aclk(clk), .aresetn(rst_n));
+
+AXIDemultiplexer #(
+    .NUM_STREAMS(2)
+) inst_bf_demux (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .select(bf_demux_select),
+
+    .in(decoded_axi[0]),
+    .out({axi_bf_in_raw, axi_bf_bypass})
+);
+
+// Inline TLAST injector: software configures the absolute beat index where the build side's
+// chunks end (first_beat) and where the probe side's chunks end (second_beat). Every other beat's
+// decoder-generated tlast is suppressed here so the Bloom filter core sees exactly two logical
+// transfers no matter how many row-group chunks it takes to build up each side. Disabled
+// (bf_last_inject_enable=0) passes tlast through unchanged.
+logic [31:0] bf_last_inject_beat_count;
+logic        bf_last_inject_hit_first;
+logic        bf_last_inject_hit_second;
+logic        bf_last_inject_hit;
+
+assign axi_bf_in_raw.tready = axi_bf_in.tready;
+
+assign axi_bf_in.tdata  = axi_bf_in_raw.tdata;
+assign axi_bf_in.tkeep  = axi_bf_in_raw.tkeep;
+assign axi_bf_in.tvalid = axi_bf_in_raw.tvalid;
+
+assign bf_last_inject_hit_first =
+    bf_last_inject_enable &&
+    axi_bf_in_raw.tvalid &&
+    axi_bf_in_raw.tready &&
+    (bf_last_inject_beat_count == bf_last_inject_first_beat);
+
+assign bf_last_inject_hit_second =
+    bf_last_inject_enable &&
+    axi_bf_in_raw.tvalid &&
+    axi_bf_in_raw.tready &&
+    (bf_last_inject_beat_count == bf_last_inject_second_beat);
+
+assign bf_last_inject_hit =
+    bf_last_inject_hit_first || bf_last_inject_hit_second;
+
+assign axi_bf_in.tlast =
+    axi_bf_in_raw.tlast || bf_last_inject_hit;
+
+always_ff @(posedge clk) begin
+    if (!rst_n) begin
+        bf_last_inject_beat_count <= 32'd0;
+    end else if (!bf_last_inject_enable) begin
+        bf_last_inject_beat_count <= 32'd0;
+    end else if (axi_bf_in_raw.tvalid && axi_bf_in_raw.tready) begin
+        if (bf_last_inject_hit_second) begin
+            bf_last_inject_beat_count <= 32'd0;
+        end else begin
+            bf_last_inject_beat_count <= bf_last_inject_beat_count + 32'd1;
+        end
+    end
+end
+
+// No real join key or materialization data flows through the Bloom filter yet -- it never sees
+// any input while decoder-stream 0 is bypassed, so these ports only need a well-defined tie-off.
+ndata_i #(data64_t, CELERIS_NUM_TUPLES) bf_probe_values_in();
+assign bf_probe_values_in.valid = 1'b0;
+assign bf_probe_values_in.last  = 1'b0;
+assign bf_probe_values_in.keep  = '0;
+assign bf_probe_values_in.data  = '0;
+
+data_i #(tuple_mask_t) bf_mask_out();
+assign bf_mask_out.ready = 1'b1; // drain, nothing consumes the mask yet
+
+ndata_i #(data64_t, CELERIS_NUM_TUPLES) bf_probe_mat_out();
+assign bf_probe_mat_out.ready = 1'b1; // drain, materialization is disabled
+
+BloomfilterOperator inst_bloomfilter_operator (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .conf(bloomfilter_conf),
+    .perf_counters(bf_perf_counters),
+
+    .in(axi_bf_in),
+    .probe_values_in(bf_probe_values_in),
+
+    .raw_out(axi_bf_out),
+    .mask_out(bf_mask_out),
+    .probe_mat_out(bf_probe_mat_out)
+);
+
+AXIMultiplexer #(
+    .NUM_STREAMS(2)
+) inst_bf_mux (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .select(bf_mux_select),
+
+    .in({axi_bf_out, axi_bf_bypass}),
+    .out(axi_out[0])
+);
+
+// -- Pass-through for remaining decoder streams -----------------------------------------------------
+for (genvar I = 1; I < NUM_DECODERS; I++) begin : gen_bf_passthrough
+    `AXIS_ASSIGN(decoded_axi[I], axi_out[I])
+end : gen_bf_passthrough
 
 // -- RDMA bypass stream (last stream slot, no decoder) --------------------------------------------
 `ifdef EN_RDMA
