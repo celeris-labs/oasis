@@ -50,11 +50,11 @@ xvlog -sv ../slot_writer/lynxTypes_stub.sv \
 
 # (If elaboration ever hangs after "Completed static elaboration", read the note at the top of
 # card_dma_model.sv: an assignment pattern pushed into a queue wedges xelab.)
-elab() { # <snapshot> <nconns> <nrd> <rdmax> [share]
+elab() { # <snapshot> <nconns> <nrd> <rdmax> [share] [slot_log2]
   [ -d "xsim.dir/$1" ] && return 0
   xelab -debug typical -timescale 1ns/1ps -top slot_reader_tb -snapshot "$1" \
         -generic_top "NCONNS=$2" -generic_top "NRD=$3" -generic_top "RDMAX=$4" \
-        -generic_top "SHARE=${5:-1}" \
+        -generic_top "SHARE=${5:-1}" -generic_top "SLOTL=${6:-22}" \
         > "xelab_$1.log" 2>&1 || { tail -40 "xelab_$1.log"; exit 1; }
 }
 
@@ -72,6 +72,7 @@ elab sr4 4 2 16384
 elab srm 1 1 4096
 elab sr2 2 2 16384
 elab sr4x 4 4 16384
+elab sr28 4 4 16384 1 28     # the stage-1 bitstream's geometry: 4 x 256 MiB slots
 
 if [ $# -ge 1 ]; then
   case "$1" in
@@ -121,6 +122,10 @@ run sr1 rpipe NPIPE=8 HOLD=0 BODY=20000 DMA_WR_ACK_LAT=200
 run srm rpipe NPIPE=3 HOLD=0 BODY=9000
 run sr4x rpipe4 NPIPE=3 BODY=6000 DMA_RD_GAP=40
 run sr4x rpipe4 NPIPE=4 BODY=70 MSS=1460
+# -- ...and at the real slot size (SLOT_LOG2 28): the top address bits of every slot are live.
+run sr28 r4x DMA_RD_GAP=40
+run sr28 rpipe4 NPIPE=4 BODY=9000 DMA_RD_GAP=40
+run sr28 rpipe4 NPIPE=3 BODY=70 MSS=1460
 # -- THE COUPLING EXPERIMENT at a realistic sink rate: the slow decoder must cost the fast one
 #    nothing at all. This pair is the proof.
 run sr2 rsolo FASTDIV=4 RMINP=95

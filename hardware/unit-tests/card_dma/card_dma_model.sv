@@ -63,11 +63,12 @@ import lynxTypes::*;
 //    ("Completed static elaboration") names nothing. Filling a temporary struct field by field and
 //    pushing that elaborates in two seconds. Bisected 2026-09-20; it is the only construct in this
 //    file that does it, and it was in both the write and the read path.
-// 2. The card memory is a flat `byte unsigned card_mem[]` over [MEM_BASE, MEM_BASE+MEM_BYTES) with
-//    a parallel `card_wr[]` "ever written" bit, not an associative array indexed by address. The
-//    associative version is tidier, but a bench then has no way to say "this address is outside the
-//    memory you were given", and that mistake reads as a silent zero. Benches size the window to
-//    the slots they use.
+// 2. The card memory is the window [MEM_BASE, MEM_BASE+MEM_BYTES), checked explicitly by in_window()
+//    on every access, so an address outside what a bench was given is an error rather than a silent
+//    zero. It is STORED as associative arrays keyed by the offset (card_mem, and card_wr as the
+//    "ever written" bit, i.e. `exists`). It was a flat `new[MEM_BYTES]` until 2026-09-23: xsim 2024.2
+//    aliases dynamic-array indices at and above 2^29 (m[(3<<28)+5] and m[(1<<28)+5] are the same
+//    byte), which corrupted every bench with 4 x 256 MiB slots -- the real stage-1 geometry.
 // =================================================================================================
 module card_dma_model #(
     parameter int DATA_BITS       = AXI_DATA_BITS,
@@ -128,13 +129,8 @@ module card_dma_model #(
     // Card memory: byte addressed, over [MEM_BASE, MEM_BASE+MEM_BYTES). card_wr carries the "has
     // ever been written" flag, so a read of uninitialised HBM is detectable.
     // ---------------------------------------------------------------------------------------------
-    byte unsigned card_mem [];
-    bit           card_wr  [];
-
-    initial begin
-        card_mem = new[int'(MEM_BYTES)];
-        card_wr  = new[int'(MEM_BYTES)];
-    end
+    byte unsigned card_mem [longint unsigned];
+    bit           card_wr  [longint unsigned];
 
     function automatic bit in_window(input longint unsigned a);
         in_window = (a >= MEM_BASE) && (a < (MEM_BASE + MEM_BYTES));
@@ -142,10 +138,10 @@ module card_dma_model #(
 
     // For benches: what is in card memory, and whether anything ever put it there.
     function automatic logic [7:0] peek(input longint unsigned a);
-        peek = in_window(a) ? card_mem[int'(a - MEM_BASE)] : 8'hxx;
+        peek = (in_window(a) && card_mem.exists(a - MEM_BASE)) ? card_mem[a - MEM_BASE] : 8'hxx;
     endfunction
     function automatic bit written(input longint unsigned a);
-        written = in_window(a) ? card_wr[int'(a - MEM_BASE)] : 1'b0;
+        written = in_window(a) && card_wr.exists(a - MEM_BASE);
     endfunction
 
     int n_err_wr = 0;
@@ -335,8 +331,8 @@ module card_dma_model #(
                                     ew($sformatf("write to %0h is outside the modelled card memory [%0h,%0h)",
                                                  a, MEM_BASE, MEM_BASE + MEM_BYTES));
                                 end else begin
-                                    card_mem[int'(a - MEM_BASE)] = wr_tdata[i*8 +: 8];
-                                    card_wr[int'(a - MEM_BASE)]  = 1'b1;
+                                    card_mem[a - MEM_BASE] = wr_tdata[i*8 +: 8];
+                                    card_wr[a - MEM_BASE]  = 1'b1;
                                 end
                             end
                         end
@@ -403,7 +399,7 @@ module card_dma_model #(
             k   = '0;
             for (int i = 0; i < n; i++) begin
                 a = base + longint'(blk) * BYTES + longint'(i);
-                d[i*8 +: 8] = written(a) ? card_mem[int'(a - MEM_BASE)] : 8'h00;
+                d[i*8 +: 8] = written(a) ? card_mem[a - MEM_BASE] : 8'h00;
                 k[i]        = 1'b1;
             end
         end
@@ -456,7 +452,7 @@ module card_dma_model #(
                                     bad = 1'b1;
                                     break;
                                 end
-                                if (!card_wr[int'(a - MEM_BASE)]) begin
+                                if (!card_wr.exists(a - MEM_BASE)) begin
                                     er($sformatf("[%0d] read of byte %0h that was never written (request [%0h,%0h))",
                                                  gd, a, lo, hi));
                                     bad = 1'b1;
