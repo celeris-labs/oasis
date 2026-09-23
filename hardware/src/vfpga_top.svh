@@ -206,7 +206,7 @@ logic [63:0]                   http_slot_base_w;
 HttpConfig #(
     .NUM_PARAM_REGS(44),
     .START_ADDR    (39),
-    .CSR_REV       (3)
+    .CSR_REV       (4)
 ) inst_http_config (
     .clk         (clk),
     .rst_n       (rst_n),
@@ -451,7 +451,7 @@ end
 localparam int NUM_HTTP_CONNS = `N_HTTP_CONNS;
 // log2 of one connection's slot. 22 = 4 MiB, so the host's largest legal GET is 4 MiB - 64 KiB.
 // The host does not guess this: handler_slots publishes it in SLOT_POLICY[29:24].
-localparam int HTTP_SLOT_LOG2 = 22;
+localparam int HTTP_SLOT_LOG2 = 28;
 
 logic                       hs_wr_req_valid, hs_wr_req_ready, hs_wr_req_last;
 logic [VADDR_BITS-1:0]      hs_wr_req_vaddr;
@@ -482,7 +482,7 @@ handler_slots #(
     .N_DECODERS (NUM_DECODERS),
     .QUEUE_DEPTH(HTTP_QUEUE_DEPTH),
     .SLOT_LOG2  (HTTP_SLOT_LOG2),
-    .CSR_REV    (3)
+    .CSR_REV    (4)
 ) inst_handler (
     .ap_clk  (clk),
     .ap_rst_n(rst_n),
