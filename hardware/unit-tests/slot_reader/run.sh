@@ -80,11 +80,12 @@ if [ $# -ge 1 ]; then
     r4x)    shift; run sr4x r4x    DMA_RD_GAP=40 "$@" ;;
     rmax)   shift; run srm  rmax   "$@" ;;
     rtwo)   shift; run sr1  rtwo   "$@" ;;
+    rpipe)  shift; run sr1  rpipe  "$@" ;;
     rgap)   shift; run sr1  rgap   DMA_RD_GAP=40 DMA_WR_BP=40 "$@" ;;
     rslow)  shift; run sr2  rslow  "$@" ;;
     rsolo)  shift; run sr2  rsolo  "$@" ;;
     rstall) shift; run sr2  rstall BODY=262144 RMINP=85 "$@" ;;
-    *) echo "usage: $0 [r1|r4|r4x|rmax|rtwo|rgap|rslow|rsolo|rstall] [PLUSARG=v ...]"; exit 2 ;;
+    *) echo "usage: $0 [r1|r4|r4x|rmax|rtwo|rpipe|rgap|rslow|rsolo|rstall] [PLUSARG=v ...]"; exit 2 ;;
   esac
   exit $(( FAILS > 0 ))
 fi

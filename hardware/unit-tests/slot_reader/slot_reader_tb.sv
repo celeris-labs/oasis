@@ -411,6 +411,36 @@ module slot_reader_tb #(
         end
     endtask
 
+    // Several whole responses for connection c as ONE persistent-connection byte stream, chopped at
+    // MSS boundaries with no regard for where a response ends -- which is what the TOE delivers
+    // when a server answers pipelined GETs back to back: response k's last body bytes and response
+    // k+1's status line share a segment, and usually a beat. Body lengths are chosen so every
+    // response ends mid-beat.
+    task automatic queue_stream(input int c, input int d, input int nresp, input int body0,
+                                input int mss = 4096);
+        byte unsigned resp[$];
+        int pos, n, bl;
+        begin
+            resp.delete();
+            for (int k = 0; k < nresp; k++) begin
+                bl = body0 + 17*k + 5;
+                make_header(resp, bl, 300 + 37*k);
+                for (int i = 0; i < bl; i++) begin
+                    resp.push_back(pat(c, src_idx[c] + i));
+                    exp_body[d].push_back(pat(c, src_idx[c] + i));
+                end
+                src_idx[c] = src_idx[c] + bl;
+            end
+            pos = 0;
+            while (pos < resp.size()) begin
+                n = resp.size() - pos;
+                if (n > mss) n = mss;
+                queue_seg(c, resp, pos, n);
+                pos = pos + n;
+            end
+        end
+    endtask
+
     // Re-order the work list so the connections' segments arrive round robin rather than one
     // response at a time -- which is what the wire actually does with several connections open,
     // and what makes the descriptor queue keep each segment's connection straight.
@@ -740,6 +770,35 @@ module slot_reader_tb #(
                 if (rate1 < target1)
                     err($sformatf("decoder 1 ran at %.4f beats/cycle, expected >= %.4f",
                                   rate1, target1));
+            end
+
+            // -- PIPELINED GETs ON ONE CONNECTION (2026-09-23, the depth > 1 question). NPIPE
+            //    entries for conn 0 are queued before a byte lands, then NPIPE responses arrive as
+            //    one persistent-connection stream (queue_stream: responses share segments and
+            //    beats). HOLD=1 stops the decoder until every byte is in the slot, so response k+1
+            //    has certainly landed behind response k before k drains. This is what the host
+            //    would do at depth NPIPE if handler_slots let it; the case asserts byte exactness.
+            "rpipe": begin
+                int npipe, hold;
+                npipe = 2; hold = 1;
+                void'($value$plusargs("NPIPE=%d", npipe));
+                void'($value$plusargs("HOLD=%d", hold));
+                if (hold) sink_stop[0] = 1'b1;
+                for (int k = 0; k < npipe; k++) push_entry(0, 0);
+                queue_stream(0, 0, npipe, body_len);
+                run_traffic();
+                repeat (200) @(negedge clk);
+                $display("  rpipe: NPIPE=%0d HOLD=%0d, all %0d bytes delivered, landed[0]=%0d",
+                         npipe, hold, src_idx[0], landed[0]);
+                sink_stop[0] = 1'b0;
+                wait_done(0, npipe, 200000);
+                repeat (200) @(negedge clk);
+                $display("  rpipe: %0d of %0d responses retired, %0d tlast(s), %0d of %0d body bytes out, residue_err=%0b landed[0]=%0d",
+                         n_done[0], npipe, n_last[0], got[0].size(), exp_body[0].size(),
+                         residue_err[0], landed[0]);
+                check_body(0);
+                if (n_last[0] != npipe)
+                    err($sformatf("decoder 0: %0d tlast(s), expected %0d", n_last[0], npipe));
             end
 
             default: err($sformatf("unknown scenario '%s'", scen));
