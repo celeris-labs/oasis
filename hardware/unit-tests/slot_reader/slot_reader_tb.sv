@@ -93,6 +93,11 @@ module slot_reader_tb #(
         .conn_tdata(conn_tdata), .conn_tkeep(conn_tkeep), .conn_tlast(conn_tlast),
         .conn_pkg_issued(conn_pkg_issued), .conn_space_ok(conn_space_ok),
         .slot_base(SLOT_BASE), .conn_release(wr_release),
+        // Tied off: nothing here takes a connection down. Left UNCONNECTED until 2026-09-23, which
+        // made charge_w, the reservation and conn_space_ok X for the whole bench -- the issuer's
+        // `while (!conn_space_ok)` then never waited, and a long response under DMA write
+        // back-pressure overran the fifo (route_stall) with the RTL behaving correctly.
+        .conn_down('0),
         .wr_req_valid(wr_req_valid), .wr_req_ready(wr_req_ready),
         .wr_req_vaddr(wr_req_vaddr), .wr_req_len(wr_req_len), .wr_req_last(wr_req_last),
         .m_axis_tvalid(w_tvalid), .m_axis_tready(w_tready),
@@ -615,6 +620,7 @@ module slot_reader_tb #(
     // more than one shared channel can carry and the number is a bandwidth split; at fastdiv 4 they
     // do not, and anything short of ~100% would be coupling. See the header.
     int rminp    = 80;
+    int mss      = 4096;     // segment size for queue_stream (rpipe, rpipe4)
     real rate0, rate1, target1;
 
     // Mixed request shapes for `r4x`: four bodies that split at RD_MAX differently (at 16 KiB:
@@ -642,6 +648,7 @@ module slot_reader_tb #(
         void'($value$plusargs("FASTDIV=%d", fastdiv));
         void'($value$plusargs("SLOWOFF=%d", slowoff));
         void'($value$plusargs("RMINP=%d", rminp));
+        void'($value$plusargs("MSS=%d", mss));
 
         reset_seq();
 
@@ -778,6 +785,25 @@ module slot_reader_tb #(
             //    beats). HOLD=1 stops the decoder until every byte is in the slot, so response k+1
             //    has certainly landed behind response k before k drains. This is what the host
             //    would do at depth NPIPE if handler_slots let it; the case asserts byte exactness.
+            // -- PIPELINED on every decoder at once: NPIPE responses per connection, one connection
+            //    per decoder, the four streams interleaved segment by segment on the wire.
+            "rpipe4": begin
+                int npipe;
+                npipe = 3;
+                void'($value$plusargs("NPIPE=%d", npipe));
+                for (int d = 0; d < NRD; d++)
+                    for (int k = 0; k < npipe; k++) push_entry(d, d);
+                for (int c = 0; c < NCONNS; c++) queue_stream(c, c, npipe, body_len + 311*c, mss);
+                interleave();
+                run_traffic();
+                for (int d = 0; d < NRD; d++) wait_done(d, npipe, 400000);
+                for (int d = 0; d < NRD; d++) begin
+                    check_body(d);
+                    if (n_last[d] != npipe)
+                        err($sformatf("decoder %0d: %0d tlast(s), expected %0d", d, n_last[d], npipe));
+                end
+            end
+
             "rpipe": begin
                 int npipe, hold;
                 npipe = 2; hold = 1;
@@ -785,7 +811,7 @@ module slot_reader_tb #(
                 void'($value$plusargs("HOLD=%d", hold));
                 if (hold) sink_stop[0] = 1'b1;
                 for (int k = 0; k < npipe; k++) push_entry(0, 0);
-                queue_stream(0, 0, npipe, body_len);
+                queue_stream(0, 0, npipe, body_len, mss);
                 run_traffic();
                 repeat (200) @(negedge clk);
                 $display("  rpipe: NPIPE=%0d HOLD=%0d, all %0d bytes delivered, landed[0]=%0d",

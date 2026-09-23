@@ -81,11 +81,12 @@ if [ $# -ge 1 ]; then
     rmax)   shift; run srm  rmax   "$@" ;;
     rtwo)   shift; run sr1  rtwo   "$@" ;;
     rpipe)  shift; run sr1  rpipe  "$@" ;;
+    rpipe4) shift; run sr4x rpipe4 "$@" ;;
     rgap)   shift; run sr1  rgap   DMA_RD_GAP=40 DMA_WR_BP=40 "$@" ;;
     rslow)  shift; run sr2  rslow  "$@" ;;
     rsolo)  shift; run sr2  rsolo  "$@" ;;
     rstall) shift; run sr2  rstall BODY=262144 RMINP=85 "$@" ;;
-    *) echo "usage: $0 [r1|r4|r4x|rmax|rtwo|rpipe|rgap|rslow|rsolo|rstall] [PLUSARG=v ...]"; exit 2 ;;
+    *) echo "usage: $0 [r1|r4|r4x|rmax|rtwo|rpipe|rpipe4|rgap|rslow|rsolo|rstall] [PLUSARG=v ...]"; exit 2 ;;
   esac
   exit $(( FAILS > 0 ))
 fi
@@ -107,6 +108,19 @@ run sr4x r4x DMA_RD_GAP=40 DMA_WR_BP=30 DMA_SEED=7
 run srm rmax
 # -- two responses in a row on one connection, with the release between them.
 run sr1 rtwo
+# -- PIPELINED GETs (CSR revision 4): several responses queued on one connection before the first
+#    drains, arriving as one stream (responses share segments and beats, every one ends mid-beat).
+#    HOLD=1 lets every byte land before the decoder takes any; HOLD=0 races them.
+for n in 2 4; do for h in 0 1; do run sr1 rpipe NPIPE=$n HOLD=$h; done; done
+run sr1 rpipe NPIPE=2 HOLD=0 BODY=400000
+run sr1 rpipe NPIPE=4 HOLD=1 BODY=400000 DMA_RD_GAP=30 DMA_WR_BP=30
+run sr1 rpipe NPIPE=4 HOLD=0 BODY=70            # 75..126-byte bodies, all in one segment
+run sr1 rpipe NPIPE=4 HOLD=1 BODY=70 MSS=64
+run sr1 rpipe NPIPE=3 HOLD=0 BODY=5000 MSS=1460 DMA_RD_GAP=40 DMA_SEED=5
+run sr1 rpipe NPIPE=8 HOLD=0 BODY=20000 DMA_WR_ACK_LAT=200
+run srm rpipe NPIPE=3 HOLD=0 BODY=9000
+run sr4x rpipe4 NPIPE=3 BODY=6000 DMA_RD_GAP=40
+run sr4x rpipe4 NPIPE=4 BODY=70 MSS=1460
 # -- THE COUPLING EXPERIMENT at a realistic sink rate: the slow decoder must cost the fast one
 #    nothing at all. This pair is the proof.
 run sr2 rsolo FASTDIV=4 RMINP=95
