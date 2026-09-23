@@ -80,6 +80,13 @@ struct OasisScanBindData : public TableFunctionData {
 	// Reader over parquet_metadata that does not open the file. It answers statistics questions at
 	// plan time, and must outlive the partition statistics it hands out (they reference it).
 	shared_ptr<ParquetReader> metadata_reader;
+
+	// Set by the Oasis optimizer extension when this scan is the probe side of a read_oasis-to-
+	// read_oasis equi-join.
+	bool runtime_bloom_enabled = false;
+	string runtime_bloom_build_filename;
+	string runtime_bloom_build_key;
+	string runtime_bloom_probe_key;
 };
 
 struct ProjectedColumn {
