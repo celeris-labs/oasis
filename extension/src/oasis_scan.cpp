@@ -12,6 +12,7 @@
 #include "oasis/oasis_context.hpp"
 #include "oasis/operator.hpp"
 #include "oasis/query_splinter.hpp"
+#include "oasis_hardware_bloom.hpp"
 #include "parcore/configuration.hpp"
 #include "parcore_metadata_util.hpp"
 #include "parquet_reader.hpp"
@@ -313,6 +314,11 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		const auto &cc = *pending.hw_chunks[k];
 		auto type = parcore::metadata::to_libstf_type(cc.type);
+
+		// Every hardware column-chunk decode flow lands on a DECODE-capability stream, and stream 0
+		// always routes through the Bloom filter's select-gated demultiplexer, so it needs its own queued bypass decision See
+		// EnqueueOasisHardwareBloomBypass for the current-config caveat (N_DECODERS == 1 only).
+		EnqueueOasisHardwareBloomBypass();
 
 		oasis::OperatorFlow flow;
 		if (rdma) {

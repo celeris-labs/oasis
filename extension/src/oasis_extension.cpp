@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "oasis_extension.hpp"
+#include "oasis_hardware_bloom.hpp"
 #include "oasis_optimizer.hpp"
 #include "oasis_profile.hpp"
 #include "oasis_scan.hpp"
@@ -68,6 +69,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Get the OasisContext to establish the connection to the FPGA.
 	Connection conn(instance);
 	GetOrCreateOasisContext(*conn.context);
+
+	// Configure the hardware Bloom filter block, keeping the top-level stream routed through the
+	// bypass path for now -- see oasis_hardware_bloom.cpp.
+	ConfigureOasisHardwareBloom();
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {
