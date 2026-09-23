@@ -15,7 +15,11 @@
 #                 The readers share ONE card read channel, which is the topology the bitstream is
 #                 built with since 2026-09-22 -- build-123 failed route_design with five card AXI
 #                 streams -- so the black-box scenarios cover the real thing.
-#   --dut both    both, which is what a bare ./run.sh does.
+#   --dut both    both, which is what a bare ./run.sh does (plus the s2 set below).
+#   --dut s2      STAGE 2 only: handler_slots at revision 5 with MORE CONNECTIONS THAN DECODERS
+#                 (NUM_CONNS 24 and 32 over NUM_DEC 4, the build-127 shape), the host model placing
+#                 every GET on a connection; the s2* scenarios plus the generic ones that are
+#                 meaningful per decoder, and s2mix with the host using 4, 24 and 32 connections.
 #
 #   ./run.sh                          everything, both DUTs, N = 1, 2, 4
 #   ./run.sh --dut slots              every slots scenario, N = 1, 2, 4
@@ -77,9 +81,12 @@ xvlog -sv lynxTypes_stub.sv \
       rxd_drain_tb.sv lane_drain_tb.sv > xvlog.log 2>&1 \
   || { tail -40 xvlog.log; exit 1; }
 
+# CSR_REV=4 (environment) elaborates handler_slots with revision 4's conn == decoder arm decoding;
+# the default is the bench's own (5, the stage-2 RTL driven stage-1 shaped: conn L on decoder L).
 elab() { # <snapshot> <generic>...
   local snap="$1"; shift
   local g=(); local x; for x in "$@"; do g+=(-generic_top "$x"); done
+  [ -n "${CSR_REV:-}" ] && [[ " $* " == *DUT_SLOTS=1* ]] && g+=(-generic_top "CSR_REV=${CSR_REV}")
   [ -d "xsim.dir/$snap" ] && return 0
   xelab -debug typical -timescale 1ns/1ps -top lane_drain_tb -snapshot "$snap" "${g[@]}" \
         > "xelab_$snap.log" 2>&1 || { tail -30 "xelab_$snap.log"; return 1; }
@@ -248,6 +255,31 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
   SNAP_OVERRIDE=lds4big_snap run_hm slots p3 4 DEPTH=4 NRESP=30 SRVLAT=1000 COALESCE
   SNAP_OVERRIDE=lds4big_snap run_hm slots refatal 4 RFN=3 HDEPTH=4
   SNAP_OVERRIDE=lds4big_snap run_hm slots refatal 4 RFN=3 RFB=20000 RFP=7 HDEPTH=4
+fi
+
+if [ "$DUT" = s2 ] || [ "$DUT" = both ]; then
+  for C in 24 32; do
+    elab "lds2c${C}_snap" "NUM_CONNS=${C}" "NUM_DEC=4" "DUT_SLOTS=1" "CSR_REV=5" || exit 1
+  done
+  for C in 24 32; do
+    echo "--- handler_slots STAGE 2 : ${C} connections, 4 decoders ---"
+    S="lds2c${C}_snap"
+    SNAP_OVERRIDE=$S run_hm slots s2mix  $C SRVLAT=500 SRVJIT=2000 COALESCE
+    SNAP_OVERRIDE=$S run_hm slots s2mix  $C SRVLAT=300 SRVJIT=300 MSS=1460 BMAX=3000 NREQ=40 HDEPTH=4
+    SNAP_OVERRIDE=$S run_hm slots s2arm  $C SRVLAT=4000 HDEPTH=1
+    SNAP_OVERRIDE=$S run_hm slots s2fatal $C SRVLAT=3000 SRVJIT=1000
+    SNAP_OVERRIDE=$S run_hm slots s2idle $C SRVLAT=300
+    for s in a g h d; do SNAP_OVERRIDE=$S run_hm slots "$s" $C; done
+    SNAP_OVERRIDE=$S run_hm slots dmabp $C DMA_WR_BP=50 DMA_RD_GAP=40
+    SNAP_OVERRIDE=$S run_hm slots big   $C
+    SNAP_OVERRIDE=$S run_hm slots thr   $C THRDIV=16
+    SNAP_OVERRIDE=$S run_hm slots p3    $C DEPTH=8 NRESP=40 SRVLAT=1000 COALESCE
+  done
+  # the RUNTIME connection count (OASIS_HTTP_CONNS on the board): the 32-connection bitstream with
+  # the host using only 4, 24 or all 32 of them.
+  for U in 4 24 32; do
+    SNAP_OVERRIDE=lds2c32_snap run_hm slots s2mix 32 S2CONNS=$U S2MINUSED=$U SRVLAT=500 SRVJIT=1000 COALESCE
+  done
 fi
 
 echo "lane_drain: $FAILS failed of $CASES case(s)"
