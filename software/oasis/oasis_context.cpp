@@ -1,5 +1,6 @@
 #include "oasis/oasis_context.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 
 #include "oasis/configuration.hpp"
@@ -122,7 +123,17 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
     scheduler_ = std::make_unique<Scheduler>(*this);
 }
 
-void OasisContext::init(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t obm_buffer_capacity) {
+void OasisContext::init(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t obm_buffer_capacity,
+                        size_t http_config_bytes) {
+    if (http_config_bytes != sizeof(HTTPReadConfig)) {
+        std::ostringstream msg;
+        msg << "liboasis/header mismatch: the caller was compiled with sizeof(HTTPReadConfig) = "
+            << http_config_bytes << ", this liboasis has " << sizeof(HTTPReadConfig)
+            << ". The caller picked up stale oasis headers (check the include order: an old "
+               "$HOME/opt/include/oasis ahead of the new install). Rebuild it against the headers "
+               "installed with this library; running on would corrupt the heap.";
+        throw std::runtime_error(msg.str());
+    }
     std::call_once(init_flag_, [memory_pool = std::move(memory_pool), obm_buffer_capacity]() mutable {
         // Configure and start Caliper before constructing the context: the constructor flushes buffers
         // and starts the scheduler, both of which can fire interrupts whose Profiler regions
@@ -207,12 +218,18 @@ void OasisContext::setup_http_slots() {
     http_slot_page_ = page;
     http->set_slot_base(reinterpret_cast<uint64_t>(page));
 
-    libstf::log(libstf::LogLevel::INFO,
-                "OasisContext: HBM slot bitstream (CSR rev %u): %u connection slot(s) of %llu KiB "
-                "at %p, offloaded to card memory; GETs capped at %llu KiB",
-                unsigned(policy.revision), unsigned(policy.n_conns),
-                static_cast<unsigned long long>(policy.slot_bytes() >> 10), page,
-                static_cast<unsigned long long>(policy.max_get_bytes() >> 10));
+    // stderr as well as the log sink: the context is built while the extension LOADS, before any
+    // statement could have enabled DuckDB's logger, so an INFO line there is never seen -- and which
+    // datapath a run used is exactly what a log has to be able to prove afterwards. Once per process.
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "OasisContext: HBM slot bitstream (CSR rev %u): %u connection slot(s) of %llu KiB "
+                  "at %p, offloaded to card memory; GETs capped at %llu KiB",
+                  unsigned(policy.revision), unsigned(policy.n_conns),
+                  static_cast<unsigned long long>(policy.slot_bytes() >> 10), page,
+                  static_cast<unsigned long long>(policy.max_get_bytes() >> 10));
+    std::fprintf(stderr, "[oasis] %s\n", line);
+    libstf::log(libstf::LogLevel::INFO, "%s", line);
 }
 
 OasisContext &OasisContext::ctx() {
