@@ -4,10 +4,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <libstf/logging.hpp>
 #include <libstf/profiling.hpp>
@@ -1935,6 +1937,57 @@ std::string HTTPRequestEcho::describe() const {
 uint64_t HTTPReadConfig::read_stream_register(libstf::stream_t /*stream*/, uint32_t reg) {
     assert(reg < HTTP_READ_CONFIG_REGS);
     return cthread->getCSR(addr_offset + reg);
+}
+
+
+std::string HTTPReadConfig::debug_dump() {
+    std::ostringstream o;
+    const auto hex = [](uint64_t v) {
+        std::ostringstream h;
+        h << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
+        return h.str();
+    };
+    const uint8_t rev   = revision();
+    const int     last  = rev >= HTTP_CSR_REVISION_SLOTS ? int(HTTP_SLOT_POLICY)
+                          : rev >= HTTP_CSR_REVISION_LANES ? int(HTTP_LANE_POLICY)
+                                                           : int(HTTP_QUEUE_DEPTH);
+    o << "HTTP CSR dump (revision " << unsigned(rev) << ", read ids 0.." << last << "):\n";
+    std::vector<uint64_t> w(static_cast<size_t>(last) + 1, 0);
+    for (int i = 0; i <= last; i++) {
+        w[i] = read_register(static_cast<uint32_t>(i)).value();
+        o << "  [" << std::setw(2) << i << "] " << hex(w[i]) << "\n";
+    }
+    o << "  status(2):   " << describe_status(static_cast<uint32_t>(w[HTTP_TOTAL_WORD])) << "\n";
+    o << "  inflight:    " << inflight().describe() << "\n";
+    o << "  stall:       " << stall().describe() << "\n";
+    o << "  response:    " << response().describe() << " (decoder 0's framer)\n";
+    if (rev >= HTTP_CSR_REVISION_LANES) {
+        const uint8_t n = lane_count();
+        o << "  " << DecodeLanes(w[HTTP_LANE_OCC], w[HTTP_LANE_READY], n).describe() << "\n";
+        o << "  " << DecodeLaneErrors(w[HTTP_LANE_ERR], n, rev).describe() << "\n";
+        for (uint8_t l = 0; l < n; l++) {
+            o << "  lane " << unsigned(l) << " state: " << DescribeLaneState(w[HTTP_LANE_STATE], l)
+              << (rev >= HTTP_CSR_REVISION_SLOTS ? " (read_state = slot_reader state)" : "") << "\n";
+        }
+        o << "  " << DecodePolicy(w[HTTP_LANE_POLICY]).describe() << "\n";
+    }
+    if (rev >= HTTP_CSR_REVISION_SLOTS) {
+        std::array<uint64_t, 4> occ {}, err {};
+        std::array<uint64_t, 2> ready {};
+        for (int k = 0; k < 4; k++) {
+            occ[k] = w[HTTP_CONN_OCC0 + k];
+            err[k] = w[HTTP_CONN_ERR0 + k];
+        }
+        for (int k = 0; k < 2; k++) {
+            ready[k] = w[HTTP_CONN_READY0 + k];
+        }
+        const auto p = DecodeSlotPolicy(w[HTTP_SLOT_POLICY]);
+        o << "  " << p.describe() << "\n";
+        o << "  " << DecodeConns(occ, ready, err, w[HTTP_CONN_DRAINED], p.n_conns).describe() << "\n";
+        o << "  (the RTL exports no slot write/read cursors or landed counts; per-decoder reader "
+             "state is the read_state nibble above)\n";
+    }
+    return o.str();
 }
 
 } // namespace oasis

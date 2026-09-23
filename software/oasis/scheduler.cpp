@@ -8,6 +8,10 @@
 #include <libstf/logging.hpp>
 #include <libstf/profiling.hpp>
 
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
+#include <unistd.h>
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -161,6 +165,166 @@ Scheduler::Scheduler(OasisContext &ctx)
     }
 
     dispatcher_ = std::thread([this] { dispatch_loop(); });
+
+    // The no-progress watchdog. On by default on the HBM-slot bitstream, where a second process
+    // cannot attach to read the handler state (it would be ctid 1, the slot descriptors use pid 0),
+    // so an in-process capture is the only one there is. Elsewhere only on request.
+    const char *env = std::getenv("OASIS_STALL_DUMP_S");
+    watchdog_on_    = (http_ && http_->slot_mode()) || (env != nullptr && *env != '\0');
+    if (env != nullptr && *env != '\0') {
+        stall_dump_s_ = std::max(0.0, std::atof(env));
+    }
+    if (watchdog_on_) {
+        note_progress();
+        watchdog_ = std::thread([this] { watchdog_loop(); });
+    }
+}
+
+void Scheduler::note_progress() {
+    last_progress_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count(),
+                            std::memory_order_relaxed);
+}
+
+// THE NO-PROGRESS WATCHDOG. Three jobs, every 500 ms, none of which touch the datapath:
+//
+// 1. WAKE every consumer blocked on a splinter channel (SplinterResultChannel::kick). A DuckDB
+//    task blocked on a flow the hardware never finishes is otherwise never run again, and DuckDB
+//    only checks the interrupt flag when a task runs -- which is why SIGINT did nothing for minutes
+//    on the build-124 q3 hang. After a kick the task re-polls, finds nothing, and either re-arms or,
+//    if the query was interrupted, throws InterruptException from its pipeline.
+//    That unwind is SAFE: it drops the scan's handle on the result channel and nothing else. The
+//    in-flight flow -- its operators, its request text and its output buffers, i.e. everything the
+//    card may still DMA into -- is owned by this Scheduler's in-flight list, which the unwind does
+//    not touch; it is released only by the flow's own completion (or abandoned, never freed, by
+//    ~Scheduler after kDrainTimeout).
+// 2. On the slot bitstream, WAKE the dispatcher, so fail_flows_on_fatal_lanes() also runs while the
+//    queue is empty. It used to run only when the dispatcher iterated, and an empty queue parks it
+//    indefinitely -- so a lane that went fatal with the last flows of a query on it hung silently.
+// 3. DUMP, once per stall, the full state when flows are outstanding and nothing has retired or
+//    been dispatched for stall_dump_s_ seconds: to stderr, and to $OASIS_DUMP_DIR/ if set.
+void Scheduler::watchdog_loop() {
+    const auto tick     = std::chrono::milliseconds(500);
+    bool       dumped   = false;
+    int64_t    dumped_at = 0;
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(watchdog_mutex_);
+            if (watchdog_cv_.wait_for(lk, tick, [this] { return watchdog_stop_; })) {
+                return;
+            }
+        }
+        std::vector<std::shared_ptr<SplinterResultChannel>> channels;
+        bool busy = false;
+        {
+            std::lock_guard<std::mutex> lock(dispatch_mutex_);
+            busy = !queue_.empty();
+            for (auto &st : streams_) {
+                busy = busy || st->enqueued.load(std::memory_order_relaxed) != 0;
+            }
+            auto it = live_channels_.begin();
+            while (it != live_channels_.end()) {
+                if (auto c = it->lock()) {
+                    channels.push_back(std::move(c));
+                    ++it;
+                } else {
+                    it = live_channels_.erase(it);
+                }
+            }
+        }
+        try {
+            for (auto &c : channels) {
+                c->kick();
+            }
+        } catch (...) { // a consumer callback must never take this thread down
+        }
+        channels.clear();
+        if (http_ && http_->slot_mode()) {
+            dispatch_cv_.notify_one();
+        }
+
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        if (!busy) {
+            note_progress(); // idle is not a stall; the clock starts when work is outstanding
+            dumped = false;
+            continue;
+        }
+        const int64_t last = last_progress_ns_.load(std::memory_order_relaxed);
+        if (dumped && last > dumped_at) {
+            dumped = false; // progress since the last dump: arm again
+        }
+        const double stalled_s = double(now - last) / 1e9;
+        if (dumped || stall_dump_s_ <= 0.0 || stalled_s < stall_dump_s_) {
+            continue;
+        }
+        dumped    = true;
+        dumped_at = now;
+        std::string text;
+        try {
+            text = describe_stall(stalled_s);
+        } catch (const std::exception &e) {
+            text = std::string("oasis stall dump failed: ") + e.what() + "\n";
+        }
+        std::fprintf(stderr, "%s", text.c_str());
+        std::fflush(stderr);
+        if (const char *dir = std::getenv("OASIS_DUMP_DIR"); dir != nullptr && *dir != '\0') {
+            const std::string path = std::string(dir) + "/oasis-stall-" + std::to_string(getpid()) +
+                                     "-" + std::to_string(now / 1000000000) + ".txt";
+            if (FILE *f = std::fopen(path.c_str(), "w")) {
+                std::fputs(text.c_str(), f);
+                std::fclose(f);
+                std::fprintf(stderr, "[oasis] stall dump written to %s\n", path.c_str());
+            }
+        }
+    }
+}
+
+std::string Scheduler::describe_stall(double stalled_s) {
+    std::ostringstream o;
+    o << "\n===== [oasis] NO PROGRESS for " << stalled_s
+      << " s (no flow retired or dispatched) -- state dump, pid " << getpid() << " =====\n";
+    {
+        std::lock_guard<std::mutex> lock(dispatch_mutex_);
+        o << "host: " << queue_.size() << " flow(s) queued, not yet placed; lane-aware="
+          << lane_aware_ << " lane_depth=" << lane_depth_ << " host_depth=" << queue_depth_.load()
+          << "\n";
+        for (size_t s = 0; s < streams_.size(); ++s) {
+            auto &st = *streams_[s];
+            std::lock_guard<std::mutex> slock(st.mutex);
+            o << "  stream " << s << ": enqueued=" << st.enqueued.load() << ", in-flight "
+              << st.in_flight.size() << "\n";
+            for (auto &slot : st.in_flight) {
+                o << "    flow done=" << slot.done << " sinks_outstanding="
+                  << slot.flow_outstanding.load() << ":";
+                for (const auto &op : slot.flow) {
+                    o << " ";
+                    op->print(o);
+                }
+                o << "\n";
+            }
+        }
+    }
+    if (http_) {
+        o << http_->debug_dump();
+    }
+    try {
+        auto dec = ctx_.config<parcore::ColumnChunkDecoderConfig>();
+        for (libstf::stream_t s = 0; s < num_streams_; ++s) {
+            const auto p = dec->read_profile(s);
+            o << "  decoder " << unsigned(s) << " in: hs=" << p.in.handshakes_cycles
+              << " starved=" << p.in.starved_cycles << " stalled=" << p.in.stalled_cycles
+              << " idle=" << p.in.idle_cycles << " | out: hs=" << p.out.handshakes_cycles
+              << " starved=" << p.out.starved_cycles << " stalled=" << p.out.stalled_cycles
+              << " idle=" << p.out.idle_cycles << "\n";
+        }
+    } catch (const std::exception &e) {
+        o << "  decoder profiles unavailable: " << e.what() << "\n";
+    }
+    o << "===== end of state dump =====\n";
+    return o.str();
 }
 
 void Scheduler::set_active_streams(libstf::stream_t active) {
@@ -174,6 +338,14 @@ void Scheduler::set_pipeline_depth(size_t depth) {
 }
 
 Scheduler::~Scheduler() {
+    if (watchdog_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(watchdog_mutex_);
+            watchdog_stop_ = true;
+        }
+        watchdog_cv_.notify_all();
+        watchdog_.join();
+    }
     // Stop the dispatcher first so no new flows are placed while we tear down.
     {
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
@@ -268,6 +440,9 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         for (auto &flow : splinter.streams) {
             queue_.push_back(Pending{std::move(flow), completion});
+        }
+        if (watchdog_on_) {
+            live_channels_.push_back(channel);
         }
     }
     dispatch_cv_.notify_one();
@@ -812,6 +987,7 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
             // thread) only *after* dropping its locks, so this thread can always finish even if the
             // reap races us here.
             if (slot->flow_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                note_progress();
                 {
                     std::lock_guard<std::mutex> slock(ss.mutex);
                     slot->done = true;
@@ -846,6 +1022,7 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         throw;
     }
 
+    note_progress();
     if (libstf::should_log(libstf::LogLevel::DEBUG)) {
         libstf::log(libstf::LogLevel::DEBUG, "Enqueued flow to stream %u",
                     static_cast<unsigned>(stream));

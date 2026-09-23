@@ -208,6 +208,29 @@ class Scheduler {
     bool                    stop_ = false;
     std::thread             dispatcher_;
 
+    // ---------------------------------------------------------------------------------------------
+    // No-progress watchdog (see watchdog_loop). On by default on a CSR revision-3 (HBM slot)
+    // bitstream, and on any other only when OASIS_STALL_DUMP_S is set, so revision-2 runs are
+    // untouched unless asked.
+    // ---------------------------------------------------------------------------------------------
+    bool                    watchdog_on_ = false;
+    double                  stall_dump_s_ = 30.0; // 0 = kick only, never dump
+    std::thread             watchdog_;
+    std::mutex              watchdog_mutex_;
+    std::condition_variable watchdog_cv_;
+    bool                    watchdog_stop_ = false;
+    /// steady_clock nanoseconds of the last flow retirement or dispatch.
+    std::atomic<int64_t>    last_progress_ns_ {0};
+    /// Channels of splinters submitted and not yet destroyed, so the watchdog can wake their
+    /// consumers. Guarded by dispatch_mutex_.
+    std::vector<std::weak_ptr<SplinterResultChannel>> live_channels_;
+
+    void watchdog_loop();
+    void note_progress();
+    /// Host-side view (queue, per-stream in-flight flows with their operators) + the HTTP CSR dump
+    /// + the decoder profiles. Takes dispatch_mutex_ and the stream mutexes itself.
+    std::string describe_stall(double stalled_s);
+
     // The dispatcher loop: Pops the queue head, picks the least-loaded active stream with a free
     // pipeline slot -- and, where the hardware reports them, a lane with credit -- and dispatches
     // there. Parks on dispatch_cv_ when the queue is empty or every active stream is full; polls it

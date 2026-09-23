@@ -269,7 +269,10 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     // request text went to DIFFERENT lanes, and nothing on either side could notice.
     const uint8_t lane = config->lane_for_stream(stream);
 
+    lane_.store(lane);
+    gets_total_.fetch_add(batch.request_bytes.empty() ? 1 : batch.request_bytes.size());
     config->submit_batch(server_ip_, server_port_, batch, lane);
+    gets_armed_.fetch_add(batch.request_bytes.empty() ? 1 : batch.request_bytes.size());
 
     // Then the text itself.
     //
@@ -393,6 +396,8 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
     // which needs every GET to have been sent. So the DMA can never outlive its source.
     text_buffers_.push_back(buf);
 
+    lane_.store(lane);
+    gets_total_.fetch_add(requests.size());
     config.push_entries(batch, lane);
 
     // The request-text sink is the lane on a multi-connection bitstream (see emit_batch).
@@ -406,6 +411,7 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
         // Proof the arm was taken before anything else is written -- the next GET's arm, or the
         // next flow's entries, would otherwise rewrite the registers it is sampled from.
         config.await_arm_consumed(lane);
+        gets_armed_.fetch_add(1);
 
         const size_t padded = ((lens[i] + beat - 1) / beat) * beat;
         for (size_t off = 0; off < padded; off += coyote::MAX_TRANSFER_SIZE) {
@@ -419,6 +425,7 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
             const bool last = off + coyote::MAX_TRANSFER_SIZE >= padded;
             ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last);
         }
+        gets_sent_.fetch_add(1);
     }
 
     // No wait for "the text has gone out" here, unlike the revision-2 path. There that wait is
@@ -436,7 +443,12 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
 }
 
 void HTTPBatchSourceOperator::print(std::ostream &os) const {
-    os << "HTTPBatchSource(path=" << path_ << ", chunks=" << chunks_.size() << ")";
+    os << "HTTPBatchSource(path=" << path_ << ", chunks=" << chunks_.size();
+    for (const auto &c : chunks_) {
+        os << " [" << c.offset << "+" << c.size << "]";
+    }
+    os << ", lane=" << lane_.load() << ", GETs armed " << gets_armed_.load() << " / DMA'd "
+       << gets_sent_.load() << " / total " << gets_total_.load() << ")";
 }
 
 void LocalSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {

@@ -719,6 +719,13 @@ class HTTPReadConfig : public libstf::Config {
     /// HTTP_DEFAULT_CHUNK_BYTES.
     static uint64_t chunk_bytes();
 
+    /// Every readback register this bitstream has, raw and decoded, as one multi-line string: the
+    /// status/stall/response words (1..15), the per-lane words (16..20, revision >= 2) and the
+    /// per-connection words (21..32, revision 3). Reads only; safe from any thread. This is the
+    /// in-process state capture -- a second process cannot attach on a revision-3 board (it would be
+    /// ctid 1, and the slot descriptors carry pid 0).
+    std::string debug_dump();
+
     /// Read CSRs 3..8: the request parameters currently latched in hardware.
     HTTPRequestEcho request_echo();
 

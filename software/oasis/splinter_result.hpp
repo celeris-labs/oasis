@@ -137,6 +137,25 @@ class SplinterResultChannel {
     // returns false. The caller must treat this as "ready now" and re-poll rather than block -- the
     // callback is never invoked synchronously on the registering thread, which would otherwise let 
     // a task reschedule (and re-enter the scan) while it is still executing.
+    /// Fire an armed readiness callback WITHOUT data: a spurious wake. The consumer re-polls, finds
+    /// nothing, and re-arms -- or, if its query has been interrupted meanwhile, notices that and
+    /// unwinds. This is what makes SIGINT reach a scan blocked on a flow the hardware will never
+    /// finish: DuckDB checks the interrupt flag only when a task RUNS, and a task blocked on this
+    /// channel runs again only when its callback fires. See Scheduler's watchdog. Returns whether a
+    /// callback was armed.
+    bool kick() {
+        std::function<void()> cb;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cb = take_ready_callback();
+        }
+        if (cb) {
+            cb();
+            return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] bool set_ready_callback(std::function<void()> cb) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!batches_.empty() || closed_) {

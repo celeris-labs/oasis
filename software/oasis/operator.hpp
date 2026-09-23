@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <libstf/buffer.hpp>
 #include <libstf/common.hpp>
 #include <libstf/output_handle.hpp>
@@ -132,6 +134,12 @@ class HTTPBatchSourceOperator final : public SourceOperator {
     /// single member would free the bytes the hardware is still reading when the next batch
     /// overwrote it.
     std::vector<std::shared_ptr<libstf::Buffer>> text_buffers_;
+    /// Host-side progress, for the stall dump (print() reads these from the watchdog thread while
+    /// apply() may be running on the dispatcher, hence atomics). -1 = not placed yet.
+    std::atomic<int>    lane_ {-1};
+    std::atomic<size_t> gets_total_ {0};
+    std::atomic<size_t> gets_armed_ {0};
+    std::atomic<size_t> gets_sent_ {0};
 
     void build_chunk(HTTPReadConfig &config, const Chunk &c, HTTPReadConfig::RequestBatch &batch);
     void emit_batch(libstf::stream_t stream, OasisContext &ctx,
