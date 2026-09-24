@@ -55,6 +55,13 @@ import lynxTypes::*;
 //   +DMA_WR_REQ_LAT= +DMA_WR_ACK_LAT= +DMA_RD_REQ_LAT= +DMA_RD_ACK_LAT= +DMA_WR_BP= +DMA_RD_GAP=
 //   +DMA_SEED=
 //
+// +DMA_PIPE makes the request latency PIPELINED: a request's data may start REQ_LAT cycles after the
+// request was ACCEPTED rather than REQ_LAT cycles after the engine finished the previous one. That is
+// what a real cdma with N_OUTSTANDING requests in flight does, and it is what a throughput bench needs
+// (unit-tests/decoder_feed): with a realistic HBM latency of ~100+ cycles the serialised default would
+// charge it once per 4 KiB segment and understate the channel by a third. Off by default, so every
+// existing bench sees exactly the engine it was written against.
+//
 // TWO THINGS THIS FILE HAS TO AVOID, BOTH COSTLY TO REDISCOVER
 // ------------------------------------------------------------
 // 1. NEVER push an assignment pattern straight into a queue. `w_q.push_back('{vaddr: ..., len:
@@ -175,6 +182,7 @@ module card_dma_model #(
     int wr_bp_i      = WR_BP_PCT;
     int rd_gap_i     = RD_GAP_PCT;
     int seed_i       = SEED;
+    bit pipe_i       = 1'b0;
 
     initial begin
         void'($value$plusargs("DMA_WR_REQ_LAT=%d", wr_req_lat_i));
@@ -184,12 +192,20 @@ module card_dma_model #(
         void'($value$plusargs("DMA_WR_BP=%d",      wr_bp_i));
         void'($value$plusargs("DMA_RD_GAP=%d",     rd_gap_i));
         void'($value$plusargs("DMA_SEED=%d",       seed_i));
+        if ($test$plusargs("DMA_PIPE")) pipe_i = 1'b1;
     end
 
     // Free-running cycle counter; the ack pipelines are scheduled against it. `int` so it starts at
     // 0 and not at X (a `time` would, and that trap has cost this repo days).
     int cyc_q = 0;
     always_ff @(posedge clk) cyc_q <= rst_n ? cyc_q + 1 : 0;
+
+    // The latency still owed by a request accepted at `acc`, given the engine is free now.
+    function automatic int lat_left(input int acc, input int lat);
+        int t;
+        t = pipe_i ? (acc + lat - cyc_q) : lat;
+        lat_left = (t < 0) ? 0 : t;
+    endfunction
 
     // =============================================================================================
     // WRITE CHANNEL
@@ -198,6 +214,7 @@ module card_dma_model #(
         longint unsigned vaddr;
         int              len;
         bit              last;
+        int              acc;    // cycle the request was accepted (+DMA_PIPE)
     } wreq_s;
 
     wreq_s           w_q  [$];   // accepted, data not consumed yet
@@ -260,6 +277,7 @@ module card_dma_model #(
                 w_new.vaddr = longint'(wr_req_vaddr);
                 w_new.len   = int'(wr_req_len);
                 w_new.last  = wr_req_last;
+                w_new.acc   = cyc_q;
                 w_q.push_back(w_new);
                 ifl_lo.push_back(longint'(wr_req_vaddr));
                 ifl_hi.push_back(longint'(wr_req_vaddr) + longint'(wr_req_len));
@@ -283,7 +301,7 @@ module card_dma_model #(
                 0: begin
                     if (w_q.size() > 0) begin
                         w_cur   = w_q[0];
-                        w_dly   = wr_req_lat_i;
+                        w_dly   = lat_left(w_cur.acc, wr_req_lat_i);
                         w_state = 1;
                     end
                 end
@@ -370,6 +388,7 @@ module card_dma_model #(
         longint unsigned vaddr;
         int              len;
         bit              last;
+        int              acc;    // cycle the request was accepted (+DMA_PIPE)
     } rreq_s;
 
     rreq_s r_q      [N_RD][$];
@@ -463,6 +482,7 @@ module card_dma_model #(
                         r_new[gd].vaddr = lo;
                         r_new[gd].len   = int'(rd_req_len[gd]);
                         r_new[gd].last  = rd_req_last[gd];
+                        r_new[gd].acc   = cyc_q;
                         r_q[gd].push_back(r_new[gd]);
                         r_ackdue[gd].push_back(0);
                         did_accept = 1'b1;
@@ -480,7 +500,7 @@ module card_dma_model #(
                         0: begin
                             if (r_q[gd].size() > 0) begin
                                 r_cur[gd]   = r_q[gd][0];
-                                r_dly[gd]   = rd_req_lat_i;
+                                r_dly[gd]   = lat_left(r_cur[gd].acc, rd_req_lat_i);
                                 r_state[gd] = 1;
                             end
                         end
