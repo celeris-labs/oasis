@@ -111,12 +111,13 @@ import lynxTypes::*;
 //     concatenation, not a shift, so it is one adder and no barrel;
 //   * `landed[]` is written only from the completion queue, never from a compare;
 //   * there is no combinational path from `wr_ack` to `wr_req_valid`;
-//   * the longest path is the descriptor computation at a segment's tlast:
-//     popcount(tkeep) -> +(beats<<6) -> + cursor -> overflow compare -> descriptor register. The
-//     32:1 cursor mux is only in series with that adder for a SINGLE-BEAT segment (otherwise the
-//     offset comes from the registered `cur_off_q`). If WP3's timing watch flags it, the fix is a
-//     one-deep register stage between tlast and the descriptor push, plus a write-forwarding mux on
-//     the cursor read.
+//   * the descriptor computation at a segment's tlast is split over two cycles (it was build-126's
+//     worst path): the tlast beat registers {conn, start offset, length}, the next cycle builds the
+//     descriptor and moves the cursor, and a segment of the same connection starting in that cycle
+//     reads the new cursor through a write-forwarding mux. See "THE DESCRIPTOR IS BUILT ONE CYCLE
+//     AFTER THE tlast" below;
+//   * a release hands its reservation back REL_LAT cycles later, through a registered adder tree,
+//     never in the release's own cycle. See "PIPELINED" at the reservation.
 // =================================================================================================
 module slot_writer #(
     parameter int N_CONNS    = 4,      // 1..32
@@ -294,34 +295,55 @@ module slot_writer #(
     logic [OFF_BITS-1:0]  cur_off_q;      // slot offset this segment starts at
     logic [CONN_BITS-1:0] seg_conn_q;
 
-    // Nothing of connection c anywhere between rx_dispatch and the ack: no descriptor outstanding
-    // and no segment part-way into the shared fifo. Registered inputs only, so this is a compare
-    // against zero and a two-term AND -- it feeds handler_slots' teardown sequencer, never a
-    // datapath decision.
+    // ---------------------------------------------------------------------------------------------
+    // THE DESCRIPTOR IS BUILT ONE CYCLE AFTER THE tlast (2026-09-24, build-126/127 timing).
+    //
+    // It used to be built in the tlast's own cycle: the TOE slice's tkeep -> popcount -> + (beats
+    // << 6) -> + cursor -> overflow compare -> the cursor's clock enable, 18 levels from a register
+    // in the shell (build-126's worst routed path, -2.1 ns; -1.5 ns on build-127). Now:
+    //   stage A (the tlast beat): the segment's connection, start offset and byte length are
+    //            registered -- the popcount and the length add are all that is left behind the
+    //            input, and the start offset is read here, as before;
+    //   stage B (the next cycle): end offset, overflow, drop, descriptor push, cursor update --
+    //            all from registers.
+    // The one thing a pipeline has to get right is the cursor READ of a segment of connection c
+    // that starts in the cycle stage B is updating c's cursor for the segment before it (they
+    // can be back to back: a segment is at least one beat). That read takes stage B's new end
+    // offset instead of the register (write forwarding). Stage B is the only writer of the
+    // cursors apart from a release, so nothing else needs forwarding.
+    // What moves by a cycle: the descriptor, and with it the reservation hand-back, infl_q and
+    // rsv_pkg_q, all of which only make the writer more conservative for that cycle. conn_quiet
+    // counts a segment in stage B as in flight.
+    // ---------------------------------------------------------------------------------------------
+    logic                 tl_valid_q;     // stage B holds a segment
+    logic [CONN_BITS-1:0] tl_conn_q;
+    logic [OFF_BITS-1:0]  tl_off_q;
+    logic [LEN_BITS_-1:0] tl_len_q;
+
+    // Nothing of connection c anywhere between rx_dispatch and the ack: no descriptor outstanding,
+    // no segment part-way into the shared fifo, none in stage B. Registered inputs only, so this is
+    // a compare against zero and a three-term AND -- it feeds handler_slots' teardown sequencer,
+    // never a datapath decision.
     always_comb begin
         for (int c = 0; c < N_CONNS; c++)
             conn_quiet[c] = (infl_q[c] == 8'd0) &&
-                            !(seg_active_q && (seg_conn_q == CONN_BITS'(c)));
+                            !(seg_active_q && (seg_conn_q == CONN_BITS'(c))) &&
+                            !(tl_valid_q && (tl_conn_q == CONN_BITS'(c)));
     end
 
-    logic [OFF_BITS-1:0]  cursor_mux_w;
-    assign cursor_mux_w = wr_cursor_q[in_conn_w];
-
-    logic [OFF_BITS-1:0]  off_sel_w;
+    // -- stage B: the descriptor, from registers -------------------------------------------------
+    logic                 desc_push_w;
     logic [CONN_BITS-1:0] conn_sel_w;
-    logic [BEAT_BITS-1:0] prior_beats_w;
-    assign off_sel_w     = seg_active_q ? cur_off_q  : cursor_mux_w;
-    assign conn_sel_w    = seg_active_q ? seg_conn_q : in_conn_w;
-    assign prior_beats_w = seg_active_q ? seg_beats_q : BEAT_BITS'(0);
-
-    logic [6:0]           pop_w;
+    logic [OFF_BITS-1:0]  off_sel_w;
     logic [LEN_BITS_-1:0] seg_len_w;
     logic [OFF_BITS-1:0]  end_off_w;
     logic                 seg_ovf_w, seg_drop_w;
 
-    assign pop_w     = 7'($countones(conn_tkeep));
-    assign seg_len_w = LEN_BITS_'({prior_beats_w, 6'b0}) + LEN_BITS_'(pop_w);
-    assign end_off_w = off_sel_w + OFF_BITS'(seg_len_w);
+    assign desc_push_w = tl_valid_q;
+    assign conn_sel_w  = tl_conn_q;
+    assign off_sel_w   = tl_off_q;
+    assign seg_len_w   = tl_len_q;
+    assign end_off_w   = tl_off_q + OFF_BITS'(tl_len_q);
     // > 2^SLOT_LOG2 rather than >=: a segment that ends exactly on the slot boundary still fits.
     assign seg_ovf_w  = end_off_w[SLOT_LOG2] && (|end_off_w[SLOT_LOG2-1:0]);
     // Once a connection has lost a segment its response has a hole in it and nothing short of the
@@ -329,8 +351,34 @@ module slot_writer #(
     // A zero-length segment is dropped too: the DMA engine rejects len == 0.
     assign seg_drop_w = seg_ovf_w || overflow_q[conn_sel_w] || (seg_len_w == '0);
 
-    logic desc_push_w;
-    assign desc_push_w = in_fire_w && conn_tlast;
+    // -- stage A: the input beat -----------------------------------------------------------------
+    logic [OFF_BITS-1:0]  cursor_mux_w;
+    // The forward does not look at stage B's drop, on purpose (it keeps the overflow compare out of
+    // the select): a dropped segment either overflowed, which poisons its connection so every
+    // later segment of it is dropped whatever offset it computes, or had zero length, whose end
+    // offset IS its start offset, i.e. the unchanged cursor. Either way the forwarded value is
+    // only ever seen by a segment that is dropped or would have read the same number.
+    always_comb begin
+        if (tl_valid_q && (tl_conn_q == in_conn_w))
+            cursor_mux_w = end_off_w;               // forwarded: stage B is moving this cursor now
+        else
+            cursor_mux_w = wr_cursor_q[in_conn_w];
+    end
+
+    logic [OFF_BITS-1:0]  off_a_w;
+    logic [CONN_BITS-1:0] conn_a_w;
+    logic [BEAT_BITS-1:0] prior_beats_w;
+    assign off_a_w       = seg_active_q ? cur_off_q  : cursor_mux_w;
+    assign conn_a_w      = seg_active_q ? seg_conn_q : in_conn_w;
+    assign prior_beats_w = seg_active_q ? seg_beats_q : BEAT_BITS'(0);
+
+    logic [6:0]           pop_w;
+    logic [LEN_BITS_-1:0] len_a_w;
+    assign pop_w   = 7'($countones(conn_tkeep));
+    assign len_a_w = LEN_BITS_'({prior_beats_w, 6'b0}) + LEN_BITS_'(pop_w);
+
+    logic tl_fire_w;   // the tlast beat of a segment is accepted: stage A -> stage B
+    assign tl_fire_w = in_fire_w && conn_tlast;
 
     // ---------------------------------------------------------------------------------------------
     // Descriptor fifo: one entry per segment, in arrival order. The data fifo carries no connection
@@ -513,6 +561,10 @@ module slot_writer #(
             seg_beats_q   <= '0;
             cur_off_q     <= '0;
             seg_conn_q    <= '0;
+            tl_valid_q    <= 1'b0;
+            tl_conn_q     <= '0;
+            tl_off_q      <= '0;
+            tl_len_q      <= '0;
             dq_head_q     <= '0;
             dq_tail_q     <= '0;
             dq_cnt_q      <= '0;
@@ -542,6 +594,14 @@ module slot_writer #(
             if (in_tvalid_w && !fifo_s_tready) route_stall_q <= 1'b1;
             // We held rx_dispatch off while the fifo held data: the card path is not keeping up.
             if (!space_ok_q && (fifo_level != '0)) space_stall_q <= 1'b1;
+
+            // -- stage A -> stage B ---------------------------------------------------------------
+            tl_valid_q <= tl_fire_w;
+            if (tl_fire_w) begin
+                tl_conn_q <= conn_a_w;
+                tl_off_q  <= off_a_w;
+                tl_len_q  <= len_a_w;
+            end
 
             // -- segment accounting -------------------------------------------------------------
             if (in_fire_w) begin

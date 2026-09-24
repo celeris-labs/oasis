@@ -186,6 +186,12 @@ module slot_writer_tb #(
     int            issued_n = 0;
     int            delivered_n = 0;
     int            toe_lat = 6;
+    // B2B: the next segment's first beat follows a tlast in the very next cycle whenever its readPkg
+    // has already been issued (no idle cycle, no TOE latency). rx_dispatch never does this -- it
+    // spends a cycle on the next packet's metadata -- but slot_writer's contract does not rely on
+    // it, and it is the only way to reach the cursor write-forwarding path (a segment of connection
+    // c starting in the cycle the descriptor of c's previous segment moves c's cursor).
+    bit            b2b = 1'b0;
 
     initial begin
         conn_tvalid     = '0;
@@ -220,7 +226,7 @@ module slot_writer_tb #(
         begin
             for (int q = 0; q < count; q++) begin
                 deliver_mbx.get(k);
-                repeat (toe_lat) @(negedge clk);
+                if (!b2b) repeat (toe_lat) @(negedge clk);
                 c     = sl_conn[k];
                 n     = sl_data[k].size();
                 nbeat = (n + BYTES - 1) / BYTES;
@@ -243,9 +249,13 @@ module slot_writer_tb #(
                         if (conn_tready[c]) break;
                     end
                 end
-                @(negedge clk);
-                conn_tvalid = '0;
-                conn_tlast  = 1'b0;
+                // Back to back: leave the bus driven, the next segment's first beat replaces this
+                // one at the next negedge.
+                if (!(b2b && (deliver_mbx.num() > 0))) begin
+                    @(negedge clk);
+                    conn_tvalid = '0;
+                    conn_tlast  = 1'b0;
+                end
                 delivered_n = delivered_n + 1;
             end
         end
@@ -333,6 +343,7 @@ module slot_writer_tb #(
         end
         if (!$value$plusargs("SCEN=%s", scen)) scen = "w1";
         void'($value$plusargs("TOELAT=%d", toe_lat));
+        if ($test$plusargs("B2B")) b2b = 1'b1;
         void'($value$plusargs("HDR=%d", hdr_len));
         void'($value$plusargs("BODY=%d", body_len));
 
@@ -443,6 +454,42 @@ module slot_writer_tb #(
                 check_slots();
             end
 
+            // -- segments back to back (run with B2B): single-beat and short segments of the SAME
+            //    connection right behind each other, and alternating connections, so a segment's
+            //    start offset is read in the very cycle its predecessor's descriptor moves the
+            //    cursor (the write-forwarding path), with every length class around a beat boundary.
+            "wb2b": begin
+                int lens [16] = '{1, 64, 65, 7, 4096, 130, 64, 1, 3000, 2, 63, 129, 1, 1, 640, 17};
+                ncase = (NCONNS < 2) ? NCONNS : 2;
+                for (int r = 0; r < 48; r++)
+                    queue_seg((ncase > 1 && (r % 3 == 2)) ? 1 : 0, lens[r % 16]);
+                run_traffic();
+                wait_landed();
+                check_slots();
+            end
+
+            // -- back to back INTO an overflow (run with B2B on 16 KiB slots): the segment that
+            //    crosses the slot end is dropped in the cycle the next segment of the same connection
+            //    reads its cursor, which must then NOT take the forwarded end offset; the one-beat
+            //    segment behind it is dropped by the poison; the neighbour lands intact.
+            "wb2bovf": begin
+                ncase = 3;
+                for (int i = 0; i < ((1 << SLOTL) / 4096) - 1; i++) queue_seg(0, 4096);
+                queue_seg(0, 4000);                      // 96 bytes short of the end
+                queue_seg(0, 96);                        // ends exactly ON the boundary: kept
+                queue_seg(0, 33, 1'b0);                  // crosses the end -> discarded
+                queue_seg(0, 1, 1'b0);                   // one beat, same conn, poisoned
+                queue_seg(2, 100);
+                queue_seg(2, 1);
+                run_traffic();
+                wait_landed();
+                check_slots();
+                if (!slot_overflow[0]) err("slot_overflow[0] did not latch");
+                if (slot_overflow[2])  err("slot_overflow[2] latched on the healthy connection");
+                if (u_dma.written(longint'(SLOT_BASE) + (longint'(1) << SLOTL)))
+                    err("a byte was written past the end of slot 0, into slot 1");
+            end
+
             default: err($sformatf("unknown scenario '%s'", scen));
         endcase
 
@@ -450,7 +497,7 @@ module slot_writer_tb #(
 
         if (route_stall)      err("route_stall latched: a routed beat was refused");
         if (model_errors > 0) err($sformatf("card DMA model reported %0d error(s)", model_errors));
-        if (scen != "wovf")
+        if ((scen != "wovf") && (scen != "wb2bovf"))
             for (int c = 0; c < NCONNS; c++)
                 if (slot_overflow[c]) err($sformatf("slot_overflow[%0d] latched unexpectedly", c));
 

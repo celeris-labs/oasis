@@ -8,7 +8,7 @@
 # (the property the whole redesign exists for), and the DMA model's own contract asserts.
 #
 #   ./run.sh                     every case; exit status 1 if any of them fails
-#   ./run.sh <case> [PLUSARG=v]  one case (w1 w4 w24 wbp wlat wovf wrel)
+#   ./run.sh <case> [PLUSARG=v]  one case (w1 w4 w24 wbp wlat wovf wrel wb2b wb2bovf)
 #
 # Bench plusargs: SCEN HDR BODY TOELAT
 # Model plusargs: DMA_WR_REQ_LAT DMA_WR_ACK_LAT DMA_WR_BP DMA_SEED
@@ -58,7 +58,9 @@ if [ $# -ge 1 ]; then
     wlat) shift; run sw4  wlat "$@" ;;
     wovf) shift; run swov wovf "$@" ;;
     wrel) shift; run sw1  wrel "$@" ;;
-    *) echo "usage: $0 [w1|w4|w24|wbp|wlat|wovf|wrel] [PLUSARG=v ...]"; exit 2 ;;
+    wb2b) shift; run sw4  wb2b B2B "$@" ;;
+    wb2bovf) shift; run swov wb2bovf B2B "$@" ;;
+    *) echo "usage: $0 [w1|w4|w24|wbp|wlat|wovf|wrel|wb2b|wb2bovf] [PLUSARG=v ...]"; exit 2 ;;
   esac
   exit $(( FAILS > 0 ))
 fi
@@ -82,6 +84,13 @@ run sw4  wlat DMA_WR_ACK_LAT=200 DMA_WR_REQ_LAT=20
 run swov wovf
 # -- two responses on one connection with a release between: the second lands at offset 0 again.
 run sw1  wrel
+# -- segments back to back, no idle cycle between a tlast and the next first beat (rx_dispatch never
+#    does that, the writer must not care): the cursor write-forwarding path, with and without a
+#    drop in the forwarding cycle, and with the write channel stalling.
+run sw4  wb2b B2B
+run sw4  wb2b B2B DMA_WR_BP=50
+run sw1  wb2b B2B
+run swov wb2bovf B2B
 
 echo "slot_writer: $FAILS failed case(s)"
 exit $(( FAILS > 0 ))
