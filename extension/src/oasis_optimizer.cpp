@@ -70,12 +70,26 @@ static bool TryExtractColumnRef(const Expression &expr, LogicalGet &get, string 
 		return false;
 	}
 
-	if (binding.column_index >= get.names.size()) {
+	// The binding indexes the get's output columns, not its file columns: map it through the
+	// projection (if any) and the projected column ids to the file column.
+	idx_t output_idx = binding.column_index;
+	if (!get.projection_ids.empty()) {
+		if (output_idx >= get.projection_ids.size()) {
+			return false;
+		}
+		output_idx = get.projection_ids[output_idx];
+	}
+	const auto &column_ids = get.GetColumnIds();
+	if (output_idx >= column_ids.size() || column_ids[output_idx].IsVirtualColumn()) {
+		return false;
+	}
+	const idx_t file_column = column_ids[output_idx].GetPrimaryIndex();
+	if (file_column >= get.names.size()) {
 		return false;
 	}
 
-	column_idx = binding.column_index;
-	column_name = get.names[column_idx].GetIdentifierName();
+	column_idx = file_column;
+	column_name = get.names[file_column].GetIdentifierName();
 	return true;
 }
 
