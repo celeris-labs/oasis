@@ -359,7 +359,7 @@ module slot_reader #(
     logic residue_err_q;
     assign residue_err = residue_err_q;
 
-    logic rel_clear_q, fr_idle_q;
+    logic fr_idle_q;
     logic done_ok_w;
     assign done_ok_w = (n_out_q == 2'd0) && (rd_cursor_q == landed_sel_q) && fr_idle_q;
 
@@ -378,7 +378,36 @@ module slot_reader #(
     // being served, and the pipeline back at rest. handler_slots gates conn_release on this.
     assign flush_busy = (st_q == S_FLUSH) || flush;
 
-    assign framer_clear = flush || (st_q == S_FLUSH) || rel_clear_q;
+    // REGISTERED (2026-09-24, build-127 timing). The framer clear is a flop: `flush || S_FLUSH`
+    // one cycle late (the value swallow_q has), OR the cycle after a RELEASE. Taken
+    // combinationally, `flush` put the handler's 32-wide conn_up/conn_dead vectors, a 32:1 mux on
+    // head_conn_q and the framer's ~2000 clear/enable pins into one path (~3900 failing endpoints
+    // on build-127, -3.1 ns, SLR1 -> SLR2). A flush now clears the framer one cycle after it is
+    // decided and holds it one cycle longer at the end; both are safe:
+    //   * the first cycle. The framer runs one cycle longer on the dead connection's bytes. It can
+    //     move one more beat of the SAME response into its skid, which may leave it on the next
+    //     cycle -- one more in-order beat of a response that is being abandoned anyway, never a
+    //     byte of anything else: resp_ack is not given while flushing, so the framer cannot cross
+    //     into a next response's body (it stops one byte short, hdr_block_w), and the reader
+    //     offers it no card beat from the next cycle on (swallow_q). A flush of a head whose
+    //     bytes are in the framer only happens when that head's connection went fatal (a head
+    //     cannot be down and not fatal: a reconnect needs pend_q == 0, and the head is pending),
+    //     and a fatal connection with a pending entry TAINTS its decoder in the same cycle
+    //     (handler_slots cuts its output two cycles later): the decoder's stream is cut short
+    //     anyway, the cut just lands one beat later. A dead connection's queued entry taken only
+    //     to be dropped has nothing in the framer at all.
+    //   * the last cycle. The head has been dropped and nothing is outstanding (S_FLUSH leaves
+    //     only at n_out_q == 0), and a new head's first byte is a read request and a card round
+    //     trip away, so one extra cycle of clear finds the framer empty.
+    // The clear after a RELEASE (the normal between-connections clear, the cycle after S_DONE2)
+    // keeps its timing exactly.
+    //
+    // It is its own flop rather than swallow_q ORed with a release flop: its only loads are the
+    // framer's, and on build-127 the framers of decoders 0 and 2 sat in another SLR than their
+    // readers, so the placer must be free to put this one register next to them. `keep` stops
+    // synthesis from merging it with swallow_q.
+    (* keep = "true" *) logic fr_clear_q;
+    assign framer_clear = fr_clear_q;
     assign head_valid   = head_valid_q;
     assign head_conn    = head_conn_q;
 
@@ -416,18 +445,20 @@ module slot_reader #(
             nxt_chunk_q   <= '0;
             nxt_last_q    <= 1'b0;
             swallow_q     <= 1'b0;
+            fr_clear_q    <= 1'b0;
             rd_pending_q  <= 1'b0;
-            rel_clear_q   <= 1'b0;
             fr_idle_q     <= 1'b0;
             residue_ev_q  <= 1'b0;
             done_conn_q   <= '0;
         end else begin
             conn_release <= '0;
-            rel_clear_q  <= 1'b0;
             residue_ev_q <= 1'b0;
             entry_done   <= 1'b0;
             resp_ack     <= 1'b0;
             swallow_q    <= flush || (st_q == S_FLUSH);
+            // swallow_q's value, or the cycle after a RELEASE (S_DONE2 takes the release branch
+            // below exactly when !nxt_same_q).
+            fr_clear_q   <= flush || (st_q == S_FLUSH) || ((st_q == S_DONE2) && !nxt_same_q);
             rd_pending_q <= head_valid_q &&
                             ((landed_sel_q > rd_cursor_q) || (n_out_q != 2'd0));
 
@@ -527,7 +558,6 @@ module slot_reader #(
                             residue_ev_q  <= 1'b1;
                         end
                         conn_release[head_conn_q] <= 1'b1;
-                        rel_clear_q               <= 1'b1;
                         head_valid_q              <= 1'b0;
                         rd_cursor_q               <= '0;
                         landed_sel_q              <= '0;
