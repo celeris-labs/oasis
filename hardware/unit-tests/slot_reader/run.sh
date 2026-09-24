@@ -27,6 +27,11 @@
 #   ./run.sh                     every case; exit status 1 if any of them fails
 #   ./run.sh <case> [PLUSARG=v]  one case (r1 r4 r4x rmax rtwo rgap rslow rsolo rstall)
 #
+# NDEC (environment, default 4) is the number of readers sharing the channel in the full-width
+# cases (sr4x/sr28: every decoder's reader at once, one connection each). 4 is exactly what these
+# cases always ran; NDEC=3 runs them for the 3-decoder build, where slot_rd_share's round robin
+# wraps at a count that is not a power of two. The snapshots are named after the width.
+#
 # Bench plusargs: SCEN BODY HDR TOELAT SLOWDIV FASTDIV SLOWOFF RMINP
 # Model plusargs: DMA_WR_REQ_LAT DMA_WR_ACK_LAT DMA_RD_REQ_LAT DMA_RD_ACK_LAT DMA_WR_BP DMA_RD_GAP
 #                 DMA_SEED
@@ -71,8 +76,10 @@ elab sr1 1 1 16384
 elab sr4 4 2 16384
 elab srm 1 1 4096
 elab sr2 2 2 16384
-elab sr4x 4 4 16384
-elab sr28 4 4 16384 1 28     # the stage-1 bitstream's geometry: 4 x 256 MiB slots
+NDEC="${NDEC:-4}"
+if [ "$NDEC" = 4 ]; then SRX=sr4x; SR28=sr28; else SRX="sr${NDEC}x"; SR28="sr28d${NDEC}"; fi
+elab "$SRX" "$NDEC" "$NDEC" 16384
+elab "$SR28" "$NDEC" "$NDEC" 16384 1 28   # the stage-1 bitstream's geometry: NDEC x 256 MiB slots
 elab sr8s 8 1 16384 1 22     # stage 2: eight connections through ONE decoder
 elab sr2s 2 1 16384          # stage 2: two connections through one decoder
 elab sr32s 32 1 16384 1 25   # stage 2 at the build-127 geometry: 32 x 32 MiB slots, one decoder
@@ -81,11 +88,11 @@ if [ $# -ge 1 ]; then
   case "$1" in
     r1)     shift; run sr1  r1     "$@" ;;
     r4)     shift; run sr4  r4     "$@" ;;
-    r4x)    shift; run sr4x r4x    DMA_RD_GAP=40 "$@" ;;
+    r4x)    shift; run "$SRX" r4x  DMA_RD_GAP=40 "$@" ;;
     rmax)   shift; run srm  rmax   "$@" ;;
     rtwo)   shift; run sr1  rtwo   "$@" ;;
     rpipe)  shift; run sr1  rpipe  "$@" ;;
-    rpipe4) shift; run sr4x rpipe4 "$@" ;;
+    rpipe4) shift; run "$SRX" rpipe4 "$@" ;;
     rgap)   shift; run sr1  rgap   DMA_RD_GAP=40 DMA_WR_BP=40 "$@" ;;
     rslow)  shift; run sr2  rslow  "$@" ;;
     rsolo)  shift; run sr2  rsolo  "$@" ;;
@@ -108,9 +115,9 @@ run sr1 rgap DMA_RD_GAP=40 DMA_WR_BP=40 DMA_SEED=11
 run sr1 r1 DMA_WR_ACK_LAT=200 DMA_RD_REQ_LAT=20 DMA_WR_REQ_LAT=20
 # -- four connections over two decoders, segments interleaved on the wire.
 run sr4 r4
-# -- ALL FOUR readers on the one shared channel at once, mixed request lengths, ~40% read gaps.
-run sr4x r4x DMA_RD_GAP=40
-run sr4x r4x DMA_RD_GAP=40 DMA_WR_BP=30 DMA_SEED=7
+# -- ALL NDEC (four) readers on the one shared channel at once, mixed request lengths, ~40% read gaps.
+run "$SRX" r4x DMA_RD_GAP=40
+run "$SRX" r4x DMA_RD_GAP=40 DMA_WR_BP=30 DMA_SEED=7
 # -- RD_MAX 4096: a 32 KiB body is split into nine reads, at most two outstanding.
 run srm rmax
 # -- two responses in a row on one connection, with the release between them.
@@ -126,12 +133,12 @@ run sr1 rpipe NPIPE=4 HOLD=1 BODY=70 MSS=64
 run sr1 rpipe NPIPE=3 HOLD=0 BODY=5000 MSS=1460 DMA_RD_GAP=40 DMA_SEED=5
 run sr1 rpipe NPIPE=8 HOLD=0 BODY=20000 DMA_WR_ACK_LAT=200
 run srm rpipe NPIPE=3 HOLD=0 BODY=9000
-run sr4x rpipe4 NPIPE=3 BODY=6000 DMA_RD_GAP=40
-run sr4x rpipe4 NPIPE=4 BODY=70 MSS=1460
+run "$SRX" rpipe4 NPIPE=3 BODY=6000 DMA_RD_GAP=40
+run "$SRX" rpipe4 NPIPE=4 BODY=70 MSS=1460
 # -- ...and at the real slot size (SLOT_LOG2 28): the top address bits of every slot are live.
-run sr28 r4x DMA_RD_GAP=40
-run sr28 rpipe4 NPIPE=4 BODY=9000 DMA_RD_GAP=40
-run sr28 rpipe4 NPIPE=3 BODY=70 MSS=1460
+run "$SR28" r4x DMA_RD_GAP=40
+run "$SR28" rpipe4 NPIPE=4 BODY=9000 DMA_RD_GAP=40
+run "$SR28" rpipe4 NPIPE=3 BODY=70 MSS=1460
 # -- THE COUPLING EXPERIMENT at a realistic sink rate: the slow decoder must cost the fast one
 #    nothing at all. This pair is the proof.
 run sr2 rsolo FASTDIV=4 RMINP=95
