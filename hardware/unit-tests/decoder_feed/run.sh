@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # decoder_feed -- does the build-127 receive path keep all 4 decoders fed under a realistic origin?
+# (NDEC=3 in the environment: the same question for the 3-decoder build, see below.)
 #
 # A throughput bench, not a liveness bench. It runs lane_drain_tb's `feed` scenario (the bench,
 # its TOE / origin / host / card-DMA models and its byte-exact checker are lane_drain's; nothing is
@@ -15,7 +16,7 @@
 #               fast   TTFB 0.12..0.14 ms, 750 MB/s per connection (the sendfile origin)
 #             sharing one 100 Gb/s wire (50 B/cycle), TCP segments of 4096 bytes
 #   host      the software's single dispatcher: PlaceOnLane (least-occupied decoder under the lane
-#             depth = conn depth x ceil(active conns / 4)), one chunk = one GET, pick_conn (free
+#             depth = conn depth x ceil(active conns / decoders)), one chunk = one GET, pick_conn (free
 #             connection round robin, else the decoder's tail below conn depth), 10 us of host work
 #             per GET, 20 us pick poll, 100 us lane retry; GETs uniform 279..424 KiB (the board's
 #             byte-weighted range)
@@ -37,15 +38,24 @@
 #   ./run.sh one NAME [+args]    one case, e.g. ./run.sh one x ORIGIN=fast S2CONNS=32 HDEPTH=2
 #   ./run.sh list FILE           the cases in FILE (lines "NAME PLUSARG..."), in parallel
 #
+# DECODERS. NDEC (environment, default 4) is the handler's N_DECODERS. 4 is the build-127 shape and
+# keeps the snapshot, work/ and runs/ exactly as before; any other count gets its own snapshot and
+# work-d<N>/ runs-d<N>/ beside them, so the two sets of logs never mix. `NDEC=3 ./run.sh one ...`
+# is the 3-decoder build (build-131): the roof is then 3 x 1.28 = 3.84 GB/s.
+#
 # Exit status 1 if any case is not byte-exact / did not drain / set a sticky stall bit.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+NDEC="${NDEC:-4}"
+if [ "$NDEC" = 4 ]; then SFX=""; else SFX="-d$NDEC"; fi
+WORK="$ROOT/work$SFX"
+RUNS="$ROOT/runs$SFX"
 LD="$ROOT/../lane_drain"
 HDL="$ROOT/../../src/hdl/http_read"
 MODEL="$ROOT/../card_dma/card_dma_model.sv"
 JOBS="${JOBS:-16}"
 SCALE="${SCALE:-1}"
-SNAP=fd32_snap
+SNAP="fd32${SFX//-/}_snap"
 
 if ! command -v xvlog >/dev/null 2>&1; then
   # shellcheck disable=SC1091
@@ -56,8 +66,8 @@ fi
 CARD=(DMA_PIPE DMA_RD_REQ_LAT=100 DMA_WR_ACK_LAT=100)
 
 build() {
-  mkdir -p "$ROOT/work"
-  cd "$ROOT/work" || exit 1
+  mkdir -p "$WORK"
+  cd "$WORK" || exit 1
   [ -d "xsim.dir/$SNAP" ] && [ "${REBUILD:-0}" = 0 ] && return 0
   rm -rf xsim.dir xvlog.pb xelab.pb .Xil 2>/dev/null || true
   local SKID=()
@@ -71,7 +81,7 @@ build() {
         "$HDL/handler_slots.sv" "$MODEL" \
         "$LD/lane_drain_tb.sv" > xvlog.log 2>&1 || { tail -40 xvlog.log; exit 1; }
   xelab -debug typical -timescale 1ns/1ps -top lane_drain_tb -snapshot "$SNAP" \
-        -generic_top NUM_CONNS=32 -generic_top NUM_DEC=4 -generic_top DUT_SLOTS=1 \
+        -generic_top NUM_CONNS=32 -generic_top NUM_DEC="$NDEC" -generic_top DUT_SLOTS=1 \
         -generic_top CSR_REV=5 -generic_top SLOT_LOG2=25 \
         > "xelab_$SNAP.log" 2>&1 || { tail -30 "xelab_$SNAP.log"; exit 1; }
 }
@@ -79,21 +89,21 @@ build() {
 # run_case NAME plusarg...   -> runs/NAME.log
 run_case() {
   local name="$1"; shift
-  local d="$ROOT/runs/$name"
+  local d="$RUNS/$name"
   mkdir -p "$d"
   # A private COPY of the snapshot, not a link: xsim -R writes the run's plusargs into
   # xsim.dir/<snap>/xsim_script.tcl, so two runs sharing one xsim.dir race and one of them runs
   # with the other's arguments (it happened). The snapshot is 2 MB.
-  rm -rf "$d/xsim.dir"; cp -r "$ROOT/work/xsim.dir" "$d/xsim.dir"
+  rm -rf "$d/xsim.dir"; cp -r "$WORK/xsim.dir" "$d/xsim.dir"
   # $value$plusargs takes the FIRST match, so a case's own SCALE= / card settings go first.
   local a=(-testplusarg SCEN=feed); local p
   for p in "$@"; do a+=(-testplusarg "$p"); done
   [[ " $* " == *" SCALE="* ]] || a+=(-testplusarg "SCALE=$SCALE")
   for p in "${CARD[@]}"; do a+=(-testplusarg "$p"); done
-  ( cd "$d" && xsim "$SNAP" -R -log "$ROOT/runs/$name.log" "${a[@]}" > /dev/null 2>&1 )
+  ( cd "$d" && xsim "$SNAP" -R -log "$RUNS/$name.log" "${a[@]}" > /dev/null 2>&1 )
   rm -rf "$d"
   # one summary line per case
-  verdict "$ROOT/runs/$name.log" "$name"
+  verdict "$RUNS/$name.log" "$name"
 }
 
 verdict() { # log name
@@ -105,7 +115,7 @@ verdict() { # log name
 }
 
 table() {
-  python3 - "$ROOT/runs" <<'EOF'
+  python3 - "$RUNS" <<'EOF'
 import glob, os, re, sys
 rows = []
 for f in sorted(glob.glob(os.path.join(sys.argv[1], '*.log'))):
@@ -161,26 +171,26 @@ case "${1:-sweep}" in
   one)
     shift; name="$1"; shift
     build
-    mkdir -p "$ROOT/runs"
+    mkdir -p "$RUNS"
     run_case "$name" "$@"
-    grep -E '^  == feed|^     |^  feed:|^FEED' "$ROOT/runs/$name.log"
-    grep -qE "^lane_drain_tb 'feed'[^:]*: PASS" "$ROOT/runs/$name.log" && \
-      ! grep -qE '^(slot_writer|card_dma_model): FAIL' "$ROOT/runs/$name.log"
+    grep -E '^  == feed|^     |^  feed:|^FEED' "$RUNS/$name.log"
+    grep -qE "^lane_drain_tb 'feed'[^:]*: PASS" "$RUNS/$name.log" && \
+      ! grep -qE '^(slot_writer|card_dma_model): FAIL' "$RUNS/$name.log"
     exit $? ;;
   sweep|list)
     if [ "$1" = list ]; then LIST="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; fi
     build
-    mkdir -p "$ROOT/runs"
+    mkdir -p "$RUNS"
     export -f run_case verdict
-    export ROOT SNAP SCALE
+    export ROOT SNAP SCALE WORK RUNS
     export CARD_S="${CARD[*]}"
-    if [ "$1" != list ]; then LIST="$ROOT/runs/sweep.list"; sweep_list > "$LIST"; : > "$ROOT/runs/sweep.verdicts"; fi
+    if [ "$1" != list ]; then LIST="$RUNS/sweep.list"; sweep_list > "$LIST"; : > "$RUNS/sweep.verdicts"; fi
     # shellcheck disable=SC2016
     xargs -P "$JOBS" -L 1 bash -c 'CARD=($CARD_S); run_case "$@"' _ < "$LIST" \
-      | tee -a "$ROOT/runs/sweep.verdicts"
+      | tee -a "$RUNS/sweep.verdicts"
     echo
     table
-    if grep -vqE '^\S+\s+PASS' "$ROOT/runs/sweep.verdicts"; then exit 1; fi
+    if grep -vqE '^\S+\s+PASS' "$RUNS/sweep.verdicts"; then exit 1; fi
     exit 0 ;;
   *) echo "usage: $0 [sweep|table|list FILE|one NAME [+plusargs]]"; exit 2 ;;
 esac

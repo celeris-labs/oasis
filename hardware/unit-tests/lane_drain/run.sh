@@ -21,6 +21,12 @@
 #                 every GET on a connection; the s2* scenarios plus the generic ones that are
 #                 meaningful per decoder, and s2mix with the host using 4, 24 and 32 connections.
 #
+# DECODER COUNT. NDEC (environment, default 4) is the handler_slots width under test: the full-width
+# stage-1 cases (lanes = connections = decoders = NDEC, e.g. `for N in 1 2 4` becomes 1 2 NDEC) and
+# the stage-2 decoder count. NDEC=4 runs exactly the cases and snapshots it always did; NDEC=3 is the
+# 3-decoder build (build-131), a decoder count that is not a power of two. The handler_multi arm is
+# the sealed build-119 baseline and does not move with it.
+#
 #   ./run.sh                          everything, both DUTs, N = 1, 2, 4
 #   ./run.sh --dut slots              every slots scenario, N = 1, 2, 4
 #   ./run.sh <scen> [lanes]           one scenario at one lane count on handler_multi (default 2)
@@ -46,6 +52,9 @@ fi
 cd "$ROOT"
 
 DUT=both
+NDEC="${NDEC:-4}"
+# Stage-2 snapshot names: unchanged at 4 decoders, suffixed with the count otherwise.
+if [ "$NDEC" = 4 ]; then S2SFX=""; else S2SFX="d${NDEC}"; fi
 ONE=""
 LANES=2
 EXTRA=()
@@ -202,7 +211,7 @@ if [ "$DUT" = multi ] || [ "$DUT" = both ]; then
 fi
 
 if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
-  for N in 1 2 4; do
+  for N in 1 2 "$NDEC"; do
     elab "lds${N}_snap"    "NUM_CONNS=${N}" "DUT_SLOTS=1" || exit 1
     elab "ldsovf${N}_snap" "NUM_CONNS=${N}" "DUT_SLOTS=1" "SLOT_LOG2=16" || exit 1
   done
@@ -217,26 +226,26 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
   for s in a2 a8 a9 a10;           do run_hm slots "$s" 2 HDEPTH=$H; done
   for s in lz1 lz2;                do run_hm slots "$s" 2 HDEPTH=$H; done
   for s in s_base s_g s_d s_e s_f; do run_hm slots "$s" 2 HDEPTH=$H; done
-  for N in 1 4; do run_hm slots s_base "$N" HDEPTH=$H; run_hm slots a2 "$N" HDEPTH=$H; done
+  for N in 1 "$NDEC"; do run_hm slots s_base "$N" HDEPTH=$H; run_hm slots a2 "$N" HDEPTH=$H; done
 
   echo "--- handler_slots : the questions only the slots raise, HDEPTH=$H ---"
   # (a) the host's biggest legal GET, on every connection at once
-  for N in 1 2 4; do run_hm slots big "$N" HDEPTH=$H; done
+  for N in 1 2 "$NDEC"; do run_hm slots big "$N" HDEPTH=$H; done
   # (b) THE experiment: one decoder throttled to 16 B/cycle, then 4, while the others run flat out
-  for N in 2 4; do
+  for N in 2 "$NDEC"; do
     run_hm slots thr "$N" THRDIV=4 HDEPTH=$H
     run_hm slots thr "$N" THRDIV=16 HDEPTH=$H
   done
   # (c) the card path slow and lumpy underneath the full scenario
-  run_hm slots dmabp 4 DMA_WR_BP=50 DMA_RD_GAP=40 HDEPTH=$H
+  run_hm slots dmabp "$NDEC" DMA_WR_BP=50 DMA_RD_GAP=40 HDEPTH=$H
   # (d) one connection overruns its slot; nobody else may notice
-  for N in 2 4; do run_hm slots ovf "$N" HDEPTH=$H; done
+  for N in 2 "$NDEC"; do run_hm slots ovf "$N" HDEPTH=$H; done
   # (e) a connection dies with a half-written slot, and its next response is byte-exact
-  for N in 2 4; do run_hm slots refatal "$N" HDEPTH=$H; done
+  for N in 2 "$NDEC"; do run_hm slots refatal "$N" HDEPTH=$H; done
   # (e2) the peer FINs right behind a response that is complete in the handler, with its decoder
   #      stalled past CLOSE_SETTLE: FSBLEN=384 leaves the last beats in the reader->framer slice
   #      (9811956), which the FIN drain must count as it counted them in the card fifo
-  for N in 2 4; do run_hm slots fsfin "$N" FSBLEN=384 HDEPTH=$H; done
+  for N in 2 "$NDEC"; do run_hm slots fsfin "$N" FSBLEN=384 HDEPTH=$H; done
   done
 
   echo "--- handler_slots : pipelined GETs (CSR revision 4) ---"
@@ -247,27 +256,28 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
     run_hm slots p1 1 DEPTH=$D NRESP=60 BLEN=5000 SRVLAT=600 COALESCE MSS=1460
     run_hm slots p3 2 DEPTH=$D NRESP=40 SRVLAT=1000 COALESCE
     run_hm slots p4 2 DEPTH=$D NRESP=60 SRVLAT=1000
-    run_hm slots p1 4 DEPTH=$D NRESP=30 BLEN=100 SRVLAT=300 COALESCE
+    run_hm slots p1 "$NDEC" DEPTH=$D NRESP=30 BLEN=100 SRVLAT=300 COALESCE
   done
   # (g) a connection torn down mid-response with THREE GETs armed on it: fatal, slot released,
   #     nobody else hurt -- the entries stranded behind the head must not leak anywhere.
-  for N in 2 4; do run_hm slots refatal "$N" RFN=3 HDEPTH=4; done
+  for N in 2 "$NDEC"; do run_hm slots refatal "$N" RFN=3 HDEPTH=4; done
   #     ...and cut in the SECOND of them, after the reader has continued onto it mid-slot.
-  for N in 2 4; do run_hm slots refatal "$N" RFN=3 RFB=20000 RFP=7 HDEPTH=4; done
-  # (h) the stage-1 bitstream's geometry, 4 x 256 MiB slots (SLOT_LOG2 28), pipelined.
-  elab lds4big_snap "NUM_CONNS=4" "DUT_SLOTS=1" "SLOT_LOG2=28" || exit 1
-  SNAP_OVERRIDE=lds4big_snap run_hm slots p3 4 DEPTH=4 NRESP=30 SRVLAT=1000 COALESCE
-  SNAP_OVERRIDE=lds4big_snap run_hm slots refatal 4 RFN=3 HDEPTH=4
-  SNAP_OVERRIDE=lds4big_snap run_hm slots refatal 4 RFN=3 RFB=20000 RFP=7 HDEPTH=4
+  for N in 2 "$NDEC"; do run_hm slots refatal "$N" RFN=3 RFB=20000 RFP=7 HDEPTH=4; done
+  # (h) the stage-1 bitstream's geometry, NDEC x 256 MiB slots (SLOT_LOG2 28), pipelined.
+  B="lds${NDEC}big_snap"
+  elab "$B" "NUM_CONNS=${NDEC}" "DUT_SLOTS=1" "SLOT_LOG2=28" || exit 1
+  SNAP_OVERRIDE=$B run_hm slots p3 "$NDEC" DEPTH=4 NRESP=30 SRVLAT=1000 COALESCE
+  SNAP_OVERRIDE=$B run_hm slots refatal "$NDEC" RFN=3 HDEPTH=4
+  SNAP_OVERRIDE=$B run_hm slots refatal "$NDEC" RFN=3 RFB=20000 RFP=7 HDEPTH=4
 fi
 
 if [ "$DUT" = s2 ] || [ "$DUT" = both ]; then
   for C in 24 32; do
-    elab "lds2c${C}_snap" "NUM_CONNS=${C}" "NUM_DEC=4" "DUT_SLOTS=1" "CSR_REV=5" || exit 1
+    elab "lds2c${C}${S2SFX}_snap" "NUM_CONNS=${C}" "NUM_DEC=${NDEC}" "DUT_SLOTS=1" "CSR_REV=5" || exit 1
   done
   for C in 24 32; do
-    echo "--- handler_slots STAGE 2 : ${C} connections, 4 decoders ---"
-    S="lds2c${C}_snap"
+    echo "--- handler_slots STAGE 2 : ${C} connections, ${NDEC} decoders ---"
+    S="lds2c${C}${S2SFX}_snap"
     SNAP_OVERRIDE=$S run_hm slots s2mix  $C SRVLAT=500 SRVJIT=2000 COALESCE
     SNAP_OVERRIDE=$S run_hm slots s2mix  $C SRVLAT=300 SRVJIT=300 MSS=1460 BMAX=3000 NREQ=40 HDEPTH=4
     # SRVLAT must outlast the whole open sequence, or "every connection armed at once" measures the
@@ -288,7 +298,7 @@ if [ "$DUT" = s2 ] || [ "$DUT" = both ]; then
   # the RUNTIME connection count (OASIS_HTTP_CONNS on the board): the 32-connection bitstream with
   # the host using only 4, 24 or all 32 of them.
   for U in 4 24 32; do
-    SNAP_OVERRIDE=lds2c32_snap run_hm slots s2mix 32 S2CONNS=$U S2MINUSED=$U SRVLAT=500 SRVJIT=1000 COALESCE
+    SNAP_OVERRIDE=lds2c32${S2SFX}_snap run_hm slots s2mix 32 S2CONNS=$U S2MINUSED=$U SRVLAT=500 SRVJIT=1000 COALESCE
   done
 fi
 
