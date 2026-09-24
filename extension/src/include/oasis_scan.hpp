@@ -120,9 +120,22 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint64_t> filter_time_ns {0};
 	std::atomic<uint64_t> string_decode_time_ns {0};
 
+	// Runtime Bloom filter (bind.runtime_bloom_enabled). There is a single hardware Bloom filter, so
+	// only one scan at a time can use it: bloom_lock holds it for this scan. When bloom_active, the
+	// build side was submitted as bloom_build (see SubmitBloomBuild) and every probe key chunk of
+	// this scan is also sent through the filter for its mask (projected column bloom_probe_slot).
+	// The probe side is ended in the destructor, once all probe chunks were sent.
+	bool bloom_active = false;
+	size_t bloom_probe_slot = 0;
+	std::unique_lock<std::mutex> bloom_lock;
+	oasis::SplinterResultHandle bloom_build;
+	bool bloom_build_submitted = false; // false if the build side had no rows
+
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
 	}
+
+	~OasisScanGlobalState() override;
 };
 
 // Per-worker scan state. Owns this worker's file handle (DuckDB FileHandles are not safe to share
@@ -133,7 +146,12 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 // exactly one buffer, and we then slice all columns' buffers in lockstep. The next group is loaded
 // only once the current buffers are fully emitted.
 struct OasisScanLocalState : public LocalTableFunctionState {
+	~OasisScanLocalState() override;
+
 	unique_ptr<FileHandle> file_handle;
+
+	// Copy of gstate.bloom_active: this worker's groups send probe key chunks through the filter.
+	bool bloom_active = false;
 
 	unique_ptr<ParquetReader> parquet_reader;
 	unique_ptr<ParquetReaderScanState> scan_state;
@@ -179,6 +197,12 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
 		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> cpu_buffers;
+
+		// Set only when gstate.bloom_active: the runtime Bloom filter's match mask for the
+		// probe key column, one CELERIS_NUM_TUPLES-bit (1 byte) group per 8 rows. Collected under the
+		// reserved tag gstate.projected_columns.size() (see PrefetchGroup / TryCollectGroup), since
+		// it isn't a projected column's value buffer.
+		std::shared_ptr<libstf::Buffer> bloom_mask_buffer;
 	};
 
 	std::deque<unique_ptr<PendingGroup>> inflight;
@@ -186,6 +210,11 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	bool groups_exhausted = false;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
+
+	// The current group's runtime Bloom filter match mask (see PendingGroup::bloom_mask_buffer),
+	// null when gstate.bloom_active is false. Not yet consumed by DecodeAndFilterSlice --
+	// applying it as a row selection is follow-up work.
+	std::shared_ptr<libstf::Buffer> current_bloom_mask;
 
 	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
 	std::vector<bool> current_needs_row_filter;

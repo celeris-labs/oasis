@@ -263,10 +263,15 @@ ON p.key = b.key;
 
 SELECT s_suppkey FROM read_oasis('extension/tpch_parquet/supplier.parquet');
 
-SELECT *
-FROM read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/lineitem.parquet') l
-JOIN read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/orders.parquet') o
-ON l.l_orderkey = o.o_orderkey;
+SELECT s.s_nationkey
+FROM read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/supplier.parquet') s
+JOIN read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/nation.parquet') n
+ON s.s_nationkey = n.n_nationkey;
+
+SELECT o.o_orderkey, o.o_custkey
+FROM read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/orders_tiny.parquet') o
+JOIN read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/customer_tiny.parquet') c
+ON o.o_custkey = c.c_custkey;
 ```
 
 ---

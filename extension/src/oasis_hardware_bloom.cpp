@@ -40,6 +40,15 @@ public:
 		uint64_t value = (uint64_t(num_columns) << 1) | (enable ? 1ULL : 0ULL);
 		write_register(libstf::ConfigRegister(0, value));
 	}
+
+	void push_input_command(BloomInputCommand cmd) {
+		write_register(libstf::ConfigRegister(1, static_cast<uint64_t>(cmd)));
+	}
+
+	// Read register 5, bit 0: sticky input command queue overflow
+	bool input_command_queue_overflowed() {
+		return (read_register(5).value() & 1ULL) != 0;
+	}
 };
 
 // Mirrors hardware/src/hdl/bf_last_injector_config.sv: three plain registers (enable, first_beat,
@@ -62,6 +71,14 @@ public:
 };
 
 } // namespace
+
+void PushBloomInputCommand(oasis::OasisContext &ctx, BloomInputCommand cmd) {
+	ctx.config<BloomFilterConfig>()->push_input_command(cmd);
+}
+
+bool BloomInputCommandQueueOverflowed(oasis::OasisContext &ctx) {
+	return ctx.config<BloomFilterConfig>()->input_command_queue_overflowed();
+}
 
 void ConfigureOasisHardwareBloom(oasis::OasisContext &ctx) {
 	ctx.config<BloomFilterConfig>()->configure_materialization(0, false);
