@@ -591,7 +591,7 @@ module handler_slots #(
     logic [3:0]            dec_tx_state [N_DECODERS];
     logic [N_DECODERS-1:0] rdr_progress_w;
     logic [N_CONNS-1:0]    rdr_release [N_DECODERS];
-    logic [N_DECODERS-1:0] sh_idle;
+    logic [N_DECODERS-1:0] sh_idle, sh_fs_idle;
 
     logic [31:0]           dec_occ_q [N_DECODERS];
 
@@ -680,7 +680,7 @@ module handler_slots #(
             .conn_up    (rdr_conn_up_w),
             .conn_dead  (conn_fatal_q),
             .flush_busy (rdr_flush_busy[d]),
-            .framer_idle(sh_idle[d]),
+            .framer_idle(sh_fs_idle[d]),   // the framer and the slice in front of it
             .framer_clear(rdr_fr_clear[d]),
 
             .landed   (landed),
@@ -722,6 +722,57 @@ module handler_slots #(
                                    (rd_req_valid[d] && rd_req_ready[d]) ||
                                    sh_resp_done[d];
 
+        // -- register slice between the reader and the framer ---------------------------------------
+        //
+        // (2026-09-24, build-127 timing.) strip_http's slave ready is a deep function of its byte
+        // cursor, and without this slice it ran on through the reader into slot_rd_share's receive
+        // fifo (its BRAM read, level and credit) and the reader's byte accounting -- on build-127
+        // across an SLR boundary for decoders 0 and 2, whose framers sat in SLR2 with the readers in
+        // SLR1 (-2.7 ns into the fifo, -2.0 ns into rem0_q). The same two-deep skid as the body
+        // output below: its tready is a function of its own two valid flops, so both ends of that
+        // cone now stop at a register. It costs one cycle of latency on the card-read data and
+        // changes nothing else:
+        //   * it is part of the FRAMER as far as the reader is concerned: `framer_idle` is the
+        //     framer's idle AND this slice empty, so a byte waiting here at a release is a residue
+        //     exactly as a byte in the framer's residue register is;
+        //   * `framer_clear` empties it together with the framer.
+        logic                       fs_tmp_v_q,  fs_ovr_v_q;
+        logic [AXI_DATA_BITS-1:0]   fs_tmp_d_q,  fs_ovr_d_q;
+        logic [AXI_DATA_BITS/8-1:0] fs_tmp_k_q,  fs_ovr_k_q;
+        logic                       fs_m_tvalid, fs_m_tready;
+        logic [AXI_DATA_BITS-1:0]   fs_m_tdata;
+        logic [AXI_DATA_BITS/8-1:0] fs_m_tkeep;
+
+        assign rdr_m_tready = !fs_tmp_v_q || !fs_ovr_v_q;
+
+        always_ff @(posedge ap_clk) begin
+            if (!ap_rst_n || rdr_fr_clear[d]) begin
+                fs_tmp_v_q <= 1'b0;
+                fs_ovr_v_q <= 1'b0;
+            end else begin
+                if (rdr_m_tready) fs_tmp_v_q <= rdr_m_tvalid;
+                if (!fs_ovr_v_q && !fs_m_tready) fs_ovr_v_q <= fs_tmp_v_q;
+                if (fs_m_tready)                 fs_ovr_v_q <= 1'b0;
+            end
+        end
+
+        // Data registers carry no reset and no clear: they are only ever read under their valid.
+        always_ff @(posedge ap_clk) begin
+            if (rdr_m_tready) begin
+                fs_tmp_d_q <= rdr_m_tdata;
+                fs_tmp_k_q <= rdr_m_tkeep;
+            end
+            if (!fs_ovr_v_q) begin
+                fs_ovr_d_q <= fs_tmp_d_q;
+                fs_ovr_k_q <= fs_tmp_k_q;
+            end
+        end
+
+        assign fs_m_tvalid = fs_tmp_v_q || fs_ovr_v_q;
+        assign fs_m_tdata  = fs_ovr_v_q ? fs_ovr_d_q : fs_tmp_d_q;
+        assign fs_m_tkeep  = fs_ovr_v_q ? fs_ovr_k_q : fs_tmp_k_q;
+        assign sh_fs_idle[d] = sh_idle[d] && !fs_tmp_v_q && !fs_ovr_v_q;
+
         // -- framing --------------------------------------------------------------------------------
         logic                       raw_tvalid, raw_tready;
         logic [AXI_DATA_BITS-1:0]   raw_tdata;
@@ -738,9 +789,9 @@ module handler_slots #(
             .body_last(rdr_body_last),
             .resp_ack (rdr_resp_ack),
 
-            .s_axis_tvalid(rdr_m_tvalid), .s_axis_tready(rdr_m_tready),
-            .s_axis_tdata (rdr_m_tdata),  .s_axis_tkeep (rdr_m_tkeep),
-            .s_axis_tlast (rdr_m_tlast),
+            .s_axis_tvalid(fs_m_tvalid), .s_axis_tready(fs_m_tready),
+            .s_axis_tdata (fs_m_tdata),  .s_axis_tkeep (fs_m_tkeep),
+            .s_axis_tlast (1'b0),        // the reader never sets one; framing is by length
 
             .m_axis_tvalid(raw_tvalid), .m_axis_tready(raw_tready),
             .m_axis_tdata (raw_tdata),  .m_axis_tkeep (raw_tkeep),
