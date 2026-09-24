@@ -756,7 +756,6 @@ module handler_slots #(
         end
         assign rdr_progress_w[d] = rdr_move_q || sh_resp_done[d];
 
-
         // -- register slice between the reader and the framer ---------------------------------------
         //
         // (2026-09-24, build-127 timing.) strip_http's slave ready is a deep function of its byte
@@ -1084,6 +1083,44 @@ module handler_slots #(
         end
     end
 
+    // THE PICK IS REGISTERED, AND RE-CHECKED WHERE IT IS ACTED ON (2026-09-24, build-127 timing).
+    // The two 32-way priority encoders above sat between the request streamers' `busy` (a 32-bit
+    // OR in http_req_stream, through conn_tx_busy_w and conn_idle_w) and bring_conn_q (-2.3 ns on
+    // build-127). BR_DONE now acts on LAST cycle's pick, and only if that connection still wants
+    // it by this cycle's registers:
+    //   * close: conn_want_close_w itself (conn_up_q && conn_fatal_q, two flops);
+    //   * reconnect: the same condition as conn_want_reconn_w with the streamer term left out. That
+    //     is exact: the pick says the full condition held last cycle, i.e. no streamer was busy
+    //     with this connection then, and a streamer can only BECOME busy with it through an arm,
+    //     which has raised pend_q -- a register checked here -- by this cycle.
+    // So BR_DONE never acts on a stale choice; it acts one cycle later than before, and when
+    // several connections want a teardown in the same cycle they are served in last cycle's order.
+    // Fatal teardowns still go first: a reconnect is only taken while no close is pending at all.
+    logic                 close_pick_v_q, reconn_pick_v_q;
+    logic [CONN_BITS-1:0] close_pick_q,   reconn_pick_q;
+    always_ff @(posedge ap_clk) begin
+        if (!ap_rst_n) begin
+            close_pick_v_q  <= 1'b0;
+            reconn_pick_v_q <= 1'b0;
+            close_pick_q    <= '0;
+            reconn_pick_q   <= '0;
+        end else begin
+            close_pick_v_q  <= close_pending_w;
+            reconn_pick_v_q <= reconn_pending_w;
+            close_pick_q    <= close_conn_w;
+            reconn_pick_q   <= reconn_conn_w;
+        end
+    end
+
+    logic close_go_w, reconn_go_w;
+    always_comb begin
+        automatic logic [CONN_BITS-1:0] r = reconn_pick_q;
+        close_go_w  = close_pick_v_q && conn_want_close_w[close_pick_q];
+        reconn_go_w = reconn_pick_v_q && !close_pending_w &&
+                      conn_up_q[r] && !conn_fatal_q[r] && (pend_q[r] == '0) && conn_drained_q[r] &&
+                      ((conn_abort_q[r] && !conn_abort_dirty_q[r]) || conn_closed[r]);
+    end
+
     // =============================================================================================
     // The bring-up FSM
     // =============================================================================================
@@ -1152,12 +1189,12 @@ module handler_slots #(
             // behind a reconnect that retry_wait_q can hold off for 65535 cycles would leave a dead
             // slot occupied for the whole backoff.
             BR_DONE: begin
-                if (close_pending_w) begin
-                    bring_conn_d = close_conn_w;
+                if (close_go_w) begin
+                    bring_conn_d = close_pick_q;
                     close_only_d = 1'b1;
                     br_d         = BR_CLOSE;
-                end else if (reconn_pending_w && (retry_wait_q == '0)) begin
-                    bring_conn_d = reconn_conn_w;
+                end else if (reconn_go_w && (retry_wait_q == '0)) begin
+                    bring_conn_d = reconn_pick_q;
                     close_only_d = 1'b0;
                     br_d         = BR_CLOSE;
                 end
