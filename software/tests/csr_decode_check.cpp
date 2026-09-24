@@ -422,11 +422,58 @@ void rev5_rules() {
     CHECK(po.stream.has_value() && *po.stream == 1);          // least loaded healthy decoder, not 2
 }
 
+// Revision 5 with THREE decoders (build-131: 32 connections over 3 decoders). The host has no
+// decoder count of its own: lane_count() is SLOT_POLICY[23:16] and the scheduler's streams are
+// ColumnChunkDecoderConfig's read register 1, both from the bitstream. What must hold is that a
+// count that is not a power of two decodes as itself and that nothing is ever placed on a fourth.
+void rev5_three_decoders() {
+    const auto sp = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(5, 32, 3, 25, 14, 64, 10));
+    CHECK(sp.valid() && sp.revision == 5 && sp.n_conns == 32 && sp.n_decoders == 3);
+    CHECK(sp.slot_bytes() == (32ULL << 20) && sp.max_get_bytes() == (32ULL << 20) - (64ULL << 10));
+
+    // DEC_STATE with a byte in position 3 that no 3-decoder bitstream drives: it is not a lane.
+    const uint64_t ds = dec_byte(true, true, false, false, 0) | (dec_byte(true, true, false, false, 0) << 8) |
+                        (dec_byte(true, true, false, false, 0) << 16) | (dec_byte(true, true, false, false, 0) << 24);
+    const uint64_t occ = 4ULL | (6ULL << 8) | (2ULL << 16) | (0ULL << 24);
+    const auto l = HTTPReadConfig::DecodeDecState(occ, ds, sp.n_decoders);
+    CHECK(l.count == 3 && l.at(2).occ == 2 && l.at(2).arm_ready);
+    bool threw = false;
+    try { (void)l.at(3); } catch (const std::exception &) { threw = true; }
+    CHECK(threw);
+
+    // Placement over three decoder lanes with four host streams active: the span is three, the
+    // least-loaded decoder (2) wins, and the rotation wraps at three, never onto a fourth.
+    oasis::Scheduler::LaneInputs li;
+    li.host_depth = 64; li.needed = 1; li.active = 4; li.rr = 0;
+    // conn depth 2 x ceil(32 / 3) = 22: lane_depth_limit()'s default on this bitstream.
+    li.lane_depth = HTTPReadConfig::LaneDepthFor(5, 2 * ((32 + 3 - 1) / 3), 64);
+    CHECK(li.lane_depth == 22);
+    li.lanes = l;
+    auto po = oasis::Scheduler::PlaceOnLane(li);
+    CHECK(po.span == 3 && po.stream.has_value() && *po.stream == 2 && po.next_rr == 0);
+    li.rr = 2;
+    li.lanes = HTTPReadConfig::DecodeDecState(22ULL | (22ULL << 8) | (21ULL << 16), ds, 3);
+    po = oasis::Scheduler::PlaceOnLane(li);
+    CHECK(po.stream.has_value() && *po.stream == 2 && po.next_rr == 0);
+    li.lanes = HTTPReadConfig::DecodeDecState(22ULL | (22ULL << 8) | (22ULL << 16), ds, 3);
+    po = oasis::Scheduler::PlaceOnLane(li);
+    CHECK(!po.stream && po.lane_bound_wait);                  // all three full: wait, no fourth
+
+    // A connection pipelined on decoder 2 is still that decoder's tail.
+    HTTPReadConfig::ConnPickInputs in;
+    in.lane = 2; in.active = 32; in.rr = 0; in.conn_depth = 2;
+    in.budget = sp.max_get_bytes(); in.need = 500000;
+    for (int c = 0; c < 32; c++) { in.drained[c] = false; in.pend[c] = 1; in.cur_dec[c] = 0; }
+    in.host_tail = 29; in.cur_dec[29] = 2; in.is_tail[29] = true; in.used[29] = 0;
+    CHECK(HTTPReadConfig::PickConn(in).conn == 29);
+}
+
 int main() {
     rev2_decoders();
     rev3_decoders();
     rev4_rules();
     rev5_rules();
+    rev5_three_decoders();
     request_split();
     placement_at_depth();
     std::printf("csr_decode_check: %d passed, %d failed\n", g_pass, g_fail);
