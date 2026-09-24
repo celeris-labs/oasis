@@ -607,6 +607,7 @@ module handler_slots #(
     logic [N_DECODERS-1:0] rdr_progress_w;
     logic [N_CONNS-1:0]    rdr_release [N_DECODERS];
     logic [N_DECODERS-1:0] sh_idle, sh_fs_idle;
+    logic [N_DECODERS-1:0] fs_busy;   // the reader->framer slice of decoder d holds a beat
 
     logic [31:0]           dec_occ_q [N_DECODERS];
     logic [N_DECODERS-1:0] body_pop_q;   // a chunk's last beat left for decoder d, one cycle ago
@@ -805,7 +806,8 @@ module handler_slots #(
         assign fs_m_tvalid = fs_tmp_v_q || fs_ovr_v_q;
         assign fs_m_tdata  = fs_ovr_v_q ? fs_ovr_d_q : fs_tmp_d_q;
         assign fs_m_tkeep  = fs_ovr_v_q ? fs_ovr_k_q : fs_tmp_k_q;
-        assign sh_fs_idle[d] = sh_idle[d] && !fs_tmp_v_q && !fs_ovr_v_q;
+        assign fs_busy[d]    = fs_tmp_v_q || fs_ovr_v_q;
+        assign sh_fs_idle[d] = sh_idle[d] && !fs_busy[d];
 
         // -- framing --------------------------------------------------------------------------------
         logic                       raw_tvalid, raw_tready;
@@ -1018,7 +1020,15 @@ module handler_slots #(
                                // (lane_drain `refatal`); asking the weaker one (dropping this term)
                                // aborts a response that was about to complete out of bytes already
                                // in the slot (lane_drain `c`). Both failures were measured.
-                               !rdr_rd_pending[d];
+                               !rdr_rd_pending[d] &&
+                               // ...and nothing waiting in the register slice in front of the
+                               // framer (9811956): those beats used to wait in slot_rd_share's
+                               // receive fifo, where rd_pending counted them. Without this term a
+                               // stalled decoder lets the slice take a response's last beats, the
+                               // drain expires and a response that is complete in the handler is
+                               // aborted (lane_drain `fsfin`). fs_busy is two flops, so the slice
+                               // keeps its point: no framer ready reaches close_drain_q.
+                               !fs_busy[d];
         end
     end
 
