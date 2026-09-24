@@ -233,6 +233,10 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
   for N in 2 4; do run_hm slots ovf "$N" HDEPTH=$H; done
   # (e) a connection dies with a half-written slot, and its next response is byte-exact
   for N in 2 4; do run_hm slots refatal "$N" HDEPTH=$H; done
+  # (e2) the peer FINs right behind a response that is complete in the handler, with its decoder
+  #      stalled past CLOSE_SETTLE: FSBLEN=384 leaves the last beats in the reader->framer slice
+  #      (9811956), which the FIN drain must count as it counted them in the card fifo
+  for N in 2 4; do run_hm slots fsfin "$N" FSBLEN=384 HDEPTH=$H; done
   done
 
   echo "--- handler_slots : pipelined GETs (CSR revision 4) ---"

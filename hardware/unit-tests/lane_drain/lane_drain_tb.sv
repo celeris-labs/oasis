@@ -2160,6 +2160,43 @@ module lane_drain_tb #(
             else verdict = "PASS";
         end
 
+        // (fsfin) the peer FINs right behind a COMPLETE response while its decoder is stalled -----
+        //
+        // (2026-09-24, the reader->framer register slice of 9811956.) Lane 0's decoder stops, then
+        // one small response lands and the origin closes the session straight after it (what a
+        // `Connection: close` or a max-requests origin does). Every byte of the response is in the
+        // handler, so nothing is owed by the network and the response must complete the moment
+        // the decoder comes back. FSBLEN sizes the body so the response's LAST beats wait in the
+        // slice in front of the framer rather than in slot_rd_share's receive fifo: there the old
+        // datapath counted them through rd_pending and held the FIN drain; if the drain does not
+        // count the slice, it expires (CLOSE_SETTLE) and aborts a finished response.
+        "fsfin": begin
+            int fsblen;
+            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
+            if (!$value$plusargs("FSBLEN=%d", fsblen)) fsblen = 448;
+            submit_batch(0, 1, 2000, o);
+            submit_batch(1, 1, 2000, o);
+            wait_drain(200000, ok);
+            $display("  [cyc=%0d] warm-up drained=%0b", cyc, ok);
+            body_ready_ctl[0] = 1'b0;                    // lane 0's decoder stops
+            submit_batch(0, 1, fsblen, o);
+            wait_cycles(3000);                           // the response lands and is read out
+            $display("  [cyc=%0d] before the FIN: lane0 done=%0d/%0d bytes=%0d outstanding=%0d",
+                     cyc, ln[0].resp_done, ln[0].planned_total, ln[0].bytes_in, outst_data());
+            peer_close(ln[0].sid);
+            wait_cycles(6000);                           // > CLOSE_SETTLE, decoder still stopped
+            body_ready_ctl[0] = 1'b1;                    // and it comes back
+            wait_drain(200000, ok);
+            $display("  [cyc=%0d] after: lane0 done=%0d/%0d conn0 fatal=%0b lane0 fatal=%0b",
+                     cyc, ln[0].resp_done, ln[0].planned_total,
+                     (DUT_SLOTS != 0) ? conn_fatal(0) : 1'b0, lane_is_fatal(0));
+            if (!ok) begin verdict = "HANG (the finished response never reached the decoder)"; dump("fsfin"); end
+            else if (n_err) begin verdict = "FAIL (routing/framing violated)"; dump("fsfin"); end
+            else if (lane_is_fatal(0) || ((DUT_SLOTS != 0) && conn_fatal(0)))
+                verdict = "FAIL (a complete response was aborted by the FIN drain)";
+            else verdict = "PASS";
+        end
+
         // (d) transient back-pressure on one lane, then it resumes ----------------------------------
         "d": begin
             if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
