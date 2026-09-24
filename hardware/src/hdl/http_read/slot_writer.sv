@@ -352,26 +352,109 @@ module slot_writer #(
 
     logic [RSV_BITS-1:0]  rsv_beats_q;
     logic [RPKG_BITS-1:0] rsv_pkg_q [N_CONNS];
-    logic                 pkg_issued_w;
-    logic [CONN_BITS-1:0] pkg_conn_w;
+    logic [N_CONNS-1:0]   charge_oh_w;  // one-hot: this readPkg is for live connection c
     logic                 charge_w;     // this readPkg is for a live connection, so reserve for it
 
-    assign pkg_issued_w = |conn_pkg_issued;
-    always_comb begin
-        pkg_conn_w = '0;
-        for (int c = 0; c < N_CONNS; c++)
-            if (conn_pkg_issued[c]) pkg_conn_w = pkg_conn_w | CONN_BITS'(c);
-    end
-    assign charge_w = pkg_issued_w && !conn_down[pkg_conn_w];
+    // rx_dispatch issues at most one readPkg per cycle, so conn_pkg_issued is one-hot (or zero) and
+    // "the issued connection is up" is a per-bit AND and an OR -- the same value as encoding the
+    // one-hot to an index and muxing conn_down with it, two mux levels shorter.
+    assign charge_oh_w = conn_pkg_issued & ~conn_down;
+    assign charge_w    = |charge_oh_w;
 
     // What a release hands back. Summed rather than taken from one connection because two readers
     // may retire in the same cycle; on the normal path both terms are zero (a reader releases only a
     // connection that has run dry, so every announced segment has landed by then) and this only has anything to do on a teardown.
-    logic [RPKG_BITS+4:0] rel_pkgs_w;
+    //
+    // PIPELINED (2026-09-24, build-127 timing). The release used to be summed over all N_CONNS,
+    // multiplied by MSS_BEATS and subtracted in the SAME cycle as conn_release -- which itself comes
+    // from the reader's head connection and the handler's teardown FSM -- and at 32 connections that
+    // was build-127's worst path (26 levels, a DSP multiply, -3.9 ns, SLR0 -> SLR1). Now:
+    //   R0  the release cycle: each released connection's rsv_pkg_q is captured beside it
+    //       (rsv_pkg_q itself is zeroed in the same cycle, exactly as before);
+    //   R1  partial sums over groups of REL_GRP connections;
+    //   R2  the total;
+    //   R3  the total x MSS_BEATS as a shift-add (x64 + x2), saturated where it no longer matters;
+    // and the shared counters subtract it at R3, i.e. REL_LAT cycles after the release.
+    // WHY THAT IS SAFE. The amount returned is identical, only later, and for those cycles the
+    // counters hold MORE reservation than exists: conn_space_ok can only be lower than before, never
+    // higher, and a lower conn_space_ok only holds rx_dispatch's readPkg issue back (the fifo's
+    // never-refuse rule depends on space_ok never being optimistic, not on it being prompt). On the
+    // normal path the amount is zero, so nothing changes at all; on a teardown the other connections
+    // see the room come back REL_LAT cycles later. The counters cannot saturate on the way: every
+    // charge is still gated by conn_space_ok, which sees the higher value.
+    localparam int REL_GRP  = 8;
+    localparam int REL_NGRP = (N_CONNS + REL_GRP - 1) / REL_GRP;
+    localparam int REL_PART = RPKG_BITS + $clog2(REL_GRP);           // 8 x 255 fits
+    localparam int REL_SUM  = RPKG_BITS + $clog2(REL_GRP * REL_NGRP); // 32 x 255 fits
+    localparam int REL_LAT  = 4;                                      // documentation only
+
+    logic [RPKG_BITS-1:0] rel_amt_q  [N_CONNS];
+    logic [REL_PART-1:0]  rel_part_q [REL_NGRP];
+    logic [REL_SUM-1:0]   rel_pkgs_q;       // R2
+    logic [REL_SUM-1:0]   rel_pkgs_r3_q;    // R3, aligned with rel_beats_q
+    // Beats a release hands back, saturated at REL_BEATS_SAT: the counter it is subtracted from is
+    // never above FIFO_DEPTH + MSS_BEATS, so any larger value already drives it to zero and the
+    // saturation is exact. It keeps the subtract below 14 bits instead of 21.
+    localparam int REL_BEATS_SAT = 2047;
+    logic [10:0]          rel_beats_q;      // R3
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            for (int c = 0; c < N_CONNS; c++)  rel_amt_q[c]  <= '0;
+            for (int g = 0; g < REL_NGRP; g++) rel_part_q[g] <= '0;
+            rel_pkgs_q    <= '0;
+            rel_pkgs_r3_q <= '0;
+            rel_beats_q   <= '0;
+        end else begin
+            for (int c = 0; c < N_CONNS; c++)
+                rel_amt_q[c] <= conn_release[c] ? rsv_pkg_q[c] : '0;
+            for (int g = 0; g < REL_NGRP; g++) begin
+                automatic logic [REL_PART-1:0] s = '0;
+                for (int k = 0; k < REL_GRP; k++)
+                    if (g*REL_GRP + k < N_CONNS) s = s + REL_PART'(rel_amt_q[g*REL_GRP + k]);
+                rel_part_q[g] <= s;
+            end
+            begin
+                automatic logic [REL_SUM-1:0] t = '0;
+                for (int g = 0; g < REL_NGRP; g++) t = t + REL_SUM'(rel_part_q[g]);
+                rel_pkgs_q <= t;
+            end
+            rel_pkgs_r3_q <= rel_pkgs_q;
+            begin
+                automatic logic [REL_SUM+6:0] b =
+                    ((REL_SUM+7)'(rel_pkgs_q) << 6) + ((REL_SUM+7)'(rel_pkgs_q) << 1);
+                rel_beats_q <= (b > (REL_SUM+7)'(REL_BEATS_SAT)) ? 11'(REL_BEATS_SAT) : 11'(b);
+            end
+        end
+    end
+    // MSS_BEATS is folded into the shift-add above; if it ever changes, so must that line.
+    initial if (MSS_BEATS != 66) $error("slot_writer: rel_beats_q hardcodes MSS_BEATS = 66");
+
+    // The next values of the two shared counters, computed from REGISTERS ONLY for each of the three
+    // things this cycle's charge/push can do to them (+1 MSS, nothing, -1 MSS). The late-arriving
+    // charge (rx_dispatch's readPkg handshake) and push (a segment's tlast) then only pick one of
+    // three -- they no longer ripple through an add, a compare, a subtract and a clamp. The values
+    // are exactly the old add-then-compare-then-subtract ones: rsv_up - rsv_dn is
+    // (rsv - released) + MSS_BEATS * (charge - push), clamped to [0, FIFO_DEPTH].
+    localparam int SB = 14;   // signed: -REL_BEATS_SAT - MSS_BEATS .. FIFO_DEPTH + MSS_BEATS
+    localparam int DB = 9;    // signed: -127 - 1 .. DESC_DEPTH + 1
+    logic [RSV_BITS-1:0]  rsv_next_w  [3];   // [0] -MSS, [1] +0, [2] +MSS
+    logic [DCNT_BITS-1:0] dq_next_w   [3];   // [0] -1,   [1] +0, [2] +1
     always_comb begin
-        rel_pkgs_w = '0;
-        for (int c = 0; c < N_CONNS; c++)
-            if (conn_release[c]) rel_pkgs_w = rel_pkgs_w + (RPKG_BITS+5)'(rsv_pkg_q[c]);
+        automatic logic signed [SB-1:0] rb, rv;
+        automatic logic signed [DB-1:0] db, dv;
+        automatic logic [6:0] rel_pkgs_sat;
+        rel_pkgs_sat = (rel_pkgs_r3_q > REL_SUM'(127)) ? 7'd127 : 7'(rel_pkgs_r3_q);
+        rb = $signed(SB'(rsv_beats_q)) - $signed(SB'(rel_beats_q));
+        db = $signed(DB'(dq_rsv_q))    - $signed(DB'(rel_pkgs_sat));
+        for (int k = 0; k < 3; k++) begin
+            rv = rb + $signed(SB'((k - 1) * MSS_BEATS));
+            dv = db + $signed(DB'(k - 1));
+            rsv_next_w[k] = (rv <= 0) ? '0 :
+                            (rv > $signed(SB'(FIFO_DEPTH))) ? RSV_BITS'(FIFO_DEPTH) : RSV_BITS'(rv);
+            dq_next_w[k]  = (dv <= 0) ? '0 :
+                            (dv > $signed(DB'(DESC_DEPTH))) ? DCNT_BITS'(DESC_DEPTH) : DCNT_BITS'(dv);
+        end
     end
 
     logic space_ok_q;
@@ -509,7 +592,7 @@ module slot_writer #(
                 if (conn_release[i]) begin
                     rsv_pkg_q[i] <= '0;
                 end else begin
-                    case ({charge_w && (pkg_conn_w == CONN_BITS'(i)),
+                    case ({charge_oh_w[i],
                            desc_push_w && (conn_sel_w == CONN_BITS'(i))})
                         2'b10: rsv_pkg_q[i] <= (rsv_pkg_q[i] == '1) ? rsv_pkg_q[i]
                                                                     : rsv_pkg_q[i] + 1'b1;
@@ -540,32 +623,14 @@ module slot_writer #(
 
             // -- reservations. A readPkg for a LIVE connection promises one MSS of fifo and one
             //    descriptor slot; the segment's tlast on the way in hands both back, and a release
-            //    hands back everything a torn-down connection was still holding. Written as an
-            //    add-then-compare-then-subtract so nothing can wrap to a huge unsigned "yes".
-            begin
-                automatic logic [RSV_BITS+RPKG_BITS+4:0] rsv_up, rsv_dn;
-                automatic logic [DSUM_BITS+RPKG_BITS+4:0] dq_up, dq_dn;
-
-                rsv_up = (RSV_BITS+RPKG_BITS+5)'(rsv_beats_q) +
-                         (charge_w ? (RSV_BITS+RPKG_BITS+5)'(MSS_BEATS) : '0);
-                rsv_dn = (desc_push_w ? (RSV_BITS+RPKG_BITS+5)'(MSS_BEATS) : '0) +
-                         ((RSV_BITS+RPKG_BITS+5)'(rel_pkgs_w) * (RSV_BITS+RPKG_BITS+5)'(MSS_BEATS));
-                if (rsv_up <= rsv_dn)
-                    rsv_beats_q <= '0;
-                else if ((rsv_up - rsv_dn) > (RSV_BITS+RPKG_BITS+5)'(FIFO_DEPTH))
-                    rsv_beats_q <= RSV_BITS'(FIFO_DEPTH);
-                else
-                    rsv_beats_q <= RSV_BITS'(rsv_up - rsv_dn);
-
-                dq_up = (DSUM_BITS+RPKG_BITS+5)'(dq_rsv_q) + (charge_w ? 1 : 0);
-                dq_dn = (desc_push_w ? 1 : 0) + (DSUM_BITS+RPKG_BITS+5)'(rel_pkgs_w);
-                if (dq_up <= dq_dn)
-                    dq_rsv_q <= '0;
-                else if ((dq_up - dq_dn) > (DSUM_BITS+RPKG_BITS+5)'(DESC_DEPTH))
-                    dq_rsv_q <= DCNT_BITS'(DESC_DEPTH);
-                else
-                    dq_rsv_q <= DCNT_BITS'(dq_up - dq_dn);
-            end
+            //    hands back everything a torn-down connection was still holding (REL_LAT cycles
+            //    later, see the release pipeline). Clamped to [0, depth] so nothing can wrap to a
+            //    huge unsigned "yes"; the three candidates are precomputed above.
+            case ({charge_w, desc_push_w})
+                2'b10:   begin rsv_beats_q <= rsv_next_w[2]; dq_rsv_q <= dq_next_w[2]; end
+                2'b01:   begin rsv_beats_q <= rsv_next_w[0]; dq_rsv_q <= dq_next_w[0]; end
+                default: begin rsv_beats_q <= rsv_next_w[1]; dq_rsv_q <= dq_next_w[1]; end
+            endcase
 
             // -- the registered space check. Written as an addition, never as a subtraction: level
             //    plus reserved may legitimately exceed the depth for a cycle and the subtraction
