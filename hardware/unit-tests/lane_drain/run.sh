@@ -266,7 +266,13 @@ if [ "$DUT" = s2 ] || [ "$DUT" = both ]; then
     S="lds2c${C}_snap"
     SNAP_OVERRIDE=$S run_hm slots s2mix  $C SRVLAT=500 SRVJIT=2000 COALESCE
     SNAP_OVERRIDE=$S run_hm slots s2mix  $C SRVLAT=300 SRVJIT=300 MSS=1460 BMAX=3000 NREQ=40 HDEPTH=4
-    SNAP_OVERRIDE=$S run_hm slots s2arm  $C SRVLAT=4000 HDEPTH=1
+    # SRVLAT must outlast the whole open sequence, or "every connection armed at once" measures the
+    # TOE model's random open latency (40..280 cycles each, $urandom) instead of the handler: the
+    # host can only arm connection k after k-1's request text is out, i.e. after it is OPEN, so the
+    # last arm lands ~C x 160 cycles in on average and up to C x 295. At 4000 the 32-connection case
+    # passed or failed with the random draw, which any RTL change reshuffles (xsim reseeds the
+    # bench's processes when the design's process layout changes).
+    SNAP_OVERRIDE=$S run_hm slots s2arm  $C SRVLAT=12000 HDEPTH=1
     SNAP_OVERRIDE=$S run_hm slots s2fatal $C SRVLAT=3000 SRVJIT=1000
     SNAP_OVERRIDE=$S run_hm slots s2idle $C SRVLAT=300
     for s in a g h d; do SNAP_OVERRIDE=$S run_hm slots "$s" $C; done
