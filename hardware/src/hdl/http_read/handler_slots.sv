@@ -407,9 +407,24 @@ module handler_slots #(
         end
     end
 
-    logic cfg_fire, arm_fire_w;
-    assign cfg_fire   = req_valid && req_ready;
-    assign arm_fire_w = cfg_fire && cfg_is_arm_w;
+    // The two kinds of beat fire from their OWN admission terms rather than through req_ready.
+    // Identical values -- for an ENTRY req_ready IS dec_entry_ready_w[cfg_dec], for an ARM it IS
+    // dec_arm_ready_w[cfg_dec] && arm_conn_ok_w -- but the entry side (the chunk queues,
+    // dec_occ_q) no longer sits behind the arm side's connection placement cone (pend_q,
+    // cur_dec_q, tail_conn_q, a 32:1 select on cfg_conn), which it never depended on. build-127
+    // timing: pend_q -> axis_rewrite_last len_mem was -3.2 ns.
+    logic                  arm_fire_w;
+    logic [N_DECODERS-1:0] entry_fire_w;
+    logic                  arm_dec_ready_w;
+    always_comb begin
+        arm_dec_ready_w = 1'b0;
+        for (int d = 0; d < N_DECODERS; d++)
+            if (cfg_dec == DEC_BITS'(d)) arm_dec_ready_w = dec_arm_ready_w[d];
+    end
+    assign arm_fire_w = cfg_is_arm_w && arm_dec_ready_w && arm_conn_ok_w;
+    for (genvar d = 0; d < N_DECODERS; d++) begin : gen_entry_fire
+        assign entry_fire_w[d] = cfg_is_entry_w && (cfg_dec == DEC_BITS'(d)) && dec_entry_ready_w[d];
+    end
 
     // =============================================================================================
     // Connection bring-up. ONE tcp_init, sequenced across connections, plus BR_DRAIN.
@@ -594,6 +609,7 @@ module handler_slots #(
     logic [N_DECODERS-1:0] sh_idle, sh_fs_idle;
 
     logic [31:0]           dec_occ_q [N_DECODERS];
+    logic [N_DECODERS-1:0] body_pop_q;   // a chunk's last beat left for decoder d, one cycle ago
 
     // The connection whose request text decoder d's streamer is sending (latched on the arm; the
     // streamer takes no second arm until the text is out, so it cannot change under a transfer).
@@ -718,9 +734,28 @@ module handler_slots #(
         // Anything moving on this decoder's read path counts as progress for the watchdog. A
         // decoder throttled to one beat every sixteen cycles is SLOW, not dead, and must never be
         // declared failed -- which is the whole claim the `thr` scenario measures.
-        assign rdr_progress_w[d] = (rdr_m_tvalid && rdr_m_tready) ||
-                                   (rd_req_valid[d] && rd_req_ready[d]) ||
-                                   sh_resp_done[d];
+        //
+        // REGISTERED (2026-09-24, build-127 timing): the two MOVEMENT terms are the handshakes of
+        // two other modules -- the beat into the framer (on build-127 strip_http's slave ready, a
+        // byte-cursor subtract, a 32-bit compare and a consumed==avail compare deep; now the slice
+        // below) and slot_rd_share's arbiter grant -- and they went on through all 32 connections'
+        // close-drain counters and this decoder's 29-bit watchdog (-3.4 ns on build-127). They are
+        // taken one cycle late; resp_done is a flop and stays exact. Both consumers are quiet TIMERS -- 1024 cycles
+        // (CLOSE_SETTLE) and 2^READ_WDOG_BITS cycles -- and the late terms cannot change a verdict:
+        // the close drain also requires !rdr_rd_pending, which is the reader's registered "no read
+        // outstanding and nothing landed unread" of the cycle before, and with that true neither a
+        // beat into the framer (it belongs to an outstanding read) nor a read request (it needs
+        // landed bytes not yet asked for) can happen in the next cycle either -- so a movement the
+        // late copy has not reported yet was already stopping the count through rd_pending. The
+        // watchdog is 2^29 cycles long.
+        logic rdr_move_q;
+        always_ff @(posedge ap_clk) begin
+            if (!ap_rst_n) rdr_move_q <= 1'b0;
+            else           rdr_move_q <= (rdr_m_tvalid && rdr_m_tready) ||
+                                         (rd_req_valid[d] && rd_req_ready[d]);
+        end
+        assign rdr_progress_w[d] = rdr_move_q || sh_resp_done[d];
+
 
         // -- register slice between the reader and the framer ---------------------------------------
         //
@@ -834,7 +869,7 @@ module handler_slots #(
             .CFG_DEPTH(QUEUE_DEPTH), .NUM_DEST(1), .DEST_BITS(1)
         ) inst_rewrite_last (
             .clk(ap_clk), .rst_n(ap_rst_n),
-            .cfg_valid(cfg_fire && cfg_is_entry_w && (cfg_dec == DEC_BITS'(d))),
+            .cfg_valid(entry_fire_w[d]),
             .cfg_ready(rwl_cfg_ready[d]),
             .cfg_len  (req_data.req_chunk_bytes),
             .cfg_dest (1'b0),
@@ -894,6 +929,21 @@ module handler_slots #(
         assign m_axis_body_tdata[d]  = sk_ovr_v_q ? sk_ovr_d_q : sk_tmp_d_q;
         assign m_axis_body_tkeep[d]  = sk_ovr_v_q ? sk_ovr_k_q : sk_tmp_k_q;
         assign m_axis_body_tlast[d]  = sk_ovr_v_q ? sk_ovr_l_q : sk_tmp_l_q;
+
+        // A chunk's last beat leaving for the decoder retires one entry of dec_occ_q. REGISTERED
+        // (2026-09-24, build-127 timing): m_axis_body_tready is the decoder's own input ready, a
+        // long cone inside parcore, and it went on into dec_occ_q's 32-bit up/down counter
+        // (-2.6 ns). Counting the pop one cycle late means the occupancy reads one entry HIGH for
+        // one cycle, i.e. an ENTRY beat for a full queue is admitted one cycle later than before;
+        // nothing is ever admitted that was not admitted before. (CONN_OCC reads it back through a
+        // register anyway.)
+        logic pop_q;
+        always_ff @(posedge ap_clk) begin
+            if (!ap_rst_n) pop_q <= 1'b0;
+            else           pop_q <= m_axis_body_tvalid[d] && m_axis_body_tready[d] &&
+                                    m_axis_body_tlast[d];
+        end
+        assign body_pop_q[d] = pop_q;
 
         assign dec_occ_ok[d] = (dec_occ_q[d] < 32'(QUEUE_DEPTH));
 
@@ -1309,9 +1359,8 @@ module handler_slots #(
             // -- per-decoder accounting ----------------------------------------------------------
             stream_refused_prev_q <= stream_refused;
             for (int d = 0; d < N_DECODERS; d++) begin
-                automatic logic push = cfg_fire && cfg_is_entry_w && (cfg_dec == DEC_BITS'(d));
-                automatic logic pop  = m_axis_body_tvalid[d] && m_axis_body_tready[d]
-                                       && m_axis_body_tlast[d];
+                automatic logic push = entry_fire_w[d];
+                automatic logic pop  = body_pop_q[d];
                 automatic logic [CONN_BITS-1:0] h = rdr_head_conn[d];
                 case ({push, pop})
                     2'b10: dec_occ_q[d] <= dec_occ_q[d] + 1'b1;
