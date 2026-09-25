@@ -272,6 +272,9 @@ SELECT o.o_orderkey, o.o_custkey
 FROM read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/orders_tiny.parquet') o
 JOIN read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/customer_tiny.parquet') c
 ON o.o_custkey = c.c_custkey;
+
+SELECT count(*), sum(o_orderkey), sum(o_totalprice), sum(o_shippriority), count(DISTINCT o_comment)
+FROM read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/orders_mini.parquet') JOIN read_oasis('/local/home/smalinin/oasis/extension/tpch_parquet/customer_mini.parquet') ON o_custkey = c_custkey;
 ```
 
 ---
