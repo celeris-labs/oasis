@@ -46,6 +46,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "ceil(value / threads) groups in flight but at least 1).",
 	    LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_GROUPS_IN_FLIGHT));
 
+	config.AddExtensionOption("oasis_runtime_bloom_filter",
+	                          "Filter the probe side of inner joins between two read_oasis scans with the hardware "
+	                          "Bloom filter (decided when the query is planned)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
 
