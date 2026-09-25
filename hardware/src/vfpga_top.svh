@@ -312,9 +312,9 @@ AXIDemultiplexer #(
 );
 
 // Build acks: one one-byte transfer (a single zero byte) per BUILD transfer, once its last beat went
-// into the Bloom filter. Not empty on purpose: the output writer only handles an empty transfer as
-// the last one of its stream. The demultiplexer takes a select for the whole next transfer, so the
-// select it took last tells whether the transfer currently going into the filter is a build chunk.
+// into the Bloom filter (an empty ack would work as well, see the output writer below). The
+// demultiplexer takes a select for the whole next transfer, so the select it took last tells whether
+// the transfer currently going into the filter is a build chunk.
 // The multiplexer picks the acks up in select order, like every other output.
 logic        bf_in_is_build;
 logic [15:0] bf_pending_acks;
@@ -531,7 +531,12 @@ NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_bypass (
 `endif
 
 // -- Output writer --------------------------------------------------------------------------------
-OutputWriter inst_output_writer (
+// The scheduler (software/oasis/scheduler.cpp) enqueues one output buffer per flow ahead of time and
+// matches the n-th interrupt of a stream with its n-th buffer. So a flow with an empty output (e.g.
+// a materialized column of which the Bloom filter kept no row) has to use up its buffer too.
+OutputWriter #(
+    .EMPTY_TRANSFER_TAKES_BUFFER(1)
+) inst_output_writer (
     .clk(clk),
     .rst_n(rst_n),
 

@@ -55,6 +55,9 @@ struct OasisScanFilter {
 	unique_ptr<TableFilter> owned_filter; // null when `filter` references a gstate-owned filter
 	const TableFilter &filter;
 	unique_ptr<TableFilterState> filter_state;
+	// False if the filter only prunes row groups and is never evaluated per row, e.g. DuckDB's own
+	// join Bloom filter where the hardware Bloom filter already filters the same column.
+	bool row_level = true;
 };
 
 struct OasisScanBindData : public TableFunctionData {
