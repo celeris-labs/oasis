@@ -1,6 +1,7 @@
 #include "oasis_optimizer.hpp"
 #include "oasis_scan.hpp"
 
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/expression.hpp"
@@ -22,6 +23,12 @@ namespace duckdb {
 struct OasisOptimizerInfo : public OptimizerExtensionInfo {
 	bool enabled = true;
 	bool verbose = true;
+};
+
+// What one optimizer pass (one query) works with: the database-wide info, and the query's settings
+struct OasisOptimizerPass {
+	OasisOptimizerInfo &info;
+	bool bloom_enabled; // oasis_runtime_bloom_filter
 	idx_t rewrites_applied = 0;
 };
 
@@ -93,8 +100,25 @@ static bool TryExtractColumnRef(const Expression &expr, LogicalGet &get, string 
 	return true;
 }
 
-static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimizerInfo &info) {
+static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimizerPass &pass) {
+	auto &info = pass.info;
 	if (join.children.size() != 2) {
+		return false;
+	}
+
+	if (!pass.bloom_enabled) {
+		if (info.verbose) {
+			OASIS_OPT_LOG("join skipped: oasis_runtime_bloom_filter is off");
+		}
+		return false;
+	}
+
+	// Filtering the probe side drops its rows without a match, which only an inner join does as well
+	// (e.g. a left join keeps them, padded with NULLs)
+	if (join.join_type != JoinType::INNER) {
+		if (info.verbose) {
+			OASIS_OPT_LOG("join skipped: %s join, only inner joins are rewritten", EnumUtil::ToChars(join.join_type));
+		}
 		return false;
 	}
 
@@ -182,7 +206,7 @@ static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimize
 		probe_bind->runtime_bloom_build_key = build_key;
 		probe_bind->runtime_bloom_probe_key = probe_key;
 
-		info.rewrites_applied++;
+		pass.rewrites_applied++;
 
 		OASIS_OPT_LOG("found read_oasis equi-join");
 		OASIS_OPT_LOG("left file    = %s", left_bind->filename.c_str());
@@ -207,9 +231,9 @@ static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimize
 	return false;
 }
 
-static void RewritePlan(LogicalOperator &op, OasisOptimizerInfo &info) {
+static void RewritePlan(LogicalOperator &op, OasisOptimizerPass &pass) {
 	for (auto &child : op.children) {
-		RewritePlan(*child, info);
+		RewritePlan(*child, pass);
 	}
 
 	if (op.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
@@ -217,7 +241,7 @@ static void RewritePlan(LogicalOperator &op, OasisOptimizerInfo &info) {
 	}
 
 	auto &join = op.Cast<LogicalComparisonJoin>();
-	TryApplyOasisBloomRewrite(join, info);
+	TryApplyOasisBloomRewrite(join, pass);
 }
 
 static void OasisOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
@@ -226,14 +250,19 @@ static void OasisOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOper
 		return;
 	}
 
+	// The setting only disables the Bloom filter rewrite, not the whole pass
+	Value runtime_bloom_filter;
+	OasisOptimizerPass pass {*info, !input.context.TryGetCurrentSetting("oasis_runtime_bloom_filter", runtime_bloom_filter) ||
+	                                    runtime_bloom_filter.IsNull() || runtime_bloom_filter.GetValue<bool>()};
+
 	if (info->verbose) {
 		OASIS_OPT_LOG("optimizer pass started");
 	}
 
-	RewritePlan(*plan, *info);
+	RewritePlan(*plan, pass);
 
 	if (info->verbose) {
-		OASIS_OPT_LOG("optimizer pass finished, rewrites_applied=%llu", (unsigned long long)info->rewrites_applied);
+		OASIS_OPT_LOG("optimizer pass finished, rewrites_applied=%llu", (unsigned long long)pass.rewrites_applied);
 	}
 }
 
