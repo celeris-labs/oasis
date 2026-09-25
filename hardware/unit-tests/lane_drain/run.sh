@@ -134,7 +134,8 @@ run_hm() { # <dut> <scen> <lanes> [plusargs...]
   # board, a week in xsim. Its own snapshot shrinks only that parameter.
   [ "$scen" = "lz2" ] && snap="${pfx}to_snap"
   # ovf has to overrun a slot, so it gets a small one rather than half a megabyte of waiting.
-  [ "$scen" = "ovf" ] && snap="${pfx}ovf${lanes}_snap"
+  # So does cuovf, which overruns it to get a fatal teardown.
+  [ "$scen" = "ovf" ] || [ "$scen" = "cuovf" ] && snap="${pfx}ovf${lanes}_snap"
 
   local a=(-testplusarg "SCEN=$scen"); local p
   for p in "$@"; do a+=(-testplusarg "$p"); done
@@ -175,7 +176,7 @@ if [ -n "$ONE" ]; then
       if [ "$DUT" = slots ]; then
         elab "lds${LANES}_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" || exit 1
         [ "$ONE" = "lz2" ] && { elab "ldsto_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" "STALL_CYCLES=8192" || exit 1; }
-        [ "$ONE" = "ovf" ] && { elab "ldsovf${LANES}_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" "SLOT_LOG2=16" || exit 1; }
+        { [ "$ONE" = "ovf" ] || [ "$ONE" = "cuovf" ]; } && { elab "ldsovf${LANES}_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" "SLOT_LOG2=16" || exit 1; }
       else
         elab "ld${LANES}_snap" "NUM_CONNS=${LANES}" || exit 1
         [ "$ONE" = "lz2" ] && { elab "ldto_snap" "NUM_CONNS=${LANES}" "STALL_CYCLES=8192" || exit 1; }
@@ -193,7 +194,7 @@ xelab -debug typical -timescale 1ns/1ps -top rxd_drain_tb -snapshot rxd_snap \
 # rx_dispatch in isolation. UNCHANGED by ADR-5 -- it is the same module on both DUTs, with the same
 # contract -- so it runs once rather than once per handler.
 echo "--- rx_dispatch (shared by both DUTs, unchanged) ---"
-for s in r1 r2 r3 r4 r5 r6 r7; do run_rxd "$s"; done
+for s in r1 r2 r3 r4 r5 r6 r7 r8; do run_rxd "$s"; done
 
 if [ "$DUT" = multi ] || [ "$DUT" = both ]; then
   if [ ${#SKID[@]} -eq 0 ]; then
@@ -206,6 +207,10 @@ if [ "$DUT" = multi ] || [ "$DUT" = both ]; then
     for s in a2 a8 a9 a10;           do run_hm multi "$s" 2; done
     for s in lz1 lz2;                do run_hm multi "$s" 2; done
     for s in s_base s_g s_d s_e s_f; do run_hm multi "$s" 2; done
+    # a fatal lane's session is released while the peer still has segments in flight: the late
+    # segment lands before lane 1's next batch, then in the middle of one of lane 1's bodies
+    run_hm multi cu 2
+    run_hm multi cu 2 MIDBODY
     for N in 1 4; do run_hm multi s_base "$N"; run_hm multi a2 "$N"; done
   fi
 fi
@@ -240,6 +245,9 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
   run_hm slots dmabp "$NDEC" DMA_WR_BP=50 DMA_RD_GAP=40 HDEPTH=$H
   # (d) one connection overruns its slot; nobody else may notice
   for N in 2 "$NDEC"; do run_hm slots ovf "$N" HDEPTH=$H; done
+  #     ...and with the overrun connection's peer still sending: its late segment lands after the
+  #     release, between two of another connection's (cuovf)
+  for N in 2 "$NDEC"; do run_hm slots cuovf "$N" HDEPTH=$H; done
   # (e) a connection dies with a half-written slot, and its next response is byte-exact
   for N in 2 "$NDEC"; do run_hm slots refatal "$N" HDEPTH=$H; done
   # (e2) the peer FINs right behind a response that is complete in the handler, with its decoder

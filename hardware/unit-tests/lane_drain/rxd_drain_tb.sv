@@ -7,7 +7,11 @@
 // TOE model, exactly as the contract describes it:
 //   * ONE shared packet FIFO, delivered in GLOBAL ARRIVAL ORDER across all sessions;
 //   * one readPkg pops exactly one packet -- whatever session it belongs to.  The readPkg does NOT
-//     select the session; rx_metadata names the session of the packet actually delivered;
+//     select the session, and rx_metadata does not name the packet's owner either: it echoes the
+//     session id the READPKG named, unchecked (rx_app_stream_if.cpp writes rxSar.sessionID, the
+//     request's).  So a readPkg that pops another session's packet delivers it labelled as the
+//     requester's -- which is exactly how a skipped readPkg corrupts another lane, and the bench
+//     counts every such pop as an error;
 //   * the data output never stalls;
 //   * the notification interface is shared and must not be held off.
 //
@@ -132,6 +136,7 @@ module rxd_drain_tb;
     Notif nq[$];         // notifications not yet presented on the wire
     Notif outst[$];      // presented, not yet answered by a readPkg
     RPkg  unmatched[$];  // readPkgs still looking for their notification
+    int   rp_sid_q[$];   // session id of every readPkg, in issue order: the metadata the TOE echoes
 
     int rp_issued  = 0;  // written only by the readPkg sink
     int pkt_taken  = 0;  // written only by the delivery engine
@@ -203,6 +208,7 @@ module rxd_drain_tb;
                                   rp_sid(rp_tdata)));
                 r = new(); r.sid = rp_sid(rp_tdata); r.len = rp_len(rp_tdata); r.at = cyc;
                 unmatched.push_back(r);
+                rp_sid_q.push_back(r.sid);
             end else begin
                 idle_since_rp = idle_since_rp + 1;
             end
@@ -226,12 +232,13 @@ module rxd_drain_tb;
     end
 
     // ---------------------------------------------------------------------------------------------
-    // TOE: packet delivery.  One readPkg -> the HEAD of the shared FIFO, regardless of session.
+    // TOE: packet delivery.  One readPkg -> the HEAD of the shared FIFO, regardless of session,
+    // labelled with the session id the readPkg named.
     // ---------------------------------------------------------------------------------------------
     int deliver_lane = -1;
 
     initial begin : deliver_engine
-        Pkt p; int i, nb, k;
+        Pkt p; int i, nb, k, msid;
         logic [AXI_DATA_BITS-1:0]   dw;
         logic [AXI_DATA_BITS/8-1:0] kw;
         rm_tvalid = 0; rm_tdata = '0; rd_tvalid = 0; rd_tdata = '0; rd_tkeep = '0; rd_tlast = 0;
@@ -240,8 +247,12 @@ module rxd_drain_tb;
             if (rst_n && (rp_issued - pkt_taken) > 0 && gfifo.size() > 0) begin
                 p = gfifo.pop_front();
                 pkt_taken = pkt_taken + 1;
+                msid = rp_sid_q.pop_front();
+                if (msid != p.sid)
+                    err($sformatf("TOE: the readPkg for session %0d popped session %0d's packet (%0d B) and labels it %0d",
+                                  msid, p.sid, p.d.size(), msid));
                 deliver_lane = lane_of_sid.exists(p.sid) ? lane_of_sid[p.sid] : -1;
-                rm_tdata  <= TCP_RX_META_BITS'(p.sid);
+                rm_tdata  <= TCP_RX_META_BITS'(msid);
                 rm_tvalid <= 1'b1;
                 do @(posedge clk); while (!rm_tready);
                 rm_tvalid <= 1'b0;
@@ -535,6 +546,31 @@ module rxd_drain_tb;
             if (dbg_overflow) verdict = "OVERFLOW (announcements dropped; the shared FIFO can never drain)";
             else if (!ok)     verdict = "HANG";
             else if (n_err)   verdict = "FAIL";
+            else              verdict = "PASS";
+        end
+
+        "r8": begin
+            // A late segment for a session the handler has just closed. On a fatal lane the handler
+            // closes the session and releases it in the same cycle (BR_CLOSE), but the TOE is then
+            // in FIN_WAIT_1, which still accepts payload and still announces it -- so the peer's
+            // in-flight bytes land in the shared FIFO after the release. Then lane 1 carries on.
+            // Dropping that announcement strands the packet, and lane 1's next readPkg pops it.
+            do_bind(0, 1); do_bind(1, 2); wait_cycles(5);
+            for (int r = 0; r < 2; r++) begin net_pkt(1, r, 4096); net_pkt(2, r, 4096); end
+            wait_drain(200000, ok);
+            $display("  warm-up drained=%0b lane0=%0d lane1=%0d bytes", ok, lane_bytes[0], lane_bytes[1]);
+            do_release(0);                        // BR_CLOSE: close request + release, same cycle
+            lane_of_sid.delete(1);                // nobody is owed session 1's bytes any more
+            net_pkt(1, 10, 1460);                 // the late segment for the closed session
+            wait_cycles(200);
+            for (int r = 2; r < 6; r++) net_pkt(2, r, 4096);   // lane 1 carries on
+            wait_drain(200000, ok);
+            $display("  lane1 bytes=%0d (still owed %0d), readPkgs=%0d, packets delivered=%0d, sharedFIFO=%0d",
+                     lane_bytes[1], lane_exp[1].d.size(), rp_issued, pkt_taken, gfifo.size());
+            dump("r8");
+            if (!ok && n_err) verdict = $sformatf("CORRUPT+HANG (%0d errors, lane 1 still owed %0d bytes)", n_err, lane_exp[1].d.size());
+            else if (n_err)   verdict = "CORRUPT (lane 1 received the closed session's bytes)";
+            else if (!ok)     verdict = $sformatf("HANG (lane 1 still owed %0d bytes; a stranded packet shifted the drain)", lane_exp[1].d.size());
             else              verdict = "PASS";
         end
 

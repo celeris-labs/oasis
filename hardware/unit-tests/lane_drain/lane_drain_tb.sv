@@ -36,7 +36,10 @@
 // The bench is the whole outside world:
 //   * TOE  : connection opens, a shared notification interface, and ONE shared packet FIFO
 //            delivered in GLOBAL ARRIVAL ORDER.  One readPkg pops one packet, whatever session it
-//            belongs to.  rx_metadata names the session actually delivered.  Data never stalls.
+//            belongs to, and rx_metadata ECHOES THE READPKG'S session id, unchecked -- as the real
+//            one does (rx_app_stream_if.cpp writes the request's rxSar.sessionID).  A readPkg that
+//            pops another session's packet therefore hands it over labelled as the requester's;
+//            every such pop is counted as an error.  Data never stalls.
 //   * HTTP : a keep-alive origin server.  It parses the GETs the DUT transmits, learns the lane
 //            from the request path, and answers with Content-Length framed 200s.
 //   * HOST : the config port (chunk-length entries, then the transfer arm) and the per-lane
@@ -512,6 +515,8 @@ module lane_drain_tb #(
     Lane  ln[NL];
 
     int rp_issued = 0, pkt_taken = 0;
+    int rp_sid_q[$];            // session id of every readPkg, in issue order: what the TOE echoes
+    int n_meta_mismatch = 0;    // readPkgs that popped another session's packet
     int n_notif_sent = 0, n_notif_data = 0;
     int notif_bp_cycles = 0, rxdata_bp_cycles = 0;
     int idle_since_rp = 0;
@@ -616,6 +621,7 @@ module lane_drain_tb #(
                                   rp_sid(rp_tdata)));
                 r = new(); r.sid = rp_sid(rp_tdata); r.len = rp_len(rp_tdata); r.at = cyc;
                 unmatched.push_back(r);
+                rp_sid_q.push_back(r.sid);
             end else if (outst_data() == 0 && unmatched.size() == 0) begin
                 // Nothing is owed a readPkg, so there is nothing for the DUT to be late with. The
                 // property is "a readPkg within LIVENESS_BOUND cycles WHILE a notification is
@@ -645,15 +651,21 @@ module lane_drain_tb #(
     // =============================================================================================
     int deliver_lane = -1;
     initial begin : deliver_engine
-        Pkt p; int i, nb, k;
+        Pkt p; int i, nb, k, msid;
         logic [AXI_DATA_BITS-1:0] dw; logic [AXI_DATA_BITS/8-1:0] kw;
         rm_tvalid = 0; rm_tdata = '0; rd_tvalid = 0; rd_tdata = '0; rd_tkeep = '0; rd_tlast = 0;
         forever begin
             @(posedge clk);
             if (rst_n && (rp_issued - pkt_taken) > 0 && gfifo.size() > 0) begin
                 p = gfifo.pop_front(); pkt_taken = pkt_taken + 1;
+                msid = rp_sid_q.pop_front();
+                if (msid != p.sid) begin
+                    n_meta_mismatch = n_meta_mismatch + 1;
+                    err($sformatf("TOE: the readPkg for session %0d popped session %0d's packet (%0d B) and labels it %0d",
+                                  msid, p.sid, p.d.size(), msid));
+                end
                 deliver_lane = (sess.exists(p.sid)) ? sess[p.sid].lane : -1;
-                rm_tdata <= TCP_RX_META_BITS'(p.sid); rm_tvalid <= 1'b1;
+                rm_tdata <= TCP_RX_META_BITS'(msid); rm_tvalid <= 1'b1;
                 do @(posedge clk); while (!rm_tready);
                 rm_tvalid <= 1'b0;
                 i = 0;
@@ -931,6 +943,10 @@ module lane_drain_tb #(
     // A peer that has stopped sending. Scenarios that kill a connection use it to stop the origin
     // queueing MORE bytes for a session that is about to go away -- see the note in `ovf`.
     int  mute_sid = -1;
+    // Sessions whose remaining bytes the origin holds back for now -- still "in flight" -- so a
+    // scenario can choose exactly when they reach the wire (cu, cuovf).
+    int  hold_sid  = -1;
+    int  hold2_sid = -1;
     bit  net_paced = 1'b1;
     int  net_allow = 1000000000;   // packets the network may still put on the wire
     bit  net_coalesce = 1'b0;   // 1 = let one TCP segment carry the tail of one response and the head of the next
@@ -944,7 +960,7 @@ module lane_drain_tb #(
                 sid = -1;
                 for (tries = 0; tries < live_sids.size(); tries++) begin
                     k = live_sids[(net_rr + tries) % live_sids.size()];
-                    if (k != mute_sid && sess[k].pending.size() > 0 && rate_ok(k)) begin
+                    if (k != mute_sid && k != hold_sid && k != hold2_sid && sess[k].pending.size() > 0 && rate_ok(k)) begin
                         sid = k; net_rr = (net_rr + tries + 1); break;
                     end
                 end
@@ -969,6 +985,16 @@ module lane_drain_tb #(
             end
         end
     end
+
+    // Keep only the first n of a held session's pending bytes: what the peer still had in flight
+    // when the connection was torn down.
+    task automatic hold_pend_trim(int sid, int n);
+        if (!sess.exists(sid)) return;
+        while (sess[sid].pending.size() > n) void'(sess[sid].pending.pop_back());
+        sess[sid].wr = {}; sess[sid].wr_left = 0;
+        $display("  [cyc=%0d] origin: %0d late byte(s) of sid %0d go on the wire after the close",
+                 cyc, sess[sid].pending.size(), sid);
+    endtask
 
     task automatic peer_close(int sid);
         Notif nn;
@@ -2968,14 +2994,11 @@ module lane_drain_tb #(
                 submit_batch(0, 1, blen, o);
                 // Wait for the writer to report the overrun, then take conn 0's PEER off the wire.
                 //
-                // The rest of a response that cannot be stored is not interesting, and leaving it
-                // queued at the origin tests something else entirely: announcements that arrive
-                // AFTER a session has been released are dropped by rx_dispatch (correctly -- a
-                // readPkg for a session the TOE has forgotten would desynchronise the shared fifo),
-                // and the bytes they named then sit at the head of the TOE's ONE shared fifo with
-                // nobody left to ask for them, blocking every packet behind them. That is a real
-                // limitation and it is build-119's as much as this design's -- see the report -- but
-                // it is not what this scenario is about, which is CONTAINMENT of a slot overrun.
+                // The rest of a response that cannot be stored is not interesting here, and
+                // leaving it queued at the origin tests something else: segments that arrive
+                // AFTER the session has been released. rx_dispatch reads those as orphans and
+                // throws them away -- `cuovf` is that scenario. This one is about CONTAINMENT of
+                // a slot overrun.
                 t0 = cyc;
                 while ((cyc - t0) < 400000 && !conn_overflowed(0)) @(posedge clk);
                 mute_sid = ln[0].sid;
@@ -3590,6 +3613,114 @@ module lane_drain_tb #(
             end
         end
 
+        // (cu) a late segment for a session torn down under a fatal ----------------------------------
+        // Lane 0's decoder stops for good with a big response armed; rx_dispatch's head-of-line
+        // watchdog kills it and the handler closes and releases the session in one cycle
+        // (BR_CLOSE). The origin still had +LATE segments in flight for that session, and the TOE
+        // -- now in FIN_WAIT_1 -- accepts and announces them. Then lane 1 carries on. Is lane 1
+        // byte-exact and complete? +MIDBODY puts the late segment in the MIDDLE of one of lane 1's
+        // bodies (two of its segments, the late one, the rest) instead of before its next batch.
+        "cu": begin
+            int sid0, c0, late;
+            if (!$value$plusargs("LATE=%d", late)) late = 1;
+            submit_batch(0, 1, 3000, o); submit_batch(1, 1, 3000, o); wait_drain(200000, ok);
+            sid0 = ln[0].sid;
+            $display("  [cyc=%0d] warm-up drained=%0b  lane0 sid=%0d lane1 sid=%0d", cyc, ok, sid0, ln[1].sid);
+            body_ready_ctl[0] = 1'b0;                  // lane 0's decoder stops FOREVER
+            lane_ignore[0]    = 1;                     // its stream is cut on purpose
+            submit_batch(0, 1, 400000, o);
+            // let ~200 KB out (more than lane 0's fifo holds), keep the rest at the origin
+            t0 = cyc;
+            while ((cyc - t0) < 200000 &&
+                   !(sess.exists(sid0) && sess[sid0].pending.size() > 0 && sess[sid0].pending.size() < 200000))
+                @(posedge clk);
+            hold_sid = sid0;
+            $display("  [cyc=%0d] origin holds sid %0d's remaining %0d bytes", cyc, sid0, sess[sid0].pending.size());
+            c0 = n_close_req; t0 = cyc;
+            while ((cyc - t0) < 400000 && n_close_req == c0) @(posedge clk);
+            $display("  [cyc=%0d] handler closed sid %0d (closes=%0d) lane0 fatal=%0b dead-sticky=%0b",
+                     cyc, sid0, n_close_req, lane_is_fatal(0), lane_dead_sticky(0));
+            ln[0].planned_total = ln[0].resp_done; ln[0].plan = {}; ln[0].expq = {};
+            ln[0].active = 0; ln[0].must_end = 0;
+            b1 = ln[1].resp_done;
+            hold_pend_trim(sid0, late * mss);
+            if (!$test$plusargs("MIDBODY")) begin
+                hold_sid = -1;                         // the late segment(s) go out now...
+                wait_cycles(5000);
+                submit_batch(1, 3, 3000, o);           // ...and lane 1 carries on
+            end else begin
+                automatic int sid1 = ln[1].sid;
+                automatic int p0;
+                hold2_sid = sid1;                      // lane 1's origin output is paced by hand
+                submit_batch(1, 3, 20000, o);
+                t0 = cyc;
+                while ((cyc - t0) < 200000 && sess[sid1].pending.size() < 60000) @(posedge clk);
+                p0 = sess[sid1].pending.size();
+                hold2_sid = -1;                        // two of lane 1's segments go out...
+                while ((cyc - t0) < 200000 && sess[sid1].pending.size() > p0 - 8192) @(posedge clk);
+                hold2_sid = sid1;
+                hold_sid  = -1;                        // ...then the closed session's late segment...
+                while ((cyc - t0) < 200000 && sess[sid0].pending.size() > 0) @(posedge clk);
+                $display("  [cyc=%0d] origin: 2 lane-1 segments, then sid %0d's late segment, then the rest of lane 1",
+                         cyc, sid0);
+                hold2_sid = -1;                        // ...then the rest of lane 1
+            end
+            wait_drain(300000, ok);
+            dump("cu");
+            $display("  lane 1: %0d -> %0d responses (planned %0d), errors=%0d, readPkgs that popped another session's packet: %0d",
+                     b1, ln[1].resp_done, ln[1].planned_total, n_err, n_meta_mismatch);
+            if (n_err)      verdict = $sformatf("CORRUPT (%0d checker errors on the surviving lane)", n_err);
+            else if (!ok)   verdict = "HANG (the surviving lane never completed)";
+            else            verdict = "PASS";
+        end
+
+        // (cuovf) the same on handler_slots: conn 0 overruns its slot -> fatal -> BR_CLOSE releases
+        // the session, while the origin still has +LATE segments in flight for it; they land between
+        // two of conn 1's segments. Runs on the SLOT_LOG2=16 snapshot, like `ovf`.
+        "cuovf": begin
+            int sid0, sid1, c0, late, blen, p0;
+            if (!$value$plusargs("LATE=%d", late)) late = 1;
+            allow_overflow = 1;
+            lane_ignore[0] = 1;
+            blen = int'(SLOT_BYTES) + 8192;
+            for (int L = 1; L < NL; L++) submit_batch(L, 2, 3000, o);
+            wait_drain(400000, ok);
+            $display("  [cyc=%0d] warm-up drained=%0b", cyc, ok);
+            submit_batch(0, 1, blen, o);
+            t0 = cyc;
+            while ((cyc - t0) < 400000 && !conn_overflowed(0)) @(posedge clk);
+            sid0 = ln[0].sid; sid1 = ln[1].sid;
+            hold_sid = sid0;                           // the rest of conn 0's response is "in flight"
+            $display("  [cyc=%0d] conn 0 (sid %0d) overflowed; origin holds its remaining %0d bytes",
+                     cyc, sid0, sess[sid0].pending.size());
+            c0 = n_close_req; t0 = cyc;
+            while ((cyc - t0) < 400000 && n_close_req == c0) @(posedge clk);
+            $display("  [cyc=%0d] handler closed sid %0d (closes=%0d) conn0 fatal=%0b", cyc, sid0, n_close_req, lane_is_fatal(0));
+            ln[0].planned_total = ln[0].resp_done; ln[0].plan = {}; ln[0].expq = {};
+            ln[0].active = 0; ln[0].must_end = 0;
+            hold_pend_trim(sid0, late * mss);
+            b1 = ln[1].resp_done;
+            hold2_sid = sid1;
+            submit_batch(1, 1, 20000, o);
+            t0 = cyc;
+            while ((cyc - t0) < 400000 && sess[sid1].pending.size() < 20000) @(posedge clk);
+            p0 = sess[sid1].pending.size();
+            hold2_sid = -1;                            // two of conn 1's segments...
+            while ((cyc - t0) < 400000 && sess[sid1].pending.size() > p0 - 8192) @(posedge clk);
+            hold2_sid = sid1;
+            hold_sid  = -1;                            // ...the closed session's late bytes...
+            while ((cyc - t0) < 400000 && sess[sid0].pending.size() > 0) @(posedge clk);
+            $display("  [cyc=%0d] origin: 2 conn-1 segments, then sid %0d's late segment, then the rest of conn 1", cyc, sid0);
+            hold2_sid = -1;                            // ...the rest of conn 1
+            wait_drain(400000, ok);
+            dump("cuovf");
+            $display("  conn 1: %0d -> %0d responses (planned %0d), errors=%0d, readPkgs that popped another session's packet: %0d, conn1 fatal=%0b",
+                     b1, ln[1].resp_done, ln[1].planned_total, n_err, n_meta_mismatch, lane_is_fatal(1));
+            if (n_err)      verdict = $sformatf("CORRUPT (%0d checker errors on the surviving connection)", n_err);
+            else if (!ok)   verdict = "HANG (the surviving connection never completed)";
+            else            verdict = "PASS";
+        end
+
         default: begin $display("unknown scenario '%s'", scen); $finish; end
         endcase
 
@@ -3604,6 +3735,7 @@ module lane_drain_tb #(
                      i, ln[i].resp_done, ln[i].planned_total, ln[i].bytes_in, ln[i].sid);
         $display("  readPkgs=%0d notifications=%0d outstanding=%0d sharedFIFO=%0d opens=%0d closes=%0d",
                  rp_issued, n_notif_sent, outst.size(), gfifo.size(), n_open_rsp, n_close_req);
+        $display("  readPkgs that popped another session's packet: %0d", n_meta_mismatch);
         $display("------------------------------------------------------------------\n");
         $finish;
     end
