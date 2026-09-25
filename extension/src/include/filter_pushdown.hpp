@@ -12,6 +12,10 @@ namespace duckdb {
 void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
                       std::vector<OasisScanFilter> &scan_filters);
 
+// Whether `filter` is the Bloom filter a DuckDB hash join pushed into its probe scan (a runtime
+// filter, wrapped in DuckDB's optional-filter functions).
+bool IsJoinBloomFilter(const TableFilter &filter);
+
 // Returns false if the pushed-down filters prove `group` cannot contain any matching row. Mirrors
 // the statistics-pruning logic of DuckDB's ParquetReader::PrepareRowGroupBuffer: For each projected
 // column with a filter, read the column chunk's Parquet statistics and ask the filter whether they
@@ -19,7 +23,8 @@ void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
 //
 // When the group survives, `needs_row_filter` holds one entry per lstate.scan_filters: false for
 // filters the statistics prove always-true on this group (no row-level evaluation needed, the
-// common case for dynamic join min/max filters on uniformly spread keys), true otherwise.
+// common case for dynamic join min/max filters on uniformly spread keys) and for filters that are
+// not evaluated per row at all (OasisScanFilter::row_level), true otherwise.
 bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
                             size_t group, std::vector<bool> &needs_row_filter);
 
