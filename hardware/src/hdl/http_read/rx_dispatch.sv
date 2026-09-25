@@ -75,6 +75,19 @@ import lynxTypes::*;
 // the notification interface instead costs nothing in ordering -- an announcement that cannot be
 // enqueued could not have been issued ahead of the head anyway -- so TREADY now falls when, and
 // only when, a slot is genuinely needed and there is none.
+//
+// AND WHY IT QUEUES ANNOUNCEMENTS FOR SESSIONS NOBODY HOLDS
+// ---------------------------------------------------------
+// The same argument, for a session the handler has already let go of. A fatal lane is closed and
+// released in the same cycle, but the TOE is then in FIN_WAIT_1 (or CLOSING/LAST_ACK) and still
+// accepts and announces whatever the peer had in flight. That segment is in the shared fifo like
+// any other. It used to be dropped here "because the session is gone" -- and then the NEXT readPkg,
+// for whichever lane came next, popped it, with that lane's session id echoed as metadata (the TOE
+// checks nothing), so another lane got the dead session's bytes. So every announcement with a
+// length is queued, and one for an unbound session is tagged an ORPHAN: it is issued in arrival
+// order without waiting on anybody's fifo, charged to no connection (no reservation, no pending
+// count, no watchdog time), and its bytes are dropped on the data side because the metadata names
+// a session nobody holds (close-unbind, 2026-09-25; rxd_drain r8, lane_drain cu and cuovf).
 // =================================================================================================
 module rx_dispatch #(
     parameter int NUM_CONNS    = 4,
@@ -194,6 +207,9 @@ module rx_dispatch #(
     // into lane 0's byte stream. Right by accident when the dead lane WAS lane 0, silent corruption
     // otherwise. Three bits per entry make it exact and survive the release.
     logic [CONN_BITS-1:0]        nq_conn[NOTIFY_DEPTH];
+    // The announcement was for a session nobody holds (released, or never bound). Its segment is in
+    // the TOE's shared fifo all the same, so it is still read in arrival order -- and thrown away.
+    logic                        nq_orphan[NOTIFY_DEPTH];
     logic [PTR_BITS-1:0]         nq_head_q, nq_tail_q;
     logic [CNT_BITS-1:0]         nq_cnt_q;
     logic                        ovf_q, route_stall_q;
@@ -224,12 +240,12 @@ module rx_dispatch #(
     assign note_len_w    = s_axis_notifications_TDATA[TCP_SESSION_BITS +: TCP_LEN_BITS];
     assign note_closed_w = s_axis_notifications_TDATA[CLOSED_BIT];
 
-    // A notification for a session we do not have bound is not an error we can act on -- it belongs
-    // to a connection torn down between the announcement and now. Dropping it is correct; queueing
-    // it would issue a readPkg for a dead session and desynchronise the shared fifo for everyone.
-    // A bare FIN (length 0) needs no slot either: it only sets the sticky closed bit.
+    // Every announcement with a length names one segment in the shared fifo, and needs a slot
+    // whether or not its session is still bound: one for a session nobody holds is queued as an
+    // orphan (see the header). A bare FIN (length 0) needs no slot: it only sets the sticky closed
+    // bit, and a readPkg of length 0 would hang the TOE.
     logic note_needs_slot_w;
-    assign note_needs_slot_w = (note_len_w != '0) && has_conn(note_sid_w);
+    assign note_needs_slot_w = (note_len_w != '0);
 
     // The ONLY thing this interface is ever held off for: a slot is needed and there is none.
     //
@@ -247,10 +263,18 @@ module rx_dispatch #(
 
     // The enqueue condition, named once. Used by the queue pointers, by the count, and by the
     // per-connection pending counters below.
+    //
+    // always_comb, not assign, for every line that calls conn_of()/has_conn(): a continuous
+    // assignment is only re-evaluated when the function's ARGUMENTS change, not when bound_q/sid_q
+    // read inside it do, so in xsim a release left these at their old value until the next
+    // notification changed note_sid_w. Synthesis builds the plain combinational logic either way;
+    // only the simulation was wrong, and it hid this very bug.
     logic                 enq_fire_w;
     logic [CONN_BITS-1:0] enq_conn_w;
+    logic                 enq_orphan_w;
     assign enq_fire_w = note_keep_w && !nq_full_w;
-    assign enq_conn_w = conn_of(note_sid_w);
+    always_comb enq_conn_w   = conn_of(note_sid_w);
+    always_comb enq_orphan_w = !has_conn(note_sid_w);
 
     // ---------------------------------------------------------------------------------------------
     // readPkg issue. Head of the queue, gated ONLY on the destination having room.
@@ -266,11 +290,16 @@ module rx_dispatch #(
     // it is never taken, and the eventual dead_q[X] assigns nothing at all. The queue is only ever
     // read when it is non-empty; saying so here keeps the X out of everything downstream.
     assign head_conn_w = nq_empty_w ? CONN_BITS'(0) : nq_conn[nq_head_q];
+    // An orphan's nq_conn is meaningless (conn_of of an unbound sid is 0): nothing below may use it
+    // for an orphan head.
+    logic  head_orphan_w;
+    assign head_orphan_w = !nq_empty_w && nq_orphan[nq_head_q];
 
     // A dead connection's packets are read anyway, and thrown away on the data side. Asking its
     // fifo would be pointless -- it is the fifo that is not draining -- and the drain must not stop.
+    // An orphan's bytes are thrown away too, and there is no fifo to ask.
     logic issue_ok_w;
-    assign issue_ok_w = !nq_empty_w && (conn_space_ok[head_conn_w] || dead_q[head_conn_w]);
+    assign issue_ok_w = !nq_empty_w && (head_orphan_w || conn_space_ok[head_conn_w] || dead_q[head_conn_w]);
 
     assign m_axis_read_package_TVALID = issue_ok_w;
     assign m_axis_read_package_TDATA  = {head_len_w, head_sid_w};
@@ -278,10 +307,11 @@ module rx_dispatch #(
     logic issue_fire_w;
     assign issue_fire_w = m_axis_read_package_TVALID && m_axis_read_package_TREADY;
 
-    // Charge the reservation to the lane the head names, on the cycle it is actually accepted.
+    // Charge the reservation to the lane the head names, on the cycle it is actually accepted. An
+    // orphan's bytes land in no fifo, so it reserves nothing.
     always_comb begin
         conn_pkg_issued = '0;
-        if (issue_fire_w) conn_pkg_issued[head_conn_w] = 1'b1;
+        if (issue_fire_w && !head_orphan_w) conn_pkg_issued[head_conn_w] = 1'b1;
     end
 
     // ---------------------------------------------------------------------------------------------
@@ -291,7 +321,8 @@ module rx_dispatch #(
     logic                 hol_blocked_w;
     logic [HOL_BITS-1:0]  hol_cnt_q;
     logic [CONN_BITS-1:0] hol_conn_q;
-    assign hol_blocked_w = !nq_empty_w && !conn_space_ok[head_conn_w] && !dead_q[head_conn_w];
+    // An orphan head waits on nobody, so it is never blocked and never times a connection.
+    assign hol_blocked_w = !nq_empty_w && !head_orphan_w && !conn_space_ok[head_conn_w] && !dead_q[head_conn_w];
 
     // ---------------------------------------------------------------------------------------------
     // Data routing. rx_meta names the session of the packet about to arrive; hold that until tlast.
@@ -301,8 +332,8 @@ module rx_dispatch #(
     // This packet is read off the bus and dropped rather than routed. Two reasons, both meaning the
     // same thing -- nobody owns these bytes any more: the session was released (its lane has either
     // gone away or been reconnected to a NEW session, and splicing an old session's bytes into a new
-    // one's stream is the corruption rxd_drain r6 exists to catch), or the connection was declared
-    // dead by the head-of-line watchdog.
+    // one's stream is the corruption rxd_drain r6 exists to catch; an orphan's packet is always this
+    // case), or the connection was declared dead by the head-of-line watchdog.
     logic                 pkt_drop_q;
 
     logic meta_fire_w;
@@ -373,6 +404,7 @@ module rx_dispatch #(
                 nq_sid[nq_tail_q]  <= note_sid_w;
                 nq_len[nq_tail_q]  <= note_len_w;
                 nq_conn[nq_tail_q] <= enq_conn_w;
+                nq_orphan[nq_tail_q] <= enq_orphan_w;
                 nq_tail_q <= (nq_tail_q == PTR_BITS'(NOTIFY_DEPTH-1)) ? '0 : nq_tail_q + 1'b1;
             end
             // Unreachable now that TREADY falls instead: an announcement that needs a slot is not
@@ -398,8 +430,8 @@ module rx_dispatch #(
                 if (release_en && (release_conn == CONN_BITS'(i))) begin
                     pend_q[i] <= '0;
                 end else begin
-                    case ({enq_fire_w   && (enq_conn_w  == CONN_BITS'(i)),
-                           issue_fire_w && (head_conn_w == CONN_BITS'(i)) && (pend_q[i] != '0)})
+                    case ({enq_fire_w   && !enq_orphan_w  && (enq_conn_w  == CONN_BITS'(i)),
+                           issue_fire_w && !head_orphan_w && (head_conn_w == CONN_BITS'(i)) && (pend_q[i] != '0)})
                         2'b10:   pend_q[i] <= pend_q[i] + 1'b1;
                         2'b01:   pend_q[i] <= pend_q[i] - 1'b1;
                         default: ;
