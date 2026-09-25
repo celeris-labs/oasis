@@ -37,7 +37,7 @@ localparam NUM_DECODERS  = NUM_STREAMS - 1;
 localparam NUM_DECODERS  = NUM_STREAMS;
 `endif
 
-// BFConfig (materialization settings and the Bloom filter's input commands) + a 1-stream
+// BFConfig (the Bloom filter's per-chunk materialization and input commands) + a 1-stream
 // StreamConfig selecting per flow where decoder-stream 0's output goes (see the Bloom filter
 // section below).
 localparam STREAM_CFG_REGS = 2;
@@ -254,13 +254,23 @@ end : gen_decoders
 //   0 (FILTER): through the Bloom filter as a probe key chunk, yields its mask (axi_bf_mask)
 //   1 (BYPASS): around the Bloom filter, yields decoded_axi[0] unchanged (axi_bf_bypass)
 //   2 (BUILD):  through the Bloom filter as a build key chunk, yields a one-byte ack (axi_bf_ack)
+//   3 (MATERIALIZE): into the Bloom filter's materializer as a column of 64-bit probe values,
+//               yields the values of the rows its probe key chunk's mask kept (axi_bf_mat)
 // FILTER and BUILD transfers look the same to the Bloom filter: the per-transfer input commands in
 // its own config (CONTINUE/END/END_ONLY, pushed with the select) decide the phase. BUILD only
 // exists because a build chunk has no output, while every flow needs one output transfer to
 // complete (and the multiplexer needs one per select): the ack stands in for it.
-localparam select_t BF_SELECT_FILTER = 0;
-localparam select_t BF_SELECT_BYPASS = 1;
-localparam select_t BF_SELECT_BUILD  = 2;
+// A probe key chunk is followed by the MATERIALIZE transfers of its columns (as many as its
+// materialization command in the Bloom filter's config says), before the next probe key chunk.
+localparam select_t BF_SELECT_FILTER      = 0;
+localparam select_t BF_SELECT_BYPASS      = 1;
+localparam select_t BF_SELECT_BUILD       = 2;
+localparam select_t BF_SELECT_MATERIALIZE = 3;
+
+// Demultiplexer outputs
+localparam select_t BF_DEMUX_KEYS         = 0;
+localparam select_t BF_DEMUX_BYPASS       = 1;
+localparam select_t BF_DEMUX_PROBE_VALUES = 2;
 
 ready_valid_i #(select_t) bf_select();
 ready_valid_i #(select_t) bf_demux_select();
@@ -272,8 +282,14 @@ assign bf_stream_conf[0].data_type_ready = 1'b1; // unused
 
 `READY_DUPLICATE(2, bf_select, {bf_demux_select, bf_mux_select})
 
-// The demultiplexer only has the two paths: BUILD goes into the Bloom filter like FILTER
-assign bf_demux_select_mapped.data  = bf_demux_select.data == BF_SELECT_BUILD ? BF_SELECT_FILTER : bf_demux_select.data;
+// The demultiplexer only has three paths: BUILD goes into the Bloom filter like FILTER
+always_comb begin
+    case (bf_demux_select.data)
+        BF_SELECT_FILTER, BF_SELECT_BUILD: bf_demux_select_mapped.data = BF_DEMUX_KEYS;
+        BF_SELECT_MATERIALIZE:             bf_demux_select_mapped.data = BF_DEMUX_PROBE_VALUES;
+        default:                           bf_demux_select_mapped.data = BF_DEMUX_BYPASS;
+    endcase
+end
 assign bf_demux_select_mapped.valid = bf_demux_select.valid;
 assign bf_demux_select.ready        = bf_demux_select_mapped.ready;
 
@@ -281,9 +297,10 @@ AXI4S axi_bf_in_raw(.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_in    (.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_out   (.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_bypass(.aclk(clk), .aresetn(rst_n));
+AXI4S axi_bf_probe_values(.aclk(clk), .aresetn(rst_n));
 
 AXIDemultiplexer #(
-    .NUM_STREAMS(2)
+    .NUM_STREAMS(3)
 ) inst_bf_demux (
     .clk(clk),
     .rst_n(rst_n),
@@ -291,7 +308,7 @@ AXIDemultiplexer #(
     .select(bf_demux_select_mapped),
 
     .in(decoded_axi[0]),
-    .out({axi_bf_in_raw, axi_bf_bypass})
+    .out({axi_bf_in_raw, axi_bf_bypass, axi_bf_probe_values}) // In BF_DEMUX_* order
 );
 
 // Build acks: one one-byte transfer (a single zero byte) per BUILD transfer, once its last beat went
@@ -372,18 +389,22 @@ always_ff @(posedge clk) begin
     end
 end
 
-// On-device materialization is not used (software disables it, see ConfigureOasisHardwareBloom),
-// so these ports only need a well-defined tie-off.
+// Probe values to materialize (MATERIALIZE), 64 bits each
 ndata_i #(data64_t, CELERIS_NUM_TUPLES) bf_probe_values_in();
-assign bf_probe_values_in.valid = 1'b0;
-assign bf_probe_values_in.last  = 1'b0;
-assign bf_probe_values_in.keep  = '0;
-assign bf_probe_values_in.data  = '0;
+AXIToNData #(
+    .data_t(data64_t),
+    .NUM_ELEMENTS(CELERIS_NUM_TUPLES)
+) inst_bf_probe_values_to_data (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(axi_bf_probe_values),
+    .out(bf_probe_values_in)
+);
 
 data_i #(tuple_mask_t) bf_mask_out();
 
 ndata_i #(data64_t, CELERIS_NUM_TUPLES) bf_probe_mat_out();
-assign bf_probe_mat_out.ready = 1'b1; // drain, materialization is disabled
 
 BloomfilterOperator inst_bloomfilter_operator (
     .clk(clk),
@@ -402,36 +423,70 @@ BloomfilterOperator inst_bloomfilter_operator (
 
 // raw_out is the Bloomfilter core's compacted (DataNormalizer/ENABLE_COMPACTOR) surviving-key
 // stream: fewer elements than went in, and not aligned with the original row positions, so it
-// can't feed a fixed-cc.num_values sink. We don't use it -- drain it unconditionally.
+// can't feed a fixed-cc.num_values sink. We don't use it -- drain it unconditionally. The surviving
+// keys are materialized like any other probe column instead.
 assign axi_bf_out.tready = 1'b1;
+
+// The materialized probe values: one transfer per MATERIALIZE transfer, with only the kept rows
+AXI4S axi_bf_mat(.aclk(clk), .aresetn(rst_n));
+NDataToAXI #(
+    .data_t(data64_t),
+    .NUM_ELEMENTS(CELERIS_NUM_TUPLES),
+    .AXI_WIDTH(AXI_DATA_BITS),
+    .NUM_AXI_ELEMENTS(8)
+) inst_bf_mat_to_axi (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(bf_probe_mat_out),
+    .out(axi_bf_mat)
+);
 
 // mask_out is a tuple_mask_t (CELERIS_NUM_TUPLES = 8 bits = 1 byte) keep-bit-per-row mask, one
 // per decoded beat of axi_bf_in, emitted *before* raw_out's compaction -- so unlike raw_out it
-// stays positionally aligned 1:1 with the probe key column's rows. Wrapped into its own
-// single-byte-per-beat AXI4S stream (no packing -- this is the simplest cut of the design) so it
-// can be sunk like any other flow's output. There is one mask transfer per probe key chunk (the
-// Bloom filter frames its mask per input transfer). Software gets both this mask and the actual
-// key values by submitting the probe key column chunk twice -- once with BYPASS (landing on
-// axi_bf_bypass, giving the real values unchanged) and once with FILTER (through the filter,
-// landing here) -- see BloomFilterStreamSelectOperator / PrefetchGroup in oasis_scan.cpp.
+// stays positionally aligned 1:1 with the probe key column's rows. The mask bytes are packed into
+// full beats (the output writer only takes normalized streams: every beat full but the last), so a
+// probe chunk of n rows yields ceil(n / 8) bytes. There is one mask transfer per probe key chunk (the
+// Bloom filter frames its mask per input transfer). Software submits the probe key column chunk
+// with FILTER for this mask, and then its 64-bit columns (the key column included) with
+// MATERIALIZE for their kept rows -- see PrefetchGroup in oasis_scan.cpp.
+ndata_i #(tuple_mask_t, 1) bf_mask_ndata(clk, rst_n);
+`DATA_ASSIGN(bf_mask_out, bf_mask_ndata)
+
+localparam BF_MASK_WORDS = AXI_DATA_BITS / $bits(tuple_mask_t);
+ndata_i #(tuple_mask_t, BF_MASK_WORDS) bf_mask_packed(clk, rst_n);
+NDataWidthConverter #(
+    .data_t(tuple_mask_t)
+) inst_bf_mask_pack (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(bf_mask_ndata),
+    .out(bf_mask_packed)
+);
+
 AXI4S axi_bf_mask(.aclk(clk), .aresetn(rst_n));
-assign axi_bf_mask.tdata          = '0;
-assign axi_bf_mask.tdata[7:0]     = bf_mask_out.data;
-assign axi_bf_mask.tkeep          = '0;
-assign axi_bf_mask.tkeep[0]       = 1'b1;
-assign axi_bf_mask.tvalid         = bf_mask_out.valid;
-assign axi_bf_mask.tlast          = bf_mask_out.last;
-assign bf_mask_out.ready          = axi_bf_mask.tready;
+NDataToAXI #(
+    .data_t(tuple_mask_t),
+    .NUM_ELEMENTS(BF_MASK_WORDS),
+    .AXI_WIDTH(AXI_DATA_BITS)
+) inst_bf_mask_to_axi (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(bf_mask_packed),
+    .out(axi_bf_mask)
+);
 
 AXIMultiplexer #(
-    .NUM_STREAMS(3)
+    .NUM_STREAMS(4)
 ) inst_bf_mux (
     .clk(clk),
     .rst_n(rst_n),
 
     .select(bf_mux_select),
 
-    .in({axi_bf_mask, axi_bf_bypass, axi_bf_ack}), // In select order: FILTER, BYPASS, BUILD
+    .in({axi_bf_mask, axi_bf_bypass, axi_bf_ack, axi_bf_mat}), // In select order: FILTER, BYPASS, BUILD, MATERIALIZE
     .out(axi_out[0])
 );
 

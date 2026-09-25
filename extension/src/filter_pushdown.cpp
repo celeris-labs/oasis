@@ -90,12 +90,19 @@ bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &
 }
 
 idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, DataChunk &scan_chunk,
-                           idx_t emit) {
+                           idx_t emit, optional_ptr<const SelectionVector> bloom_sel, idx_t bloom_count) {
 	const idx_t scan_count = emit;
 	idx_t approved_tuple_count = scan_count;
 	auto &sel = lstate.filter_sel;
 	sel.Initialize(nullptr);
 	bool any_filter_ran = false;
+	if (bloom_sel) {
+		// The rows the runtime Bloom filter dropped are out before any filter runs, like a filter
+		// that already ran. The filters below narrow sel in place.
+		sel.Initialize(*bloom_sel);
+		approved_tuple_count = bloom_count;
+		any_filter_ran = true;
+	}
 
 	auto *define_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->define_buf.ptr);
 	auto *repeat_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->repeat_buf.ptr);

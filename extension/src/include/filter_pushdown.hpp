@@ -32,7 +32,10 @@ bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &
 // lstate.current_needs_row_filter entry is false are skipped (proven always-true on this group).
 // The hardware columns must already be in scan_chunk. Slices scan_chunk to the surviving rows and
 // returns their count (0 = fully filtered, scan_chunk contents undefined).
+// If `bloom_sel` is set, only its `bloom_count` rows (the ones the runtime Bloom filter kept) are
+// considered at all.
 idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, DataChunk &scan_chunk,
-                           idx_t emit);
+                           idx_t emit, optional_ptr<const SelectionVector> bloom_sel = nullptr,
+                           idx_t bloom_count = 0);
 
 } // namespace duckdb
