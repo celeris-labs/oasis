@@ -66,6 +66,9 @@ struct OasisScanFilter {
 	unique_ptr<TableFilterState> filter_state;
 	// Whether `filter` takes the file type of the column, the type of the column chunk statistics.
 	bool prune_on_stats = true;
+	// False if the filter only prunes row groups and is never evaluated per row, e.g. DuckDB's own
+	// join Bloom filter where the hardware Bloom filter already filters the same column.
+	bool row_level = true;
 };
 
 struct OasisScanBindData : public TableFunctionData {
