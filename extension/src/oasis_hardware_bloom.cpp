@@ -13,21 +13,9 @@ namespace duckdb {
 
 namespace {
 
-// Mirrors celeris's BFConfig (celeris/hardware/src/hdl/config/bloomfilter_config.sv): a single
-// write register combining a 32-bit materialization column count with a 1-bit materialization
-// enable flag.
-//
-// KNOWN LIMITATION (deferred, not fixed here): celeris's MaskMaterializer (the consumer of
-// num_columns/enable_materialization inside BloomfilterOperator, see
-// celeris/hardware/src/hdl/bloomfilter/mask_materializer.sv) hardwires both signals' `ready` to 0
-// and never re-arms its latch (cols_remaining_valid only clears on a full system reset), so only
-// the very first value ever written to this register takes effect -- every later write just queues
-// up behind it, unconsumed, for the life of the hardware context. That's fine for now since
-// materialization is disabled and never re-configured, but it means num_columns/enable can't
-// actually differ across different Bloom-accelerated joins yet: making that work needs
-// MaskMaterializer itself to pop and re-latch at each new logical use, the same per-use
-// consumption BloomFilterStreamSelectOperator's select channel already gets right. Tracked for
-// whenever real materialization support is built; not addressed in this commit.
+// Mirrors celeris's BFConfig (celeris/hardware/src/hdl/config/bloomfilter_config.sv): register 0
+// takes the materialization commands (one per probe chunk, see PushBloomMaterializeCommand),
+// register 1 the input commands.
 class BloomFilterConfig : public libstf::Config {
 public:
 	static constexpr uint64_t ID = 6; // BLOOMFILTER_CONFIG_ID (celeris/hardware/src/hdl/common.sv)
@@ -36,8 +24,9 @@ public:
 	    : libstf::Config(std::move(cthread), addr_offset, num_regs) {
 	}
 
-	void configure_materialization(uint32_t num_columns, bool enable) {
-		uint64_t value = (uint64_t(num_columns) << 1) | (enable ? 1ULL : 0ULL);
+	// {num_columns, enable}: a chunk is only materialized if enabled with at least one column
+	void push_materialize_command(uint32_t num_columns) {
+		uint64_t value = (uint64_t(num_columns) << 1) | (num_columns != 0 ? 1ULL : 0ULL);
 		write_register(libstf::ConfigRegister(0, value));
 	}
 
@@ -45,9 +34,10 @@ public:
 		write_register(libstf::ConfigRegister(1, static_cast<uint64_t>(cmd)));
 	}
 
-	// Read register 5, bit 0: sticky input command queue overflow
-	bool input_command_queue_overflowed() {
-		return (read_register(5).value() & 1ULL) != 0;
+	// Read register 5: sticky command queue overflows, bit 0 input commands, bit 1 materialization
+	// commands
+	bool command_queue_overflowed() {
+		return (read_register(5).value() & 0b11ULL) != 0;
 	}
 };
 
@@ -76,12 +66,17 @@ void PushBloomInputCommand(oasis::OasisContext &ctx, BloomInputCommand cmd) {
 	ctx.config<BloomFilterConfig>()->push_input_command(cmd);
 }
 
-bool BloomInputCommandQueueOverflowed(oasis::OasisContext &ctx) {
-	return ctx.config<BloomFilterConfig>()->input_command_queue_overflowed();
+void PushBloomMaterializeCommand(oasis::OasisContext &ctx, uint32_t num_columns) {
+	ctx.config<BloomFilterConfig>()->push_materialize_command(num_columns);
+}
+
+bool BloomCommandQueueOverflowed(oasis::OasisContext &ctx) {
+	return ctx.config<BloomFilterConfig>()->command_queue_overflowed();
 }
 
 void ConfigureOasisHardwareBloom(oasis::OasisContext &ctx) {
-	ctx.config<BloomFilterConfig>()->configure_materialization(0, false);
+	// Nothing to configure in the Bloom filter itself: its materialization and input commands are
+	// pushed per chunk.
 	ctx.config<BloomFilterLastInjectorConfig>()->configure(false, 0, 0);
 }
 

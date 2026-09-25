@@ -26,7 +26,13 @@ enum class BloomInputCommand : uint8_t {
 
 void PushBloomInputCommand(oasis::OasisContext &ctx, BloomInputCommand cmd);
 
-// Whether a write to the (1024-entry) input command queue was ever lost because it was full.
-bool BloomInputCommandQueueOverflowed(oasis::OasisContext &ctx);
+// Materialization command of celeris's MaskMaterializer (BFConfig register 0, see
+// celeris/hardware/src/hdl/bloomfilter/mask_materializer.sv): every probe key chunk needs one, in
+// chunk order, pushed with its input command. It gives the number of columns (MATERIALIZE
+// transfers of 64-bit values) that follow the chunk and are materialized with its mask, 0 for none.
+void PushBloomMaterializeCommand(oasis::OasisContext &ctx, uint32_t num_columns);
+
+// Whether a write to one of the (1024-entry) command queues was ever lost because it was full.
+bool BloomCommandQueueOverflowed(oasis::OasisContext &ctx);
 
 } // namespace duckdb
