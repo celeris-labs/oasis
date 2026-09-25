@@ -65,6 +65,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "to INT32.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	config.AddExtensionOption("oasis_runtime_bloom_filter",
+	                          "Filter the probe side of inner joins between two read_oasis scans with the hardware "
+	                          "Bloom filter (decided when the query is planned)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
 
