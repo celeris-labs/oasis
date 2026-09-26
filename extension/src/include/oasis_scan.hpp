@@ -124,13 +124,14 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint64_t> string_decode_time_ns {0};
 
 	// Runtime Bloom filter (bind.runtime_bloom_enabled). There is a single hardware Bloom filter, so
-	// only one scan at a time can use it: bloom_lock holds it for this scan. When bloom_active, the
+	// only one scan at a time can use it: bloom_filter_held says this scan holds it (see
+	// TryAcquireBloomFilter, released in the destructor). When bloom_active, the
 	// build side was submitted as bloom_build (see SubmitBloomBuild) and every probe key chunk of
 	// this scan is also sent through the filter for its mask (projected column bloom_probe_slot).
 	// The probe side is ended in the destructor, once all probe chunks were sent.
 	bool bloom_active = false;
 	size_t bloom_probe_slot = 0;
-	std::unique_lock<std::mutex> bloom_lock;
+	bool bloom_filter_held = false;
 	oasis::SplinterResultHandle bloom_build;
 	bool bloom_build_submitted = false; // false if the build side had no rows
 
@@ -246,5 +247,8 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 };
 
 void RegisterOasisScanFunction(ExtensionLoader &loader);
+
+// read_oasis's cardinality callback: the file's total row count (from the Parquet metadata).
+unique_ptr<NodeStatistics> OasisScanCardinality(ClientContext &context, const FunctionData *bind_data);
 
 } // namespace duckdb

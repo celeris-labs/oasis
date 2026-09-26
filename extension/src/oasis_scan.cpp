@@ -71,18 +71,6 @@ static const char *BloomStreamSelectName(BloomStreamSelect select) {
 	return "unknown";
 }
 
-static const char *BloomInputCommandName(BloomInputCommand cmd) {
-	switch (cmd) {
-	case BloomInputCommand::CONTINUE:
-		return "CONTINUE";
-	case BloomInputCommand::END:
-		return "END";
-	case BloomInputCommand::END_ONLY:
-		return "END_ONLY";
-	}
-	return "unknown";
-}
-
 // Mirrors celeris's StreamConfig (parcore/libstf/hardware/src/hdl/config/stream_config.sv)
 // instantiated with NUM_STREAMS=1 in vfpga_top.svh, selecting where decoder-stream 0 routes its
 // transfer (see BloomStreamSelect).
@@ -102,9 +90,11 @@ public:
 	}
 };
 
-// Pushes one stream-select decision when applied, and for key chunks through the Bloom filter also
-// its input command (see BloomInputCommand) and, for probe key chunks, its materialization command
-// (the number of MATERIALIZE flows following it, see PushBloomMaterializeCommand). Included once per hardware column-chunk decode flow
+// Pushes one stream-select decision when applied, and for key chunks through the Bloom filter (FILTER,
+// BUILD) also their input command (CONTINUE, see BloomInputCommand) and, for probe key chunks, their
+// materialization command (the number of MATERIALIZE flows following it, see
+// PushBloomMaterializeCommand). With end_side, it also ends the side after the chunk (END): the
+// last build chunk ends the build side like this. Included once per hardware column-chunk decode flow
 // (see PrefetchGroup) so it runs on the scheduler's single dispatcher thread, under the target
 // stream's lock -- exactly like every other operator's hardware configuration -- rather than as a
 // direct call from whichever worker thread happens to be running PrefetchGroup. That's what
@@ -112,45 +102,54 @@ public:
 // corresponding AXI4S transfer actually reaches the demultiplexer and the Bloom filter, even with
 // many worker threads submitting flows concurrently.
 //
-// Only correct while N_DECODERS == 1 (the current build default): with more than one decode
-// stream, the scheduler load-balances flows across them, and a flow that lands on a stream other
-// than 0 never needed this push at all -- there is currently no way to know in advance which
-// stream a flow will land on.
+// Only correct while N_DECODERS == 1: with more than one decode stream, the scheduler
+// load-balances flows across them, and a flow that lands on a stream other than 0 never needed
+// this push at all -- there is currently no way to know in advance which stream a flow will land
+// on. Checked when the extension loads (CheckOasisHardwareBloom) and when the hardware is
+// elaborated (vfpga_top.svh).
 class BloomFilterStreamSelectOperator final : public oasis::Operator {
 public:
 	explicit BloomFilterStreamSelectOperator(BloomStreamSelect select,
-	                                         std::optional<BloomInputCommand> input_cmd = std::nullopt,
-	                                         std::optional<uint32_t> materialize_columns = std::nullopt)
-	    : select_(select), input_cmd_(input_cmd), materialize_columns_(materialize_columns) {
-		D_ASSERT(input_cmd_.has_value() == (select_ == BloomStreamSelect::FILTER || select_ == BloomStreamSelect::BUILD));
+	                                         std::optional<uint32_t> materialize_columns = std::nullopt,
+	                                         bool end_side = false)
+	    : select_(select), materialize_columns_(materialize_columns), end_side_(end_side) {
 		D_ASSERT(materialize_columns_.has_value() == (select_ == BloomStreamSelect::FILTER));
+		D_ASSERT(!end_side_ || IsKeyChunk());
 	}
 
 	void apply(libstf::stream_t, oasis::OasisContext &ctx) override {
 		ctx.config<BloomFilterStreamConfig>()->select(select_);
-		if (input_cmd_) {
-			PushBloomInputCommand(ctx, *input_cmd_);
+		if (IsKeyChunk()) {
+			PushBloomInputCommand(ctx, BloomInputCommand::CONTINUE);
 		}
 		if (materialize_columns_) {
 			PushBloomMaterializeCommand(ctx, *materialize_columns_);
+		}
+		if (end_side_) {
+			PushBloomInputCommand(ctx, BloomInputCommand::END);
 		}
 	}
 
 	void print(std::ostream &os) const override {
 		os << "BloomFilterStreamSelect(" << BloomStreamSelectName(select_);
-		if (input_cmd_) {
-			os << ", " << BloomInputCommandName(*input_cmd_);
-		}
 		if (materialize_columns_) {
 			os << ", materialize " << *materialize_columns_;
+		}
+		if (end_side_) {
+			os << ", END";
 		}
 		os << ")";
 	}
 
 private:
-	BloomStreamSelect                select_;
-	std::optional<BloomInputCommand> input_cmd_;
-	std::optional<uint32_t>          materialize_columns_;
+	// A key chunk through the Bloom filter, which takes an input command
+	bool IsKeyChunk() const {
+		return select_ == BloomStreamSelect::FILTER || select_ == BloomStreamSelect::BUILD;
+	}
+
+	BloomStreamSelect       select_;
+	std::optional<uint32_t> materialize_columns_;
+	bool                    end_side_;
 };
 
 } // namespace
@@ -181,8 +180,18 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	return std::move(bind_data);
 }
 
+// What the runtime Bloom filter's build side needs, see PrepareBloomBuild
+struct BloomBuildPlan {
+	size_t probe_slot;                      // Projected column of the probe key
+	parcore::metadata::Metadata build_meta; // Of the build file
+	size_t build_col_id;                    // Build key column in build_meta
+};
+
+static std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
+                                                       const OasisScanGlobalState &gstate);
+static bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate);
 static void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
-                             OasisScanGlobalState &gstate);
+                             const BloomBuildPlan &plan, OasisScanGlobalState &gstate);
 
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
@@ -236,9 +245,12 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	}
 
 	// The runtime Bloom filter's build side goes to the hardware once per scan, before any worker
-	// submits a probe key chunk.
+	// submits a probe key chunk. The filter is only taken if the scan can use it.
 	if (bind_data.runtime_bloom_enabled && !gstate->emit_cardinality_only) {
-		SubmitBloomBuild(context, ctx, bind_data, *gstate);
+		auto plan = PrepareBloomBuild(context, bind_data, *gstate);
+		if (plan && TryAcquireBloomFilter(context, *gstate)) {
+			SubmitBloomBuild(context, ctx, bind_data, *plan, *gstate);
+		}
 	}
 
 	// Register a cold-start yield budget for hardware scans -- roughly one yield per prospective
@@ -362,8 +374,13 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 	return chunks.empty() ? 0 : chunks[0].num_values;
 }
 
-// The single hardware Bloom filter can only serve one scan at a time.
-static std::mutex bloom_filter_mutex;
+// The single hardware Bloom filter can only serve one scan at a time: set while a scan holds it.
+// Taken without waiting (a scan that finds it in use runs without it) and released by the scan's
+// global state, possibly on another thread than the one that took it.
+// TODO: Let a scan wait for the filter instead of running without it. It must not block DuckDB's
+// worker threads or the client thread (e.g. yield with an AsyncTask), and it needs the filter to be
+// taken when the scan starts and released when it ends, not at schedule time and query teardown.
+static std::atomic<bool> bloom_filter_in_use {false};
 
 // Whether the Bloom filter hardware can take this key column: 64-bit keys (the filter hashes 8 of
 // them per 512-bit beat) and exactly one decoded value per row (the mask is positional, so the
@@ -392,14 +409,11 @@ static bool IsBloomKeyColumn(const parcore::metadata::Metadata &meta, size_t col
 	return true;
 }
 
-// Sends the runtime Bloom filter's build side through the hardware: one flow per build row group
-// that decodes the build key chunk on decoder-stream 0 and routes it into the filter (BUILD). The
-// oasis top answers every build chunk with a one-byte ack transfer, which completes the flow. The build
-// chunks are CONTINUE except for the last one (END), which switches the filter to probing: the
-// probe key chunks the workers send later queue up behind it on the same stream. On success, the
-// scan holds the Bloom filter (gstate.bloom_lock) until ~OasisScanGlobalState ends the probe side.
-static void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
-                             OasisScanGlobalState &gstate) {
+// Checks whether this scan can use the runtime Bloom filter, without touching it: the probe and
+// build keys have to be required INT64 columns, the probe key a hardware column of the scan. Logs
+// why and returns nothing if not. Throws if a probe row group is too large for the hardware.
+static std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
+                                                       const OasisScanGlobalState &gstate) {
 	// The probe key column has to be one of our hardware columns: its chunks are what we filter
 	std::optional<size_t> probe_slot;
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
@@ -411,12 +425,12 @@ static void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, c
 	if (!probe_slot) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a hardware column of this scan.",
 		                 bind.runtime_bloom_probe_key.c_str());
-		return;
+		return std::nullopt;
 	}
 	if (!IsBloomKeyColumn(bind.metadata, gstate.projected_columns[*probe_slot].column_id)) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a required INT64 column.",
 		                 bind.runtime_bloom_probe_key.c_str());
-		return;
+		return std::nullopt;
 	}
 
 	// Checked before the filter is touched, so a failing scan leaves it unused
@@ -438,20 +452,41 @@ static void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, c
 	if (build_col == build_meta.column_names.end()) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' not found in '%s'.",
 		                 bind.runtime_bloom_build_key.c_str(), bind.runtime_bloom_build_filename.c_str());
-		return;
+		return std::nullopt;
 	}
 	const size_t build_col_id = static_cast<size_t>(build_col - build_meta.column_names.begin());
 	if (!IsBloomKeyColumn(build_meta, build_col_id)) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' is not a required INT64 column.",
 		                 bind.runtime_bloom_build_key.c_str());
-		return;
+		return std::nullopt;
 	}
 
-	gstate.bloom_lock = std::unique_lock<std::mutex>(bloom_filter_mutex, std::try_to_lock);
-	if (!gstate.bloom_lock.owns_lock()) {
+	return BloomBuildPlan {*probe_slot, std::move(build_meta), build_col_id};
+}
+
+// Takes the Bloom filter for this scan if no other scan holds it (without waiting). The scan then
+// holds it (gstate.bloom_filter_held) until ~OasisScanGlobalState, also if SubmitBloomBuild throws.
+static bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate) {
+	bool in_use = false;
+	if (!bloom_filter_in_use.compare_exchange_strong(in_use, true, std::memory_order_acquire)) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: the hardware Bloom filter is in use by another scan.");
-		return;
+		return false;
 	}
+	gstate.bloom_filter_held = true;
+	return true;
+}
+
+// Sends the runtime Bloom filter's build side through the hardware: one flow per build row group
+// that decodes the build key chunk on decoder-stream 0 and routes it into the filter (BUILD). The
+// oasis top answers every build chunk with a one-byte ack transfer, which completes the flow. The build
+// chunks are CONTINUE except for the last one (END), which switches the filter to probing: the
+// probe key chunks the workers send later queue up behind it on the same stream. The scan has to
+// hold the filter (TryAcquireBloomFilter); ~OasisScanGlobalState ends the probe side.
+static void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
+                             const BloomBuildPlan &plan, OasisScanGlobalState &gstate) {
+	D_ASSERT(gstate.bloom_filter_held);
+	const auto &build_meta = plan.build_meta;
+	const size_t build_col_id = plan.build_col_id;
 
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto build_handle = fs.OpenFile(bind.runtime_bloom_build_filename, FileOpenFlags::FILE_FLAGS_READ);
@@ -466,17 +501,18 @@ static void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, c
 
 	if (build_chunks.empty()) {
 		// Nothing to build: end the (empty) build side right away. No other scan can use the
-		// filter meanwhile (bloom_lock), so nothing can be queued in between.
-		PushBloomInputCommand(ctx, BloomInputCommand::END_ONLY);
+		// filter meanwhile (bloom_filter_in_use), so nothing can be queued in between.
+		PushBloomInputCommand(ctx, BloomInputCommand::END);
 	} else {
 		oasis::QuerySplinter splinter;
 		splinter.streams.reserve(build_chunks.size());
 		for (size_t k = 0; k < build_chunks.size(); k++) {
 			const auto &cc = *build_chunks[k];
-			const auto cmd = k + 1 == build_chunks.size() ? BloomInputCommand::END : BloomInputCommand::CONTINUE;
+			// The last build chunk also ends the build side, in the same flow: right after its chunk
+			const bool last = k + 1 == build_chunks.size();
 
 			oasis::OperatorFlow flow;
-			flow.push_back(std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BUILD, cmd));
+			flow.push_back(std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BUILD, std::nullopt, last));
 			if (rdma) {
 				flow.push_back(MakeRDMASource(*rdma, cc));
 			} else {
@@ -501,28 +537,32 @@ static void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, c
 	}
 
 	gstate.bloom_active = true;
-	gstate.bloom_probe_slot = *probe_slot;
+	gstate.bloom_probe_slot = plan.probe_slot;
 	DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter: submitted %llu build key chunk(s) of '%s'.",
 	                 (unsigned long long)build_chunks.size(), bind.runtime_bloom_build_filename.c_str());
 }
 
 OasisScanGlobalState::~OasisScanGlobalState() {
-	if (!bloom_active) {
+	if (!bloom_filter_held) {
 		return;
 	}
 	// Every worker has drained its probe key chunks (~OasisScanLocalState), so all their CONTINUEs
-	// were pushed: end the probe side, which also resets the filter for the next scan.
-	try {
-		while (bloom_build_submitted && bloom_build.get_next_batch()) {
+	// were pushed: end the probe side, which also resets the filter for the next scan. If
+	// SubmitBloomBuild threw after taking the filter (!bloom_active), nothing reached the filter.
+	if (bloom_active) {
+		try {
+			while (bloom_build_submitted && bloom_build.get_next_batch()) {
+			}
+			PushBloomInputCommand(*ctx, BloomInputCommand::END);
+			if (BloomCommandQueueOverflowed(*ctx)) {
+				fprintf(stderr, "[OASIS] A hardware Bloom filter command queue overflowed, its results are not "
+				                "reliable.\n");
+			}
+		} catch (std::exception &e) {
+			fprintf(stderr, "[OASIS] Failed to end the runtime Bloom filter's probe side: %s\n", e.what());
 		}
-		PushBloomInputCommand(*ctx, BloomInputCommand::END_ONLY);
-		if (BloomCommandQueueOverflowed(*ctx)) {
-			fprintf(stderr, "[OASIS] A hardware Bloom filter command queue overflowed, its results are not "
-			                "reliable.\n");
-		}
-	} catch (std::exception &e) {
-		fprintf(stderr, "[OASIS] Failed to end the runtime Bloom filter's probe side: %s\n", e.what());
 	}
+	bloom_filter_in_use.store(false, std::memory_order_release);
 }
 
 OasisScanLocalState::~OasisScanLocalState() {
@@ -657,7 +697,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// nothing of another row group gets between the key chunk and its columns.
 	//
 	// Every probe chunk is sent with CONTINUE: no worker knows which chunk will be the last one
-	// (groups are claimed dynamically and pruned), so the probe side is ended with END_ONLY once
+	// (groups are claimed dynamically and pruned), so the probe side is ended with END once
 	// the whole scan is done (see ~OasisScanGlobalState).
 	if (gstate.bloom_active) {
 		std::vector<size_t> mat_k;
@@ -678,7 +718,6 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		// vfpga_top.svh.
 		add_decode_flow(*probe_k,
 		                std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::FILTER,
-		                                                                  BloomInputCommand::CONTINUE,
 		                                                                  static_cast<uint32_t>(mat_k.size())),
 		                (pending.num_rows + 7) / 8, gstate.projected_columns.size());
 		bloom_mask_flows = 1;
@@ -729,11 +768,11 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		return;
 	}
 
+	const size_t num_flows = splinter.streams.size();
 	pending.result = ctx.scheduler().submit(std::move(splinter));
 	pending.submitted = true;
 	DUCKDB_LOG_DEBUG(context, "Submitted QuerySplinter (%llu flow(s)) for row group %llu.",
-	                 (unsigned long long)(pending.hw_slot.size() + pending.cpu_slot.size()),
-	                 (unsigned long long)group);
+	                 (unsigned long long)num_flows, (unsigned long long)group);
 }
 
 // Positions the shared CPU readers at the start of `group`'s CPU/string columns (page-header

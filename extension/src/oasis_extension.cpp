@@ -37,7 +37,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Number of streams the scheduler drives (0 = all available)", LogicalType::UBIGINT,
 	                          Value::UBIGINT(0), SetSchedulerNumStreams);
 	config.AddExtensionOption("oasis_scheduler_queue_depth",
-	                          "Max splinters in flight per stream (0 = hardware config-FIFO depth)",
+	                          "Max splinters in flight per stream (0 = hardware config-FIFO depth, which is also the upper bound)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0), SetSchedulerQueueDepth);
 	config.AddExtensionOption(
 	    "oasis_scan_groups_in_flight",
@@ -75,9 +75,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	Connection conn(instance);
 	auto &oasis_ctx = GetOrCreateOasisContext(*conn.context);
 
-	// Configure the hardware Bloom filter block, keeping the top-level stream routed through the
-	// bypass path for now -- see oasis_hardware_bloom.cpp.
-	ConfigureOasisHardwareBloom(oasis_ctx);
+	// Fail early if the hardware design does not fit the Bloom filter integration.
+	CheckOasisHardwareBloom(oasis_ctx);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {

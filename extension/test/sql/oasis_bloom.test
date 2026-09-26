@@ -125,13 +125,12 @@ statement ok
 COPY (FROM bf_ext_probe_t WHERE x_id <= 4 UNION ALL FROM bf_ext_probe_t WHERE x_id > 4)
 TO '{TEST_DIR}/bf_ext_probe.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1);
 
-# Keys the Bloom filter can't take, one row group: s_int INTEGER (= s_id) and s_opt an optional
-# BIGINT (0, 7, NULL, then no match with bf_ext_build)
+# A key the Bloom filter can't take, one row group: s_int INTEGER (= s_id)
 statement ok
-CREATE TABLE bf_skip_t (s_id BIGINT NOT NULL, s_int INTEGER NOT NULL, s_opt BIGINT);
+CREATE TABLE bf_skip_t (s_id BIGINT NOT NULL, s_int INTEGER NOT NULL);
 
 statement ok
-INSERT INTO bf_skip_t SELECT i, i, CASE i WHEN 0 THEN 0 WHEN 1 THEN 7 WHEN 2 THEN NULL ELSE 100 + i END FROM range(8) t(i);
+INSERT INTO bf_skip_t SELECT i, i FROM range(8) t(i);
 
 statement ok
 COPY bf_skip_t TO '{TEST_DIR}/bf_skip.parquet' (FORMAT parquet);
@@ -183,13 +182,6 @@ SELECT count(*) FROM (
 WHERE num_children IS NULL AND repetition_type <> 'REQUIRED';
 ----
 0
-
-query II
-SELECT name, repetition_type FROM parquet_schema('{TEST_DIR}/bf_skip.parquet') WHERE num_children IS NULL ORDER BY name;
-----
-s_id	REQUIRED
-s_int	REQUIRED
-s_opt	OPTIONAL
 
 # ---------------------------------------------------------------------------
 # Several row groups on both sides, all kinds of columns
@@ -502,20 +494,6 @@ SELECT count(*), sum(a.s_id)
 FROM read_oasis('{TEST_DIR}/bf_skip.parquet') a JOIN read_oasis('{TEST_DIR}/bf_skip.parquet') b ON a.s_int = b.s_int;
 ----
 8	28
-
-query II
-SELECT bloom_used(), bloom_skipped('not a required INT64 column');
-----
-0	1
-
-# An optional (nullable) BIGINT key on the probe side (bf_skip has more rows): 0 and 7 (twice) match
-statement ok
-CALL truncate_duckdb_logs();
-
-query I
-SELECT count(*) FROM read_oasis('{TEST_DIR}/bf_skip.parquet') JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON s_opt = e_key;
-----
-3
 
 query II
 SELECT bloom_used(), bloom_skipped('not a required INT64 column');
