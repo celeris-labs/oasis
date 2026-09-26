@@ -1,12 +1,15 @@
 #include "oasis_hardware_bloom.hpp"
 
 #include "oasis/oasis_context.hpp"
+#include "parcore/configuration.hpp"
 
 #include <coyote/cThread.hpp>
 #include <libstf/configuration.hpp>
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace duckdb {
@@ -41,25 +44,6 @@ public:
 	}
 };
 
-// Mirrors hardware/src/hdl/bf_last_injector_config.sv: three plain registers (enable, first_beat,
-// second_beat) controlling the inline TLAST injector on the Bloom filter's input stream in
-// vfpga_top.svh, which concatenates however many decoded row-group chunks make up the build and
-// probe sides into the two logical transfers the Bloom filter core expects.
-class BloomFilterLastInjectorConfig : public libstf::Config {
-public:
-	static constexpr uint64_t ID = 0xa3f19d2c6b8e0741ULL; // BF_LAST_INJECT_CONFIG_ID (hardware/src/hdl/common.sv)
-
-	BloomFilterLastInjectorConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset, uint32_t num_regs)
-	    : libstf::Config(std::move(cthread), addr_offset, num_regs) {
-	}
-
-	void configure(bool enable, uint32_t first_beat, uint32_t second_beat) {
-		write_register(libstf::ConfigRegister(0, enable ? 1ULL : 0ULL));
-		write_register(libstf::ConfigRegister(1, first_beat));
-		write_register(libstf::ConfigRegister(2, second_beat));
-	}
-};
-
 } // namespace
 
 void PushBloomInputCommand(oasis::OasisContext &ctx, BloomInputCommand cmd) {
@@ -74,10 +58,13 @@ bool BloomCommandQueueOverflowed(oasis::OasisContext &ctx) {
 	return ctx.config<BloomFilterConfig>()->command_queue_overflowed();
 }
 
-void ConfigureOasisHardwareBloom(oasis::OasisContext &ctx) {
-	// Nothing to configure in the Bloom filter itself: its materialization and input commands are
-	// pushed per chunk.
-	ctx.config<BloomFilterLastInjectorConfig>()->configure(false, 0, 0);
+void CheckOasisHardwareBloom(oasis::OasisContext &ctx) {
+	const auto num_decoders = ctx.config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
+	if (num_decoders != 1) {
+		throw std::runtime_error("Oasis requires a hardware design with exactly one column chunk decoder "
+		                         "(the Bloom filter's stream select is on decoder stream 0), but it has " +
+		                         std::to_string(num_decoders));
+	}
 }
 
 } // namespace duckdb
