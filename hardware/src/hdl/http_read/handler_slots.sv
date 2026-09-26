@@ -607,7 +607,7 @@ module handler_slots #(
     logic [N_DECODERS-1:0] rdr_progress_w;
     logic [N_CONNS-1:0]    rdr_release [N_DECODERS];
     logic [N_DECODERS-1:0] sh_idle, sh_fs_idle;
-    logic [N_DECODERS-1:0] fs_busy;   // the reader->framer slice of decoder d holds a beat
+    logic [N_DECODERS-1:0] fs_busy;   // the reader->framer slices of decoder d hold a beat
 
     logic [31:0]           dec_occ_q [N_DECODERS];
     logic [N_DECODERS-1:0] body_pop_q;   // a chunk's last beat left for decoder d, one cycle ago
@@ -771,6 +771,54 @@ module handler_slots #(
         //     framer's idle AND this slice empty, so a byte waiting here at a release is a residue
         //     exactly as a byte in the framer's residue register is;
         //   * `framer_clear` empties it together with the framer.
+        //
+        // TWO SLICES, ONE ON EACH SIDE (2026-09-26, build-133 timing). One slice is a register on
+        // one side of a cut only: the placer put it next to the framer, and its ready (two flops)
+        // still fanned out combinationally into the reader's byte accounting and slot_rd_share's
+        // credit and receive-fifo read enable on the other side of the SLR2/SLR1 boundary
+        // (build-133: fs_ovr_v_q -> slot_rd_share credit_ok_q -1.85 ns, -> rx_fifo[3] read enable
+        // -1.71 ns, -> slot_reader rem0_q -1.37 ns). So it is now two of the same slice in a row,
+        // reader -> rs_* -> fs_* -> strip_http: the reader and slot_rd_share see the ready of the
+        // slice beside them, the framer is fed by the slice beside it, and between the two the
+        // data and the ready are both register to register. One more cycle of card-read latency;
+        // order and throughput are unchanged. Both slices are one unit for everything that asks:
+        // fs_busy (the FIN drain, framer_idle) is any valid in either, and framer_clear empties
+        // both.
+        logic                       rs_tmp_v_q,  rs_ovr_v_q;
+        logic [AXI_DATA_BITS-1:0]   rs_tmp_d_q,  rs_ovr_d_q;
+        logic [AXI_DATA_BITS/8-1:0] rs_tmp_k_q,  rs_ovr_k_q;
+        logic                       rs_m_tvalid, rs_m_tready;
+        logic [AXI_DATA_BITS-1:0]   rs_m_tdata;
+        logic [AXI_DATA_BITS/8-1:0] rs_m_tkeep;
+
+        assign rdr_m_tready = !rs_tmp_v_q || !rs_ovr_v_q;
+
+        always_ff @(posedge ap_clk) begin
+            if (!ap_rst_n || rdr_fr_clear[d]) begin
+                rs_tmp_v_q <= 1'b0;
+                rs_ovr_v_q <= 1'b0;
+            end else begin
+                if (rdr_m_tready) rs_tmp_v_q <= rdr_m_tvalid;
+                if (!rs_ovr_v_q && !rs_m_tready) rs_ovr_v_q <= rs_tmp_v_q;
+                if (rs_m_tready)                 rs_ovr_v_q <= 1'b0;
+            end
+        end
+
+        always_ff @(posedge ap_clk) begin
+            if (rdr_m_tready) begin
+                rs_tmp_d_q <= rdr_m_tdata;
+                rs_tmp_k_q <= rdr_m_tkeep;
+            end
+            if (!rs_ovr_v_q) begin
+                rs_ovr_d_q <= rs_tmp_d_q;
+                rs_ovr_k_q <= rs_tmp_k_q;
+            end
+        end
+
+        assign rs_m_tvalid = rs_tmp_v_q || rs_ovr_v_q;
+        assign rs_m_tdata  = rs_ovr_v_q ? rs_ovr_d_q : rs_tmp_d_q;
+        assign rs_m_tkeep  = rs_ovr_v_q ? rs_ovr_k_q : rs_tmp_k_q;
+
         logic                       fs_tmp_v_q,  fs_ovr_v_q;
         logic [AXI_DATA_BITS-1:0]   fs_tmp_d_q,  fs_ovr_d_q;
         logic [AXI_DATA_BITS/8-1:0] fs_tmp_k_q,  fs_ovr_k_q;
@@ -778,14 +826,14 @@ module handler_slots #(
         logic [AXI_DATA_BITS-1:0]   fs_m_tdata;
         logic [AXI_DATA_BITS/8-1:0] fs_m_tkeep;
 
-        assign rdr_m_tready = !fs_tmp_v_q || !fs_ovr_v_q;
+        assign rs_m_tready = !fs_tmp_v_q || !fs_ovr_v_q;
 
         always_ff @(posedge ap_clk) begin
             if (!ap_rst_n || rdr_fr_clear[d]) begin
                 fs_tmp_v_q <= 1'b0;
                 fs_ovr_v_q <= 1'b0;
             end else begin
-                if (rdr_m_tready) fs_tmp_v_q <= rdr_m_tvalid;
+                if (rs_m_tready) fs_tmp_v_q <= rs_m_tvalid;
                 if (!fs_ovr_v_q && !fs_m_tready) fs_ovr_v_q <= fs_tmp_v_q;
                 if (fs_m_tready)                 fs_ovr_v_q <= 1'b0;
             end
@@ -793,9 +841,9 @@ module handler_slots #(
 
         // Data registers carry no reset and no clear: they are only ever read under their valid.
         always_ff @(posedge ap_clk) begin
-            if (rdr_m_tready) begin
-                fs_tmp_d_q <= rdr_m_tdata;
-                fs_tmp_k_q <= rdr_m_tkeep;
+            if (rs_m_tready) begin
+                fs_tmp_d_q <= rs_m_tdata;
+                fs_tmp_k_q <= rs_m_tkeep;
             end
             if (!fs_ovr_v_q) begin
                 fs_ovr_d_q <= fs_tmp_d_q;
@@ -806,7 +854,7 @@ module handler_slots #(
         assign fs_m_tvalid = fs_tmp_v_q || fs_ovr_v_q;
         assign fs_m_tdata  = fs_ovr_v_q ? fs_ovr_d_q : fs_tmp_d_q;
         assign fs_m_tkeep  = fs_ovr_v_q ? fs_ovr_k_q : fs_tmp_k_q;
-        assign fs_busy[d]    = fs_tmp_v_q || fs_ovr_v_q;
+        assign fs_busy[d]    = rs_tmp_v_q || rs_ovr_v_q || fs_tmp_v_q || fs_ovr_v_q;
         assign sh_fs_idle[d] = sh_idle[d] && !fs_busy[d];
 
         // -- framing --------------------------------------------------------------------------------
@@ -1085,8 +1133,9 @@ module handler_slots #(
                                // receive fifo, where rd_pending counted them. Without this term a
                                // stalled decoder lets the slice take a response's last beats, the
                                // drain expires and a response that is complete in the handler is
-                               // aborted (lane_drain `fsfin`). fs_busy is two flops, so the slice
-                               // keeps its point: no framer ready reaches close_drain_q.
+                               // aborted (lane_drain `fsfin`). fs_busy is the four valid flops of
+                               // the two slices, so they keep their point: no framer ready reaches
+                               // close_drain_q.
                                !fs_busy[d];
         end
     end
