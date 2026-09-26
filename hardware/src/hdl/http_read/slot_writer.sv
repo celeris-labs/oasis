@@ -41,6 +41,13 @@ import lynxTypes::*;
 // be reached while `conn_space_ok` is honoured, and if it ever IS reached, `route_stall` latches and
 // stays latched. That bit is the gate for this work package.
 //
+// Since 2026-09-26 (build-133 timing) every routed beat passes through ONE INPUT REGISTER before
+// the fifo and the segment accounting see it, and `conn_tready` is that register's ready: constant
+// high, because the register takes a beat every cycle. The fifo's refusal is still the event that
+// matters and `route_stall` still latches on it, one cycle later, at the register's output; the
+// beat is lost there exactly as it was lost at rx_dispatch's output before. See "THE INPUT
+// REGISTER" below.
+//
 // THE RESERVATION -- ONE COUNTER, SHARED
 // --------------------------------------
 // `conn_space_ok` cannot simply ask the fifo how full it is. A readPkg's bytes do not arrive when it
@@ -222,14 +229,39 @@ module slot_writer #(
     // ---------------------------------------------------------------------------------------------
     // Input side: one-hot decode, the shared fifo, and the never-refuse rule.
     // ---------------------------------------------------------------------------------------------
+    // THE INPUT REGISTER (2026-09-26, build-133 timing). rx_dispatch's routed beat is the shell's
+    // rx register slice gated by rx_dispatch's packet state, and it went straight on into this
+    // fifo's BRAM write enable and the segment accounting (build-133: shell tcp rx slice ->
+    // rx_dispatch conn_tvalid -> inst_slot_fifo ENARDEN, -1.79 ns, 4 levels of pure distance).
+    // Every beat is now registered here first, unconditionally -- valid, data, keep, last -- and
+    // everything below works on the registered copy. It is exactly the old module fed one cycle
+    // later: the same beats, in the same order, the same accounting. The reservation needs
+    // nothing: a beat in this register is still covered by its readPkg's reservation (that is
+    // handed back only at the segment's descriptor), and conn_quiet counts it (below).
+    logic [N_CONNS-1:0]       in_v_q;
+    logic [AXI_DATA_BITS-1:0] in_d_q;
+    logic [KEEP_BITS-1:0]     in_k_q;
+    logic                     in_l_q;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) in_v_q <= '0;
+        else        in_v_q <= conn_tvalid;
+    end
+    // Data carry no reset and no enable: they are only ever read under in_v_q.
+    always_ff @(posedge clk) begin
+        in_d_q <= conn_tdata;
+        in_k_q <= conn_tkeep;
+        in_l_q <= conn_tlast;
+    end
+
     logic                 in_tvalid_w;
     logic [CONN_BITS-1:0] in_conn_w;
 
-    assign in_tvalid_w = |conn_tvalid;
+    assign in_tvalid_w = |in_v_q;
     always_comb begin
         in_conn_w = '0;
         for (int c = 0; c < N_CONNS; c++) begin
-            if (conn_tvalid[c]) in_conn_w = in_conn_w | CONN_BITS'(c);
+            if (in_v_q[c]) in_conn_w = in_conn_w | CONN_BITS'(c);
         end
     end
 
@@ -239,7 +271,9 @@ module slot_writer #(
     logic [KEEP_BITS-1:0]     fifo_m_tkeep;
     logic [LVL_BITS-1:0]      fifo_level;
 
-    assign conn_tready = {N_CONNS{fifo_s_tready}};
+    // The input register takes every beat (see the header): the fifo's refusal is caught at the
+    // register's output, by route_stall and the fifo's own fifo_stall.
+    assign conn_tready = '1;
 
     logic in_fire_w;
     assign in_fire_w = in_tvalid_w && fifo_s_tready;
@@ -255,9 +289,9 @@ module slot_writer #(
         .clear(1'b0),
         .s_axis_tvalid(in_tvalid_w),
         .s_axis_tready(fifo_s_tready),
-        .s_axis_tdata(conn_tdata),
-        .s_axis_tkeep(conn_tkeep),
-        .s_axis_tlast(conn_tlast),
+        .s_axis_tdata(in_d_q),
+        .s_axis_tkeep(in_k_q),
+        .s_axis_tlast(in_l_q),
         .m_axis_tvalid(fifo_m_tvalid),
         .m_axis_tready(fifo_m_tready),
         .m_axis_tdata(fifo_m_tdata),
@@ -321,14 +355,15 @@ module slot_writer #(
     logic [LEN_BITS_-1:0] tl_len_q;
 
     // Nothing of connection c anywhere between rx_dispatch and the ack: no descriptor outstanding,
-    // no segment part-way into the shared fifo, none in stage B. Registered inputs only, so this is
-    // a compare against zero and a three-term AND -- it feeds handler_slots' teardown sequencer,
-    // never a datapath decision.
+    // no segment part-way into the shared fifo, none in stage B, and no beat of it in the input
+    // register. Registered inputs only, so this is a compare against zero and a four-term AND --
+    // it feeds handler_slots' teardown sequencer, never a datapath decision.
     always_comb begin
         for (int c = 0; c < N_CONNS; c++)
             conn_quiet[c] = (infl_q[c] == 8'd0) &&
                             !(seg_active_q && (seg_conn_q == CONN_BITS'(c))) &&
-                            !(tl_valid_q && (tl_conn_q == CONN_BITS'(c)));
+                            !(tl_valid_q && (tl_conn_q == CONN_BITS'(c))) &&
+                            !in_v_q[c];
     end
 
     // -- stage B: the descriptor, from registers -------------------------------------------------
@@ -374,11 +409,11 @@ module slot_writer #(
 
     logic [6:0]           pop_w;
     logic [LEN_BITS_-1:0] len_a_w;
-    assign pop_w   = 7'($countones(conn_tkeep));
+    assign pop_w   = 7'($countones(in_k_q));
     assign len_a_w = LEN_BITS_'({prior_beats_w, 6'b0}) + LEN_BITS_'(pop_w);
 
     logic tl_fire_w;   // the tlast beat of a segment is accepted: stage A -> stage B
-    assign tl_fire_w = in_fire_w && conn_tlast;
+    assign tl_fire_w = in_fire_w && in_l_q;
 
     // ---------------------------------------------------------------------------------------------
     // Descriptor fifo: one entry per segment, in arrival order. The data fifo carries no connection
@@ -609,8 +644,8 @@ module slot_writer #(
                     cur_off_q  <= cursor_mux_w;
                     seg_conn_q <= in_conn_w;
                 end
-                seg_active_q <= !conn_tlast;
-                seg_beats_q  <= conn_tlast ? BEAT_BITS'(0) : (prior_beats_w + BEAT_BITS'(1));
+                seg_active_q <= !in_l_q;
+                seg_beats_q  <= in_l_q ? BEAT_BITS'(0) : (prior_beats_w + BEAT_BITS'(1));
             end
 
             // -- descriptor push + cursor advance ------------------------------------------------
@@ -759,9 +794,9 @@ module slot_writer #(
         if (rst_n) begin
             if ($countones(conn_tvalid) > 1)
                 $display("slot_writer: FAIL t=%0t conn_tvalid %b is not one-hot", $time, conn_tvalid);
-            if (in_fire_w && !conn_tlast && (conn_tkeep != {KEEP_BITS{1'b1}}))
+            if (in_fire_w && !in_l_q && (in_k_q != {KEEP_BITS{1'b1}}))
                 $display("slot_writer: FAIL t=%0t non-final segment beat tkeep %0h is not full",
-                         $time, conn_tkeep);
+                         $time, in_k_q);
             if (desc_push_w)                          sim_inflight[conn_sel_w]++;
             if (wr_ack && (aq_cnt_q != '0))           sim_inflight[aq_conn[aq_head_q]]--;
             if (out_done_w && (ost_q == O_DISCARD))   sim_inflight[req_conn_q]--;
