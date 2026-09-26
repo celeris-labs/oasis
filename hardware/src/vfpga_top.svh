@@ -30,7 +30,7 @@ localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
 // MemConfig write side needs NUM_STREAMS+1 regs, read side needs 3 (ID, num_streams, max_enqueued).
 localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
 
-localparam NUM_CONFIGS   = 6;
+localparam NUM_CONFIGS   = 5;
 `ifdef EN_RDMA
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `else
@@ -68,8 +68,7 @@ GlobalConfig #(
         COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS),
         NUM_READ_REQ_CONFIG_REGS * NUM_STREAMS,
         BLOOMFILTER_NUM_CONFIG_REGS,
-        STREAM_CFG_REGS,
-        NUM_BF_LAST_INJECT_CONFIG_REGS
+        STREAM_CFG_REGS
     }),
     .READ_CONFIG_SKID_DEPTH(2)
 ) inst_config (
@@ -134,8 +133,10 @@ BFConfig inst_bf_config (
     .perf_counters(bf_perf_counters)
 );
 
+// One select per flow on decoder stream 0: as many can be enqueued as the decoder takes flows
 StreamConfig #(
-    .NUM_STREAMS(1)
+    .NUM_STREAMS(1),
+    .MAX_OUTSTANDING_STREAMS(COLUMN_CHUNK_DECODER_MAX_ENQUEUED_CONFIGS)
 ) inst_bf_stream_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -144,21 +145,6 @@ StreamConfig #(
     .read_config(read_configs[4]),
 
     .out(bf_stream_conf)
-);
-
-logic        bf_last_inject_enable;
-logic [31:0] bf_last_inject_first_beat;
-logic [31:0] bf_last_inject_second_beat;
-BFLastInjectorConfig inst_bf_last_injector_config (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .write_config(write_configs[5]),
-    .read_config(read_configs[5]),
-
-    .enable(bf_last_inject_enable),
-    .first_beat(bf_last_inject_first_beat),
-    .second_beat(bf_last_inject_second_beat)
 );
 
 // -- Arbiter the read send queue ------------------------------------------------------------------
@@ -249,6 +235,11 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
 end : gen_decoders
 
 // -- Bloom filter on decoder-stream 0 -------------------------------------------------------------
+if (NUM_DECODERS != 1) $error({"The Bloom filter requires exactly one decoder: software pushes a ",
+    "stream select for every decode flow, not knowing which decoder stream the scheduler places it ",
+    "on. With more decoders, the selects of flows on streams >= 1 would pile up in stream 0's select ",
+    "queue and misroute its transfers."});
+
 // The stream config's `select` chooses, per flow, where decoder-stream 0's transfer goes. Pushed
 // per flow by BloomFilterStreamSelectOperator (oasis_scan.cpp), not configured once here:
 //   0 (FILTER): through the Bloom filter as a probe key chunk, yields its mask (axi_bf_mask)
@@ -256,8 +247,8 @@ end : gen_decoders
 //   2 (BUILD):  through the Bloom filter as a build key chunk, yields a one-byte ack (axi_bf_ack)
 //   3 (MATERIALIZE): into the Bloom filter's materializer as a column of 64-bit probe values,
 //               yields the values of the rows its probe key chunk's mask kept (axi_bf_mat)
-// FILTER and BUILD transfers look the same to the Bloom filter: the per-transfer input commands in
-// its own config (CONTINUE/END/END_ONLY, pushed with the select) decide the phase. BUILD only
+// FILTER and BUILD transfers look the same to the Bloom filter: the input commands in its own config
+// (CONTINUE per transfer, END after a side, pushed with the select) decide the phase. BUILD only
 // exists because a build chunk has no output, while every flow needs one output transfer to
 // complete (and the multiplexer needs one per select): the ack stands in for it.
 // A probe key chunk is followed by the MATERIALIZE transfers of its columns (as many as its
@@ -293,7 +284,6 @@ end
 assign bf_demux_select_mapped.valid = bf_demux_select.valid;
 assign bf_demux_select.ready        = bf_demux_select_mapped.ready;
 
-AXI4S axi_bf_in_raw(.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_in    (.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_out   (.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_bypass(.aclk(clk), .aresetn(rst_n));
@@ -308,7 +298,7 @@ AXIDemultiplexer #(
     .select(bf_demux_select_mapped),
 
     .in(decoded_axi[0]),
-    .out({axi_bf_in_raw, axi_bf_bypass, axi_bf_probe_values}) // In BF_DEMUX_* order
+    .out({axi_bf_in, axi_bf_bypass, axi_bf_probe_values}) // In BF_DEMUX_* order
 );
 
 // Build acks: one one-byte transfer (a single zero byte) per BUILD transfer, once its last beat went
@@ -326,7 +316,7 @@ assign axi_bf_ack.tkeep  = 1; // One byte
 assign axi_bf_ack.tlast  = 1'b1;
 assign axi_bf_ack.tvalid = bf_pending_acks != 0;
 
-assign bf_build_done = bf_in_is_build && axi_bf_in_raw.tvalid && axi_bf_in_raw.tready && axi_bf_in_raw.tlast;
+assign bf_build_done = bf_in_is_build && axi_bf_in.tvalid && axi_bf_in.tready && axi_bf_in.tlast;
 assign bf_ack_sent   = axi_bf_ack.tvalid && axi_bf_ack.tready;
 
 always_ff @(posedge clk) begin
@@ -338,54 +328,6 @@ always_ff @(posedge clk) begin
             bf_in_is_build <= bf_demux_select.data == BF_SELECT_BUILD;
         end
         bf_pending_acks <= bf_pending_acks + bf_build_done - bf_ack_sent;
-    end
-end
-
-// Inline TLAST injector: software configures the absolute beat index where the build side's
-// chunks end (first_beat) and where the probe side's chunks end (second_beat). Every other beat's
-// decoder-generated tlast is suppressed here so the Bloom filter core sees exactly two logical
-// transfers no matter how many row-group chunks it takes to build up each side. Disabled
-// (bf_last_inject_enable=0) passes tlast through unchanged.
-logic [31:0] bf_last_inject_beat_count;
-logic        bf_last_inject_hit_first;
-logic        bf_last_inject_hit_second;
-logic        bf_last_inject_hit;
-
-assign axi_bf_in_raw.tready = axi_bf_in.tready;
-
-assign axi_bf_in.tdata  = axi_bf_in_raw.tdata;
-assign axi_bf_in.tkeep  = axi_bf_in_raw.tkeep;
-assign axi_bf_in.tvalid = axi_bf_in_raw.tvalid;
-
-assign bf_last_inject_hit_first =
-    bf_last_inject_enable &&
-    axi_bf_in_raw.tvalid &&
-    axi_bf_in_raw.tready &&
-    (bf_last_inject_beat_count == bf_last_inject_first_beat);
-
-assign bf_last_inject_hit_second =
-    bf_last_inject_enable &&
-    axi_bf_in_raw.tvalid &&
-    axi_bf_in_raw.tready &&
-    (bf_last_inject_beat_count == bf_last_inject_second_beat);
-
-assign bf_last_inject_hit =
-    bf_last_inject_hit_first || bf_last_inject_hit_second;
-
-assign axi_bf_in.tlast =
-    axi_bf_in_raw.tlast || bf_last_inject_hit;
-
-always_ff @(posedge clk) begin
-    if (!rst_n) begin
-        bf_last_inject_beat_count <= 32'd0;
-    end else if (!bf_last_inject_enable) begin
-        bf_last_inject_beat_count <= 32'd0;
-    end else if (axi_bf_in_raw.tvalid && axi_bf_in_raw.tready) begin
-        if (bf_last_inject_hit_second) begin
-            bf_last_inject_beat_count <= 32'd0;
-        end else begin
-            bf_last_inject_beat_count <= bf_last_inject_beat_count + 32'd1;
-        end
     end
 end
 
