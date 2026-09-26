@@ -646,14 +646,78 @@ endgenerate
 // register file answers anything above NUM_READ_REGS-1 with resp_error. Both have to cover 20.
 `ASSERT_ELAB(AXIL_DATA_BITS >= 64)
 
-ConfigReadRegisterFile #(
-    .NUM_REGS(NUM_READ_REGS)
-) inst_read_reg_file (
-    .clk   (clk),
-    .rst_n (reset_synced),
+// -------------------------------------------------------------------------------------------------
+// The read register file, IN TWO REGISTERED STAGES (2026-09-26, build-128/133 timing).
+//
+// This used to be libstf's ConfigReadRegisterFile: on the read handshake it compared the address
+// against every register and OR-muxed the 39 64-bit words straight into resp_data, in one cycle.
+// Both ends of that cone were far away: the address is libstf's inst_config.read_addr (a subtract
+// in the read splitter, fanout ~780 into every register file of the design), and the words are
+// combinational status from all over the handler and the decoder lanes. It was build-128's worst
+// path (read_addr -> resp_data, -1.457 ns), and on build-133 strip_http's status compare ran into
+// resp_data across an SLR boundary (-2.00 ns) and read_addr into it at -1.67 ns.
+//
+// Now, with the same protocol towards the splitter (read_ready only while idle, resp_valid held
+// until resp_ready):
+//   * every word is registered each cycle (read_words_q), so the mux reads flops of this module;
+//   * the handshake cycle h only registers the address decode (rd_match_q);
+//   * cycle h+1 muxes rd_match_q over read_words_q -- which hold the words of cycle h -- into
+//     resp_data/resp_error and raises resp_valid.
+// So a read returns exactly the values the old register file returned (the words and the decode of
+// the handshake cycle), one cycle later. The splitter waits for resp_valid however long it takes
+// (it matches responses to reads through its own fifo), so the extra cycle is legal on the AXI-Lite
+// side too: rvalid simply comes a cycle later.
+// -------------------------------------------------------------------------------------------------
+logic [AXIL_DATA_BITS - 1:0] read_words_q[NUM_READ_REGS];
 
-    .in    (read_config),
-    .values(read_registers)
-);
+always_ff @(posedge clk) begin
+    for (int i = 0; i < NUM_READ_REGS; i++) read_words_q[i] <= read_registers[i];
+end
+
+typedef enum logic [1:0] {RD_WAIT, RD_SELECT, RD_RESPOND} rd_state_t;
+rd_state_t                   rd_state_q;
+logic [NUM_READ_REGS - 1:0]  rd_match_q;
+logic [AXIL_DATA_BITS - 1:0] rd_data_w;
+
+assign read_config.read_ready = (rd_state_q == RD_WAIT);
+
+always_ff @(posedge clk) begin
+    if (!reset_synced) begin
+        rd_state_q             <= RD_WAIT;
+        read_config.resp_valid <= 1'b0;
+    end else begin
+        case (rd_state_q)
+            RD_WAIT: begin
+                if (read_config.read_valid) rd_state_q <= RD_SELECT;
+            end
+            RD_SELECT: begin
+                read_config.resp_valid <= 1'b1;
+                rd_state_q             <= RD_RESPOND;
+            end
+            default: begin // RD_RESPOND
+                if (read_config.resp_ready) begin
+                    read_config.resp_valid <= 1'b0;
+                    rd_state_q             <= RD_WAIT;
+                end
+            end
+        endcase
+    end
+end
+
+// Decode and response data carry no reset: they are only ever read under their state.
+always_ff @(posedge clk) begin
+    if ((rd_state_q == RD_WAIT) && read_config.read_valid) begin
+        for (int i = 0; i < NUM_READ_REGS; i++) rd_match_q[i] <= (read_config.read_addr == i);
+    end
+    if (rd_state_q == RD_SELECT) begin
+        read_config.resp_data  <= rd_data_w;
+        read_config.resp_error <= !(|rd_match_q);
+    end
+end
+
+always_comb begin
+    rd_data_w = '0;
+    for (int i = 0; i < NUM_READ_REGS; i++) rd_data_w |= rd_match_q[i] ? read_words_q[i] : '0;
+end
 
 endmodule
