@@ -180,29 +180,29 @@ IO Error
 # enough to be stored as FIXED_LEN_BYTE_ARRAY is not one of them.
 statement ok
 COPY (SELECT i::INTEGER AS a, i::DECIMAL(38, 2) AS d FROM range(0, 100) t(i))
-TO '__TEST_DIR__/flba.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY);
+TO '{TEST_DIR}/flba.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY);
 
 statement error
-SELECT * FROM read_oasis('__TEST_DIR__/flba.parquet');
+SELECT * FROM read_oasis('{TEST_DIR}/flba.parquet');
 ----
 not supported by ParCore
 
 # Only UNCOMPRESSED and SNAPPY column chunks can be fed to the decoder.
 statement ok
 COPY (SELECT i::INTEGER AS a FROM range(0, 100) t(i))
-TO '__TEST_DIR__/zstd.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
+TO '{TEST_DIR}/zstd.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
 
 statement error
-SELECT * FROM read_oasis('__TEST_DIR__/zstd.parquet');
+SELECT * FROM read_oasis('{TEST_DIR}/zstd.parquet');
 ----
 not supported by ParCore
 
 # A file with a schema but no row groups has nothing to scan.
 statement ok
-COPY (SELECT 1::INTEGER AS a WHERE false) TO '__TEST_DIR__/empty.parquet' (FORMAT PARQUET);
+COPY (SELECT 1::INTEGER AS a WHERE false) TO '{TEST_DIR}/empty.parquet' (FORMAT PARQUET);
 
 statement error
-SELECT * FROM read_oasis('__TEST_DIR__/empty.parquet');
+SELECT * FROM read_oasis('{TEST_DIR}/empty.parquet');
 ----
 Parquet file contains no row groups
 
