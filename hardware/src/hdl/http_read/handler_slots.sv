@@ -845,12 +845,64 @@ module handler_slots #(
             .idle(sh_idle[d])
         );
 
+        // -- register slice between the framer and the chunk counter ------------------------------
+        //
+        // (2026-09-26, build-133 timing.) strip_http's output skid went straight into
+        // axis_rewrite_last's popcount of tkeep, its 32-bit `remaining <= beat_bytes` compare and
+        // the remaining counter's clear, and the counter's ready went straight back into the
+        // skid's ~1150 clock enables. On build-133 the framers of decoders 1 and 3 were placed in
+        // SLR2 with their chunk counters in SLR1, and that cone was -2.02 ns (strip_http[1]
+        // skid_keep_q -> rewrite_last remaining_q; -1.89 ns on to the body slice's tlast). The same
+        // two-deep skid as the other slices here: both of its ends are flops, so an SLR cut on
+        // either side of it lands on a register-to-register path. One cycle of body latency;
+        // order and throughput are unchanged. It is DOWNSTREAM of the framer: strip_http's
+        // resp_done says a response's last beat has left the framer, which it has once it is in
+        // here, and `framer_clear` does not empty it -- a beat in here belongs to a response that
+        // is already complete in the framer (exactly as a beat in the body slice below does), and
+        // clearing it at the release after that response would drop body bytes.
+        logic                       rl_tmp_v_q,  rl_ovr_v_q;
+        logic [AXI_DATA_BITS-1:0]   rl_tmp_d_q,  rl_ovr_d_q;
+        logic [AXI_DATA_BITS/8-1:0] rl_tmp_k_q,  rl_ovr_k_q;
+        logic                       rl_m_tvalid, rl_m_tready;
+        logic [AXI_DATA_BITS-1:0]   rl_m_tdata;
+        logic [AXI_DATA_BITS/8-1:0] rl_m_tkeep;
+
+        assign raw_tready = !rl_tmp_v_q || !rl_ovr_v_q;
+
+        always_ff @(posedge ap_clk) begin
+            if (!ap_rst_n) begin
+                rl_tmp_v_q <= 1'b0;
+                rl_ovr_v_q <= 1'b0;
+            end else begin
+                if (raw_tready) rl_tmp_v_q <= raw_tvalid;
+                if (!rl_ovr_v_q && !rl_m_tready) rl_ovr_v_q <= rl_tmp_v_q;
+                if (rl_m_tready)                 rl_ovr_v_q <= 1'b0;
+            end
+        end
+
+        always_ff @(posedge ap_clk) begin
+            if (raw_tready) begin
+                rl_tmp_d_q <= raw_tdata;
+                rl_tmp_k_q <= raw_tkeep;
+            end
+            if (!rl_ovr_v_q) begin
+                rl_ovr_d_q <= rl_tmp_d_q;
+                rl_ovr_k_q <= rl_tmp_k_q;
+            end
+        end
+
+        assign rl_m_tvalid = rl_tmp_v_q || rl_ovr_v_q;
+        assign rl_m_tdata  = rl_ovr_v_q ? rl_ovr_d_q : rl_tmp_d_q;
+        assign rl_m_tkeep  = rl_ovr_v_q ? rl_ovr_k_q : rl_tmp_k_q;
+
         // -- a TAINTED decoder's output is cut here -------------------------------------------------
         //
         // Its byte stream lost a response (see "STAGE 2" in the header), so nothing more of it may
         // reach the decoder: the framer keeps running -- responses of healthy connections queued on
         // this decoder must still be framed and retired so those connections drain -- and its body
-        // beats are dropped. The flop keeps the new term out of the framer's ready path.
+        // beats are dropped. The flop keeps the new term out of the slice's ready path. The cut is
+        // AFTER the slice above, so beats waiting in it when the cut rises are dropped too, as
+        // beats waiting in the framer's skid were before the slice existed.
         logic taint_cut_q;
         always_ff @(posedge ap_clk) begin
             if (!ap_rst_n) taint_cut_q <= 1'b0;
@@ -858,16 +910,23 @@ module handler_slots #(
         end
 
         logic rwl_s_tvalid, rwl_s_tready;
-        assign rwl_s_tvalid = raw_tvalid && !taint_cut_q;
-        assign raw_tready   = taint_cut_q ? 1'b1 : rwl_s_tready;
+        assign rwl_s_tvalid = rl_m_tvalid && !taint_cut_q;
+        assign rl_m_tready  = taint_cut_q ? 1'b1 : rwl_s_tready;
 
-        // -- chunk boundaries by byte count, unchanged ----------------------------------------------
+        // -- chunk boundaries by byte count ---------------------------------------------------------
+        //
+        // CFG_REG (2026-09-26, build-128/133 timing): the entry admission (entry_fire_w: the host's
+        // config beat, dec_occ_q's compare and this queue's own cfg_ready) reaches the length
+        // queue through a register instead of straight into its write enable, and cfg_ready
+        // counts the length still in that register (see axis_rewrite_last). A chunk length enters
+        // the queue one cycle later; the admission itself is unchanged. The body data reaches it a
+        // cycle later too (the slice above), so the two keep their relative timing.
         logic                       rwl_tvalid, rwl_tready, rwl_tlast;
         logic [AXI_DATA_BITS-1:0]   rwl_tdata;
         logic [AXI_DATA_BITS/8-1:0] rwl_tkeep;
 
         axis_rewrite_last #(
-            .CFG_DEPTH(QUEUE_DEPTH), .NUM_DEST(1), .DEST_BITS(1)
+            .CFG_DEPTH(QUEUE_DEPTH), .NUM_DEST(1), .DEST_BITS(1), .CFG_REG(1'b1)
         ) inst_rewrite_last (
             .clk(ap_clk), .rst_n(ap_rst_n),
             .cfg_valid(entry_fire_w[d]),
@@ -875,7 +934,7 @@ module handler_slots #(
             .cfg_len  (req_data.req_chunk_bytes),
             .cfg_dest (1'b0),
             .s_tvalid(rwl_s_tvalid), .s_tready(rwl_s_tready),
-            .s_tdata (raw_tdata),  .s_tkeep (raw_tkeep),
+            .s_tdata (rl_m_tdata), .s_tkeep (rl_m_tkeep),
             .m_tvalid(rwl_tvalid), .m_tready(rwl_tready),
             .m_tdata (rwl_tdata),  .m_tkeep (rwl_tkeep),
             .m_tlast (rwl_tlast),

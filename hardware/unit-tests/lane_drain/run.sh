@@ -251,9 +251,15 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
   # (e) a connection dies with a half-written slot, and its next response is byte-exact
   for N in 2 "$NDEC"; do run_hm slots refatal "$N" HDEPTH=$H; done
   # (e2) the peer FINs right behind a response that is complete in the handler, with its decoder
-  #      stalled past CLOSE_SETTLE: FSBLEN=384 leaves the last beats in the reader->framer slice
-  #      (9811956), which the FIN drain must count as it counted them in the card fifo
-  for N in 2 "$NDEC"; do run_hm slots fsfin "$N" FSBLEN=384 HDEPTH=$H; done
+  #      stalled past CLOSE_SETTLE: FSBLEN=512 leaves the last beats in the reader->framer slice
+  #      (9811956), which the FIN drain must count as it counted them in the card fifo. It was 384
+  #      until the framer -> chunk counter slice (2026-09-26) put two more beats of buffering
+  #      downstream of the framer: the same position is now 2 x 64 bytes further on (a mutation
+  #      with the drain's fs_busy term removed fails here, as it did at 384 before). 384 now leaves
+  #      the last beats INSIDE strip_http (residue and output skid), which the drain does not
+  #      count -- a hole older than the slice, and not this case's question: d2c6e89 already fails
+  #      FSBLEN=128..256 the same way.
+  for N in 2 "$NDEC"; do run_hm slots fsfin "$N" FSBLEN=512 HDEPTH=$H; done
   done
 
   echo "--- handler_slots : pipelined GETs (CSR revision 4) ---"
