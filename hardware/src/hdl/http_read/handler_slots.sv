@@ -608,6 +608,7 @@ module handler_slots #(
     logic [N_CONNS-1:0]    rdr_release [N_DECODERS];
     logic [N_DECODERS-1:0] sh_idle, sh_fs_idle;
     logic [N_DECODERS-1:0] fs_busy;   // the reader->framer slices of decoder d hold a beat
+    logic [N_DECODERS-1:0] fs_busy_q; // fs_busy one cycle late, for the FIN drain (close_quiet_w)
 
     logic [31:0]           dec_occ_q [N_DECODERS];
     logic [N_DECODERS-1:0] body_pop_q;   // a chunk's last beat left for decoder d, one cycle ago
@@ -856,6 +857,17 @@ module handler_slots #(
         assign fs_m_tkeep  = fs_ovr_v_q ? fs_ovr_k_q : fs_tmp_k_q;
         assign fs_busy[d]    = rs_tmp_v_q || rs_ovr_v_q || fs_tmp_v_q || fs_ovr_v_q;
         assign sh_fs_idle[d] = sh_idle[d] && !fs_busy[d];
+
+        // fs_busy as the FIN drain sees it, REGISTERED (2026-09-26, build-133 timing): the four
+        // valid flops of the lane's slices went on through close_quiet_w's decoder mux into all 32
+        // connections' close_drain_q resets (-1.68 ns, 404 endpoints, SLR2 -> SLR1). Why one cycle
+        // late is exact enough: see the fs_busy term of close_quiet_w.
+        logic fs_busy_r;
+        always_ff @(posedge ap_clk) begin
+            if (!ap_rst_n) fs_busy_r <= 1'b0;
+            else           fs_busy_r <= fs_busy[d];
+        end
+        assign fs_busy_q[d] = fs_busy_r;
 
         // -- framing --------------------------------------------------------------------------------
         logic                       raw_tvalid, raw_tready;
@@ -1136,7 +1148,17 @@ module handler_slots #(
                                // aborted (lane_drain `fsfin`). fs_busy is the four valid flops of
                                // the two slices, so they keep their point: no framer ready reaches
                                // close_drain_q.
-                               !fs_busy[d];
+                               //
+                               // It is taken ONE CYCLE LATE (fs_busy_q, 2026-09-26, build-133
+                               // timing), and that never lets the drain count over a beat: the
+                               // slices only fill from the reader, and a beat entering them in the
+                               // cycle before is rdr_move_q in this one, i.e. !rdr_progress_w[d]
+                               // above is already false. So "fs_busy_q low and no progress" implies
+                               // "the slices are empty now" -- this term is true only where the
+                               // unregistered one was -- and it is false for at most one extra
+                               // cycle after they empty, which restarts the 1024-cycle drain one
+                               // cycle later, never sooner.
+                               !fs_busy_q[d];
         end
     end
 
