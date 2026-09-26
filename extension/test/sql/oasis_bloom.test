@@ -1,0 +1,603 @@
+# name: test/sql/oasis_bloom.test
+# description: Runtime Bloom filter on inner joins between two read_oasis scans
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# Joins are checked against exact values from the closed-form fixtures, some also against the same
+# join over read_parquet (`want`, the same multiset of rows: bag_diff() = 0).
+#
+# In simulation, every read_oasis scan costs a hardware flow per row group and hardware column, which
+# dominates the run time. So every join with read_oasis runs exactly once, on the smallest fixture
+# that shows what it tests, and checks of the optimizer's decision alone use EXPLAIN (it plans, so
+# the optimizer runs and logs, but executes no scan).
+#
+# Decisions are checked in duckdb_logs: the optimizer logs "Runtime Bloom filter rewrite: ..." for a
+# join it rewrites and "join skipped: ..." for one it doesn't. The probe scan logs "Runtime Bloom
+# filter: submitted ..." when it sends the build side through the filter, and "Runtime Bloom filter
+# skipped: ..." when it can't use it.
+
+statement ok
+CALL enable_logging(level = 'debug');
+
+# The macro's body is bound when it is created, so got and want have to exist. Every test replaces
+# them, and the macro is expanded again at every call.
+statement ok
+CREATE TABLE got (placeholder INTEGER);
+
+statement ok
+CREATE TABLE want (placeholder INTEGER);
+
+statement ok
+CREATE MACRO bag_diff() AS (
+    (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) +
+    (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)));
+
+statement ok
+CREATE MACRO bloom_used() AS (
+    SELECT count(*) FROM duckdb_logs WHERE message LIKE 'Runtime Bloom filter: submitted%');
+
+statement ok
+CREATE MACRO bloom_rewrites() AS (
+    SELECT count(*) FROM duckdb_logs WHERE message LIKE 'Runtime Bloom filter rewrite:%');
+
+statement ok
+CREATE MACRO bloom_skipped(reason) AS (
+    SELECT count(*) FROM duckdb_logs WHERE message LIKE 'Runtime Bloom filter skipped: %' || reason || '%');
+
+query I
+SELECT current_setting('oasis_runtime_bloom_filter');
+----
+true
+
+# ---------------------------------------------------------------------------
+# Fixtures
+#
+# The Bloom filter only takes required INT64 keys. DuckDB writes a column as required if its
+# statistics prove it has no NULLs, e.g. when it comes from a NOT NULL column. With a single thread
+# and ROW_GROUP_SIZE 1, every branch of a UNION ALL becomes its own row group.
+#
+# bf_build: b_key = 3 * b_val for b_val = 0..255, in row groups of 128 and 128 rows.
+# bf_probe: p_id = 0..637 in row groups of 250, 1, 256 and 131 rows, with p_key:
+#   - row group 0 (p_id 0..249):   7 * p_id % 1500, 49 rows match
+#   - row group 1 (p_id 250):      3, matches
+#   - row group 2 (p_id 251..506): (7 * p_id % 255) * 3 + 1, never a multiple of 3, so no row
+#                                  matches. Its keys are within the build side's min/max, so the
+#                                  row group can't be skipped: the filter drops all its rows, and
+#                                  its materialized columns are empty transfers. The Bloom filter
+#                                  (HASH_WIDTH 12) has no false positive among them.
+#   - row group 3 (p_id 507..637): 7 * p_id % 1500, 11 rows match
+# and columns of all kinds: materialized on the device (BIGINT, DOUBLE, DECIMAL(15,2)), decoded
+# in hardware and filtered on the CPU (INTEGER, DATE), and decoded on the CPU (VARCHAR).
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE bf_build_t (b_key BIGINT NOT NULL, b_val BIGINT NOT NULL);
+
+statement ok
+INSERT INTO bf_build_t SELECT i * 3, i FROM range(256) t(i);
+
+statement ok
+COPY (FROM bf_build_t WHERE b_val < 128 UNION ALL FROM bf_build_t WHERE b_val >= 128)
+TO '{TEST_DIR}/bf_build.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1);
+
+statement ok
+CREATE TABLE bf_probe_t (p_id BIGINT NOT NULL, p_key BIGINT NOT NULL, p_double DOUBLE NOT NULL,
+    p_dec DECIMAL(15, 2) NOT NULL, p_int INTEGER NOT NULL, p_date DATE NOT NULL, p_str VARCHAR NOT NULL);
+
+statement ok
+INSERT INTO bf_probe_t
+SELECT i,
+       CASE WHEN i = 250 THEN 3 WHEN i BETWEEN 251 AND 506 THEN (i * 7 % 255) * 3 + 1 ELSE i * 7 % 1500 END,
+       i * 0.5, i * 1.25, i, DATE '2020-01-01' + i::INTEGER, 's' || i
+FROM range(638) t(i);
+
+statement ok
+COPY (FROM bf_probe_t WHERE p_id < 250
+      UNION ALL FROM bf_probe_t WHERE p_id = 250
+      UNION ALL FROM bf_probe_t WHERE p_id BETWEEN 251 AND 506
+      UNION ALL FROM bf_probe_t WHERE p_id >= 507)
+TO '{TEST_DIR}/bf_probe.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1);
+
+# Extreme and duplicate keys, one row group each
+statement ok
+CREATE TABLE bf_ext_build_t (e_key BIGINT NOT NULL, e_val BIGINT NOT NULL);
+
+statement ok
+INSERT INTO bf_ext_build_t VALUES ('-9223372036854775808'::BIGINT, 1), (-5, 2), (0, 3), (7, 4), (7, 5), (9223372036854775807, 6);
+
+statement ok
+COPY bf_ext_build_t TO '{TEST_DIR}/bf_ext_build.parquet' (FORMAT parquet);
+
+statement ok
+CREATE TABLE bf_ext_probe_t (x_id BIGINT NOT NULL, x_key BIGINT NOT NULL);
+
+statement ok
+INSERT INTO bf_ext_probe_t VALUES (1, '-9223372036854775808'::BIGINT), (2, -5), (3, 0), (4, 7), (5, 7), (6, 9223372036854775807), (7, 42), (8, -42), (9, 1);
+
+# Two row groups. With more rows than bf_ext_build (9 > 6), it is the probe side
+statement ok
+COPY (FROM bf_ext_probe_t WHERE x_id <= 4 UNION ALL FROM bf_ext_probe_t WHERE x_id > 4)
+TO '{TEST_DIR}/bf_ext_probe.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1);
+
+# A key the Bloom filter can't take, one row group: s_int INTEGER (= s_id)
+statement ok
+CREATE TABLE bf_skip_t (s_id BIGINT NOT NULL, s_int INTEGER NOT NULL);
+
+statement ok
+INSERT INTO bf_skip_t SELECT i, i FROM range(8) t(i);
+
+statement ok
+COPY bf_skip_t TO '{TEST_DIR}/bf_skip.parquet' (FORMAT parquet);
+
+# A probe side with a row group larger than the hardware Bloom filter supports (131072 rows)
+statement ok
+CREATE TABLE bf_big_t (k BIGINT NOT NULL);
+
+statement ok
+INSERT INTO bf_big_t SELECT i FROM range(131078) t(i);
+
+statement ok
+COPY (FROM bf_big_t WHERE k < 131073 UNION ALL FROM bf_big_t WHERE k >= 131073)
+TO '{TEST_DIR}/bf_big.parquet' (FORMAT parquet, ROW_GROUP_SIZE 131073);
+
+statement ok
+RESET threads;
+
+# The fixtures have the layout the tests rely on
+query I
+SELECT list(num_rows ORDER BY row_group_id) FROM (
+    SELECT DISTINCT row_group_id, row_group_num_rows AS num_rows FROM parquet_metadata('{TEST_DIR}/bf_probe.parquet'));
+----
+[250, 1, 256, 131]
+
+query I
+SELECT list(num_rows ORDER BY row_group_id) FROM (
+    SELECT DISTINCT row_group_id, row_group_num_rows AS num_rows FROM parquet_metadata('{TEST_DIR}/bf_build.parquet'));
+----
+[128, 128]
+
+query I
+SELECT list(num_rows ORDER BY row_group_id) FROM (
+    SELECT DISTINCT row_group_id, row_group_num_rows AS num_rows FROM parquet_metadata('{TEST_DIR}/bf_ext_probe.parquet'));
+----
+[4, 5]
+
+query I
+SELECT list(num_rows ORDER BY row_group_id) FROM (
+    SELECT DISTINCT row_group_id, row_group_num_rows AS num_rows FROM parquet_metadata('{TEST_DIR}/bf_big.parquet'));
+----
+[131073, 5]
+
+query I
+SELECT count(*) FROM (
+    FROM parquet_schema('{TEST_DIR}/bf_probe.parquet') UNION ALL FROM parquet_schema('{TEST_DIR}/bf_build.parquet')
+    UNION ALL FROM parquet_schema('{TEST_DIR}/bf_ext_probe.parquet') UNION ALL FROM parquet_schema('{TEST_DIR}/bf_ext_build.parquet')
+    UNION ALL FROM parquet_schema('{TEST_DIR}/bf_big.parquet'))
+WHERE num_children IS NULL AND repetition_type <> 'REQUIRED';
+----
+0
+
+# ---------------------------------------------------------------------------
+# Several row groups on both sides, all kinds of columns
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str, b_key, b_val
+FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+query I
+SELECT bloom_used();
+----
+1
+
+statement ok
+CREATE OR REPLACE TABLE want AS
+SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str, b_key, b_val
+FROM read_parquet('{TEST_DIR}/bf_probe.parquet') JOIN read_parquet('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+query I
+SELECT bag_diff();
+----
+0
+
+query IIIIIIIIII
+SELECT count(*), sum(p_id), sum(p_key), sum(p_double), sum(p_dec), sum(p_int), min(p_date), max(p_date),
+       count(DISTINCT p_str), sum(b_val) FROM got;
+----
+61	10780	22713	5390.0	13475.00	10780	2020-01-01	2021-06-21	61	7571
+
+# The matches per row group, including the single row of row group 1 and none of row group 2
+query II
+SELECT CASE WHEN p_id < 250 THEN 0 WHEN p_id = 250 THEN 1 WHEN p_id <= 506 THEN 2 ELSE 3 END AS rg, count(*)
+FROM got GROUP BY rg ORDER BY rg;
+----
+0	49
+1	1
+3	11
+
+# ---------------------------------------------------------------------------
+# The optimizer's decision alone (EXPLAIN, no scan runs): an inner join is rewritten, but not with the
+# setting off, and no other join type, as they keep rows without a match on some side, which the
+# Bloom filter would drop from the probe side
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT p_id, b_val
+FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+query II
+SELECT bloom_rewrites(), bloom_used();
+----
+1	0
+
+statement ok
+SET oasis_runtime_bloom_filter = false;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT p_id, b_val
+FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+query II
+SELECT bloom_rewrites(), (SELECT count(*) FROM duckdb_logs WHERE message LIKE '%oasis_runtime_bloom_filter is off%') > 0;
+----
+0	true
+
+statement ok
+RESET oasis_runtime_bloom_filter;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT p_id, b_val
+FROM read_oasis('{TEST_DIR}/bf_probe.parquet') LEFT JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+statement ok
+EXPLAIN SELECT p_id, b_val
+FROM read_oasis('{TEST_DIR}/bf_build.parquet') RIGHT JOIN read_oasis('{TEST_DIR}/bf_probe.parquet') ON p_key = b_key;
+
+statement ok
+EXPLAIN SELECT p_id, b_val
+FROM read_oasis('{TEST_DIR}/bf_probe.parquet') FULL JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+# Semi join
+statement ok
+EXPLAIN SELECT p_id FROM read_oasis('{TEST_DIR}/bf_probe.parquet')
+WHERE EXISTS (SELECT 1 FROM read_oasis('{TEST_DIR}/bf_build.parquet') WHERE b_key = p_key);
+
+# Anti join
+statement ok
+EXPLAIN SELECT p_id FROM read_oasis('{TEST_DIR}/bf_probe.parquet')
+WHERE NOT EXISTS (SELECT 1 FROM read_oasis('{TEST_DIR}/bf_build.parquet') WHERE b_key = p_key);
+
+# Mark join
+statement ok
+EXPLAIN SELECT p_id, p_key IN (SELECT b_key FROM read_oasis('{TEST_DIR}/bf_build.parquet')) AS m
+FROM read_oasis('{TEST_DIR}/bf_probe.parquet');
+
+query I
+SELECT bloom_rewrites();
+----
+0
+
+# Operators between the probe scan and the join that decide which rows reach the join: filtering
+# the scan's rows first would change their result, so the join is not rewritten. A table function
+# only takes a sample in the `alias: function(...)` form, which samples the scan itself.
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT p_id, b_val
+FROM p: read_oasis('{TEST_DIR}/bf_probe.parquet') TABLESAMPLE reservoir(100 ROWS) REPEATABLE (42)
+JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+statement ok
+EXPLAIN SELECT p_id, b_val
+FROM (SELECT * FROM read_oasis('{TEST_DIR}/bf_probe.parquet') ORDER BY p_id LIMIT 100)
+JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+statement ok
+EXPLAIN SELECT p_id, rn, b_val
+FROM (SELECT *, row_number() OVER (ORDER BY p_id) AS rn FROM read_oasis('{TEST_DIR}/bf_probe.parquet'))
+JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
+
+query I
+SELECT bloom_rewrites();
+----
+0
+
+# ---------------------------------------------------------------------------
+# Pushed-down filters on a materialized (DOUBLE), a CPU-filtered (INTEGER) and a CPU-decoded
+# (VARCHAR) column, on top of the Bloom filter, and a filtered build side: the hardware Bloom filter
+# holds all build keys, a superset (p_id 250 passes it with b_val 1, the join drops it). With one
+# thread and one row group in flight.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads = 1;
+
+statement ok
+SET oasis_scan_groups_in_flight = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT p_id, b_val
+FROM read_oasis('{TEST_DIR}/bf_probe.parquet')
+JOIN (SELECT * FROM read_oasis('{TEST_DIR}/bf_build.parquet') WHERE b_val % 2 = 0) ON p_key = b_key
+WHERE p_double >= 20 AND p_int % 2 = 0 AND p_str NOT LIKE '%7%';
+
+query I
+SELECT bloom_used();
+----
+1
+
+statement ok
+RESET threads;
+
+statement ok
+RESET oasis_scan_groups_in_flight;
+
+statement ok
+CREATE OR REPLACE TABLE want AS
+SELECT p_id, b_val
+FROM read_parquet('{TEST_DIR}/bf_probe.parquet')
+JOIN (SELECT * FROM read_parquet('{TEST_DIR}/bf_build.parquet') WHERE b_val % 2 = 0) ON p_key = b_key
+WHERE p_double >= 20 AND p_int % 2 = 0 AND p_str NOT LIKE '%7%';
+
+query I
+SELECT bag_diff();
+----
+0
+
+query III
+SELECT count(*), sum(p_id), sum(b_val) FROM got;
+----
+21	4746	3074
+
+# ---------------------------------------------------------------------------
+# Projections: only the key is emitted, with a filter-only column
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT p_key FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key
+WHERE p_date < DATE '2021-01-01';
+
+query III
+SELECT bloom_used(), count(*), sum(p_key) FROM got;
+----
+1	50	15519
+
+# ---------------------------------------------------------------------------
+# A filter on the join key: pushed into both scans, it prunes the probe side's row group 1 (key 3)
+# by its statistics. Matches with p_key in 100..600: p_id 15..84, 231..249 and 507..513, every 3rd.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT p_id, p_key FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key
+WHERE p_key BETWEEN 100 AND 600;
+
+query IIII
+SELECT bloom_used(), (SELECT count(*) FROM duckdb_logs WHERE message LIKE 'Skipping row group 1:%') > 0, count(*), sum(p_id)
+FROM got;
+----
+1	true	34	4398
+
+query I
+SELECT sum(p_key) FROM got;
+----
+11286
+
+# ---------------------------------------------------------------------------
+# Filters the scans can't take, around the join: one across both sides (p_id < b_val * 3, i.e.
+# p_id < p_key) and one over two columns of the probe side (1.5 * p_id > 100). The second stays a
+# filter between the probe scan and the join, through which the join is still rewritten. Matches:
+# p_id 69..108 (every 3rd) and 507..537 (every 3rd).
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT p_id, b_val FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key
+WHERE p_id < b_val * 3 AND p_double + p_int > 100;
+
+query III
+SELECT bloom_used(), count(*), sum(p_id) FROM got;
+----
+1	25	6981
+
+# ---------------------------------------------------------------------------
+# ORDER BY ... LIMIT on the join result (a Top-N above the join, which also pushes a filter into
+# the probe scan): the largest matching p_id, in order
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT p_id FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key
+ORDER BY p_id DESC LIMIT 3;
+----
+537
+534
+531
+
+query I
+SELECT bloom_used();
+----
+1
+
+# ---------------------------------------------------------------------------
+# Extreme and duplicate keys (7 is twice on each side)
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT x_id, x_key, e_val
+FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key;
+
+query IIII
+SELECT bloom_used(), count(*), sum(x_id), sum(e_val) FROM got;
+----
+1	8	30	30
+
+query II
+SELECT x_key, count(*) FROM got GROUP BY x_key ORDER BY x_key;
+----
+-9223372036854775808	1
+-5	1
+0	1
+7	4
+9223372036854775807	1
+
+# ---------------------------------------------------------------------------
+# Keys the Bloom filter can't take: the join is rewritten, but the scan runs without the filter
+# ---------------------------------------------------------------------------
+
+# INTEGER keys (s_int = s_id, unique)
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(a.s_id)
+FROM read_oasis('{TEST_DIR}/bf_skip.parquet') a JOIN read_oasis('{TEST_DIR}/bf_skip.parquet') b ON a.s_int = b.s_int;
+----
+8	28
+
+query II
+SELECT bloom_used(), bloom_skipped('not a required INT64 column');
+----
+0	1
+
+# ---------------------------------------------------------------------------
+# Two joins in one query
+# ---------------------------------------------------------------------------
+
+# A chain of three scans: only the join directly between two scans is rewritten, and its filtered
+# output feeds the other join. The 8 rows of bf_ext_probe x bf_ext_build have e_val 1..6, each
+# matching b_val once (b_key = 3 * b_val).
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT x_id, e_val, b_key
+FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet')
+JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key
+JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON e_val = b_val;
+
+query IIII
+SELECT bloom_used(), count(*), sum(x_id), sum(b_key) FROM got;
+----
+1	8	30	90
+
+# Two independent rewritten joins: there is one hardware Bloom filter, so a probe scan that starts
+# while the other one holds it runs without it. Either way, both joins are correct.
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT x_id AS id, e_val AS v
+FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key
+UNION ALL
+SELECT e_val, b_val
+FROM read_oasis('{TEST_DIR}/bf_ext_build.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON e_val = b_val;
+
+query II
+SELECT bloom_used() >= 1, bloom_used() + bloom_skipped('in use by another scan');
+----
+true	2
+
+query III
+SELECT count(*), sum(id), sum(v) FROM got;
+----
+14	51	51
+
+# ---------------------------------------------------------------------------
+# Scans that end early or fail leave the Bloom filter usable
+# ---------------------------------------------------------------------------
+
+# Filters that prune every probe row group by its statistics (p_id = 250 is only in row group 1,
+# where p_int is 250), but not the file's: the probe side ends without a single chunk
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key
+WHERE p_id = 250 AND p_int = 300;
+----
+0
+
+query I
+SELECT bloom_used();
+----
+1
+
+# LIMIT stops the probe scan (bf_ext_probe, two row groups) before all its row groups are collected
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM (
+    SELECT x_id FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key
+    LIMIT 1);
+----
+1
+
+query I
+SELECT bloom_used();
+----
+1
+
+# A probe row group larger than the hardware supports fails before the filter is used. The build
+# side has fewer rows, so bf_big is the probe side.
+statement error
+SELECT count(*) FROM read_oasis('{TEST_DIR}/bf_build.parquet') JOIN read_oasis('{TEST_DIR}/bf_big.parquet') ON b_key = k;
+----
+more than the 131072 the hardware Bloom filter supports
+
+# Afterwards, the filter works as before
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(x_id) FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key;
+----
+8	30
+
+query I
+SELECT bloom_used();
+----
+1

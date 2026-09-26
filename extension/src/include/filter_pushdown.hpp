@@ -12,6 +12,10 @@ namespace duckdb {
 void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
                       std::vector<OasisScanFilter> &scan_filters);
 
+// Whether `filter` is the Bloom filter a DuckDB hash join pushed into its probe scan (a runtime
+// filter, wrapped in DuckDB's optional-filter functions).
+bool IsJoinBloomFilter(const TableFilter &filter);
+
 // Returns false if the pushed-down filters prove `group` cannot contain any matching row. Mirrors
 // the statistics-pruning logic of DuckDB's ParquetReader::PrepareRowGroupBuffer: For each projected
 // column with a filter, read the column chunk's Parquet statistics and ask the filter whether they
@@ -19,7 +23,8 @@ void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
 //
 // When the group survives, `needs_row_filter` holds one entry per lstate.scan_filters: false for
 // filters the statistics prove always-true on this group (no row-level evaluation needed, the
-// common case for dynamic join min/max filters on uniformly spread keys), true otherwise.
+// common case for dynamic join min/max filters on uniformly spread keys) and for filters that are
+// not evaluated per row at all (OasisScanFilter::row_level), true otherwise.
 bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
                             size_t group, std::vector<bool> &needs_row_filter);
 
@@ -32,7 +37,10 @@ bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &
 // lstate.current_needs_row_filter entry is false are skipped (proven always-true on this group).
 // The hardware columns must already be in scan_chunk. Slices scan_chunk to the surviving rows and
 // returns their count (0 = fully filtered, scan_chunk contents undefined).
+// If `bloom_sel` is set, only its `bloom_count` rows (the ones the runtime Bloom filter kept) are
+// considered at all.
 idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, DataChunk &scan_chunk,
-                           idx_t emit);
+                           idx_t emit, optional_ptr<const SelectionVector> bloom_sel = nullptr,
+                           idx_t bloom_count = 0);
 
 } // namespace duckdb

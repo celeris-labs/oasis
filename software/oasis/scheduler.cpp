@@ -184,7 +184,8 @@ std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capabili
     const auto &candidates = streams_by_capability_[capability_index(capability)];
 
     // Only the DECODE streams have the runtime knobs: the active span caps the candidates and the
-    // pipeline-depth knob replaces the per-stream hardware flow bound.
+    // pipeline-depth knob lowers the per-stream hardware flow bound (it never raises it: the
+    // hardware's per-flow config queues only hold max_flows entries, and writes beyond are lost).
     const bool tunable = capability == StreamCapability::DECODE;
     size_t     span    = candidates.size();
     if (tunable) {
@@ -198,7 +199,7 @@ std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capabili
         const libstf::stream_t s    = candidates[c];
         const StreamState     &ss   = *streams_[s];
         const size_t           load = ss.enqueued.load(std::memory_order_relaxed);
-        if (load >= (tunable ? depth : ss.max_flows)) {
+        if (load >= (tunable ? std::min(depth, ss.max_flows) : ss.max_flows)) {
             continue; // Flow gate full.
         }
         if (ss.max_buffers - ss.enqueued_buffers.load(std::memory_order_relaxed) < num_buffers) {

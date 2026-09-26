@@ -55,12 +55,22 @@ struct OasisScanFilter {
 	unique_ptr<TableFilter> owned_filter; // null when `filter` references a gstate-owned filter
 	const TableFilter &filter;
 	unique_ptr<TableFilterState> filter_state;
+	// False if the filter only prunes row groups and is never evaluated per row, e.g. DuckDB's own
+	// join Bloom filter where the hardware Bloom filter already filters the same column.
+	bool row_level = true;
 };
 
 struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
 	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
+
+	// Set by the Oasis optimizer extension when this scan is the probe side of a read_oasis-to-
+	// read_oasis equi-join.
+	bool runtime_bloom_enabled = false;
+	string runtime_bloom_build_filename;
+	string runtime_bloom_build_key;
+	string runtime_bloom_probe_key;
 };
 
 struct ProjectedColumn {
@@ -113,9 +123,23 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint64_t> filter_time_ns {0};
 	std::atomic<uint64_t> string_decode_time_ns {0};
 
+	// Runtime Bloom filter (bind.runtime_bloom_enabled). There is a single hardware Bloom filter, so
+	// only one scan at a time can use it: bloom_filter_held says this scan holds it (see
+	// TryAcquireBloomFilter, released in the destructor). When bloom_active, the
+	// build side was submitted as bloom_build (see SubmitBloomBuild) and every probe key chunk of
+	// this scan is also sent through the filter for its mask (projected column bloom_probe_slot).
+	// The probe side is ended in the destructor, once all probe chunks were sent.
+	bool bloom_active = false;
+	size_t bloom_probe_slot = 0;
+	bool bloom_filter_held = false;
+	oasis::SplinterResultHandle bloom_build;
+	bool bloom_build_submitted = false; // false if the build side had no rows
+
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
 	}
+
+	~OasisScanGlobalState() override;
 };
 
 // Per-worker scan state. Owns this worker's file handle (DuckDB FileHandles are not safe to share
@@ -126,7 +150,12 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 // exactly one buffer, and we then slice all columns' buffers in lockstep. The next group is loaded
 // only once the current buffers are fully emitted.
 struct OasisScanLocalState : public LocalTableFunctionState {
+	~OasisScanLocalState() override;
+
 	unique_ptr<FileHandle> file_handle;
+
+	// Copy of gstate.bloom_active: this worker's groups send probe key chunks through the filter.
+	bool bloom_active = false;
 
 	unique_ptr<ParquetReader> parquet_reader;
 	unique_ptr<ParquetReaderScanState> scan_state;
@@ -172,6 +201,16 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
 		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> cpu_buffers;
+
+		// Set only when gstate.bloom_active: the runtime Bloom filter's match mask for the
+		// probe key column, one bit per row, CELERIS_NUM_TUPLES (8) rows per byte, least
+		// significant bit first. Collected under the reserved tag gstate.projected_columns.size()
+		// (see PrefetchGroup / TryCollectGroup), since it isn't a projected column's value buffer.
+		std::shared_ptr<libstf::Buffer> bloom_mask_buffer;
+
+		// Per projected column: whether the Bloom filter materialized it, i.e. hw_buffers holds only
+		// the values of the rows the mask kept (see PrefetchGroup).
+		std::vector<bool> materialized;
 	};
 
 	std::deque<unique_ptr<PendingGroup>> inflight;
@@ -179,6 +218,15 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	bool groups_exhausted = false;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
+
+	// The current group's runtime Bloom filter match mask (see PendingGroup::bloom_mask_buffer),
+	// null when gstate.bloom_active is false. It selects the rows of every slice before any other
+	// filter (see EmitOneSlice).
+	std::shared_ptr<libstf::Buffer> current_bloom_mask;
+	// The current group's materialized columns (see PendingGroup::materialized), and the number of
+	// kept rows before the current slice: where the slice starts in their buffers.
+	std::vector<bool> current_materialized;
+	size_t current_kept_offset = 0;
 
 	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
 	std::vector<bool> current_needs_row_filter;
@@ -199,5 +247,8 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 };
 
 void RegisterOasisScanFunction(ExtensionLoader &loader);
+
+// read_oasis's cardinality callback: the file's total row count (from the Parquet metadata).
+unique_ptr<NodeStatistics> OasisScanCardinality(ClientContext &context, const FunctionData *bind_data);
 
 } // namespace duckdb
