@@ -229,6 +229,12 @@ module strip_http (
     // status on the level of `done` and caught the parser mid-"206". Content-Length was immune only
     // because it was already latched here; status now is too.
     logic [23:0] status_latched_q;
+    // status_ok, REGISTERED beside status_latched_q (2026-09-26, build-133 timing): the two 24-bit
+    // compares used to sit between status_latched_q and the handler's conn_status_bad_q / the CSR
+    // readback, across an SLR boundary whenever the framer and the handler core are placed apart
+    // (build-133: -2.02 ns, strip_http[1] in SLR2 -> handler in SLR1). Loaded in the same branch,
+    // from the same value, so it is status_latched_q's compare in every cycle: no latency.
+    logic        status_ok_q;
     logic [1:0]  status_sp_q;  // spaces seen in the status line (saturating)
     logic        hdr_started_q; // a byte of the current header block has been taken
     logic [1:0]  status_cnt_q; // status digits captured (0..3)
@@ -349,6 +355,7 @@ module strip_http (
             cl_latched_q  <= '0;
             status_q          <= '0;
             status_latched_q  <= '0;
+            status_ok_q       <= 1'b0;
             status_sp_q   <= '0;
             status_cnt_q  <= '0;
             hdr_started_q <= 1'b0;
@@ -429,6 +436,7 @@ module strip_http (
                         // here is provably the pair belonging to the response about to be framed.
                         cl_latched_q     <= cl_q;
                         status_latched_q <= status_q;
+                        status_ok_q      <= (status_q == "200") || (status_q == "206");
                         if (!cl_seen_q) begin
                             error_q <= 1'b1;
                         end else if (cl_q == 32'd0) begin
@@ -547,7 +555,7 @@ module strip_http (
     assign resp_dirty      = dirty_q;
     assign resp_error      = error_q;
     assign status_ascii    = status_latched_q;
-    assign status_ok       = (status_latched_q == "200") || (status_latched_q == "206");
+    assign status_ok       = status_ok_q;
     assign content_length  = cl_latched_q;
     assign body_remaining  = body_left_q;
 
