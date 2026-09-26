@@ -495,10 +495,14 @@ module handler_slots #(
     logic [N_CONNS-1:0]         rxd_has_pending, rxd_conn_dead;
     logic                       rxd_overflow, rxd_route_stall;
 
+    // NOTE_REG: notifications pass through a register slice before the session lookup
+    // (2026-09-26, build-133 timing; see rx_dispatch). handler_multi keeps the default, so the
+    // build-119 arm is unchanged.
     rx_dispatch #(
         .NUM_CONNS       (N_CONNS),
         .NOTIFY_DEPTH    (64),
-        .HOL_STALL_CYCLES(LANE_STALL_CYCLES)
+        .HOL_STALL_CYCLES(LANE_STALL_CYCLES),
+        .NOTE_REG        (1'b1)
     ) inst_rx_dispatch (
         .clk(ap_clk), .rst_n(ap_rst_n),
         .s_axis_notifications_TVALID(s_axis_notifications_TVALID),

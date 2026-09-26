@@ -98,6 +98,11 @@ module rx_dispatch #(
     // Cycles the head of the queue may wait on ONE connection that is accepting nothing before that
     // connection is declared dead. See the note above for the sizing argument.
     parameter int HOL_STALL_CYCLES = 65536,
+    // 1: notifications pass through a two-deep register slice before anything looks at them, so
+    // TREADY is a flop and the session lookup starts from a register of ours (2026-09-26,
+    // build-133 timing; see "THE NOTIFICATION SLICE" below). 0 is the original behaviour and the
+    // default, so handler_multi and every bench that does not ask are unchanged.
+    parameter bit  NOTE_REG     = 1'b0,
     localparam int CONN_BITS   = (NUM_CONNS > 1) ? $clog2(NUM_CONNS) : 1,
     localparam int PTR_BITS    = $clog2(NOTIFY_DEPTH),
     localparam int CNT_BITS    = $clog2(NOTIFY_DEPTH + 1),
@@ -177,8 +182,10 @@ module rx_dispatch #(
     logic [TCP_SESSION_BITS-1:0] sid_q   [NUM_CONNS];
     logic                        closed_q[NUM_CONNS];
 
-    // Combinational lookup. NUM_CONNS is small (<= 8) so a flat compare is cheaper and shallower
-    // than any encoded scheme, and it keeps the mapping visible in one place.
+    // Combinational lookup: a flat compare against every bound session. It was written for
+    // NUM_CONNS <= 8; at 32 connections it is a 32-way CAM of 16-bit compares and a priority
+    // encode (build-133: 9 levels into pend_q's clock enables), which is why NOTE_REG feeds it
+    // from a register.
     function automatic logic [CONN_BITS-1:0] conn_of(input logic [TCP_SESSION_BITS-1:0] sid);
         conn_of = '0;
         for (int i = 0; i < NUM_CONNS; i++) begin
@@ -232,13 +239,72 @@ module rx_dispatch #(
     assign nq_empty_w = (nq_cnt_q == '0);
     assign nq_full_w  = (nq_cnt_q == CNT_BITS'(NOTIFY_DEPTH));
 
+    // ---------------------------------------------------------------------------------------------
+    // THE NOTIFICATION SLICE (NOTE_REG, 2026-09-26, build-133 timing). Everything below consumes
+    // a notification through nt_valid_w / nt_data_w / nt_ready_w. Without NOTE_REG those are the
+    // port itself. With it, a two-deep slice sits in between: its output (nt_*) is one register,
+    // its spare catches the beat that arrives while the output is held, and TREADY is the spare's
+    // valid flop -- so neither the session lookup (the notification's sid through the 32-entry
+    // CAM into the per-connection pending counters, -1.42 ns from the shell's notify register
+    // slice on build-133) nor the queue-full decision reaches back into the shell any more. It
+    // is exactly the original module fed by a TOE that presents each notification one cycle
+    // later: the lookup, the enqueue, the sticky FIN and the queue-full hold are all evaluated
+    // on the slice's output in the cycle it is consumed, against the binding state of that
+    // cycle, as before. Order is preserved (a two-deep fifo), throughput is one per cycle, and
+    // the queue is still never overrun (nt_ready_w is the original TREADY rule, applied at the
+    // slice's output; the slice itself only holds two more).
+    // ---------------------------------------------------------------------------------------------
+    logic                       nt_valid_w, nt_ready_w;
+    logic [TCP_NOTIFY_BITS-1:0] nt_data_w;
+
+    if (NOTE_REG) begin : gen_note_reg
+        logic                       nr_v_q,  nr2_v_q;
+        logic [TCP_NOTIFY_BITS-1:0] nr_d_q,  nr2_d_q;
+
+        assign s_axis_notifications_TREADY = !nr2_v_q;
+
+        always_ff @(posedge clk) begin
+            if (!rst_n) begin
+                nr_v_q  <= 1'b0;
+                nr2_v_q <= 1'b0;
+            end else if (nt_ready_w || !nr_v_q) begin
+                // the output register is consumed (or empty): refill it, from the spare first
+                if (nr2_v_q) begin
+                    nr_v_q  <= 1'b1;
+                    nr2_v_q <= 1'b0;
+                end else begin
+                    nr_v_q  <= s_axis_notifications_TVALID;
+                end
+            end else if (s_axis_notifications_TVALID && !nr2_v_q) begin
+                // the output register is held: a beat arriving now waits in the spare
+                nr2_v_q <= 1'b1;
+            end
+        end
+
+        // Data registers carry no reset: they are only ever read under their valid.
+        always_ff @(posedge clk) begin
+            if (nt_ready_w || !nr_v_q) begin
+                nr_d_q <= nr2_v_q ? nr2_d_q : s_axis_notifications_TDATA;
+            end else if (s_axis_notifications_TVALID && !nr2_v_q) begin
+                nr2_d_q <= s_axis_notifications_TDATA;
+            end
+        end
+
+        assign nt_valid_w = nr_v_q;
+        assign nt_data_w  = nr_d_q;
+    end else begin : gen_note_direct
+        assign s_axis_notifications_TREADY = nt_ready_w;
+        assign nt_valid_w = s_axis_notifications_TVALID;
+        assign nt_data_w  = s_axis_notifications_TDATA;
+    end
+
     // Incoming notification, unpacked.
     logic [TCP_SESSION_BITS-1:0] note_sid_w;
     logic [TCP_LEN_BITS-1:0]     note_len_w;
     logic                        note_closed_w, note_fire_w;
-    assign note_sid_w    = s_axis_notifications_TDATA[TCP_SESSION_BITS-1:0];
-    assign note_len_w    = s_axis_notifications_TDATA[TCP_SESSION_BITS +: TCP_LEN_BITS];
-    assign note_closed_w = s_axis_notifications_TDATA[CLOSED_BIT];
+    assign note_sid_w    = nt_data_w[TCP_SESSION_BITS-1:0];
+    assign note_len_w    = nt_data_w[TCP_SESSION_BITS +: TCP_LEN_BITS];
+    assign note_closed_w = nt_data_w[CLOSED_BIT];
 
     // Every announcement with a length names one segment in the shared fifo, and needs a slot
     // whether or not its session is still bound: one for a session nobody holds is queued as an
@@ -255,8 +321,8 @@ module rx_dispatch #(
     // announcement strands its bytes in the TOE's shared fifo permanently: nobody is left to ask
     // for them and every packet behind them waits forever. Flow control loses nothing; dropping
     // loses the connection.
-    assign s_axis_notifications_TREADY = !(note_needs_slot_w && nq_full_w);
-    assign note_fire_w   = s_axis_notifications_TVALID && s_axis_notifications_TREADY;
+    assign nt_ready_w    = !(note_needs_slot_w && nq_full_w);
+    assign note_fire_w   = nt_valid_w && nt_ready_w;
 
     logic note_keep_w;
     assign note_keep_w = note_fire_w && note_needs_slot_w;
