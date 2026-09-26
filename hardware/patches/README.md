@@ -90,3 +90,30 @@ huge page costs 262144 of them and the fifth `userMap` fails against upstream's 
 OASIS maps `LIBSTF_HUGE_PAGES=10` huge pages plus one 1 GB slot page. On an `EN_MEM=0` shell (every
 bitstream up to build-122) no card shadow is allocated at all and the two constants are dead. Cost
 is 52 MB of `vzalloc`'d chunk metadata instead of 32 MB (`sizeof(struct chunk)` = 16 B).
+
+## The StreamProfiler input register (0006) — libstf
+
+`0006-libstf-stream-profiler-input-register.patch` is, like 0003/0004, not for the network submodule,
+so `apply.sh` does not handle it. It is a working-tree change to **`parcore/libstf`** (expected HEAD
+`31d98eb`), file `hardware/src/hdl/util/stream_profiler.sv`, and unlike 0003/0004 it **is** part of
+every bitstream: the build seals libstf's HDL into `hdl/ext/raw/lib1/`, so a `git submodule update`
+that wipes it silently rebuilds the old profiler. Re-apply from the repo root and confirm:
+
+```sh
+git -C parcore/libstf apply --check ../../hardware/patches/0006-libstf-stream-profiler-input-register.patch
+git -C parcore/libstf apply         ../../hardware/patches/0006-libstf-stream-profiler-input-register.patch
+git -C parcore/libstf diff --stat -- hardware/src/hdl/util   # stream_profiler.sv | 41 (32 insertions, 9 deletions)
+```
+
+(`git -C parcore/libstf apply --check --reverse ...` succeeding means it is already applied.)
+
+What it does: `StreamProfiler` takes the observed stream's `valid`, `ready` and `last`, and its own
+`stop`, through one register before anything counts them. Every ColumnChunkDecoder instantiates two of
+them (`inst_profile_in` / `inst_profile_out`, parcore `column_chunk_decoder.sv`), and the decoder's
+`in.ready` -- a deep cone out of the page header parser -- fanned out into the clock enables of the
+64-bit handshake/stalled/starved counters. On build-133 (4 decoders, placed) that was the worst path
+of the whole design, SLR2 -> SLR1: `gen_http_decoders[1]` page_header_parser -> inst_profile_in
+counters CE at -2.188 ns (-1.866 for decoder 3; 1,231 failing endpoints in 133). With every input
+registered the profiler is exactly its old self one cycle later: the same counts, reported one cycle
+late, and nothing about the observed stream changes. The instantiation is inside parcore, which is
+why the register lives in libstf and not at the call site.
