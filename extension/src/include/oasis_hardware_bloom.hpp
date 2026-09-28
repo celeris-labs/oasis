@@ -1,12 +1,15 @@
 #pragma once
 
+#include "duckdb/common/types/selection_vector.hpp"
 #include "oasis/operator.hpp"
+#include "oasis/splinter_result.hpp"
 #include "parcore/metadata/metadata.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <ostream>
+#include <string>
 
 namespace oasis {
 class OasisContext;
@@ -100,5 +103,40 @@ size_t CountBloomKeptRows(const libstf::Buffer &mask, size_t num_rows);
 // Atomic hardware lock ensuring only one scan uses the physical Bloom filter at a time.
 bool TryAcquireBloomFilter();
 void ReleaseBloomFilter();
+
+class ClientContext;
+
+// Loads build-side Parquet metadata, verifies the build key column is a valid INT64 Bloom key,
+// and constructs the BloomBuildPlan. Returns nullopt if the key is missing or incompatible.
+std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t probe_slot,
+                                             const std::string &build_filename,
+                                             const std::string &build_key);
+
+struct BloomBuildSubmission {
+	oasis::SplinterResultHandle handle;
+	bool submitted = false;
+	size_t num_chunks = 0;
+};
+
+// Submits the build side of the runtime Bloom filter to the hardware.
+// If the build side has no non-empty chunks, it immediately sends BloomInputCommand::END.
+BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisContext &ctx,
+                                         const std::string &build_filename, const BloomBuildPlan &plan);
+
+// Drains any pending build batches, pushes BloomInputCommand::END to end the probe side,
+// checks for command queue overflow, and releases the Bloom filter hardware lock.
+void TeardownHardwareBloom(oasis::OasisContext *ctx, oasis::SplinterResultHandle &bloom_build,
+                           bool bloom_filter_held, bool bloom_active, bool bloom_build_submitted);
+
+// Populates bloom_sel with the indices of rows kept by the Bloom filter mask within the slice
+// [row_offset, row_offset + emit), and returns the count of kept rows.
+idx_t ComputeBloomSliceSelection(const libstf::Buffer &mask_buf, size_t row_offset,
+                                 idx_t emit, SelectionVector &bloom_sel);
+
+// Verifies that all materialized column buffers have exactly the expected size (kept rows * 8 bytes).
+// Throws InternalException on size mismatch.
+void VerifyBloomMaterializedBuffers(const libstf::Buffer &mask_buf, size_t num_rows, size_t group_idx,
+                                   const std::vector<bool> &materialized,
+                                   const std::vector<std::shared_ptr<libstf::Buffer>> &hw_buffers);
 
 } // namespace duckdb
