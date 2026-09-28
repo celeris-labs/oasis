@@ -313,12 +313,10 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 // The single hardware Bloom filter can only serve one scan at a time: set while a scan holds it.
 // Taken without waiting (a scan that finds it in use runs without it) and released by the scan's
 // global state, possibly on another thread than the one that took it.
-// Checks whether this scan can use the runtime Bloom filter, without touching it: the probe and
-// build keys have to be required INT64 columns, the probe key a hardware column of the scan. Logs
-// why and returns nothing if not. Throws if a probe row group is too large for the hardware.
-static std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
-                                                       const OasisScanGlobalState &gstate) {
-	// The probe key column has to be one of our hardware columns: its chunks are what we filter
+// Verifies that the scan's probe key is a hardware column and a valid INT64 column, and returns its
+// projection slot index.
+static std::optional<size_t> ObtainBloomProbeSlot(ClientContext &context, const OasisScanBindData &bind,
+                                                  const OasisScanGlobalState &gstate) {
 	std::optional<size_t> probe_slot;
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
@@ -336,8 +334,11 @@ static std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, c
 		                 bind.runtime_bloom_probe_key.c_str());
 		return std::nullopt;
 	}
+	return probe_slot;
+}
 
-	// Checked before the filter is touched, so a failing scan leaves it unused
+// Throws if any probe row group exceeds the maximum size supported by the Bloom filter hardware.
+static void CheckBloomRowGroupSizes(const OasisScanBindData &bind) {
 	for (size_t group = 0; group < bind.metadata.groups.size(); group++) {
 		if (RowGroupNumRows(bind, group) > BLOOM_MAX_PROBE_ROWS) {
 			throw NotImplementedException(
@@ -347,25 +348,20 @@ static std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, c
 			    (unsigned long long)BLOOM_MAX_PROBE_ROWS);
 		}
 	}
+}
 
-	// Build side metadata, read once per scan
-	ParquetOptions parquet_opts(context);
-	ParquetReader build_reader(context, OpenFileInfo {bind.runtime_bloom_build_filename}, parquet_opts);
-	auto build_meta = BuildParcoreMetadata(build_reader);
-	auto build_col = std::find(build_meta.column_names.begin(), build_meta.column_names.end(), bind.runtime_bloom_build_key);
-	if (build_col == build_meta.column_names.end()) {
-		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' not found in '%s'.",
-		                 bind.runtime_bloom_build_key.c_str(), bind.runtime_bloom_build_filename.c_str());
-		return std::nullopt;
-	}
-	const size_t build_col_id = static_cast<size_t>(build_col - build_meta.column_names.begin());
-	if (!IsBloomKeyColumn(build_meta, build_col_id)) {
-		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' is not a required INT64 column.",
-		                 bind.runtime_bloom_build_key.c_str());
+// Checks whether this scan can use the runtime Bloom filter: validates probe slot, checks row group
+// sizes, and builds the plan from the build Parquet file.
+static std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
+                                                       const OasisScanGlobalState &gstate) {
+	auto probe_slot = ObtainBloomProbeSlot(context, bind, gstate);
+	if (!probe_slot) {
 		return std::nullopt;
 	}
 
-	return BloomBuildPlan {*probe_slot, std::move(build_meta), build_col_id};
+	CheckBloomRowGroupSizes(bind);
+
+	return BuildBloomPlan(context, *probe_slot, bind.runtime_bloom_build_filename, bind.runtime_bloom_build_key);
 }
 
 // Takes the Bloom filter for this scan if no other scan holds it (without waiting). The scan then
@@ -379,92 +375,22 @@ static bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &
 	return true;
 }
 
-// Sends the runtime Bloom filter's build side through the hardware: one flow per build row group
-// that decodes the build key chunk on decoder-stream 0 and routes it into the filter (BUILD). The
-// oasis top answers every build chunk with a one-byte ack transfer, which completes the flow. The build
-// chunks are CONTINUE except for the last one (END), which switches the filter to probing: the
-// probe key chunks the workers send later queue up behind it on the same stream. The scan has to
-// hold the filter (TryAcquireBloomFilter); ~OasisScanGlobalState ends the probe side.
+// Sends the runtime Bloom filter's build side through the hardware: delegates the build-side
+// splinter submission to SubmitBloomBuildSide, and updates the scan's global Bloom filter state.
 static void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
                              const BloomBuildPlan &plan, OasisScanGlobalState &gstate) {
 	D_ASSERT(gstate.bloom_filter_held);
-	const auto &build_meta = plan.build_meta;
-	const size_t build_col_id = plan.build_col_id;
-
-	auto &fs = FileSystem::GetFileSystem(context);
-	auto build_handle = fs.OpenFile(bind.runtime_bloom_build_filename, FileOpenFlags::FILE_FLAGS_READ);
-	auto *rdma = dynamic_cast<RDMAFileHandle *>(build_handle.get());
-
-	std::vector<const parcore::metadata::ColumnChunk *> build_chunks;
-	for (const auto &group : build_meta.groups) {
-		if (group.chunks[build_col_id].num_values != 0) {
-			build_chunks.push_back(&group.chunks[build_col_id]);
-		}
-	}
-
-	if (build_chunks.empty()) {
-		// Nothing to build: end the (empty) build side right away. No other scan can use the
-		// filter meanwhile (bloom_filter_in_use), so nothing can be queued in between.
-		PushBloomInputCommand(ctx, BloomInputCommand::END);
-	} else {
-		oasis::QuerySplinter splinter;
-		splinter.streams.reserve(build_chunks.size());
-		for (size_t k = 0; k < build_chunks.size(); k++) {
-			const auto &cc = *build_chunks[k];
-			// The last build chunk also ends the build side, in the same flow: right after its chunk
-			const bool last = k + 1 == build_chunks.size();
-
-			oasis::OperatorFlow flow;
-			flow.push_back(std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BUILD, std::nullopt, last));
-			if (rdma) {
-				flow.push_back(MakeRDMASource(*rdma, cc));
-			} else {
-				CoalescedFetcher fetcher(*build_handle, ctx.memory_pool(),
-				                         CoalescedFetcher::GroupSpan {cc.offset, cc.total_compressed_size});
-				auto range = fetcher.Register(cc.offset, cc.total_compressed_size);
-				fetcher.PrepareReads();
-				for (size_t idx = 0; idx < fetcher.num_reads(); idx++) {
-					fetcher.ExecuteMergedRead(idx);
-				}
-				flow.push_back(MakeHostSource(fetcher.Resolve(range))); // Keeps the read bytes alive
-			}
-			flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
-			    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type), cc.has_def_levels,
-			    cc.has_rep_levels));
-			// The oasis top answers a build chunk with a one-byte ack
-			flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(64), k));
-			splinter.streams.push_back(std::move(flow));
-		}
-		gstate.bloom_build = ctx.scheduler().submit(std::move(splinter));
-		gstate.bloom_build_submitted = true;
-	}
-
+	auto submission = SubmitBloomBuildSide(context, ctx, bind.runtime_bloom_build_filename, plan);
+	gstate.bloom_build = std::move(submission.handle);
+	gstate.bloom_build_submitted = submission.submitted;
 	gstate.bloom_active = true;
 	gstate.bloom_probe_slot = plan.probe_slot;
 	DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter: submitted %llu build key chunk(s) of '%s'.",
-	                 (unsigned long long)build_chunks.size(), bind.runtime_bloom_build_filename.c_str());
+	                 (unsigned long long)submission.num_chunks, bind.runtime_bloom_build_filename.c_str());
 }
 
 OasisScanGlobalState::~OasisScanGlobalState() {
-	if (!bloom_filter_held) {
-		return;
-	}
-	// Every worker has drained its probe key chunks (~OasisScanLocalState), so all their CONTINUEs
-	// were pushed: end the probe side, which also resets the filter for the next scan. If
-	// SubmitBloomBuild threw after taking the filter (!bloom_active), nothing reached the filter.
-	if (bloom_active) {
-		try {
-			while (bloom_build_submitted && bloom_build.get_next_batch()) {
-			}
-			PushBloomInputCommand(*ctx, BloomInputCommand::END);
-			if (BloomCommandQueueOverflowed(*ctx)) {
-				fprintf(stderr, "[OASIS] A hardware Bloom filter command queue overflowed, its results are not "
-				                "reliable.\n");
-			}
-		} catch (std::exception &e) {
-			fprintf(stderr, "[OASIS] Failed to end the runtime Bloom filter's probe side: %s\n", e.what());
-		}
-	ReleaseBloomFilter();
+	TeardownHardwareBloom(ctx, bloom_build, bloom_filter_held, bloom_active, bloom_build_submitted);
 }
 
 OasisScanLocalState::~OasisScanLocalState() {
@@ -844,17 +770,8 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	// The materialized columns have to hold exactly the rows the Bloom filter's mask kept
 	if (head.bloom_mask_buffer) {
-		const size_t kept = CountBloomKeptRows(*head.bloom_mask_buffer, head.num_rows);
-		for (size_t i = 0; i < head.materialized.size(); i++) {
-			const auto elem_size = gstate.projected_columns[i].elem_size;
-			if (head.materialized[i] && head.hw_buffers[i]->size != kept * elem_size) {
-				throw InternalException("Bloom filter materialized %llu values of column %llu in row group %llu, "
-				                        "but its mask kept %llu rows",
-				                        (unsigned long long)(head.hw_buffers[i]->size / elem_size),
-				                        (unsigned long long)i, (unsigned long long)head.group,
-				                        (unsigned long long)kept);
-			}
-		}
+		VerifyBloomMaterializedBuffers(*head.bloom_mask_buffer, head.num_rows, head.group,
+		                               head.materialized, head.hw_buffers);
 	}
 
 	lstate.current_buffers = std::move(head.hw_buffers);
@@ -961,16 +878,7 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	SelectionVector bloom_sel;
 	idx_t bloom_kept = emit;
 	if (bloom) {
-		const auto *mask = static_cast<const uint8_t *>(lstate.current_bloom_mask->ptr);
-		bloom_sel.Initialize(emit);
-		bloom_kept = 0;
-		for (idx_t i = 0; i < emit; i++) {
-			const size_t row = lstate.current_buf_offset + i;
-			const bool keep = (mask[row / 8] >> (row % 8)) & 1;
-			if (keep) {
-				bloom_sel.set_index(bloom_kept++, i);
-			}
-		}
+		bloom_kept = ComputeBloomSliceSelection(*lstate.current_bloom_mask, lstate.current_buf_offset, emit, bloom_sel);
 	}
 
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
