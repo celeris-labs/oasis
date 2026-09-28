@@ -126,19 +126,23 @@ bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &
 
 idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, DataChunk &scan_chunk,
                            idx_t emit, optional_ptr<const SelectionVector> candidate_sel, idx_t candidate_count) {
-	const idx_t scan_count = emit;
-	idx_t approved_tuple_count = scan_count;
-	auto &sel = lstate.filter_sel;
-	sel.Initialize(nullptr);
-	bool any_filter_ran = false;
-	if (candidate_sel) {
-		// The rows outside the candidate selection are out before any filter runs, like a filter
-		// that already ran. The filters below narrow sel in place.
-		sel.Initialize(*candidate_sel);
-		approved_tuple_count = candidate_count;
-		any_filter_ran = true;
-	}
+	/*
+	Function internals and terminology:
 
+	The function decodes CPU columns and applies filter to both CPU and HW columns.
+	It combines the results of all filters, so it can return a (consistent) subset of the rows for all columns.
+
+	This works by progressively pruning the rows as more filters are evaluated. This leads to different mappings of the original rows:
+	- Page space - all rows as stored in the parquet file.
+	- Candidate space - the rows that are selected by candidate_sel (if present, otherwise it's the same as page space).
+	- Survivor space - the rows that survive all filters so far.
+
+	HW columns are inherently in candidate space, as they are arrive (or are pruned) from the FPGA.
+	They are sliced to survivor space at the end of the function.
+
+	CPU columns are decoded from page space directly into survivor space. Every time the survivor space is pruned, ALL the CPU columns are adjusted.
+	*/
+	
 	auto *define_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->define_buf.ptr);
 	auto *repeat_ptr = reinterpret_cast<uint8_t *>(lstate.scan_state->repeat_buf.ptr);
 
@@ -147,70 +151,94 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 		return k >= lstate.current_needs_row_filter.size() || lstate.current_needs_row_filter[k];
 	};
 
+	const idx_t scan_count = candidate_sel ? candidate_count : emit;
+	idx_t approved_tuple_count = scan_count;
+	auto &sel = lstate.filter_sel;
+	sel.Initialize(nullptr);
+
 	lstate.cpu_column_read.assign(gstate.projected_columns.size(), false);
 
-	// Phase 1: CPU filter columns. The first active conjunct of a column consumes the slice from
-	// its reader via Filter() (dictionary pages evaluate the predicate once per dictionary entry);
-	// further active conjuncts filter the decoded vector in place. Every reader must consume each
-	// slice exactly once, so a column whose rows are already all rejected skips instead.
-	if (gstate.has_cpu_columns) {
-		ScopedTimer timer(lstate.string_decode_time_ns);
-		for (size_t k = 0; k < lstate.scan_filters.size(); k++) {
-			auto &scan_filter = lstate.scan_filters[k];
-			// Filter keys are output/projection indices, aligned with projected_columns and
-			// scan_chunk.data.
-			const auto &col = gstate.projected_columns[scan_filter.filter_idx];
-			if (!col.is_cpu || !filter_active(k)) {
-				continue;
-			}
-			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);
-			auto &vec = scan_chunk.data[scan_filter.filter_idx];
-			if (!lstate.cpu_column_read[scan_filter.filter_idx]) {
-				lstate.cpu_column_read[scan_filter.filter_idx] = true;
-				if (approved_tuple_count == 0) {
-					reader.Skip(scan_count);
-					continue;
-				}
-				// The reader writes into define/repeat scratch as a side effect; zero per slice so
-				// a short final slice can't inherit a previous slice's levels.
-				lstate.scan_state->define_buf.zero();
-				lstate.scan_state->repeat_buf.zero();
-				ColumnReaderInput input(scan_count, define_ptr, repeat_ptr);
-				reader.Filter(input, vec, scan_filter.filter, *scan_filter.filter_state, sel, approved_tuple_count,
-				              !any_filter_ran);
-				any_filter_ran = true;
-			} else if (approved_tuple_count > 0) {
-				ColumnReader::ApplyFilter(vec, scan_filter.filter, *scan_filter.filter_state, scan_count, sel,
-				                          approved_tuple_count);
-				any_filter_ran = true;
-			}
-		}
-	}
-
-	// Phase 2: hardware-column filters, on the already-decoded flat vectors.
+	// Step 1: hardware-column filters, evaluated directly on in-memory FPGA buffers.
 	{
 		ScopedTimer timer(lstate.filter_time_ns);
 		for (size_t k = 0; k < lstate.scan_filters.size(); k++) {
 			if (approved_tuple_count == 0) {
 				break;
 			}
+
 			auto &scan_filter = lstate.scan_filters[k];
 			const auto &col = gstate.projected_columns[scan_filter.filter_idx];
 			if (col.is_cpu || !filter_active(k)) {
 				continue;
 			}
+
 			auto &vec = scan_chunk.data[scan_filter.filter_idx];
-			UnifiedVectorFormat vdata;
-			vec.ToUnifiedFormat(vdata);
-			ColumnSegment::FilterSelection(sel, vec, vdata, scan_filter.filter, *scan_filter.filter_state, scan_count,
-			                               approved_tuple_count);
+			ColumnReader::ApplyFilter(vec, scan_filter.filter, *scan_filter.filter_state, scan_count, sel,
+			                          approved_tuple_count);
 		}
 	}
 
-	// Phase 3: remaining CPU columns, decoded only for the surviving rows. A column that is not
-	// needed -- all rows rejected, or filter-only and not emitted -- is skipped. Skips are
-	// deferred and flushed by this column's next read; leftovers at the end of a group are
-	// discarded with the readers (InitGroupCPUColumns recreates them per group).
+	auto to_page_sel = [&](const SelectionVector &current_sel, idx_t count) -> SelectionVector {
+		if (!candidate_sel) {
+			return current_sel;
+		}
+		return SelectionVector(candidate_sel->Slice(current_sel, count));
+	};
+
+	// read_cpu_column parses the CPU column and returns it in survivor space.
+	auto read_cpu_column = [&](size_t col_idx) {
+		auto &reader = lstate.scan_state->GetColumnReader(gstate.projected_columns[col_idx].column_id);
+		auto &vec = scan_chunk.data[col_idx];
+		lstate.scan_state->define_buf.zero();
+		lstate.scan_state->repeat_buf.zero();
+
+		auto reader_sel = candidate_to_page_space(sel, approved_tuple_count);
+
+		ColumnReaderInput input(emit, define_ptr, repeat_ptr);
+		reader.Select(input, vec, reader_sel, approved_tuple_count);
+		vec.Slice(reader_sel, approved_tuple_count);
+	};
+
+	// Step 2: CPU filter columns, decoded only for rows surviving hardware filters.
+	if (gstate.has_cpu_columns && approved_tuple_count > 0) {
+		ScopedTimer timer(lstate.string_decode_time_ns);
+		for (size_t k = 0; k < lstate.scan_filters.size(); k++) {
+			if (approved_tuple_count == 0) {
+				break;
+			}
+
+			auto &scan_filter = lstate.scan_filters[k];
+			const auto &col = gstate.projected_columns[scan_filter.filter_idx];
+			if (!col.is_cpu || !filter_active(k)) {
+				continue;
+			}
+
+			auto &vec = scan_chunk.data[scan_filter.filter_idx];
+			if (!lstate.cpu_column_read[scan_filter.filter_idx]) {
+				lstate.cpu_column_read[scan_filter.filter_idx] = true;
+				read_cpu_column(scan_filter.filter_idx);
+			}
+
+			SelectionVector filter_sel;
+			filter_sel.Initialize(nullptr);
+			idx_t prev_count = approved_tuple_count;
+			ColumnReader::ApplyFilter(vec, scan_filter.filter, *scan_filter.filter_state, prev_count,
+			                          filter_sel, approved_tuple_count);
+			if (approved_tuple_count < prev_count) {
+				// update survivor space
+				sel.Initialize(sel.Slice(filter_sel, approved_tuple_count));
+
+				// update all CPU columns
+				for (size_t j = 0; j < gstate.projected_columns.size(); j++) {
+					if (gstate.projected_columns[j].is_cpu && lstate.cpu_column_read[j]) {
+						scan_chunk.data[j].Slice(filter_sel, approved_tuple_count);
+					}
+				}
+			}
+		}
+	}
+
+	// Step 3: remaining emitted CPU columns, decoded only for the final surviving rows.
 	if (gstate.has_cpu_columns) {
 		ScopedTimer timer(lstate.string_decode_time_ns);
 		for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
@@ -218,31 +246,33 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 			if (!col.is_cpu || lstate.cpu_column_read[i]) {
 				continue;
 			}
+
 			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);
 			if (approved_tuple_count == 0 || !gstate.column_emitted[i]) {
-				reader.Skip(scan_count);
+				reader.Skip(emit);
 				continue;
 			}
-			lstate.scan_state->define_buf.zero();
-			lstate.scan_state->repeat_buf.zero();
-			ColumnReaderInput input(scan_count, define_ptr, repeat_ptr);
-			auto &vec = scan_chunk.data[i];
-			reader.Select(input, vec, sel, approved_tuple_count);
-			if (vec.GetVectorType() == VectorType::FLAT_VECTOR) {
-				FlatVector::SetSize(vec, count_t(scan_count));
-			}
+
+			read_cpu_column(i);
 		}
 	}
 
 	if (approved_tuple_count == 0) {
+		scan_chunk.SetChildCardinality(0);
 		return 0;
 	}
-	// Unwritten vectors (skipped filter-only columns) have stale sizes, so set instead of check.
-	scan_chunk.SetChildCardinality(scan_count);
+
+	// Slice hardware columns down to the surviving rows.
+	// CPU columns are actively sliced during filter evaluation, so they are already in the correct survivor space.
 	if (approved_tuple_count != scan_count) {
-		scan_chunk.Slice(sel, approved_tuple_count);
-		scan_chunk.CheckCardinality(approved_tuple_count);
+		for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+			if (!gstate.projected_columns[i].is_cpu) {
+				scan_chunk.data[i].Slice(sel, approved_tuple_count);
+			}
+		}
 	}
+	
+	scan_chunk.SetChildCardinality(approved_tuple_count);
 	return approved_tuple_count;
 }
 
