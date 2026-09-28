@@ -2,13 +2,24 @@
 
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "coalesced_fetcher.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis/query_splinter.hpp"
+#include "parquet_reader.hpp"
 #include "parcore/configuration.hpp"
+#include "parcore_metadata_util.hpp"
+#include "rdma_file_system.hpp"
 
 #include <coyote/cThread.hpp>
 #include <libstf/configuration.hpp>
 
+#include <algorithm>
+
 #include <atomic>
+#include <cstdio>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -81,6 +92,20 @@ public:
 };
 
 static std::atomic<bool> bloom_filter_in_use {false};
+
+std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdma,
+                                                      const parcore::metadata::ColumnChunk &cc) {
+	return std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + cc.offset, cc.total_compressed_size);
+}
+
+std::unique_ptr<oasis::SourceOperator> MakeHostSource(const CoalescedFetcher::RangeView &view) {
+	auto *slice_ptr = static_cast<uint8_t *>(view.buffer->ptr) + view.offset;
+	size_t capacity = view.buffer->capacity - view.offset;
+	auto parent = view.buffer;
+	std::shared_ptr<libstf::Buffer> slice(new libstf::Buffer {slice_ptr, view.size, capacity},
+	                                      [parent](libstf::Buffer *b) { delete b; });
+	return std::make_unique<oasis::LocalSourceOperator>(std::move(slice));
+}
 
 } // namespace
 
@@ -179,6 +204,139 @@ bool TryAcquireBloomFilter() {
 
 void ReleaseBloomFilter() {
 	bloom_filter_in_use.store(false, std::memory_order_release);
+}
+
+std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t probe_slot,
+                                             const std::string &build_filename,
+                                             const std::string &build_key) {
+	ParquetOptions parquet_opts(context);
+	ParquetReader build_reader(context, OpenFileInfo {build_filename}, parquet_opts);
+	auto build_meta = BuildParcoreMetadata(build_reader);
+	auto build_col = std::find(build_meta.column_names.begin(), build_meta.column_names.end(), build_key);
+	if (build_col == build_meta.column_names.end()) {
+		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' not found in '%s'.",
+		                 build_key.c_str(), build_filename.c_str());
+		return std::nullopt;
+	}
+	const size_t build_col_id = static_cast<size_t>(build_col - build_meta.column_names.begin());
+	if (!IsBloomKeyColumn(build_meta, build_col_id)) {
+		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' is not a required INT64 column.",
+		                 build_key.c_str());
+		return std::nullopt;
+	}
+
+	return BloomBuildPlan {probe_slot, std::move(build_meta), build_col_id};
+}
+
+BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisContext &ctx,
+                                         const std::string &build_filename, const BloomBuildPlan &plan) {
+	const auto &build_meta = plan.build_meta;
+	const size_t build_col_id = plan.build_col_id;
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto build_handle = fs.OpenFile(build_filename, FileOpenFlags::FILE_FLAGS_READ);
+	auto *rdma = dynamic_cast<RDMAFileHandle *>(build_handle.get());
+
+	std::vector<const parcore::metadata::ColumnChunk *> build_chunks;
+	for (const auto &group : build_meta.groups) {
+		if (group.chunks[build_col_id].num_values != 0) {
+			build_chunks.push_back(&group.chunks[build_col_id]);
+		}
+	}
+
+	if (build_chunks.empty()) {
+		// Nothing to build: end the (empty) build side right away. No other scan can use the
+		// filter meanwhile (bloom_filter_in_use), so nothing can be queued in between.
+		PushBloomInputCommand(ctx, BloomInputCommand::END);
+		return BloomBuildSubmission {oasis::SplinterResultHandle {}, false, 0};
+	}
+
+	oasis::QuerySplinter splinter;
+	splinter.streams.reserve(build_chunks.size());
+	for (size_t k = 0; k < build_chunks.size(); k++) {
+		const auto &cc = *build_chunks[k];
+		// The last build chunk also ends the build side, in the same flow: right after its chunk
+		const bool last = k + 1 == build_chunks.size();
+
+		oasis::OperatorFlow flow;
+		flow.push_back(std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BUILD, std::nullopt, last));
+		if (rdma) {
+			flow.push_back(MakeRDMASource(*rdma, cc));
+		} else {
+			CoalescedFetcher fetcher(*build_handle, ctx.memory_pool(),
+			                         CoalescedFetcher::GroupSpan {cc.offset, cc.total_compressed_size});
+			auto range = fetcher.Register(cc.offset, cc.total_compressed_size);
+			fetcher.PrepareReads();
+			for (size_t idx = 0; idx < fetcher.num_reads(); idx++) {
+				fetcher.ExecuteMergedRead(idx);
+			}
+			flow.push_back(MakeHostSource(fetcher.Resolve(range))); // Keeps the read bytes alive
+		}
+		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
+		    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type), cc.has_def_levels,
+		    cc.has_rep_levels));
+		// The oasis top answers a build chunk with a one-byte ack
+		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(64), k));
+		splinter.streams.push_back(std::move(flow));
+	}
+
+	auto handle = ctx.scheduler().submit(std::move(splinter));
+	return BloomBuildSubmission {std::move(handle), true, build_chunks.size()};
+}
+
+void TeardownHardwareBloom(oasis::OasisContext *ctx, oasis::SplinterResultHandle &bloom_build,
+                           bool bloom_filter_held, bool bloom_active, bool bloom_build_submitted) {
+	if (!bloom_filter_held) {
+		return;
+	}
+	// Every worker has drained its probe key chunks (~OasisScanLocalState), so all their CONTINUEs
+	// were pushed: end the probe side, which also resets the filter for the next scan. If
+	// SubmitBloomBuild threw after taking the filter (!bloom_active), nothing reached the filter.
+	if (bloom_active && ctx) {
+		try {
+			while (bloom_build_submitted && bloom_build.get_next_batch()) {
+			}
+			PushBloomInputCommand(*ctx, BloomInputCommand::END);
+			if (BloomCommandQueueOverflowed(*ctx)) {
+				fprintf(stderr, "[OASIS] A hardware Bloom filter command queue overflowed, its results are not "
+				                "reliable.\n");
+			}
+		} catch (std::exception &e) {
+			fprintf(stderr, "[OASIS] Failed to end the runtime Bloom filter's probe side: %s\n", e.what());
+		}
+	}
+	ReleaseBloomFilter();
+}
+
+idx_t ComputeBloomSliceSelection(const libstf::Buffer &mask_buf, size_t row_offset,
+                                 idx_t emit, SelectionVector &bloom_sel) {
+	const auto *mask = static_cast<const uint8_t *>(mask_buf.ptr);
+	bloom_sel.Initialize(emit);
+	idx_t bloom_kept = 0;
+	for (idx_t i = 0; i < emit; i++) {
+		const size_t row = row_offset + i;
+		const bool keep = (mask[row / 8] >> (row % 8)) & 1;
+		if (keep) {
+			bloom_sel.set_index(bloom_kept++, i);
+		}
+	}
+	return bloom_kept;
+}
+
+void VerifyBloomMaterializedBuffers(const libstf::Buffer &mask_buf, size_t num_rows, size_t group_idx,
+                                   const std::vector<bool> &materialized,
+                                   const std::vector<std::shared_ptr<libstf::Buffer>> &hw_buffers) {
+	const size_t kept = CountBloomKeptRows(mask_buf, num_rows);
+	constexpr size_t elem_size = sizeof(uint64_t);
+	for (size_t i = 0; i < materialized.size(); i++) {
+		if (materialized[i] && hw_buffers[i]->size != kept * elem_size) {
+			throw InternalException("Bloom filter materialized %llu values of column %llu in row group %llu, "
+			                        "but its mask kept %llu rows",
+			                        (unsigned long long)(hw_buffers[i]->size / elem_size),
+			                        (unsigned long long)i, (unsigned long long)group_idx,
+			                        (unsigned long long)kept);
+		}
+	}
 }
 
 } // namespace duckdb
