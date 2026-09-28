@@ -99,9 +99,9 @@ class DecodeColumnChunkOperator final : public Operator {
 
 /**
  * Sink that writes the stream's output to host buffers pre-allocated by the caller at the exact
- * transfer size. A flow ends in exactly one sink; a transfer larger than a single output-writer
- * buffer spans multiple buffers, which the hardware fills in enqueue order. apply() enqueues every
- * buffer to the FPGA's output writer for `stream`, in order.
+ * transfer size. A transfer larger than a single output-writer buffer spans multiple buffers,
+ * which the hardware fills in enqueue order. apply() enqueues every buffer to the FPGA's output
+ * writer for `stream`, in order.
  */
 class LocalSinkOperator final : public Operator {
   public:

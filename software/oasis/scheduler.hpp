@@ -106,19 +106,22 @@ class Scheduler {
     // One enqueued sink output buffer awaiting its hardware interrupt, recorded in the stream's
     // FIFO in enqueue order. Holds everything handle_completion needs without re-locking the
     // in-flight list: the buffer to surface, the tag, the splinter completion, a stable iterator
-    // to the owning in-flight slot, and whether this is the sink's final buffer (whose interrupt
+    // to the owning in-flight slot, whether this is the sink's final buffer (matching the hardware
+    // `last` interrupt flag), and whether this is the flow's final buffer (whose interrupt
     // concludes the flow).
     struct PendingCompletion {
         std::shared_ptr<libstf::Buffer>     buffer;
         size_t                              tag;
         std::shared_ptr<SplinterCompletion> completion;
         std::list<InFlight>::iterator       slot;
-        bool                                last = false;
+        bool                                sink_last = false;
+        bool                                last      = false;
     };
 
     // A queued flow waiting for the dispatcher to place it on a stream providing its capability.
-    // Carries the shared completion record of the splinter it belongs to and its sink's buffer
-    // count (the buffer-slot dispatch gate needs it before the flow is placed).
+    // Carries the shared completion record of the splinter it belongs to and the total buffer
+    // count across all of its sinks (the buffer-slot dispatch gate needs it before the flow is
+    // placed).
     struct Pending {
         OperatorFlow                        flow;
         std::shared_ptr<SplinterCompletion> completion;
