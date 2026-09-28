@@ -492,10 +492,10 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// always routes through the Bloom filter's select-gated demultiplexer, so it needs its own
 	// queued select decision -- pushed first, before the source triggers the transfer, so it's
 	// queued ahead of any data that could reach the demultiplexer.
-	auto add_decode_flow = [&](size_t k, std::unique_ptr<BloomFilterStreamSelectOperator> select, size_t sink_size,
-	                           size_t tag) {
+	auto append_decode_chunk = [&](oasis::OperatorFlow &flow, size_t k,
+	                               std::unique_ptr<BloomFilterStreamSelectOperator> select, size_t sink_size,
+	                               size_t tag) {
 		const auto &cc = *pending.hw_chunks[k];
-		oasis::OperatorFlow flow;
 		flow.push_back(std::move(select));
 		if (rdma) {
 			flow.push_back(MakeRDMASource(*rdma, cc));
@@ -505,7 +505,6 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
 		    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type)));
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(sink_size), tag));
-		splinter.streams.push_back(std::move(flow));
 	};
 	auto decoded_size = [&](size_t k) {
 		const auto &cc = *pending.hw_chunks[k];
@@ -519,9 +518,11 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// The runtime Bloom filter filters the whole row group. Its probe key chunk goes through the
 	// filter (FILTER) for its mask, one bit per row. The 64-bit columns (the key column included)
 	// follow it into the filter's materializer (MATERIALIZE), which only returns their kept rows.
+	// All Bloom filter transfers for this row group (the probe key match mask followed by the
+	// 64-bit materialized columns) are unified into a single OperatorFlow. Because a flow is
+	// scheduled atomically onto a single stream, no other flow can be interleaved between the
+	// FILTER mask transfer and its subsequent MATERIALIZE transfers.
 	// The other columns are decoded as usual and dropped by the mask on the CPU (see EmitOneSlice).
-	// The scheduler enqueues a splinter's flows back to back and dispatches them in order, so
-	// nothing of another row group gets between the key chunk and its columns.
 	//
 	// Every probe chunk is sent with CONTINUE: no worker knows which chunk will be the last one
 	// (groups are claimed dynamically and pruned), so the probe side is ended with END once
@@ -543,25 +544,31 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		// so this value never collides with one (see TryCollectGroup). One mask bit per row,
 		// CELERIS_NUM_TUPLES (8) rows packed per output byte -- see the axi_bf_mask wrapper in
 		// vfpga_top.svh.
-		add_decode_flow(*probe_k,
-		                std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::FILTER,
-		                                                                  static_cast<uint32_t>(mat_k.size())),
-		                (pending.num_rows + 7) / 8, gstate.projected_columns.size());
+		oasis::OperatorFlow bloom_flow;
+		append_decode_chunk(bloom_flow, *probe_k,
+		                    std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::FILTER,
+		                                                                      static_cast<uint32_t>(mat_k.size())),
+		                    (pending.num_rows + 7) / 8, gstate.projected_columns.size());
 		bloom_mask_flows = 1;
 
 		// Sized for all rows, the buffer's size then says how many were kept
 		for (auto k : mat_k) {
-			add_decode_flow(k, std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::MATERIALIZE),
-			                decoded_size(k), pending.hw_slot[k]);
+			append_decode_chunk(bloom_flow, k,
+			                    std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::MATERIALIZE),
+			                    decoded_size(k), pending.hw_slot[k]);
 			pending.materialized[pending.hw_slot[k]] = true;
 			is_bypassed[k] = false;
 		}
+		splinter.streams.push_back(std::move(bloom_flow));
 	}
 
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		if (is_bypassed[k]) {
-			add_decode_flow(k, std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BYPASS),
-			                decoded_size(k), pending.hw_slot[k]);
+			oasis::OperatorFlow bypass_flow;
+			append_decode_chunk(bypass_flow, k,
+			                    std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BYPASS),
+			                    decoded_size(k), pending.hw_slot[k]);
+			splinter.streams.push_back(std::move(bypass_flow));
 		}
 	}
 	pending.batches_remaining = pending.hw_slot.size() + bloom_mask_flows;
