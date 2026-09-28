@@ -1052,22 +1052,19 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	}
 
 	// The runtime Bloom filter's mask selects the slice's kept rows (bloom_sel), before any other
-	// filter. The materialized columns only hold the kept rows, so they are referenced through
-	// bloom_rank (slice row -> index of the row's value), which makes them line up with the other
-	// columns. Both are allocated per slice: the vectors we emit may reference them.
+	// filter. Both materialized and bypassed columns are prepared in bloom_kept space: materialized
+	// columns are dense flat vectors directly from the FPGA, and bypassed columns are sliced by
+	// bloom_sel down to bloom_kept rows.
 	const bool bloom = lstate.current_bloom_mask != nullptr;
 	SelectionVector bloom_sel;
-	SelectionVector bloom_rank;
 	idx_t bloom_kept = emit;
 	if (bloom) {
 		const auto *mask = static_cast<const uint8_t *>(lstate.current_bloom_mask->ptr);
 		bloom_sel.Initialize(emit);
-		bloom_rank.Initialize(emit);
 		bloom_kept = 0;
 		for (idx_t i = 0; i < emit; i++) {
 			const size_t row = lstate.current_buf_offset + i;
 			const bool keep = (mask[row / 8] >> (row % 8)) & 1;
-			bloom_rank.set_index(i, keep ? bloom_kept : 0); // A dropped row is never read, any value in range will do
 			if (keep) {
 				bloom_sel.set_index(bloom_kept++, i);
 			}
@@ -1091,7 +1088,6 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 			FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_kept_offset * col.elem_size,
 			                    count_t(bloom_kept));
 			vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
-			vec.Slice(bloom_rank, emit);
 			continue;
 		}
 		if (buf->size / col.elem_size != total_elements) {
@@ -1127,6 +1123,9 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_buf_offset * col.elem_size,
 		                    count_t(emit));
 		vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
+		if (bloom && bloom_kept > 0) {
+			vec.Slice(bloom_sel, bloom_kept);
+		}
 	}
 
 	// Decode the CPU columns and apply the pushed-down filters (late-materialized: Filter columns
