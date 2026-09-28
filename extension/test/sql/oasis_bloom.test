@@ -340,7 +340,7 @@ CALL truncate_duckdb_logs();
 
 statement ok
 CREATE OR REPLACE TABLE got AS
-SELECT p_id, b_val
+SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str, b_val
 FROM read_oasis('{TEST_DIR}/bf_probe.parquet')
 JOIN (SELECT * FROM read_oasis('{TEST_DIR}/bf_build.parquet') WHERE b_val % 2 = 0) ON p_key = b_key
 WHERE p_double >= 20 AND p_int % 2 = 0 AND p_str NOT LIKE '%7%';
@@ -358,7 +358,7 @@ RESET oasis_scan_groups_in_flight;
 
 statement ok
 CREATE OR REPLACE TABLE want AS
-SELECT p_id, b_val
+SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str, b_val
 FROM read_parquet('{TEST_DIR}/bf_probe.parquet')
 JOIN (SELECT * FROM read_parquet('{TEST_DIR}/bf_build.parquet') WHERE b_val % 2 = 0) ON p_key = b_key
 WHERE p_double >= 20 AND p_int % 2 = 0 AND p_str NOT LIKE '%7%';
@@ -368,10 +368,10 @@ SELECT bag_diff();
 ----
 0
 
-query III
-SELECT count(*), sum(p_id), sum(b_val) FROM got;
+query IIII
+SELECT count(*), sum(p_id), count(DISTINCT p_str), sum(b_val) FROM got;
 ----
-21	4746	3074
+21	4746	21	3074
 
 # ---------------------------------------------------------------------------
 # Projections: only the key is emitted, with a filter-only column
