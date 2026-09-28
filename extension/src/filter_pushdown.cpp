@@ -48,7 +48,7 @@ void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
 	}
 }
 
-bool IsJoinBloomFilter(const TableFilter &filter) {
+bool IsDuckDBJoinBloomFilter(const TableFilter &filter) {
 	if (filter.filter_type == TableFilterType::LEGACY_BLOOM_FILTER) {
 		return true;
 	}
@@ -125,17 +125,17 @@ bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &
 }
 
 idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &lstate, DataChunk &scan_chunk,
-                           idx_t emit, optional_ptr<const SelectionVector> bloom_sel, idx_t bloom_count) {
+                           idx_t emit, optional_ptr<const SelectionVector> candidate_sel, idx_t candidate_count) {
 	const idx_t scan_count = emit;
 	idx_t approved_tuple_count = scan_count;
 	auto &sel = lstate.filter_sel;
 	sel.Initialize(nullptr);
 	bool any_filter_ran = false;
-	if (bloom_sel) {
-		// The rows the runtime Bloom filter dropped are out before any filter runs, like a filter
+	if (candidate_sel) {
+		// The rows outside the candidate selection are out before any filter runs, like a filter
 		// that already ran. The filters below narrow sel in place.
-		sel.Initialize(*bloom_sel);
-		approved_tuple_count = bloom_count;
+		sel.Initialize(*candidate_sel);
+		approved_tuple_count = candidate_count;
 		any_filter_ran = true;
 	}
 
