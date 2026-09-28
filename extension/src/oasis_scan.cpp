@@ -49,109 +49,6 @@ private:
 	oasis::SplinterResultHandle result;
 };
 
-// Where decoder-stream 0's transfer goes, see the demultiplexer/multiplexer in vfpga_top.svh.
-enum class BloomStreamSelect : uint64_t {
-	FILTER = 0,     // Through the Bloom filter as a probe key chunk, yields its mask
-	BYPASS = 1,     // Around the Bloom filter, yields the decoded values unchanged
-	BUILD = 2,      // Through the Bloom filter as a build key chunk, yields a one-byte ack
-	MATERIALIZE = 3 // A 64-bit column of the last probe key chunk, yields the values of its kept rows
-};
-
-static const char *BloomStreamSelectName(BloomStreamSelect select) {
-	switch (select) {
-	case BloomStreamSelect::FILTER:
-		return "filter";
-	case BloomStreamSelect::BYPASS:
-		return "bypass";
-	case BloomStreamSelect::BUILD:
-		return "build";
-	case BloomStreamSelect::MATERIALIZE:
-		return "materialize";
-	}
-	return "unknown";
-}
-
-// Mirrors celeris's StreamConfig (parcore/libstf/hardware/src/hdl/config/stream_config.sv)
-// instantiated with NUM_STREAMS=1 in vfpga_top.svh, selecting where decoder-stream 0 routes its
-// transfer (see BloomStreamSelect).
-class BloomFilterStreamConfig : public libstf::Config {
-public:
-	static constexpr uint64_t ID = 1; // STREAM_CONFIG_ID (parcore/libstf/hardware/src/hdl/common.sv)
-
-	BloomFilterStreamConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset, uint32_t num_regs)
-	    : libstf::Config(std::move(cthread), addr_offset, num_regs) {
-	}
-
-	// Value layout is (select << 3) | data_type, matching stream_conf_t's packed layout (data_type
-	// is 3 bits, unused here).
-	void select(BloomStreamSelect select) {
-		constexpr uint64_t DATA_TYPE_BITS = 3;
-		write_register(libstf::ConfigRegister(0, static_cast<uint64_t>(select) << DATA_TYPE_BITS));
-	}
-};
-
-// Pushes one stream-select decision when applied, and for key chunks through the Bloom filter (FILTER,
-// BUILD) also their input command (CONTINUE, see BloomInputCommand) and, for probe key chunks, their
-// materialization command (the number of MATERIALIZE flows following it, see
-// PushBloomMaterializeCommand). With end_side, it also ends the side after the chunk (END): the
-// last build chunk ends the build side like this. Included once per hardware column-chunk decode flow
-// (see PrefetchGroup) so it runs on the scheduler's single dispatcher thread, under the target
-// stream's lock -- exactly like every other operator's hardware configuration -- rather than as a
-// direct call from whichever worker thread happens to be running PrefetchGroup. That's what
-// guarantees both pushes land in their hardware queues in the same relative order the
-// corresponding AXI4S transfer actually reaches the demultiplexer and the Bloom filter, even with
-// many worker threads submitting flows concurrently.
-//
-// Only correct while N_DECODERS == 1: with more than one decode stream, the scheduler
-// load-balances flows across them, and a flow that lands on a stream other than 0 never needed
-// this push at all -- there is currently no way to know in advance which stream a flow will land
-// on. Checked when the extension loads (CheckOasisHardwareBloom) and when the hardware is
-// elaborated (vfpga_top.svh).
-class BloomFilterStreamSelectOperator final : public oasis::Operator {
-public:
-	explicit BloomFilterStreamSelectOperator(BloomStreamSelect select,
-	                                         std::optional<uint32_t> materialize_columns = std::nullopt,
-	                                         bool end_side = false)
-	    : select_(select), materialize_columns_(materialize_columns), end_side_(end_side) {
-		D_ASSERT(materialize_columns_.has_value() == (select_ == BloomStreamSelect::FILTER));
-		D_ASSERT(!end_side_ || IsKeyChunk());
-	}
-
-	void apply(libstf::stream_t, oasis::OasisContext &ctx) override {
-		ctx.config<BloomFilterStreamConfig>()->select(select_);
-		if (IsKeyChunk()) {
-			PushBloomInputCommand(ctx, BloomInputCommand::CONTINUE);
-		}
-		if (materialize_columns_) {
-			PushBloomMaterializeCommand(ctx, *materialize_columns_);
-		}
-		if (end_side_) {
-			PushBloomInputCommand(ctx, BloomInputCommand::END);
-		}
-	}
-
-	void print(std::ostream &os) const override {
-		os << "BloomFilterStreamSelect(" << BloomStreamSelectName(select_);
-		if (materialize_columns_) {
-			os << ", materialize " << *materialize_columns_;
-		}
-		if (end_side_) {
-			os << ", END";
-		}
-		os << ")";
-	}
-
-private:
-	// A key chunk through the Bloom filter, which takes an input command
-	bool IsKeyChunk() const {
-		return select_ == BloomStreamSelect::FILTER || select_ == BloomStreamSelect::BUILD;
-	}
-
-	BloomStreamSelect       select_;
-	std::optional<uint32_t> materialize_columns_;
-	bool                    end_side_;
-};
-
 } // namespace
 
 unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBindInput &input,
@@ -416,38 +313,6 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 // The single hardware Bloom filter can only serve one scan at a time: set while a scan holds it.
 // Taken without waiting (a scan that finds it in use runs without it) and released by the scan's
 // global state, possibly on another thread than the one that took it.
-// TODO: Let a scan wait for the filter instead of running without it. It must not block DuckDB's
-// worker threads or the client thread (e.g. yield with an AsyncTask), and it needs the filter to be
-// taken when the scan starts and released when it ends, not at schedule time and query teardown.
-static std::atomic<bool> bloom_filter_in_use {false};
-
-// Whether the Bloom filter hardware can take this key column: 64-bit keys (the filter hashes 8 of
-// them per 512-bit beat) and exactly one decoded value per row (the mask is positional, so the
-// decoder must not drop NULLs).
-static bool IsBloomKeyColumn(const parcore::metadata::Metadata &meta, size_t col_id);
-
-// The most rows a probe row group can have: the Bloom filter's materializer holds its whole mask
-// (2^LOG_MASK_BUFF_SZ bytes with LOG_MASK_BUFF_SZ = 14, celeris
-// hardware/src/hdl/bloomfilter/mask_materializer.sv). DuckDB writes row groups of 122880 rows.
-static constexpr size_t BLOOM_MAX_PROBE_ROWS = (size_t(1) << 14) * 8;
-
-// Whether the Bloom filter can materialize this column chunk: 64-bit values (the materializer's
-// width) and exactly one decoded value per row (it pairs the i-th value with the i-th mask bit).
-static bool IsBloomMaterializableChunk(const parcore::metadata::ColumnChunk &cc) {
-	return libstf::size_of(parcore::metadata::to_libstf_type(cc.type)) == 8 && !cc.has_def_levels &&
-	       !cc.has_rep_levels;
-}
-
-static bool IsBloomKeyColumn(const parcore::metadata::Metadata &meta, size_t col_id) {
-	for (const auto &group : meta.groups) {
-		const auto &cc = group.chunks[col_id];
-		if (cc.type != parcore::metadata::Type::INT64_T || cc.has_def_levels || cc.has_rep_levels) {
-			return false;
-		}
-	}
-	return true;
-}
-
 // Checks whether this scan can use the runtime Bloom filter, without touching it: the probe and
 // build keys have to be required INT64 columns, the probe key a hardware column of the scan. Logs
 // why and returns nothing if not. Throws if a probe row group is too large for the hardware.
@@ -506,8 +371,7 @@ static std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, c
 // Takes the Bloom filter for this scan if no other scan holds it (without waiting). The scan then
 // holds it (gstate.bloom_filter_held) until ~OasisScanGlobalState, also if SubmitBloomBuild throws.
 static bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate) {
-	bool in_use = false;
-	if (!bloom_filter_in_use.compare_exchange_strong(in_use, true, std::memory_order_acquire)) {
+	if (!duckdb::TryAcquireBloomFilter()) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: the hardware Bloom filter is in use by another scan.");
 		return false;
 	}
@@ -600,8 +464,7 @@ OasisScanGlobalState::~OasisScanGlobalState() {
 		} catch (std::exception &e) {
 			fprintf(stderr, "[OASIS] Failed to end the runtime Bloom filter's probe side: %s\n", e.what());
 		}
-	}
-	bloom_filter_in_use.store(false, std::memory_order_release);
+	ReleaseBloomFilter();
 }
 
 OasisScanLocalState::~OasisScanLocalState() {
@@ -946,23 +809,6 @@ static void TopUpPrefetch(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		PrefetchGroup(context, ctx, gstate, lstate, bind, *pending);
 		lstate.inflight.push_back(std::move(pending));
 	}
-}
-
-// Number of rows the runtime Bloom filter kept: the set bits of the group's mask (see PendingGroup).
-static size_t CountBloomKeptRows(const libstf::Buffer &mask, size_t num_rows) {
-	if (mask.size < (num_rows + 7) / 8) {
-		throw InternalException("Bloom filter mask has %llu bytes for %llu rows", (unsigned long long)mask.size,
-		                        (unsigned long long)num_rows);
-	}
-	const auto *bytes = static_cast<const uint8_t *>(mask.ptr);
-	size_t kept = 0;
-	for (size_t b = 0; b < num_rows / 8; b++) {
-		kept += __builtin_popcount(bytes[b]);
-	}
-	if (num_rows % 8 != 0) {
-		kept += __builtin_popcount(bytes[num_rows / 8] & ((1u << (num_rows % 8)) - 1));
-	}
-	return kept;
 }
 
 static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,

@@ -178,7 +178,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 		}
 	}
 
-	auto to_page_sel = [&](const SelectionVector &current_sel, idx_t count) -> SelectionVector {
+	auto candidate_to_page_space = [&](const SelectionVector &current_sel, idx_t count) -> SelectionVector {
 		if (!candidate_sel) {
 			return current_sel;
 		}
