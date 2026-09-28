@@ -378,7 +378,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	// used to prune row groups, never per row
 	if (gstate.bloom_active) {
 		for (auto &scan_filter : lstate->scan_filters) {
-			if (scan_filter.filter_idx == gstate.bloom_probe_slot && IsJoinBloomFilter(scan_filter.filter)) {
+			if (scan_filter.filter_idx == gstate.bloom_probe_slot && IsDuckDBJoinBloomFilter(scan_filter.filter)) {
 				scan_filter.row_level = false;
 				DUCKDB_LOG_DEBUG(context.client, "DuckDB's join Bloom filter on '%s' only prunes row groups: the "
 				                                 "hardware Bloom filter filters its rows.",
