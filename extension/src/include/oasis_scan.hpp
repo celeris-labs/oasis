@@ -84,8 +84,7 @@ struct OasisScanBindData : public TableFunctionData {
 	// plan time, and must outlive the partition statistics it hands out (they reference it).
 	shared_ptr<ParquetReader> metadata_reader;
 
-	// Set by the Oasis optimizer extension when this scan is the probe side of a read_oasis-to-
-	// read_oasis equi-join.
+	// Set by the Oasis optimizer extension
 	bool runtime_bloom_enabled = false;
 	string runtime_bloom_build_filename;
 	string runtime_bloom_build_key;
