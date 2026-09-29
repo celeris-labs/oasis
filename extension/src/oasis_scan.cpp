@@ -220,11 +220,20 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	if (gstate.filters) {
 		BuildScanFilters(context.client, *gstate.filters, lstate->scan_filters);
 	}
-	// DuckDB's own join Bloom filter on the column the hardware Bloom filter already filters is only
-	// used to prune row groups, never per row
-	if (gstate.bloom_active) {
-		DisableRowLevelJoinBloomFilters(context.client, bind_data.runtime_bloom_probe_key,
-		                                gstate.bloom_probe_key_slot, lstate->scan_filters);
+	Value duckdb_bloom_filter;
+	bool enable_duckdb_bloom = false;
+	if (context.client.TryGetCurrentSetting("oasis_duckdb_bloom_filter", duckdb_bloom_filter) && !duckdb_bloom_filter.IsNull()) {
+		enable_duckdb_bloom = duckdb_bloom_filter.GetValue<bool>();
+	}
+
+	if (!enable_duckdb_bloom) {
+		std::vector<OasisScanFilter> new_filters;
+		for (auto &f : lstate->scan_filters) {
+			if (!IsDuckDBJoinBloomFilter(f.filter)) {
+				new_filters.push_back(std::move(f));
+			}
+		}
+		lstate->scan_filters = std::move(new_filters);
 	}
 
 	return std::move(lstate);
