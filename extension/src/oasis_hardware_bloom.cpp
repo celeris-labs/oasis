@@ -8,6 +8,7 @@
 #include "coalesced_fetcher.hpp"
 #include "oasis/oasis_context.hpp"
 #include "oasis/query_splinter.hpp"
+#include "filter_pushdown.hpp"
 #include "parquet_reader.hpp"
 #include "parcore/configuration.hpp"
 #include "parcore_metadata_util.hpp"
@@ -337,6 +338,177 @@ void VerifyBloomMaterializedBuffers(const libstf::Buffer &mask_buf, size_t num_r
 			                        (unsigned long long)kept);
 		}
 	}
+}
+
+namespace {
+
+uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
+	const auto &chunks = bind.metadata.groups[group].chunks;
+	return chunks.empty() ? 0 : chunks[0].num_values;
+}
+
+std::optional<size_t> ObtainBloomProbeSlot(ClientContext &context, const OasisScanBindData &bind,
+                                          const OasisScanGlobalState &gstate) {
+	std::optional<size_t> probe_slot;
+	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+		const auto &col = gstate.projected_columns[i];
+		if (!col.is_cpu && bind.metadata.column_names[col.column_id] == bind.runtime_bloom_probe_key) {
+			probe_slot = i;
+		}
+	}
+	if (!probe_slot) {
+		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a hardware column of this scan.",
+		                 bind.runtime_bloom_probe_key.c_str());
+		return std::nullopt;
+	}
+	if (!IsBloomKeyColumn(bind.metadata, gstate.projected_columns[*probe_slot].column_id)) {
+		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a required INT64 column.",
+		                 bind.runtime_bloom_probe_key.c_str());
+		return std::nullopt;
+	}
+	return probe_slot;
+}
+
+void CheckBloomRowGroupSizes(const OasisScanBindData &bind) {
+	for (size_t group = 0; group < bind.metadata.groups.size(); group++) {
+		if (RowGroupNumRows(bind, group) > BLOOM_MAX_PROBE_ROWS) {
+			throw NotImplementedException(
+			    "Runtime Bloom filter: row group %llu of '%s' has %llu rows, more than the %llu the hardware Bloom "
+			    "filter supports.",
+			    (unsigned long long)group, bind.filename.c_str(), (unsigned long long)RowGroupNumRows(bind, group),
+			    (unsigned long long)BLOOM_MAX_PROBE_ROWS);
+		}
+	}
+}
+
+} // namespace
+
+std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
+                                               const OasisScanGlobalState &gstate) {
+	auto probe_slot = ObtainBloomProbeSlot(context, bind, gstate);
+	if (!probe_slot) {
+		return std::nullopt;
+	}
+
+	CheckBloomRowGroupSizes(bind);
+
+	return BuildBloomPlan(context, *probe_slot, bind.runtime_bloom_build_filename, bind.runtime_bloom_build_key);
+}
+
+bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate) {
+	if (!duckdb::TryAcquireBloomFilter()) {
+		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: the hardware Bloom filter is in use by another scan.");
+		return false;
+	}
+	gstate.bloom_filter_held = true;
+	return true;
+}
+
+void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
+                      const BloomBuildPlan &plan, OasisScanGlobalState &gstate) {
+	D_ASSERT(gstate.bloom_filter_held);
+	auto submission = SubmitBloomBuildSide(context, ctx, bind.runtime_bloom_build_filename, plan);
+	gstate.bloom_build = std::move(submission.handle);
+	gstate.bloom_build_submitted = submission.submitted;
+	gstate.bloom_active = true;
+	gstate.bloom_probe_slot = plan.probe_slot;
+	DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter: submitted %llu build key chunk(s) of '%s'.",
+	                 (unsigned long long)submission.num_chunks, bind.runtime_bloom_build_filename.c_str());
+}
+
+void DisableRowLevelJoinBloomFilters(ClientContext &context, const std::string &probe_key_name,
+                                     size_t bloom_probe_slot, std::vector<OasisScanFilter> &scan_filters) {
+	for (auto &scan_filter : scan_filters) {
+		if (scan_filter.filter_idx == bloom_probe_slot && IsDuckDBJoinBloomFilter(scan_filter.filter)) {
+			scan_filter.row_level = false;
+			DUCKDB_LOG_DEBUG(context, "DuckDB's join Bloom filter on '%s' only prunes row groups: the "
+			                          "hardware Bloom filter filters its rows.",
+			                 probe_key_name.c_str());
+		}
+	}
+}
+
+void DrainInFlightBloomProbeSplinters(OasisScanLocalState &lstate) {
+	for (auto &pending : lstate.inflight) {
+		if (pending->submitted) {
+			while (pending->result.get_next_batch()) {
+			}
+		}
+	}
+}
+
+namespace {
+
+void AppendDecodeChunk(oasis::OperatorFlow &flow,
+                       oasis::OasisContext &ctx,
+                       const OasisScanLocalState::PendingGroup &pending,
+                       RDMAFileHandle *rdma,
+                       size_t k,
+                       std::unique_ptr<BloomFilterStreamSelectOperator> select,
+                       size_t sink_size,
+                       size_t tag) {
+	const auto &cc = *pending.hw_chunks[k];
+	flow.push_back(std::move(select));
+	if (rdma) {
+		flow.push_back(MakeRDMASource(*rdma, cc));
+	} else {
+		flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
+	}
+	flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
+	    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type), cc.has_def_levels,
+	    cc.has_rep_levels));
+	flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(sink_size), tag));
+}
+
+size_t DecodedChunkSize(const parcore::metadata::ColumnChunk &cc) {
+	return cc.num_values * libstf::size_of(parcore::metadata::to_libstf_type(cc.type));
+}
+
+} // namespace
+
+oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
+                                            OasisScanLocalState::PendingGroup &pending,
+                                            RDMAFileHandle *rdma,
+                                            size_t bloom_probe_slot,
+                                            size_t num_projected_columns,
+                                            std::vector<bool> &is_bypassed) {
+	std::vector<size_t> mat_k;
+	std::optional<size_t> probe_k;
+	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
+		if (pending.hw_slot[k] == bloom_probe_slot) {
+			probe_k = k;
+		}
+		if (IsBloomMaterializableChunk(*pending.hw_chunks[k])) {
+			mat_k.push_back(k);
+		}
+	}
+	D_ASSERT(probe_k); // The probe key is a hardware column (see SubmitBloomBuild)
+
+	oasis::OperatorFlow bloom_flow;
+	AppendDecodeChunk(bloom_flow, ctx, pending, rdma, *probe_k,
+	                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::FILTER,
+	                                                                    static_cast<uint32_t>(mat_k.size())),
+	                  (pending.num_rows + 7) / 8, num_projected_columns);
+
+	for (auto k : mat_k) {
+		AppendDecodeChunk(bloom_flow, ctx, pending, rdma, k,
+		                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::MATERIALIZE),
+		                  DecodedChunkSize(*pending.hw_chunks[k]), pending.hw_slot[k]);
+		pending.materialized[pending.hw_slot[k]] = true;
+		is_bypassed[k] = false;
+	}
+	return bloom_flow;
+}
+
+oasis::OperatorFlow ConstructBypassFlow(oasis::OasisContext &ctx,
+                                        const OasisScanLocalState::PendingGroup &pending,
+                                        RDMAFileHandle *rdma,
+                                        size_t k) {
+	oasis::OperatorFlow flow;
+	AppendDecodeChunk(flow, ctx, pending, rdma, k,
+	                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BYPASS),
+	                  DecodedChunkSize(*pending.hw_chunks[k]), pending.hw_slot[k]);
+	return flow;
 }
 
 } // namespace duckdb
