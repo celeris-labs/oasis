@@ -211,7 +211,7 @@ void ReleaseBloomFilter() {
 	bloom_filter_in_use.store(false, std::memory_order_release);
 }
 
-std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t probe_slot,
+std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t probe_key_slot,
                                              const std::string &build_filename,
                                              const std::string &build_key) {
 	ParquetOptions parquet_opts(context);
@@ -223,20 +223,20 @@ std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t prob
 		                 build_key.c_str(), build_filename.c_str());
 		return std::nullopt;
 	}
-	const size_t build_col_id = static_cast<size_t>(build_col - build_meta.column_names.begin());
-	if (!IsBloomKeyColumn(build_meta, build_col_id)) {
+	const size_t build_key_col_id = static_cast<size_t>(build_col - build_meta.column_names.begin());
+	if (!IsBloomKeyColumn(build_meta, build_key_col_id)) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' is not a required INT64 column.",
 		                 build_key.c_str());
 		return std::nullopt;
 	}
 
-	return BloomBuildPlan {probe_slot, std::move(build_meta), build_col_id};
+	return BloomBuildPlan {probe_key_slot, std::move(build_meta), build_key_col_id};
 }
 
 BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisContext &ctx,
                                          const std::string &build_filename, const BloomBuildPlan &plan) {
 	const auto &build_meta = plan.build_meta;
-	const size_t build_col_id = plan.build_col_id;
+	const size_t build_key_col_id = plan.build_key_col_id;
 
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto build_handle = fs.OpenFile(build_filename, FileOpenFlags::FILE_FLAGS_READ);
@@ -244,8 +244,8 @@ BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisCo
 
 	std::vector<const parcore::metadata::ColumnChunk *> build_chunks;
 	for (const auto &group : build_meta.groups) {
-		if (group.chunks[build_col_id].num_values != 0) {
-			build_chunks.push_back(&group.chunks[build_col_id]);
+		if (group.chunks[build_key_col_id].num_values != 0) {
+			build_chunks.push_back(&group.chunks[build_key_col_id]);
 		}
 	}
 
@@ -351,26 +351,26 @@ uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 	return chunks.empty() ? 0 : chunks[0].num_values;
 }
 
-std::optional<size_t> ObtainBloomProbeSlot(ClientContext &context, const OasisScanBindData &bind,
+std::optional<size_t> ObtainBloomProbeKeySlot(ClientContext &context, const OasisScanBindData &bind,
                                           const OasisScanGlobalState &gstate) {
-	std::optional<size_t> probe_slot;
+	std::optional<size_t> probe_key_slot;
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (!col.is_cpu && bind.metadata.column_names[col.column_id] == bind.runtime_bloom_probe_key) {
-			probe_slot = i;
+			probe_key_slot = i;
 		}
 	}
-	if (!probe_slot) {
+	if (!probe_key_slot) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a hardware column of this scan.",
 		                 bind.runtime_bloom_probe_key.c_str());
 		return std::nullopt;
 	}
-	if (!IsBloomKeyColumn(bind.metadata, gstate.projected_columns[*probe_slot].column_id)) {
+	if (!IsBloomKeyColumn(bind.metadata, gstate.projected_columns[*probe_key_slot].column_id)) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a required INT64 column.",
 		                 bind.runtime_bloom_probe_key.c_str());
 		return std::nullopt;
 	}
-	return probe_slot;
+	return probe_key_slot;
 }
 
 void CheckBloomRowGroupSizes(const OasisScanBindData &bind) {
@@ -389,14 +389,14 @@ void CheckBloomRowGroupSizes(const OasisScanBindData &bind) {
 
 std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
                                                const OasisScanGlobalState &gstate) {
-	auto probe_slot = ObtainBloomProbeSlot(context, bind, gstate);
-	if (!probe_slot) {
+	auto probe_key_slot = ObtainBloomProbeKeySlot(context, bind, gstate);
+	if (!probe_key_slot) {
 		return std::nullopt;
 	}
 
 	CheckBloomRowGroupSizes(bind);
 
-	return BuildBloomPlan(context, *probe_slot, bind.runtime_bloom_build_filename, bind.runtime_bloom_build_key);
+	return BuildBloomPlan(context, *probe_key_slot, bind.runtime_bloom_build_filename, bind.runtime_bloom_build_key);
 }
 
 bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate) {
@@ -415,7 +415,7 @@ void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const Oa
 	gstate.bloom_build = std::move(submission.handle);
 	gstate.bloom_build_submitted = submission.submitted;
 	gstate.bloom_active = true;
-	gstate.bloom_probe_slot = plan.probe_slot;
+	gstate.bloom_probe_key_slot = plan.probe_key_slot;
 	DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter: submitted %llu build key chunk(s) of '%s'.",
 	                 (unsigned long long)submission.num_chunks, bind.runtime_bloom_build_filename.c_str());
 }
@@ -451,9 +451,9 @@ static bool IsDuckDBJoinBloomFilter(const TableFilter &filter) {
 }
 
 void DisableRowLevelJoinBloomFilters(ClientContext &context, const std::string &probe_key_name,
-                                     size_t bloom_probe_slot, std::vector<OasisScanFilter> &scan_filters) {
+                                     size_t bloom_probe_key_slot, std::vector<OasisScanFilter> &scan_filters) {
 	for (auto &scan_filter : scan_filters) {
-		if (scan_filter.filter_idx == bloom_probe_slot && IsDuckDBJoinBloomFilter(scan_filter.filter)) {
+		if (scan_filter.filter_idx == bloom_probe_key_slot && IsDuckDBJoinBloomFilter(scan_filter.filter)) {
 			scan_filter.row_level = false;
 			DUCKDB_LOG_DEBUG(context, "DuckDB's join Bloom filter on '%s' only prunes row groups: the "
 			                          "hardware Bloom filter filters its rows.",
@@ -503,16 +503,16 @@ size_t DecodedChunkSize(const parcore::metadata::ColumnChunk &cc) {
 oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
                                             OasisScanLocalState::PendingGroup &pending,
                                             RDMAFileHandle *rdma,
-                                            size_t bloom_probe_slot,
+                                            size_t bloom_probe_key_slot,
                                             size_t num_projected_columns,
                                             std::vector<bool> &is_bypassed) {
 	std::vector<size_t> mat_k;
 	std::optional<size_t> probe_k;
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
-		if (pending.hw_slot[k] == bloom_probe_slot) {
+		if (pending.hw_slot[k] == bloom_probe_key_slot) {
 			probe_k = k;
-		}
-		if (IsBloomMaterializableChunk(*pending.hw_chunks[k])) {
+			mat_k.push_back(k);
+		} else if (IsBloomMaterializableChunk(*pending.hw_chunks[k])) {
 			mat_k.push_back(k);
 		}
 	}
