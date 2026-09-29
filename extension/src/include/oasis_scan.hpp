@@ -55,9 +55,6 @@ struct OasisScanFilter {
 	unique_ptr<TableFilter> owned_filter; // null when `filter` references a gstate-owned filter
 	const TableFilter &filter;
 	unique_ptr<TableFilterState> filter_state;
-	// False if the filter only prunes row groups and is never evaluated per row, e.g. DuckDB's own
-	// join Bloom filter where the hardware Bloom filter already filters the same column.
-	bool row_level = true;
 };
 
 struct OasisScanBindData : public TableFunctionData {
@@ -65,8 +62,7 @@ struct OasisScanBindData : public TableFunctionData {
 	parcore::metadata::Metadata metadata;
 	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
 
-	// Set by the Oasis optimizer extension when this scan is the probe side of a read_oasis-to-
-	// read_oasis equi-join.
+	// Set by the Oasis optimizer extension
 	bool runtime_bloom_enabled = false;
 	string runtime_bloom_build_filename;
 	string runtime_bloom_build_key;

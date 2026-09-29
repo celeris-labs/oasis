@@ -50,9 +50,6 @@ void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
 bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
                             size_t group, std::vector<bool> &needs_row_filter) {
 	needs_row_filter.assign(lstate.scan_filters.size(), true);
-	for (size_t k = 0; k < lstate.scan_filters.size(); k++) {
-		needs_row_filter[k] = lstate.scan_filters[k].row_level;
-	}
 	if (lstate.scan_filters.empty()) {
 		return true;
 	}
