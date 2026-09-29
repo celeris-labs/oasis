@@ -91,6 +91,8 @@ bool TryAcquireBloomFilter();
 void ReleaseBloomFilter();
 
 class ClientContext;
+class TableFilter;
+bool IsDuckDBJoinBloomFilter(const TableFilter &filter);
 
 struct BloomBuildSubmission {
 	oasis::SplinterResultHandle handle;
@@ -123,11 +125,6 @@ bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate)
 
 void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
                       const BloomBuildPlan &plan, OasisScanGlobalState &gstate);
-
-// Disables row-level evaluation for DuckDB join Bloom filters on the hardware probe column,
-// leaving them active only for row-group pruning.
-void DisableRowLevelJoinBloomFilters(ClientContext &context, const std::string &probe_key_name,
-                                     size_t bloom_probe_key_slot, std::vector<OasisScanFilter> &scan_filters);
 
 void DrainInFlightBloomProbeSplinters(OasisScanLocalState &lstate);
 
