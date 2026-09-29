@@ -12,9 +12,6 @@ namespace duckdb {
 void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
                       std::vector<OasisScanFilter> &scan_filters);
 
-// Whether `filter` is the Bloom filter a DuckDB hash join pushed into its probe scan (a runtime
-// filter, wrapped in DuckDB's optional-filter functions).
-bool IsDuckDBJoinBloomFilter(const TableFilter &filter);
 
 // Returns false if the pushed-down filters prove `group` cannot contain any matching row. Mirrors
 // the statistics-pruning logic of DuckDB's ParquetReader::PrepareRowGroupBuffer: For each projected

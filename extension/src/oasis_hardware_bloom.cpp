@@ -5,6 +5,10 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "coalesced_fetcher.hpp"
 #include "oasis/oasis_context.hpp"
 #include "oasis/query_splinter.hpp"
@@ -414,6 +418,36 @@ void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const Oa
 	gstate.bloom_probe_slot = plan.probe_slot;
 	DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter: submitted %llu build key chunk(s) of '%s'.",
 	                 (unsigned long long)submission.num_chunks, bind.runtime_bloom_build_filename.c_str());
+}
+
+static bool IsDuckDBJoinBloomFilter(const TableFilter &filter) {
+	if (filter.filter_type == TableFilterType::LEGACY_BLOOM_FILTER) {
+		return true;
+	}
+	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
+		return false;
+	}
+	// A hash join wraps its Bloom filter in an (selectivity-)optional filter, see
+	// JoinFilterPushdownInfo::PushBloomFilter
+	const Expression *expr = filter.Cast<ExpressionFilter>().expr.get();
+	while (expr && expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &func = expr->Cast<BoundFunctionExpression>();
+		const auto &name = func.Function().GetName();
+		if (name == BloomFilterScalarFun::NAME) {
+			return true;
+		}
+		if (!func.BindInfo()) {
+			return false;
+		}
+		if (name == SelectivityOptionalFilterScalarFun::NAME) {
+			expr = func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().child_filter_expr.get();
+		} else if (name == OptionalFilterScalarFun::NAME) {
+			expr = func.BindInfo()->Cast<OptionalFilterFunctionData>().child_filter_expr.get();
+		} else {
+			return false;
+		}
+	}
+	return false;
 }
 
 void DisableRowLevelJoinBloomFilters(ClientContext &context, const std::string &probe_key_name,
