@@ -2,7 +2,9 @@
 
 #include "duckdb/common/types/selection_vector.hpp"
 #include "oasis/operator.hpp"
+#include "oasis/query_splinter.hpp"
 #include "oasis/splinter_result.hpp"
+#include "oasis_scan.hpp"
 #include "parcore/metadata/metadata.hpp"
 
 #include <cstddef>
@@ -138,5 +140,45 @@ idx_t ComputeBloomSliceSelection(const libstf::Buffer &mask_buf, size_t row_offs
 void VerifyBloomMaterializedBuffers(const libstf::Buffer &mask_buf, size_t num_rows, size_t group_idx,
                                    const std::vector<bool> &materialized,
                                    const std::vector<std::shared_ptr<libstf::Buffer>> &hw_buffers);
+
+// Validates probe key column, checks that all row group sizes fit within BLOOM_MAX_PROBE_ROWS,
+// and builds the BloomBuildPlan from the build Parquet file. Returns std::nullopt if the probe key
+// is missing or incompatible.
+std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
+                                               const OasisScanGlobalState &gstate);
+
+// Attempts to acquire the hardware Bloom filter for this scan. Returns true if acquired and sets
+// gstate.bloom_filter_held.
+bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate);
+
+// Submits the runtime Bloom filter build side and updates gstate with the build handle and active flag.
+void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
+                      const BloomBuildPlan &plan, OasisScanGlobalState &gstate);
+
+// Disables row-level evaluation for DuckDB join Bloom filters on the hardware probe column,
+// leaving them active only for row-group pruning.
+void DisableRowLevelJoinBloomFilters(ClientContext &context, const std::string &probe_key_name,
+                                     size_t bloom_probe_slot, std::vector<OasisScanFilter> &scan_filters);
+
+// Drains any submitted but unfinished splinters in the worker's inflight queue on early termination,
+// ensuring all probe transfers finish before the probe side is ended.
+void DrainInFlightBloomProbeSplinters(OasisScanLocalState &lstate);
+
+class RDMAFileHandle;
+
+// Constructs the unified Bloom filter probe flow (FILTER mask transfer + MATERIALIZE column transfers)
+// for this row group and marks materialized columns.
+oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
+                                            OasisScanLocalState::PendingGroup &pending,
+                                            RDMAFileHandle *rdma,
+                                            size_t bloom_probe_slot,
+                                            size_t num_projected_columns,
+                                            std::vector<bool> &is_bypassed);
+
+// Constructs a bypass decode flow for column chunk k (routing around the Bloom filter).
+oasis::OperatorFlow ConstructBypassFlow(oasis::OasisContext &ctx,
+                                        const OasisScanLocalState::PendingGroup &pending,
+                                        RDMAFileHandle *rdma,
+                                        size_t k);
 
 } // namespace duckdb
