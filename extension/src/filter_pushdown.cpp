@@ -95,7 +95,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 	/*
 	Function internals and terminology:
 
-	The function decodes CPU columns and applies filter to both CPU and HW columns.
+	The function decodes CPU columns and applies filters to both CPU and HW columns.
 	It combines the results of all filters, so it can return a (consistent) subset of the rows for all columns.
 
 	This works by progressively pruning the rows as more filters are evaluated. This leads to different mappings of the original rows:
@@ -151,8 +151,8 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 		return SelectionVector(candidate_sel->Slice(current_sel, count));
 	};
 
-	// read_cpu_column parses the CPU column and returns it in survivor space.
-	auto read_cpu_column = [&](size_t col_idx) {
+	// read_cpu_column parses the CPU column and stores it in survivor space.
+	auto read_cpu_column = [&](size_t col_idx) -> void {
 		auto &reader = lstate.scan_state->GetColumnReader(gstate.projected_columns[col_idx].column_id);
 		auto &vec = scan_chunk.data[col_idx];
 		lstate.scan_state->define_buf.zero();
@@ -179,11 +179,11 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 				continue;
 			}
 
-			auto &vec = scan_chunk.data[scan_filter.filter_idx];
 			if (!lstate.cpu_column_read[scan_filter.filter_idx]) {
 				lstate.cpu_column_read[scan_filter.filter_idx] = true;
 				read_cpu_column(scan_filter.filter_idx);
 			}
+			auto &vec = scan_chunk.data[scan_filter.filter_idx];
 
 			SelectionVector filter_sel;
 			filter_sel.Initialize(nullptr); // (full) identity
