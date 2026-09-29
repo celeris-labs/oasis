@@ -123,7 +123,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 	const idx_t scan_count = candidate_sel ? candidate_count : emit;
 	idx_t approved_tuple_count = scan_count;
 	auto &sel = lstate.filter_sel;
-	sel.Initialize(nullptr);
+	sel.Initialize(nullptr); // (full) identity
 
 	lstate.cpu_column_read.assign(gstate.projected_columns.size(), false);
 
@@ -189,7 +189,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 			}
 
 			SelectionVector filter_sel;
-			filter_sel.Initialize(nullptr);
+			filter_sel.Initialize(nullptr); // (full) identity
 			idx_t prev_count = approved_tuple_count;
 			ColumnReader::ApplyFilter(vec, scan_filter.filter, *scan_filter.filter_state, prev_count,
 			                          filter_sel, approved_tuple_count);

@@ -137,10 +137,10 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	// only one scan at a time can use it: bloom_filter_held says this scan holds it (see
 	// TryAcquireBloomFilter, released in the destructor). When bloom_active, the
 	// build side was submitted as bloom_build (see SubmitBloomBuild) and every probe key chunk of
-	// this scan is also sent through the filter for its mask (projected column bloom_probe_slot).
+	// this scan is also sent through the filter for its mask (projected column bloom_probe_key_slot).
 	// The probe side is ended in the destructor, once all probe chunks were sent.
 	bool bloom_active = false;
-	size_t bloom_probe_slot = 0;
+	size_t bloom_probe_key_slot = 0;
 	bool bloom_filter_held = false;
 	oasis::SplinterResultHandle bloom_build;
 	bool bloom_build_submitted = false; // false if the build side had no rows
