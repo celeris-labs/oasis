@@ -159,6 +159,10 @@ static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimize
 			probe_key = left_key;
 		}
 
+		if (probe_bind->runtime_bloom_enabled) {
+			continue;
+		}
+
 		probe_bind->runtime_bloom_enabled = true;
 		probe_bind->runtime_bloom_build_filename = build_bind->filename;
 		probe_bind->runtime_bloom_build_key = build_key;
