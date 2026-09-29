@@ -241,7 +241,7 @@ if (NUM_DECODERS != 1) $error({"The Bloom filter requires exactly one decoder: s
     "queue and misroute its transfers."});
 
 // The stream config's `select` chooses, per flow, where decoder-stream 0's transfer goes. Pushed
-// per flow by BloomFilterStreamSelectOperator (oasis_scan.cpp), not configured once here:
+// per flow by BloomFilterStreamSelectOperator (oasis_scan.cpp):
 //   0 (FILTER): through the Bloom filter as a probe key chunk, yields its mask (axi_bf_mask)
 //   1 (BYPASS): around the Bloom filter, yields decoded_axi[0] unchanged (axi_bf_bypass)
 //   2 (BUILD):  through the Bloom filter as a build key chunk, yields a one-byte ack (axi_bf_ack)
@@ -363,10 +363,7 @@ BloomfilterOperator inst_bloomfilter_operator (
     .probe_mat_out(bf_probe_mat_out)
 );
 
-// raw_out is the Bloomfilter core's compacted (DataNormalizer/ENABLE_COMPACTOR) surviving-key
-// stream: fewer elements than went in, and not aligned with the original row positions, so it
-// can't feed a fixed-cc.num_values sink. We don't use it -- drain it unconditionally. The surviving
-// keys are materialized like any other probe column instead.
+// We don't use it -- drain it unconditionally. The surviving keys are materialized like any other probe column instead.
 assign axi_bf_out.tready = 1'b1;
 
 // The materialized probe values: one transfer per MATERIALIZE transfer, with only the kept rows
@@ -384,14 +381,6 @@ NDataToAXI #(
     .out(axi_bf_mat)
 );
 
-// mask_out is a tuple_mask_t (CELERIS_NUM_TUPLES = 8 bits = 1 byte) keep-bit-per-row mask, one
-// per decoded beat of axi_bf_in, emitted *before* raw_out's compaction -- so unlike raw_out it
-// stays positionally aligned 1:1 with the probe key column's rows. The mask bytes are packed into
-// full beats (the output writer only takes normalized streams: every beat full but the last), so a
-// probe chunk of n rows yields ceil(n / 8) bytes. There is one mask transfer per probe key chunk (the
-// Bloom filter frames its mask per input transfer). Software submits the probe key column chunk
-// with FILTER for this mask, and then its 64-bit columns (the key column included) with
-// MATERIALIZE for their kept rows -- see PrefetchGroup in oasis_scan.cpp.
 ndata_i #(tuple_mask_t, 1) bf_mask_ndata(clk, rst_n);
 `DATA_ASSIGN(bf_mask_out, bf_mask_ndata)
 

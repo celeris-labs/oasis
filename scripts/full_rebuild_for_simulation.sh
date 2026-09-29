@@ -7,17 +7,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/opt}"
 
-# 1. Purge any previously installed Coyote (and its simulation driver)/libstf/parcore/oasis artifacts. These sit on
-#    $PREFIX/include, which is a PUBLIC include dir of the `libstf` CMake target (via
-#    JEMALLOC_INCLUDE_DIRS) and therefore leaks into every downstream target's include path.
-#    If left behind, stale headers here can silently shadow the fresh ones checked out below,
-#    even though the library itself gets rebuilt and reinstalled correctly.
+# 1. Purge any previously installed Coyote (and its simulation driver)/libstf/parcore/oasis artifacts.
 rm -rf "$PREFIX"/include/{coyote,coyotesim,libstf,parcore,oasis} \
        "$PREFIX"/lib/{libcoyote.so,libcoyotesim.so,liblibstf.so,libparcore.so,liboasis.so} \
        "$PREFIX"/lib/cmake/{Coyote,CoyoteSimulation,libstf,parcore,oasis}
 
-# 2. Rebuild and reinstall the Coyote simulation driver (libcoyotesim.so): it runs xsim and moves
-#    the software's transfers to and from it. The extension links it with EN_SIMULATION.
+# 2. Rebuild and reinstall the Coyote simulation driver (libcoyotesim.so).
 COYOTE_SIM_SW="$REPO_ROOT/parcore/libstf/coyote/sim/sw"
 rm -rf "$COYOTE_SIM_SW/build"
 cmake -S "$COYOTE_SIM_SW" -B "$COYOTE_SIM_SW/build" -DCMAKE_INSTALL_PREFIX="$PREFIX"
@@ -47,6 +42,7 @@ make -C "$REPO_ROOT/extension" EXT_FLAGS="-DEN_SIMULATION=ON" -j
 cat <<EOF
 
 Done. To run the extension in simulation, set in your shell:
+  module load vivado/2024.2
   export COYOTE_SIM_DIR="$REPO_ROOT/hardware/build-sim"
   export LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib64\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 EOF
