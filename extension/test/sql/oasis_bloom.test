@@ -601,3 +601,22 @@ query I
 SELECT bloom_used();
 ----
 1
+
+# A star join where the same table acts as a probe for multiple build tables.
+# The optimizer visits the innermost join directly between two scans and rewrites it.
+# The outer join's left child is the inner join, so it's not directly between two scans.
+# Our patch prevents any silent overwrite if the optimizer were to visit it again.
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT x_id, e_val, s_int
+FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet')
+JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key
+JOIN read_oasis('{TEST_DIR}/bf_skip.parquet') ON x_key = s_id;
+
+query II
+SELECT bloom_used(), bloom_rewrites();
+----
+1	1
