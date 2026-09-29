@@ -420,7 +420,7 @@ void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const Oa
 	                 (unsigned long long)submission.num_chunks, bind.runtime_bloom_build_filename.c_str());
 }
 
-static bool IsDuckDBJoinBloomFilter(const TableFilter &filter) {
+bool IsDuckDBJoinBloomFilter(const TableFilter &filter) {
 	if (filter.filter_type == TableFilterType::LEGACY_BLOOM_FILTER) {
 		return true;
 	}
@@ -450,17 +450,7 @@ static bool IsDuckDBJoinBloomFilter(const TableFilter &filter) {
 	return false;
 }
 
-void DisableRowLevelJoinBloomFilters(ClientContext &context, const std::string &probe_key_name,
-                                     size_t bloom_probe_key_slot, std::vector<OasisScanFilter> &scan_filters) {
-	for (auto &scan_filter : scan_filters) {
-		if (scan_filter.filter_idx == bloom_probe_key_slot && IsDuckDBJoinBloomFilter(scan_filter.filter)) {
-			scan_filter.row_level = false;
-			DUCKDB_LOG_DEBUG(context, "DuckDB's join Bloom filter on '%s' only prunes row groups: the "
-			                          "hardware Bloom filter filters its rows.",
-			                 probe_key_name.c_str());
-		}
-	}
-}
+
 
 void DrainInFlightBloomProbeSplinters(OasisScanLocalState &lstate) {
 	for (auto &pending : lstate.inflight) {
