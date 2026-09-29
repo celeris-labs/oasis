@@ -2,9 +2,7 @@
 
 #include "column_reader.hpp"
 #include "duckdb/logging/log_manager.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
-#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "parquet_reader.hpp"
@@ -48,35 +46,6 @@ void BuildScanFilters(ClientContext &context, const TableFilterSet &filters,
 	}
 }
 
-bool IsDuckDBJoinBloomFilter(const TableFilter &filter) {
-	if (filter.filter_type == TableFilterType::LEGACY_BLOOM_FILTER) {
-		return true;
-	}
-	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER) {
-		return false;
-	}
-	// A hash join wraps its Bloom filter in an (selectivity-)optional filter, see
-	// JoinFilterPushdownInfo::PushBloomFilter
-	const Expression *expr = filter.Cast<ExpressionFilter>().expr.get();
-	while (expr && expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-		auto &func = expr->Cast<BoundFunctionExpression>();
-		const auto &name = func.Function().GetName();
-		if (name == BloomFilterScalarFun::NAME) {
-			return true;
-		}
-		if (!func.BindInfo()) {
-			return false;
-		}
-		if (name == SelectivityOptionalFilterScalarFun::NAME) {
-			expr = func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>().child_filter_expr.get();
-		} else if (name == OptionalFilterScalarFun::NAME) {
-			expr = func.BindInfo()->Cast<OptionalFilterFunctionData>().child_filter_expr.get();
-		} else {
-			return false;
-		}
-	}
-	return false;
-}
 
 bool RowGroupMatchesFilters(ClientContext &context, const OasisScanGlobalState &gstate, OasisScanLocalState &lstate,
                             size_t group, std::vector<bool> &needs_row_filter) {
