@@ -57,6 +57,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Bloom filter (decided when the query is planned)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
+	config.AddExtensionOption("oasis_duckdb_bloom_filter",
+	                          "Enable DuckDB's native join Bloom filters on read_oasis scans",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
 
