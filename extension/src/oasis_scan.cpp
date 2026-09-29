@@ -287,7 +287,7 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	// used to prune row groups, never per row
 	if (gstate.bloom_active) {
 		DisableRowLevelJoinBloomFilters(context.client, bind_data.runtime_bloom_probe_key,
-		                                gstate.bloom_probe_slot, lstate->scan_filters);
+		                                gstate.bloom_probe_key_slot, lstate->scan_filters);
 	}
 
 	return std::move(lstate);
@@ -413,7 +413,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// the whole scan is done (see ~OasisScanGlobalState).
 	if (gstate.bloom_active) {
 		splinter.streams.push_back(ConstructBloomProbeFlow(ctx, pending, rdma,
-		                                                   gstate.bloom_probe_slot,
+		                                                   gstate.bloom_probe_key_slot,
 		                                                   gstate.projected_columns.size(), is_bypassed));
 		bloom_mask_flows = 1;
 	}
