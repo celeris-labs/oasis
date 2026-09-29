@@ -209,9 +209,7 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> cpu_buffers;
 
 		// Set only when gstate.bloom_active: the runtime Bloom filter's match mask for the
-		// probe key column, one bit per row, CELERIS_NUM_TUPLES (8) rows per byte, least
-		// significant bit first. Collected under the reserved tag gstate.projected_columns.size()
-		// (see PrefetchGroup / TryCollectGroup), since it isn't a projected column's value buffer.
+		// probe key column, one bit per row, least significant bit first.
 		std::shared_ptr<libstf::Buffer> bloom_mask_buffer;
 
 		// Per projected column: whether the Bloom filter materialized it, i.e. hw_buffers holds only
@@ -226,8 +224,7 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 
 	// The current group's runtime Bloom filter match mask (see PendingGroup::bloom_mask_buffer),
-	// null when gstate.bloom_active is false. It selects the rows of every slice before any other
-	// filter (see EmitOneSlice).
+	// null when gstate.bloom_active is false.
 	std::shared_ptr<libstf::Buffer> current_bloom_mask;
 	// The current group's materialized columns (see PendingGroup::materialized), and the number of
 	// kept rows before the current slice: where the slice starts in their buffers.

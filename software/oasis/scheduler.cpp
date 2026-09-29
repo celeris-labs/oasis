@@ -144,7 +144,6 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
                 total_buffers += s->buffers().size();
             }
         }
-        assert(total_buffers > 0 && "flow has no sink");
 
         pending.num_buffers    = total_buffers;
         const auto &candidates = streams_by_capability_[capability_index(pending.capability)];
