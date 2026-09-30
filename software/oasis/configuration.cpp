@@ -1,4 +1,5 @@
 #include <cstring>
+#include <stdexcept>
 #include <string>
 
 #include <oasis/configuration.hpp>
@@ -31,5 +32,35 @@ void ReadReqConfig::enqueue_read(libstf::stream_t stream, size_t vaddr, size_t s
 }
 
 const libstf::stream_t ReadReqConfig::num_streams() const { return num_streams_; }
+
+GenericConfig::GenericConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
+                             uint32_t num_regs)
+    : Config(cthread, addr_offset, num_regs) {}
+
+uint64_t GenericConfig::notify_count() {
+    return read_register(GENERIC_CONFIG_NOTIFY_COUNT_REG).value();
+}
+
+bool GenericConfig::has_bypass_profile() const {
+    return num_regs >= GENERIC_CONFIG_BYPASS_PROFILE_REG + NUM_BYPASS_PROFILE_REGS;
+}
+
+parcore::StreamProfile GenericConfig::read_bypass_profile() {
+    if (!has_bypass_profile()) {
+        throw std::runtime_error(
+            "Hardware design on device has no bypass StreamProfiler (non-RDMA build?)");
+    }
+
+    // Ascending order matters: the hardware resets the profiler when the last counter is read.
+    auto base = GENERIC_CONFIG_BYPASS_PROFILE_REG;
+
+    parcore::StreamProfile profile;
+    profile.handshakes_cycles = read_register(base + 0).value();
+    profile.starved_cycles    = read_register(base + 1).value();
+    profile.stalled_cycles    = read_register(base + 2).value();
+    profile.idle_cycles       = read_register(base + 3).value();
+    profile.last_handshakes   = read_register(base + 4).value();
+    return profile;
+}
 
 } // namespace oasis

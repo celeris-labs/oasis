@@ -57,6 +57,11 @@ public:
         return global_config_.get_config<T>();
     }
 
+    template <typename T>
+    bool has_config() {
+        return global_config_.has_config(T::ID);
+    }
+
     bool isRDMAEnabled() const { return rdma_enabled_; }
 
     /**

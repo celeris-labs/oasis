@@ -17,8 +17,8 @@
 
 namespace duckdb {
 
-// Default for oasis_scan_groups_in_flight (see the AddExtensionOption below).
-static constexpr uint64_t DEFAULT_GROUPS_IN_FLIGHT = 16;
+// Default for oasis_prefetch_depth (see the AddExtensionOption below).
+static constexpr uint64_t DEFAULT_PREFETCH_DEPTH = 2;
 
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
@@ -38,11 +38,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Max splinters in flight per stream (0 = hardware config-FIFO depth)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0), SetSchedulerQueueDepth);
 	config.AddExtensionOption(
-	    "oasis_scan_groups_in_flight",
-	    "Row groups a single read_oasis scan keeps submitted but not yet collected, overlapping "
-	    "submission with collection. Split across the scan's worker threads (each worker keeps "
-	    "ceil(value / threads) groups in flight but at least 1).",
-	    LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_GROUPS_IN_FLIGHT));
+	    "oasis_prefetch_depth",
+	    "Row groups each read_oasis worker thread keeps submitted but not yet collected, overlapping "
+	    "submission with collection. 0 executes synchronously: each worker submits one group at a "
+	    "time and blocks on the worker thread until it completes.",
+	    LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_PREFETCH_DEPTH));
+	config.AddExtensionOption(
+	    "oasis_enable_yield",
+	    "Whether read_oasis workers yield to the DuckDB scheduler while waiting on hardware during "
+	    "cold start, letting other workers prime the pipeline breadth-first. Set false to disable "
+	    "yielding entirely.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);

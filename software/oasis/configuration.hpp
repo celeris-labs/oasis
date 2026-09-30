@@ -3,6 +3,7 @@
 #include "libstf/common.hpp"
 #include <coyote/cThread.hpp>
 #include <libstf/configuration.hpp>
+#include <parcore/configuration.hpp>
 
 #include <vector>
 
@@ -20,7 +21,7 @@ constexpr const uint64_t READ_REQ_CONFIG_ID   = 0x2f966a70f04c0e93;
 class ReadReqConfig : public libstf::Config {
   public:
     ReadReqConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
-                   uint32_t num_regs);
+                  uint32_t num_regs);
 
     /**
      * For RDMA reads, sets the base vaddr of the remote region that `stream`'s read addresses are
@@ -51,6 +52,27 @@ class ReadReqConfig : public libstf::Config {
   private:
     libstf::stream_t       num_streams_;
     std::vector<uintptr_t> base_vaddrs_;
+};
+
+// GenericConfig read side: local address 0 is the config ID, 1 the OutputWriter notify counter,
+// and (RDMA builds only) 2..6 the bypass stream's StreamProfiler counters.
+constexpr const uint64_t GENERIC_CONFIG_ID                 = static_cast<uint64_t>(-1);
+constexpr const uint32_t GENERIC_CONFIG_NOTIFY_COUNT_REG   = 1;
+constexpr const uint32_t GENERIC_CONFIG_BYPASS_PROFILE_REG = 2;
+constexpr const uint32_t NUM_BYPASS_PROFILE_REGS           = 5;
+
+class GenericConfig : public libstf::Config {
+  public:
+    GenericConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset,
+                  uint32_t num_regs);
+
+    uint64_t notify_count();
+
+    bool has_bypass_profile() const;
+
+    parcore::StreamProfile read_bypass_profile();
+
+    static constexpr uint64_t ID = GENERIC_CONFIG_ID;
 };
 
 } // namespace oasis

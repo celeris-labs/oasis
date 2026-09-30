@@ -108,6 +108,14 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 
 	size_t groups_in_flight_per_worker = 1;
 
+	// SET oasis_prefetch_depth = 0: one group at a time per worker, collected by blocking on the
+	// worker thread instead of descheduling through the async-task path.
+	bool synchronous = false;
+
+	// Cold-start yielding (see the yield-budget registration in OasisScanInitGlobal); disabled via
+	// SET oasis_enable_yield = false.
+	bool yield_enabled = true;
+
 	// Scan-wide profiling totals, folded in from each worker's local counters when its scan
 	// finishes (OasisScanGetMetrics) and reported on the query profiling tree.
 	std::atomic<uint64_t> filter_time_ns {0};

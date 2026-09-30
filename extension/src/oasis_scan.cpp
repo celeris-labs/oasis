@@ -87,13 +87,15 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 		gstate->physical_scan = &input.op->Cast<PhysicalTableScan>();
 	}
 
-	// Split the scan-wide groups-in-flight budget across the worker threads this scan will run on.
 	Value groups_in_flight_val;
-	context.TryGetCurrentSetting("oasis_scan_groups_in_flight", groups_in_flight_val);
-	size_t const groups_in_flight = groups_in_flight_val.IsNull() ? 16 : groups_in_flight_val.GetValue<uint64_t>();
-	size_t const num_threads =
-	    std::max<size_t>(1, static_cast<size_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
-	gstate->groups_in_flight_per_worker = std::max<size_t>(2, (groups_in_flight + num_threads - 1) / num_threads);
+	context.TryGetCurrentSetting("oasis_prefetch_depth", groups_in_flight_val);
+	size_t const groups_in_flight = groups_in_flight_val.IsNull() ? 2 : groups_in_flight_val.GetValue<uint64_t>();
+	gstate->synchronous = groups_in_flight == 0;
+	gstate->groups_in_flight_per_worker = std::max<size_t>(1, groups_in_flight);
+
+	Value yield_val;
+	context.TryGetCurrentSetting("oasis_enable_yield", yield_val);
+	gstate->yield_enabled = yield_val.IsNull() || yield_val.GetValue<bool>();
 
 	for (auto col_id : input.column_ids) {
 		if (col_id == COLUMN_IDENTIFIER_EMPTY) {
@@ -130,7 +132,9 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	// total_groups; INITIALIZE_ON_SCHEDULE runs this eagerly at schedule time so we know that count
 	// before any worker executes. Budget is consumed only by yields that actually happen, so any
 	// unused remainder is harmless -- no reconciliation needed.
-	if (!gstate->emit_cardinality_only) {
+	if (!gstate->emit_cardinality_only && gstate->yield_enabled && !gstate->synchronous) {
+		size_t const num_threads =
+		    std::max<size_t>(1, static_cast<size_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
 		size_t const yield_budget = std::max<size_t>(1, std::min<size_t>(gstate->total_groups, num_threads));
 		ctx.add_yield_budget(yield_budget);
 	}
@@ -495,14 +499,20 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	// A group with nothing to fetch or decode in hardware (string-only projection on the local
 	// path) submitted no splinter, so skip straight to loading the string columns.
 	if (head.submitted) {
-		if (ctx.try_consume_yield()) {
-			out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
-			return LoadResult::BLOCKED;
-		}
+		if (gstate.synchronous) {
+			while (!TryCollectGroup(context, gstate, bind, head)) {
+				head.result.wait_ready();
+			}
+		} else {
+			if (gstate.yield_enabled && ctx.try_consume_yield()) {
+				out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
+				return LoadResult::BLOCKED;
+			}
 
-		if (!TryCollectGroup(context, gstate, bind, head)) {
-			out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
-			return LoadResult::BLOCKED;
+			if (!TryCollectGroup(context, gstate, bind, head)) {
+				out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
+				return LoadResult::BLOCKED;
+			}
 		}
 	}
 

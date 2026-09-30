@@ -1,6 +1,7 @@
 #include "oasis_profile.hpp"
 
 #include "oasis_context_cache_entry.hpp"
+#include "oasis/configuration.hpp"
 #include "oasis/oasis_context.hpp"
 #include "parcore/configuration.hpp"
 
@@ -15,10 +16,13 @@ namespace {
 constexpr double BYTES_PER_HANDSHAKE = 64.0;
 constexpr double CLOCK_PERIOD_NS = 4.0;
 
-// One materialized output row: the raw counters for a decoder's input and output stream plus the
-// derived throughput numbers. throughput is in GB/s (== bytes per nanosecond).
+// One materialized output row: the raw counters for a stream slot plus the derived throughput
+// numbers. Decoder slots have an input and an output profiler; the RDMA bypass slot has a single
+// profiler on its output stream, so its in-side columns are NULL. throughput is in GB/s (== bytes
+// per nanosecond).
 struct ProfileRow {
-	uint64_t decoder;
+	uint64_t stream;
+	bool has_in;
 
 	parcore::DecoderProfile profile;
 
@@ -39,9 +43,10 @@ double ThroughputGBps(uint64_t handshakes, uint64_t cycles) {
 	return bytes / time_ns;
 }
 
-ProfileRow MakeRow(uint64_t decoder, const parcore::DecoderProfile &p) {
+ProfileRow MakeRow(uint64_t stream, const parcore::DecoderProfile &p) {
 	ProfileRow row;
-	row.decoder = decoder;
+	row.stream = stream;
+	row.has_in = true;
 	row.profile = p;
 
 	// Overall: every cycle the profiler observed for this stream, including idle gaps between
@@ -56,6 +61,25 @@ ProfileRow MakeRow(uint64_t decoder, const parcore::DecoderProfile &p) {
 	row.in_throughput_excl_idle_gbps = ThroughputGBps(p.in.handshakes_cycles, in_busy);
 	row.out_throughput_gbps = ThroughputGBps(p.out.handshakes_cycles, out_total);
 	row.out_throughput_excl_idle_gbps = ThroughputGBps(p.out.handshakes_cycles, out_busy);
+	return row;
+}
+
+// The bypass stream has one StreamProfiler on its output (the RDMA-read data feeding the output
+// writer), so only the out-side of the row is populated.
+ProfileRow MakeBypassRow(uint64_t stream, const parcore::StreamProfile &p) {
+	ProfileRow row;
+	row.stream = stream;
+	row.has_in = false;
+	row.profile.in = {};
+	row.profile.out = p;
+
+	uint64_t out_total = p.handshakes_cycles + p.starved_cycles + p.stalled_cycles + p.idle_cycles;
+	uint64_t out_busy = p.handshakes_cycles + p.starved_cycles + p.stalled_cycles;
+
+	row.in_throughput_gbps = 0.0;
+	row.in_throughput_excl_idle_gbps = 0.0;
+	row.out_throughput_gbps = ThroughputGBps(p.handshakes_cycles, out_total);
+	row.out_throughput_excl_idle_gbps = ThroughputGBps(p.handshakes_cycles, out_busy);
 	return row;
 }
 
@@ -81,17 +105,19 @@ void DefineColumns(vector<string> &names, vector<LogicalType> &types) {
 		types.emplace_back(std::move(type));
 	};
 
-	add("decoder", LogicalType::UBIGINT);
+	add("stream", LogicalType::UBIGINT);
 
 	add("in_handshakes_cycles", LogicalType::UBIGINT);
 	add("in_starved_cycles", LogicalType::UBIGINT);
 	add("in_stalled_cycles", LogicalType::UBIGINT);
 	add("in_idle_cycles", LogicalType::UBIGINT);
+	add("in_last_handshakes", LogicalType::UBIGINT);
 
 	add("out_handshakes_cycles", LogicalType::UBIGINT);
 	add("out_starved_cycles", LogicalType::UBIGINT);
 	add("out_stalled_cycles", LogicalType::UBIGINT);
 	add("out_idle_cycles", LogicalType::UBIGINT);
+	add("out_last_handshakes", LogicalType::UBIGINT);
 
 	add("in_throughput_gbps", LogicalType::DOUBLE);
 	add("in_throughput_excl_idle_gbps", LogicalType::DOUBLE);
@@ -116,9 +142,19 @@ unique_ptr<GlobalTableFunctionState> OasisProfileInitGlobal(ClientContext &conte
 	auto config = ctx.config<parcore::ColumnChunkDecoderConfig>();
 
 	auto num_decoders = config->num_decoders();
-	gstate->rows.reserve(num_decoders);
+	gstate->rows.reserve(num_decoders + 1);
 	for (libstf::stream_t decoder = 0; decoder < num_decoders; decoder++) {
 		gstate->rows.push_back(MakeRow(decoder, config->read_profile(decoder)));
+	}
+
+	// The RDMA bypass stream occupies the last stream slot (== num_decoders) and has its own
+	// StreamProfiler behind the GenericConfig. Older bitstreams have no GenericConfig and non-RDMA
+	// builds expose no bypass counters, so those simply emit the decoder rows only.
+	if (ctx.has_config<oasis::GenericConfig>()) {
+		auto generic = ctx.config<oasis::GenericConfig>();
+		if (generic->has_bypass_profile()) {
+			gstate->rows.push_back(MakeBypassRow(num_decoders, generic->read_bypass_profile()));
+		}
 	}
 
 	return std::move(gstate);
@@ -139,20 +175,28 @@ void OasisProfileFunction(ClientContext &context, TableFunctionInput &data_p, Da
 		const auto &p = row.profile;
 
 		idx_t col = 0;
-		output.data[col++].SetValue(i, Value::UBIGINT(row.decoder));
+		// The bypass row has no input-side profiler; its in_* columns are NULL.
+		auto in_u64 = [&](uint64_t v) {
+			return row.has_in ? Value::UBIGINT(v) : Value(LogicalType::UBIGINT);
+		};
+		auto in_f64 = [&](double v) { return row.has_in ? Value::DOUBLE(v) : Value(LogicalType::DOUBLE); };
 
-		output.data[col++].SetValue(i, Value::UBIGINT(p.in.handshakes_cycles));
-		output.data[col++].SetValue(i, Value::UBIGINT(p.in.starved_cycles));
-		output.data[col++].SetValue(i, Value::UBIGINT(p.in.stalled_cycles));
-		output.data[col++].SetValue(i, Value::UBIGINT(p.in.idle_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(row.stream));
+
+		output.data[col++].SetValue(i, in_u64(p.in.handshakes_cycles));
+		output.data[col++].SetValue(i, in_u64(p.in.starved_cycles));
+		output.data[col++].SetValue(i, in_u64(p.in.stalled_cycles));
+		output.data[col++].SetValue(i, in_u64(p.in.idle_cycles));
+		output.data[col++].SetValue(i, in_u64(p.in.last_handshakes));
 
 		output.data[col++].SetValue(i, Value::UBIGINT(p.out.handshakes_cycles));
 		output.data[col++].SetValue(i, Value::UBIGINT(p.out.starved_cycles));
 		output.data[col++].SetValue(i, Value::UBIGINT(p.out.stalled_cycles));
 		output.data[col++].SetValue(i, Value::UBIGINT(p.out.idle_cycles));
+		output.data[col++].SetValue(i, Value::UBIGINT(p.out.last_handshakes));
 
-		output.data[col++].SetValue(i, Value::DOUBLE(row.in_throughput_gbps));
-		output.data[col++].SetValue(i, Value::DOUBLE(row.in_throughput_excl_idle_gbps));
+		output.data[col++].SetValue(i, in_f64(row.in_throughput_gbps));
+		output.data[col++].SetValue(i, in_f64(row.in_throughput_excl_idle_gbps));
 		output.data[col++].SetValue(i, Value::DOUBLE(row.out_throughput_gbps));
 		output.data[col++].SetValue(i, Value::DOUBLE(row.out_throughput_excl_idle_gbps));
 	}
