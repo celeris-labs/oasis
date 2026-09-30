@@ -58,6 +58,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	for (auto &col : parquet_reader.columns) {
 		names.push_back(col.name.GetIdentifierName());
 		return_types.push_back(col.type);
+		bind_data->column_types.push_back(col.type);
 	}
 
 	auto meta = BuildParcoreMetadata(parquet_reader);
@@ -70,6 +71,24 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	bind_data->parquet_metadata = parquet_reader.metadata;
 
 	return std::move(bind_data);
+}
+
+// DuckDB type whose physical layout matches what the FPGA writes for a libstf type.
+static LogicalType HardwareOutputType(libstf::type_t type) {
+	switch (type) {
+	case libstf::type_t::BYTE_T:
+		return LogicalType::BOOLEAN;
+	case libstf::type_t::INT32_T:
+		return LogicalType::INTEGER;
+	case libstf::type_t::INT64_T:
+		return LogicalType::BIGINT;
+	case libstf::type_t::FLOAT_T:
+		return LogicalType::FLOAT;
+	case libstf::type_t::DOUBLE_T:
+		return LogicalType::DOUBLE;
+	default:
+		throw InternalException("Unexpected libstf type");
+	}
 }
 
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -105,7 +124,23 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 		auto t = bind_data.metadata.groups[0].chunks[col_id].type;
 		if (parcore::metadata::is_libstf_type(t)) {
 			// Hardware path: Fixed-width type the ParCore decoder handles.
-			gstate->projected_columns.push_back({col_id, libstf::size_of(parcore::metadata::to_libstf_type(t)), false});
+			ProjectedColumn col {col_id, libstf::size_of(parcore::metadata::to_libstf_type(t)), false};
+			// The decoded buffer is referenced zero-copy as the table column's vector, so the
+			// hardware's element width must equal the DuckDB type's. Parquet logical types that
+			// narrow the physical type (INT_8/INT_16/UINT_8/UINT_16 on INT32, TIME_MILLIS on INT32)
+			// would need a converting copy; reject them until that is supported rather than
+			// reinterpreting the bytes as the narrower type.
+			const auto &column_type = bind_data.column_types[col_id];
+			if (GetTypeIdSize(column_type.InternalType()) != col.elem_size) {
+				throw NotImplementedException(
+				    "read_oasis: column '%s' has DuckDB type %s (%llu bytes) but is decoded in hardware as %s "
+				    "(%llu bytes). Rewrite the file with the column cast to the physical width (e.g. INTEGER).",
+				    bind_data.metadata.column_names[col_id].c_str(), column_type.ToString().c_str(),
+				    (unsigned long long)GetTypeIdSize(column_type.InternalType()),
+				    HardwareOutputType(parcore::metadata::to_libstf_type(t)).ToString().c_str(),
+				    (unsigned long long)col.elem_size);
+			}
+			gstate->projected_columns.push_back(std::move(col));
 		} else {
 			// CPU path: Variable-length type (BYTE_ARRAY/string) decoded by DuckDB's ColumnReader.
 			gstate->projected_columns.push_back({col_id, 0, true});
@@ -389,11 +424,19 @@ static void InitGroupCPUColumns(ClientContext &context, OasisScanGlobalState &gs
 	const auto &row_group_columns = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns;
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*lstate.scan_state->thrift_file_proto->getTransport());
 	trans.ClearPrefetch();
+	// On the RDMA path every CPU column's bytes are already staged on the handle, so each column
+	// gets its own read head and is served entirely from host memory. Letting the transport merge
+	// neighbouring string columns into one read head would span the hardware-decoded columns in
+	// between, and those bytes are not staged: every such "gap" turns into a synchronous RDMA
+	// round trip on this worker thread, on the bypass stream, while the decoders are busy with
+	// the next group. On the local path merging still pays off (fewer file reads).
+	const bool rdma_path =
+	    dynamic_cast<RDMAFileHandle *>(&lstate.scan_state->file_handle->GetFileHandle()) != nullptr;
 	for (const auto &col : gstate.projected_columns) {
 		if (col.is_cpu) {
 			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);
 			reader.InitializeRead(group, row_group_columns, *lstate.scan_state->thrift_file_proto);
-			reader.RegisterPrefetch(trans, /*allow_merge=*/true);
+			reader.RegisterPrefetch(trans, /*allow_merge=*/!rdma_path);
 		}
 	}
 	trans.FinalizeRegistration();
@@ -523,12 +566,16 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	lstate.current_group = head.group;
 
 	// For RDMA, stage the splinter-fetched CPU column bytes on the handle the thrift transport
-	// reads through (the parquet reader's underlying file handle -- NOT lstate.file_handle), so the
-	// prefetch in InitGroupCPUColumns is served from host memory instead of blocking the worker on
-	// RDMA round trips. Staging replaces the previous group's ranges (releasing those buffers once
-	// the transport no longer references their bytes).
+	// reads through, so the prefetch in InitGroupCPUColumns is served from host memory instead of
+	// blocking the worker on RDMA round trips. That handle is the scan state's own
+	// (ParquetReader::InitializeScan opens it and builds the thrift protocol on it) -- NOT the
+	// reader's bind-time handle (GetHandle()) and NOT lstate.file_handle. Staging on either of
+	// those leaves the transport with zero staged ranges and every string column is fetched a
+	// second time, synchronously, on this worker. Staging replaces the previous group's ranges
+	// (releasing those buffers once the transport no longer references their bytes).
 	if (!head.cpu_slot.empty()) {
-		auto *rdma = dynamic_cast<RDMAFileHandle *>(&lstate.parquet_reader->GetHandle().GetFileHandle());
+		D_ASSERT(lstate.scan_state->file_handle);
+		auto *rdma = dynamic_cast<RDMAFileHandle *>(&lstate.scan_state->file_handle->GetFileHandle());
 		D_ASSERT(rdma); // cpu_slot is only populated on the RDMA path
 		std::vector<RDMAFileHandle::StagedRange> ranges;
 		ranges.reserve(head.cpu_slot.size());

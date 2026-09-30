@@ -616,7 +616,12 @@ int main(int argc, char *argv[]) {
         payload_total += file_size;
     }
 
-    uint64_t region_size = dir_header_size + payload_total;
+    // The FPGA rounds every RDMA read length up to a 64-byte data beat, so a read that ends within
+    // the last 63 bytes of the payload (a Parquet footer does) reaches past it. Register that much
+    // slack behind the payload; a read crossing the registered region would otherwise be NAKed and
+    // put the queue pair into the error state.
+    constexpr uint64_t READ_PAD_SLACK = 64;
+    uint64_t region_size = dir_header_size + payload_total + READ_PAD_SLACK;
 
     // Compute file offsets within the region.
     std::vector<uint64_t> offsets(files.size());
@@ -663,6 +668,7 @@ int main(int argc, char *argv[]) {
 
     // Lay out the directory.
     std::memset(ep.mem, 0, dir_header_size);
+    std::memset(ep.mem + dir_header_size + payload_total, 0, READ_PAD_SLACK);
     uint8_t *p = ep.mem;
     write_header_value<uint64_t>(p, dir_header_size);
     for (size_t i = 0; i < files.size(); ++i) {

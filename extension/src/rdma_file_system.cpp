@@ -95,22 +95,24 @@ void RDMAFileSystem::RDMAReadRange(uint64_t remote_offset, void *dst, size_t siz
 	// EnsureInitialized has already created the OasisContext singleton.
 	auto &ctx = oasis::OasisContext::ctx();
 
-	// One raw flow on the bypass stream: an RDMA source writing directly into one sink buffer per
-	// FPGA output-buffer-sized chunk. The scheduler capability-matches it onto the bypass stream.
-	oasis::OperatorFlow flow;
-	flow.push_back(std::make_unique<oasis::RDMASourceOperator>(remote_offset, size));
-	size_t remaining = size;
-	while (remaining > 0) {
+	// One raw flow on the bypass stream: an RDMA source writing into one sink whose buffers are
+	// FPGA output-buffer-sized chunks (the scheduler allows exactly one sink per flow). The
+	// scheduler capability-matches it onto the bypass stream.
+	std::vector<std::shared_ptr<libstf::Buffer>> buffers;
+	for (size_t remaining = size; remaining > 0;) {
 		size_t chunk = std::min<size_t>(remaining, libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE);
-		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(chunk)));
+		buffers.push_back(ctx.allocate_output_buffer(chunk));
 		remaining -= chunk;
 	}
+	oasis::OperatorFlow flow;
+	flow.push_back(std::make_unique<oasis::RDMASourceOperator>(remote_offset, size));
+	flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(buffers)));
 	oasis::QuerySplinter splinter;
 	splinter.streams.push_back(std::move(flow));
 	auto handle = ctx.scheduler().submit(std::move(splinter));
 
-	// Drain the flow's batches. The bypass stream completes its sinks in enqueue order, so the
-	// batches arrive in file order and can be copied out sequentially.
+	// Drain the flow's batches. The bypass stream completes the sink's buffers in enqueue order, so
+	// the batches arrive in file order and can be copied out sequentially.
 	size_t copied = 0;
 	while (auto batch = handle.get_next_batch()) {
 		const auto &buf = batch->buffer;

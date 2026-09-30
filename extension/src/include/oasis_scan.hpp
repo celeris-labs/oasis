@@ -58,6 +58,8 @@ struct OasisScanFilter {
 };
 
 struct OasisScanBindData : public TableFunctionData {
+	// DuckDB type of every file column, as read_parquet would report it (the scan's return types).
+	vector<LogicalType> column_types;
 	string filename;
 	parcore::metadata::Metadata metadata;
 	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
