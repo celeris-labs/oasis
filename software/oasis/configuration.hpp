@@ -8,7 +8,7 @@
 
 namespace oasis {
 
-constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A515;
+constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A516; // Keep in sync with hardware/src/hdl/common.sv
 
 // Per-stream write registers: [0] vaddr, [1] size, [2] ctid.
 constexpr const uint64_t READ_REQ_CONFIG_REGS = 3;

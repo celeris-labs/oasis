@@ -25,6 +25,7 @@ build (`-DEN_SIMULATION=ON`, with `COYOTE_SIM_DIR` set) works too, but is slow e
 | `sql/oasis_filter.test` | Zone-map pruning, row-level filtering, conjunction splitting, `filter_prune` |
 | `sql/oasis_cpu_columns.test` | `BYTE_ARRAY` columns decoded on the CPU, alone and mixed with hardware columns |
 | `sql/oasis_settings.test` | Extension settings and their validation, the stream profiler, bind-time errors |
+| `sql/oasis_bloom.test` | Runtime Bloom filter on joins between two `read_oasis` scans: when it is used or skipped, join types, row groups without matches, all kinds of columns, filters, two joins in one query, early stops and errors |
 
 ## How the assertions are built
 
@@ -54,7 +55,7 @@ regenerates them, and the layout matters:
 | `huge.parquet` | 1 INT64 col, 21 M rows, 21 row groups | Not used by any test: its column chunks are `RLE_DICTIONARY`, which the ParCore decoder does not handle |
 
 Fixtures that need a variable-length column, an unsupported type, or an unsupported codec are
-written into `__TEST_DIR__` by the tests themselves rather than checked in. Note that this only
+written into `{TEST_DIR}` by the tests themselves rather than checked in. Note that this only
 works while the fixed-width columns stay `PLAIN`-encoded — the decoder requires it, and DuckDB's
 writer only avoids dictionary-encoding a column when its values are distinct enough.
 

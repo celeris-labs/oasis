@@ -12,7 +12,7 @@
 namespace oasis {
 
 /**
- * One operator flow: source(s) -> operator(s) -> sink, ending in exactly one LocalSinkOperator.
+ * One operator flow: source(s) -> operator(s) -> sink(s).
  * OperatorFlows are mapped onto hardware streams.
  */
 using OperatorFlow = std::vector<std::unique_ptr<Operator>>;

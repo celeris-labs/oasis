@@ -1,5 +1,10 @@
 .claude
 build*
+.venv/**
+venv/**
+opt/**
+extension/vcpkg/
+extension/tpch_parquet/**
 
 # Generated unit test files
 hardware/unit-tests/diff/**
