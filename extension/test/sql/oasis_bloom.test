@@ -195,6 +195,11 @@ CREATE OR REPLACE TABLE got AS
 SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str, b_key, b_val
 FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key;
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Several row groups on both sides, all kinds of columns | CREATE OR REPLACE TABLE got AS SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Several row groups on both sides, all kinds of columns | CREATE OR REPLACE TABLE got AS SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query I
 SELECT bloom_used();
 ----
@@ -326,14 +331,11 @@ SELECT bloom_rewrites();
 # Pushed-down filters on a materialized (DOUBLE), a CPU-filtered (INTEGER) and a CPU-decoded
 # (VARCHAR) column, on top of the Bloom filter, and a filtered build side: the hardware Bloom filter
 # holds all build keys, a superset (p_id 250 passes it with b_val 1, the join drops it). With one
-# thread and one row group in flight.
+# row group in flight per worker.
 # ---------------------------------------------------------------------------
 
 statement ok
-SET threads = 1;
-
-statement ok
-SET oasis_scan_groups_in_flight = 1;
+SET oasis_prefetch_depth = 1;
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -345,16 +347,18 @@ FROM read_oasis('{TEST_DIR}/bf_probe.parquet')
 JOIN (SELECT * FROM read_oasis('{TEST_DIR}/bf_build.parquet') WHERE b_val % 2 = 0) ON p_key = b_key
 WHERE p_double >= 20 AND p_int % 2 = 0 AND p_str NOT LIKE '%7%';
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Pushed-down filters on a materialized (DOUBLE), a CPU-filtered (INTEGE | CREATE OR REPLACE TABLE got AS SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Pushed-down filters on a materialized (DOUBLE), a CPU-filtered (INTEGE | CREATE OR REPLACE TABLE got AS SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query I
 SELECT bloom_used();
 ----
 1
 
 statement ok
-RESET threads;
-
-statement ok
-RESET oasis_scan_groups_in_flight;
+RESET oasis_prefetch_depth;
 
 statement ok
 CREATE OR REPLACE TABLE want AS
@@ -385,6 +389,11 @@ CREATE OR REPLACE TABLE got AS
 SELECT p_key FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key
 WHERE p_date < DATE '2021-01-01';
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Projections: only the key is emitted, with a filter-only column | CREATE OR REPLACE TABLE got AS SELECT p_key FROM bf_probe JOIN bf_build ON p_key = b_') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Projections: only the key is emitted, with a filter-only column | CREATE OR REPLACE TABLE got AS SELECT p_key FROM bf_probe JOIN bf_build ON p_key = b_') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query III
 SELECT bloom_used(), count(*), sum(p_key) FROM got;
 ----
@@ -402,6 +411,11 @@ statement ok
 CREATE OR REPLACE TABLE got AS
 SELECT p_id, p_key FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key
 WHERE p_key BETWEEN 100 AND 600;
+
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: A filter on the join key: pushed into both scans, it prunes the probe | CREATE OR REPLACE TABLE got AS SELECT p_id, p_key FROM bf_probe JOIN bf_build ON p_ke') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: A filter on the join key: pushed into both scans, it prunes the probe | CREATE OR REPLACE TABLE got AS SELECT p_id, p_key FROM bf_probe JOIN bf_build ON p_ke') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
 
 query IIII
 SELECT bloom_used(), (SELECT count(*) FROM duckdb_logs WHERE message LIKE 'Skipping row group 1:%') > 0, count(*), sum(p_id)
@@ -429,6 +443,11 @@ CREATE OR REPLACE TABLE got AS
 SELECT p_id, b_val FROM read_oasis('{TEST_DIR}/bf_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON p_key = b_key
 WHERE p_id < b_val * 3 AND p_double + p_int > 100;
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Filters the scans can t take, around the join: one across both sides ( | CREATE OR REPLACE TABLE got AS SELECT p_id, b_val FROM bf_probe JOIN bf_build ON p_ke') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Filters the scans can t take, around the join: one across both sides ( | CREATE OR REPLACE TABLE got AS SELECT p_id, b_val FROM bf_probe JOIN bf_build ON p_ke') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query III
 SELECT bloom_used(), count(*), sum(p_id) FROM got;
 ----
@@ -450,6 +469,11 @@ ORDER BY p_id DESC LIMIT 3;
 534
 531
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: ORDER BY ... LIMIT on the join result (a Top-N above the join, which a | SELECT p_id FROM bf_probe JOIN bf_build ON p_key = b_key ORDER BY p_id DESC LIMIT 3') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: ORDER BY ... LIMIT on the join result (a Top-N above the join, which a | SELECT p_id FROM bf_probe JOIN bf_build ON p_key = b_key ORDER BY p_id DESC LIMIT 3') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query I
 SELECT bloom_used();
 ----
@@ -466,6 +490,11 @@ statement ok
 CREATE OR REPLACE TABLE got AS
 SELECT x_id, x_key, e_val
 FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key;
+
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Extreme and duplicate keys (7 is twice on each side) | CREATE OR REPLACE TABLE got AS SELECT x_id, x_key, e_val FROM bf_ext_probe JOIN bf_ex') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Extreme and duplicate keys (7 is twice on each side) | CREATE OR REPLACE TABLE got AS SELECT x_id, x_key, e_val FROM bf_ext_probe JOIN bf_ex') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
 
 query IIII
 SELECT bloom_used(), count(*), sum(x_id), sum(e_val) FROM got;
@@ -495,6 +524,11 @@ FROM read_oasis('{TEST_DIR}/bf_skip.parquet') a JOIN read_oasis('{TEST_DIR}/bf_s
 ----
 8	28
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is rewritten, but the scan | SELECT count(*), sum(a.s_id) FROM bf_skip a JOIN bf_skip b ON a.s_int = b.s_int') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is rewritten, but the scan | SELECT count(*), sum(a.s_id) FROM bf_skip a JOIN bf_skip b ON a.s_int = b.s_int') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query II
 SELECT bloom_used(), bloom_skipped('not a required INT64 column');
 ----
@@ -517,6 +551,11 @@ FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet')
 JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key
 JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON e_val = b_val;
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Two joins in one query | CREATE OR REPLACE TABLE got AS SELECT x_id, e_val, b_key FROM bf_ext_probe JOIN bf_ex') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Two joins in one query | CREATE OR REPLACE TABLE got AS SELECT x_id, e_val, b_key FROM bf_ext_probe JOIN bf_ex') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query IIII
 SELECT bloom_used(), count(*), sum(x_id), sum(b_key) FROM got;
 ----
@@ -534,6 +573,11 @@ FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet') JOIN read_oasis('{TEST_DIR}/b
 UNION ALL
 SELECT e_val, b_val
 FROM read_oasis('{TEST_DIR}/bf_ext_build.parquet') JOIN read_oasis('{TEST_DIR}/bf_build.parquet') ON e_val = b_val;
+
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Two joins in one query | CREATE OR REPLACE TABLE got AS SELECT x_id AS id, e_val AS v FROM bf_ext_probe JOIN b') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Two joins in one query | CREATE OR REPLACE TABLE got AS SELECT x_id AS id, e_val AS v FROM bf_ext_probe JOIN b') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
 
 query II
 SELECT bloom_used() >= 1, bloom_used() + bloom_skipped('in use by another scan');
@@ -560,6 +604,11 @@ WHERE p_id = 250 AND p_int = 300;
 ----
 0
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Scans that end early or fail leave the Bloom filter usable | SELECT count(*) FROM bf_probe JOIN bf_build ON p_key = b_key WHERE p_id = 250 AND p_i') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Scans that end early or fail leave the Bloom filter usable | SELECT count(*) FROM bf_probe JOIN bf_build ON p_key = b_key WHERE p_id = 250 AND p_i') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query I
 SELECT bloom_used();
 ----
@@ -576,6 +625,11 @@ SELECT count(*) FROM (
 ----
 1
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: Scans that end early or fail leave the Bloom filter usable | SELECT count(*) FROM ( SELECT x_id FROM bf_ext_probe JOIN bf_ext_build ON x_key = e_k') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Scans that end early or fail leave the Bloom filter usable | SELECT count(*) FROM ( SELECT x_id FROM bf_ext_probe JOIN bf_ext_build ON x_key = e_k') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query I
 SELECT bloom_used();
 ----
@@ -588,6 +642,11 @@ SELECT count(*) FROM read_oasis('{TEST_DIR}/bf_build.parquet') JOIN read_oasis('
 ----
 more than the 131072 the hardware Bloom filter supports
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: A probe row group larger than the hardware supports fails before the f | SELECT count(*) FROM bf_build JOIN bf_big ON b_key = k') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: A probe row group larger than the hardware supports fails before the f | SELECT count(*) FROM bf_build JOIN bf_big ON b_key = k') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 # Afterwards, the filter works as before
 statement ok
 CALL truncate_duckdb_logs();
@@ -596,6 +655,11 @@ query II
 SELECT count(*), sum(x_id) FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet') JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key;
 ----
 8	30
+
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: A probe row group larger than the hardware supports fails before the f | SELECT count(*), sum(x_id) FROM bf_ext_probe JOIN bf_ext_build ON x_key = e_key') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: A probe row group larger than the hardware supports fails before the f | SELECT count(*), sum(x_id) FROM bf_ext_probe JOIN bf_ext_build ON x_key = e_key') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
 
 query I
 SELECT bloom_used();
@@ -616,7 +680,17 @@ FROM read_oasis('{TEST_DIR}/bf_ext_probe.parquet')
 JOIN read_oasis('{TEST_DIR}/bf_ext_build.parquet') ON x_key = e_key
 JOIN read_oasis('{TEST_DIR}/bf_skip.parquet') ON x_key = s_id;
 
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: A probe row group larger than the hardware supports fails before the f | CREATE OR REPLACE TABLE got AS SELECT x_id, e_val, s_int FROM bf_ext_probe JOIN bf_ex') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: A probe row group larger than the hardware supports fails before the f | CREATE OR REPLACE TABLE got AS SELECT x_id, e_val, s_int FROM bf_ext_probe JOIN bf_ex') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
 query II
 SELECT bloom_used(), bloom_rewrites();
 ----
 1	1
+
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom] done: end of test file') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: end of test file') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
