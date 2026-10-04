@@ -96,31 +96,6 @@ static LogicalType HardwareOutputType(libstf::type_t type) {
 	}
 }
 
-// What the runtime Bloom filter's build side needs, see PrepareBloomBuild
-struct BloomBuildPlan {
-	size_t probe_slot;                      // Projected column of the probe key
-	parcore::metadata::Metadata build_meta; // Of the build file
-	size_t build_col_id;                    // Build key column in build_meta
-};
-
-// DuckDB type whose physical layout matches what the FPGA writes for a libstf type.
-static LogicalType HardwareOutputType(libstf::type_t type) {
-	switch (type) {
-	case libstf::type_t::BYTE_T:
-		return LogicalType::BOOLEAN;
-	case libstf::type_t::INT32_T:
-		return LogicalType::INTEGER;
-	case libstf::type_t::INT64_T:
-		return LogicalType::BIGINT;
-	case libstf::type_t::FLOAT_T:
-		return LogicalType::FLOAT;
-	case libstf::type_t::DOUBLE_T:
-		return LogicalType::DOUBLE;
-	default:
-		throw InternalException("Unexpected libstf type");
-	}
-}
-
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
 	auto &ctx = GetOrCreateOasisContext(context);
