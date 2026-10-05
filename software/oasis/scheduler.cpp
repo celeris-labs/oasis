@@ -136,15 +136,16 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
         Pending pending;
         pending.capability = required_capability(flow);
         pending.completion = completion;
-        const LocalSinkOperator *sink = nullptr;
+        
+        size_t total_buffers = 0;
         for (const auto &op : flow) {
             if (const auto *s = dynamic_cast<const LocalSinkOperator *>(op.get())) {
-                assert(sink == nullptr && "flow has more than one sink");
-                sink = s;
+                assert(s->buffers().size() > 0 && "flow has a sink with no buffers");
+                total_buffers += s->buffers().size();
             }
         }
-        assert(sink != nullptr && "flow has no sink");
-        pending.num_buffers    = sink->buffers().size();
+
+        pending.num_buffers    = total_buffers;
         const auto &candidates = streams_by_capability_[capability_index(pending.capability)];
         if (candidates.empty()) {
             throw std::runtime_error(
@@ -152,6 +153,7 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
                 to_string(pending.capability) +
                 " capability, but this hardware provides no such stream");
         }
+
         const bool fits_some_stream =
             std::any_of(candidates.begin(), candidates.end(), [&](libstf::stream_t s) {
                 return pending.num_buffers <= streams_[s]->max_buffers;
@@ -184,7 +186,8 @@ std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capabili
     const auto &candidates = streams_by_capability_[capability_index(capability)];
 
     // Only the DECODE streams have the runtime knobs: the active span caps the candidates and the
-    // pipeline-depth knob replaces the per-stream hardware flow bound.
+    // pipeline-depth knob lowers the per-stream hardware flow bound (it never raises it: the
+    // hardware's per-flow config queues only hold max_flows entries, and writes beyond are lost).
     const bool tunable = capability == StreamCapability::DECODE;
     size_t     span    = candidates.size();
     if (tunable) {
@@ -198,7 +201,7 @@ std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capabili
         const libstf::stream_t s    = candidates[c];
         const StreamState     &ss   = *streams_[s];
         const size_t           load = ss.enqueued.load(std::memory_order_relaxed);
-        if (load >= (tunable ? depth : ss.max_flows)) {
+        if (load >= (tunable ? std::min(depth, ss.max_flows) : ss.max_flows)) {
             continue; // Flow gate full.
         }
         if (ss.max_buffers - ss.enqueued_buffers.load(std::memory_order_relaxed) < num_buffers) {
@@ -303,8 +306,8 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
     // Park the flow in the in-flight list; the iterator is stable for handle_completion to flag
     // `done`. The dispatcher already reserved the slot (atomically bumped
     // `enqueued`/`enqueued_buffers`).
-    LocalSinkOperator            *sink = nullptr;
-    std::list<InFlight>::iterator slot;
+    std::vector<LocalSinkOperator *> sinks;
+    std::list<InFlight>::iterator    slot;
     {
         libstf::Profiler::open_regions({profiler_prefix + "dispatch_to::setup"});
         std::lock_guard<std::mutex> lock(ss.mutex);
@@ -313,26 +316,34 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         slot->completion = pending.completion;
         for (auto &op : slot->flow) {
             if (auto *s = dynamic_cast<LocalSinkOperator *>(op.get())) {
-                sink = s;
+                sinks.push_back(s);
             }
         }
-        assert(sink != nullptr && "flow has no sink");
+        assert(!sinks.empty() && "flow has no sink");
 
         // Record a pending completion per sink buffer *before* any buffer is enqueued so the
         // interrupt that fires once the hardware writes always finds its match. The FIFO order must
         // equal the enqueue (CSR) order below; both run here, on the single dispatcher thread. The
-        // final buffer's completion concludes the flow.
-        const auto &buffers = sink->buffers();
-        for (size_t i = 0; i < buffers.size(); ++i) {
-            ss.completions.push_back(PendingCompletion{buffers[i], sink->tag(), slot->completion,
-                                                       slot, i + 1 == buffers.size()});
+        // final buffer of the final sink concludes the flow.
+        for (size_t s_idx = 0; s_idx < sinks.size(); ++s_idx) {
+            auto       *s            = sinks[s_idx];
+            const auto &buffers      = s->buffers();
+            const bool  is_last_sink = (s_idx + 1 == sinks.size());
+            for (size_t i = 0; i < buffers.size(); ++i) {
+                const bool is_sink_last = (i + 1 == buffers.size());
+                const bool is_flow_last = is_last_sink && is_sink_last;
+                ss.completions.push_back(PendingCompletion{buffers[i], s->tag(), slot->completion,
+                                                           slot, is_sink_last, is_flow_last});
+            }
         }
         libstf::Profiler::close_regions({profiler_prefix + "dispatch_to::setup"});
     }
 
-    // Enqueue the sink's output buffers to the FPGA (CSR writes), in FIFO order, before the sources
+    // Enqueue the sinks' output buffers to the FPGA (CSR writes), in FIFO order, before the sources
     // trigger the transfer so the hardware output writer already has a destination.
-    sink->apply(stream, ctx_);
+    for (auto *s : sinks) {
+        s->apply(stream, ctx_);
+    }
 
     // Apply the remaining operators (sources, decode config), which start the transfer.
     for (auto &op : slot->flow) {
@@ -373,10 +384,10 @@ void Scheduler::handle_completion(libstf::stream_t stream, uint32_t bytes_writte
     pc.buffer->size = bytes_written;
     pc.completion->channel->push_batch(pc.tag, pc.buffer);
 
-    // The hardware sets `last` on the interrupt of the buffer that saw the flow's final beat --
+    // The hardware sets `last` on the interrupt of the buffer that saw the transfer's final beat --
     // that must be exactly the sink's final buffer. The accounting below trusts the software
     // bookkeeping (pc.last) so a stray hardware flag cannot corrupt the pipeline.
-    assert(last == pc.last && "hardware `last` flag disagrees with the sink's final buffer");
+    assert(last == pc.sink_last && "hardware `last` flag disagrees with the sink's final buffer");
 
     if (pc.last) {
         // Flow done (one interrupt, for the sink's final buffer, concludes each flow): flag the
