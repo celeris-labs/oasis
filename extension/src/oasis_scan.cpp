@@ -71,6 +71,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 		throw InvalidInputException("Parquet file contains no row groups");
 	}
 	bind_data->metadata = std::move(meta);
+	bind_data->bloom_dense_columns = ComputeBloomDenseColumns(parquet_reader);
 	bind_data->filename = parquet_file;
 
 	bind_data->parquet_metadata = parquet_reader.metadata;
@@ -397,8 +398,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// the whole scan is done (see ~OasisScanGlobalState).
 	if (gstate.bloom_active) {
 		splinter.streams.push_back(ConstructBloomProbeFlow(ctx, pending, rdma,
-		                                                   gstate.bloom_probe_key_slot,
-		                                                   gstate.projected_columns.size(), is_bypassed));
+		                                                   gstate.bloom_probe_key_slot, gstate.projected_columns,
+		                                                   bind.bloom_dense_columns, is_bypassed));
 		bloom_mask_flows = 1;
 	}
 

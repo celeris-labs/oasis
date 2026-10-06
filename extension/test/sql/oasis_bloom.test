@@ -55,8 +55,12 @@ true
 # ---------------------------------------------------------------------------
 # Fixtures
 #
-# The Bloom filter only takes required INT64 keys. DuckDB writes a column as required if its
-# statistics prove it has no NULLs, e.g. when it comes from a NOT NULL column. With a single thread
+# The Bloom filter only takes INT64 keys, and only materializes 64-bit columns, that are OPTIONAL
+# in the file (they carry the definition-level section the column chunk decoder strips) and whose
+# statistics prove every row group has no NULLs (null_count = 0). DuckDB writes a column as REQUIRED
+# if the statistics of the query it is copied from prove it has no NULLs, so every fixture table
+# gets one extra all-NULL row (the table's statistics then keep allowing NULLs), which the COPY
+# leaves out again by selecting on the helper column g (NULL for that row). With a single thread
 # and ROW_GROUP_SIZE 1, every branch of a UNION ALL becomes its own row group.
 #
 # bf_build: b_key = 3 * b_val for b_val = 0..255, in row groups of 128 and 128 rows.
@@ -77,73 +81,88 @@ statement ok
 SET threads = 1;
 
 statement ok
-CREATE TABLE bf_build_t (b_key BIGINT NOT NULL, b_val BIGINT NOT NULL);
+CREATE TABLE bf_build_t (b_key BIGINT, b_val BIGINT, g INTEGER);
 
 statement ok
-INSERT INTO bf_build_t SELECT i * 3, i FROM range(256) t(i);
+INSERT INTO bf_build_t SELECT i * 3, i, CASE WHEN i < 128 THEN 0 ELSE 1 END FROM range(256) t(i);
 
 statement ok
-COPY (FROM bf_build_t WHERE b_val < 128 UNION ALL FROM bf_build_t WHERE b_val >= 128)
+INSERT INTO bf_build_t VALUES (NULL, NULL, NULL);
+
+statement ok
+COPY (SELECT b_key, b_val FROM bf_build_t WHERE g = 0 UNION ALL SELECT b_key, b_val FROM bf_build_t WHERE g = 1)
 TO '{TEST_DIR}/bf_build.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1);
 
 statement ok
-CREATE TABLE bf_probe_t (p_id BIGINT NOT NULL, p_key BIGINT NOT NULL, p_double DOUBLE NOT NULL,
-    p_dec DECIMAL(15, 2) NOT NULL, p_int INTEGER NOT NULL, p_date DATE NOT NULL, p_str VARCHAR NOT NULL);
+CREATE TABLE bf_probe_t (p_id BIGINT, p_key BIGINT, p_double DOUBLE, p_dec DECIMAL(15, 2), p_int INTEGER,
+    p_date DATE, p_str VARCHAR, g INTEGER);
 
 statement ok
 INSERT INTO bf_probe_t
 SELECT i,
        CASE WHEN i = 250 THEN 3 WHEN i BETWEEN 251 AND 506 THEN (i * 7 % 255) * 3 + 1 ELSE i * 7 % 1500 END,
-       i * 0.5, i * 1.25, i, DATE '2020-01-01' + i::INTEGER, 's' || i
+       i * 0.5, i * 1.25, i, DATE '2020-01-01' + i::INTEGER, 's' || i,
+       CASE WHEN i < 250 THEN 0 WHEN i = 250 THEN 1 WHEN i <= 506 THEN 2 ELSE 3 END
 FROM range(638) t(i);
 
 statement ok
-COPY (FROM bf_probe_t WHERE p_id < 250
-      UNION ALL FROM bf_probe_t WHERE p_id = 250
-      UNION ALL FROM bf_probe_t WHERE p_id BETWEEN 251 AND 506
-      UNION ALL FROM bf_probe_t WHERE p_id >= 507)
+INSERT INTO bf_probe_t VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+statement ok
+COPY (SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str FROM bf_probe_t WHERE g = 0
+      UNION ALL SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str FROM bf_probe_t WHERE g = 1
+      UNION ALL SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str FROM bf_probe_t WHERE g = 2
+      UNION ALL SELECT p_id, p_key, p_double, p_dec, p_int, p_date, p_str FROM bf_probe_t WHERE g = 3)
 TO '{TEST_DIR}/bf_probe.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1);
 
 # Extreme and duplicate keys, one row group each
 statement ok
-CREATE TABLE bf_ext_build_t (e_key BIGINT NOT NULL, e_val BIGINT NOT NULL);
+CREATE TABLE bf_ext_build_t (e_key BIGINT, e_val BIGINT, g INTEGER);
 
 statement ok
-INSERT INTO bf_ext_build_t VALUES ('-9223372036854775808'::BIGINT, 1), (-5, 2), (0, 3), (7, 4), (7, 5), (9223372036854775807, 6);
+INSERT INTO bf_ext_build_t VALUES ('-9223372036854775808'::BIGINT, 1, 0), (-5, 2, 0), (0, 3, 0), (7, 4, 0), (7, 5, 0),
+    (9223372036854775807, 6, 0), (NULL, NULL, NULL);
 
 statement ok
-COPY bf_ext_build_t TO '{TEST_DIR}/bf_ext_build.parquet' (FORMAT parquet);
+COPY (SELECT e_key, e_val FROM bf_ext_build_t WHERE g = 0) TO '{TEST_DIR}/bf_ext_build.parquet' (FORMAT parquet);
 
 statement ok
-CREATE TABLE bf_ext_probe_t (x_id BIGINT NOT NULL, x_key BIGINT NOT NULL);
+CREATE TABLE bf_ext_probe_t (x_id BIGINT, x_key BIGINT, g INTEGER);
 
 statement ok
-INSERT INTO bf_ext_probe_t VALUES (1, '-9223372036854775808'::BIGINT), (2, -5), (3, 0), (4, 7), (5, 7), (6, 9223372036854775807), (7, 42), (8, -42), (9, 1);
+INSERT INTO bf_ext_probe_t VALUES (1, '-9223372036854775808'::BIGINT, 0), (2, -5, 0), (3, 0, 0), (4, 7, 0), (5, 7, 1),
+    (6, 9223372036854775807, 1), (7, 42, 1), (8, -42, 1), (9, 1, 1), (NULL, NULL, NULL);
 
 # Two row groups. With more rows than bf_ext_build (9 > 6), it is the probe side
 statement ok
-COPY (FROM bf_ext_probe_t WHERE x_id <= 4 UNION ALL FROM bf_ext_probe_t WHERE x_id > 4)
+COPY (SELECT x_id, x_key FROM bf_ext_probe_t WHERE g = 0 UNION ALL SELECT x_id, x_key FROM bf_ext_probe_t WHERE g = 1)
 TO '{TEST_DIR}/bf_ext_probe.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1);
 
 # A key the Bloom filter can't take, one row group: s_int INTEGER (= s_id)
 statement ok
-CREATE TABLE bf_skip_t (s_id BIGINT NOT NULL, s_int INTEGER NOT NULL);
+CREATE TABLE bf_skip_t (s_id BIGINT, s_int INTEGER, g INTEGER);
 
 statement ok
-INSERT INTO bf_skip_t SELECT i, i FROM range(8) t(i);
+INSERT INTO bf_skip_t SELECT i, i, 0 FROM range(8) t(i);
 
 statement ok
-COPY bf_skip_t TO '{TEST_DIR}/bf_skip.parquet' (FORMAT parquet);
+INSERT INTO bf_skip_t VALUES (NULL, NULL, NULL);
+
+statement ok
+COPY (SELECT s_id, s_int FROM bf_skip_t WHERE g = 0) TO '{TEST_DIR}/bf_skip.parquet' (FORMAT parquet);
 
 # A probe side with a row group larger than the hardware Bloom filter supports (131072 rows)
 statement ok
-CREATE TABLE bf_big_t (k BIGINT NOT NULL);
+CREATE TABLE bf_big_t (k BIGINT, g INTEGER);
 
 statement ok
-INSERT INTO bf_big_t SELECT i FROM range(131078) t(i);
+INSERT INTO bf_big_t SELECT i, CASE WHEN i < 131073 THEN 0 ELSE 1 END FROM range(131078) t(i);
 
 statement ok
-COPY (FROM bf_big_t WHERE k < 131073 UNION ALL FROM bf_big_t WHERE k >= 131073)
+INSERT INTO bf_big_t VALUES (NULL, NULL);
+
+statement ok
+COPY (SELECT k FROM bf_big_t WHERE g = 0 UNION ALL SELECT k FROM bf_big_t WHERE g = 1)
 TO '{TEST_DIR}/bf_big.parquet' (FORMAT parquet, ROW_GROUP_SIZE 131073);
 
 statement ok
@@ -179,7 +198,17 @@ SELECT count(*) FROM (
     FROM parquet_schema('{TEST_DIR}/bf_probe.parquet') UNION ALL FROM parquet_schema('{TEST_DIR}/bf_build.parquet')
     UNION ALL FROM parquet_schema('{TEST_DIR}/bf_ext_probe.parquet') UNION ALL FROM parquet_schema('{TEST_DIR}/bf_ext_build.parquet')
     UNION ALL FROM parquet_schema('{TEST_DIR}/bf_big.parquet'))
-WHERE num_children IS NULL AND repetition_type <> 'REQUIRED';
+WHERE num_children IS NULL AND repetition_type <> 'OPTIONAL';
+----
+0
+
+# ... and none of their row groups has a NULL, which is what lets the Bloom filter take them.
+query I
+SELECT count(*) FROM (
+    FROM parquet_metadata('{TEST_DIR}/bf_probe.parquet') UNION ALL FROM parquet_metadata('{TEST_DIR}/bf_build.parquet')
+    UNION ALL FROM parquet_metadata('{TEST_DIR}/bf_ext_probe.parquet') UNION ALL FROM parquet_metadata('{TEST_DIR}/bf_ext_build.parquet')
+    UNION ALL FROM parquet_metadata('{TEST_DIR}/bf_big.parquet'))
+WHERE stats_null_count IS DISTINCT FROM 0;
 ----
 0
 
@@ -530,7 +559,7 @@ COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is 
 COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is rewritten, but the scan | SELECT count(*), sum(a.s_id) FROM bf_skip a JOIN bf_skip b ON a.s_int = b.s_int') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
 
 query II
-SELECT bloom_used(), bloom_skipped('not a required INT64 column');
+SELECT bloom_used(), bloom_skipped('not a NULL-free INT64 column');
 ----
 0	1
 

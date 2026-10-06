@@ -63,6 +63,9 @@ struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
 	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
+	// Per file column: delivers exactly one value per row, so the Bloom filter can take it (see
+	// ComputeBloomDenseColumns).
+	std::vector<bool> bloom_dense_columns;
 
 	// Set by the Oasis optimizer extension
 	bool runtime_bloom_enabled = false;
