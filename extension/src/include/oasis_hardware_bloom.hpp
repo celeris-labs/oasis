@@ -73,6 +73,7 @@ private:
 struct BloomBuildPlan {
 	size_t probe_key_slot;
 	parcore::metadata::Metadata build_meta;
+	std::vector<bool> build_dense_columns; // see ComputeBloomDenseColumns
 	size_t build_key_col_id;
 };
 
@@ -80,9 +81,21 @@ struct BloomBuildPlan {
 // see hardware/src/hdl/bloomfilter/mask_materializer.sv).
 constexpr size_t BLOOM_MAX_PROBE_ROWS = (size_t(1) << 14) * 8;
 
-bool IsBloomMaterializableChunk(const parcore::metadata::ColumnChunk &cc);
+// Per file column: whether the hardware delivers exactly one value per row for it, which is what the
+// Bloom filter's mask and materializer need. That holds for a column that
+//  - has a definition-level section but no repetition-level one (max_definition_level > 0 and
+//    max_repetition_level == 0): the column chunk decoder strips exactly that one leading section, and
+//  - has no NULLs in any row group (null_count statistics == 0), so no value is missing.
+// A REQUIRED column has no level section for the decoder to strip and is deliberately excluded.
+std::vector<bool> ComputeBloomDenseColumns(ParquetReader &reader);
 
-bool IsBloomKeyColumn(const parcore::metadata::Metadata &meta, size_t col_id);
+// A 64-bit column the filter's materializer can return the kept rows of.
+bool IsBloomMaterializableColumn(const std::vector<bool> &dense_columns, size_t col_id,
+                                 const parcore::metadata::ColumnChunk &cc);
+
+// An INT64 column the Bloom filter can take as its key.
+bool IsBloomKeyColumn(const parcore::metadata::Metadata &meta, const std::vector<bool> &dense_columns,
+                      size_t col_id);
 
 size_t CountBloomKeptRows(const libstf::Buffer &mask, size_t num_rows);
 
@@ -136,7 +149,8 @@ oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
                                             OasisScanLocalState::PendingGroup &pending,
                                             RDMAFileHandle *rdma,
                                             size_t bloom_probe_key_slot,
-                                            size_t num_projected_columns,
+                                            const std::vector<ProjectedColumn> &projected_columns,
+                                            const std::vector<bool> &dense_columns,
                                             std::vector<bool> &is_bypassed);
 
 // Constructs a bypass decode flow for column chunk k (routing around the Bloom filter).

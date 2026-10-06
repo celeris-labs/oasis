@@ -171,15 +171,64 @@ bool BloomFilterStreamSelectOperator::IsKeyChunk() const {
 	return select_ == BloomStreamSelect::FILTER || select_ == BloomStreamSelect::BUILD;
 }
 
-bool IsBloomMaterializableChunk(const parcore::metadata::ColumnChunk &cc) {
-	return libstf::size_of(parcore::metadata::to_libstf_type(cc.type)) == 8 && !cc.has_def_levels &&
-	       !cc.has_rep_levels;
+// Marks the leaves that carry a definition-level section but no repetition-level one. `column_index` is
+// the leaf's position in the file, which is also its index into RowGroup::columns.
+static void MarkBloomLevelLayout(const ParquetColumnSchema &schema, std::vector<bool> &dense) {
+	if (schema.children.empty()) {
+		if (schema.schema_type != ParquetColumnSchemaType::COLUMN) {
+			return; // Synthetic column (file_row_number and friends); no column chunk backs it.
+		}
+		if (schema.column_index < dense.size()) {
+			dense[schema.column_index] = schema.max_define > 0 && schema.max_repeat == 0;
+		}
+		return;
+	}
+	for (auto &child : schema.children) {
+		MarkBloomLevelLayout(child, dense);
+	}
 }
 
-bool IsBloomKeyColumn(const parcore::metadata::Metadata &meta, size_t col_id) {
+std::vector<bool> ComputeBloomDenseColumns(ParquetReader &reader) {
+	auto *file_meta = reader.GetFileMetadata();
+	const size_t num_leaf_columns = file_meta->row_groups.empty() ? 0 : file_meta->row_groups[0].columns.size();
+	std::vector<bool> dense(num_leaf_columns, false);
+	if (!reader.root_schema) {
+		return dense;
+	}
+	MarkBloomLevelLayout(*reader.root_schema, dense);
+
+	// Column statistics must prove the absence of NULLs in every row group. A missing statistic proves nothing.
+	for (const auto &rg : file_meta->row_groups) {
+		for (size_t col_idx = 0; col_idx < num_leaf_columns; col_idx++) {
+			if (!dense[col_idx]) {
+				continue;
+			}
+			if (col_idx >= rg.columns.size()) {
+				dense[col_idx] = false;
+				continue;
+			}
+			const auto &cmd = rg.columns[col_idx].meta_data;
+			if (!cmd.__isset.statistics || !cmd.statistics.__isset.null_count || cmd.statistics.null_count != 0) {
+				dense[col_idx] = false;
+			}
+		}
+	}
+	return dense;
+}
+
+bool IsBloomMaterializableColumn(const std::vector<bool> &dense_columns, size_t col_id,
+                                 const parcore::metadata::ColumnChunk &cc) {
+	return col_id < dense_columns.size() && dense_columns[col_id] &&
+	       libstf::size_of(parcore::metadata::to_libstf_type(cc.type)) == 8;
+}
+
+bool IsBloomKeyColumn(const parcore::metadata::Metadata &meta, const std::vector<bool> &dense_columns,
+                      size_t col_id) {
+	if (col_id >= dense_columns.size() || !dense_columns[col_id]) {
+		return false;
+	}
 	for (const auto &group : meta.groups) {
-		const auto &cc = group.chunks[col_id];
-		if (cc.type != parcore::metadata::Type::INT64_T || cc.has_def_levels || cc.has_rep_levels) {
+		if (group.chunks[col_id].type != parcore::metadata::Type::INT64_T) {
 			return false;
 		}
 	}
@@ -217,6 +266,7 @@ std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t prob
 	ParquetOptions parquet_opts(context);
 	ParquetReader build_reader(context, OpenFileInfo {build_filename}, parquet_opts);
 	auto build_meta = BuildParcoreMetadata(build_reader);
+	auto build_dense_columns = ComputeBloomDenseColumns(build_reader);
 	auto build_col = std::find(build_meta.column_names.begin(), build_meta.column_names.end(), build_key);
 	if (build_col == build_meta.column_names.end()) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' not found in '%s'.",
@@ -224,13 +274,13 @@ std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t prob
 		return std::nullopt;
 	}
 	const size_t build_key_col_id = static_cast<size_t>(build_col - build_meta.column_names.begin());
-	if (!IsBloomKeyColumn(build_meta, build_key_col_id)) {
-		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' is not a required INT64 column.",
+	if (!IsBloomKeyColumn(build_meta, build_dense_columns, build_key_col_id)) {
+		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' is not a NULL-free INT64 column.",
 		                 build_key.c_str());
 		return std::nullopt;
 	}
 
-	return BloomBuildPlan {probe_key_slot, std::move(build_meta), build_key_col_id};
+	return BloomBuildPlan {probe_key_slot, std::move(build_meta), std::move(build_dense_columns), build_key_col_id};
 }
 
 BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisContext &ctx,
@@ -278,8 +328,7 @@ BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisCo
 			flow.push_back(MakeHostSource(fetcher.Resolve(range))); // Keeps the read bytes alive
 		}
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
-		    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type), cc.has_def_levels,
-		    cc.has_rep_levels));
+		    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type)));
 		// The oasis top answers a build chunk with a one-byte ack
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(64), k));
 		splinter.streams.push_back(std::move(flow));
@@ -365,8 +414,8 @@ std::optional<size_t> ObtainBloomProbeKeySlot(ClientContext &context, const Oasi
 		                 bind.runtime_bloom_probe_key.c_str());
 		return std::nullopt;
 	}
-	if (!IsBloomKeyColumn(bind.metadata, gstate.projected_columns[*probe_key_slot].column_id)) {
-		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a required INT64 column.",
+	if (!IsBloomKeyColumn(bind.metadata, bind.bloom_dense_columns, gstate.projected_columns[*probe_key_slot].column_id)) {
+		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a NULL-free INT64 column.",
 		                 bind.runtime_bloom_probe_key.c_str());
 		return std::nullopt;
 	}
@@ -479,8 +528,7 @@ void AppendDecodeChunk(oasis::OperatorFlow &flow,
 		flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 	}
 	flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
-	    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type), cc.has_def_levels,
-	    cc.has_rep_levels));
+	    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type)));
 	flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(sink_size), tag));
 }
 
@@ -494,7 +542,8 @@ oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
                                             OasisScanLocalState::PendingGroup &pending,
                                             RDMAFileHandle *rdma,
                                             size_t bloom_probe_key_slot,
-                                            size_t num_projected_columns,
+                                            const std::vector<ProjectedColumn> &projected_columns,
+                                            const std::vector<bool> &dense_columns,
                                             std::vector<bool> &is_bypassed) {
 	std::vector<size_t> mat_k;
 	std::optional<size_t> probe_k;
@@ -502,7 +551,8 @@ oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
 		if (pending.hw_slot[k] == bloom_probe_key_slot) {
 			probe_k = k;
 			mat_k.push_back(k);
-		} else if (IsBloomMaterializableChunk(*pending.hw_chunks[k])) {
+		} else if (IsBloomMaterializableColumn(dense_columns, projected_columns[pending.hw_slot[k]].column_id,
+		                                         *pending.hw_chunks[k])) {
 			mat_k.push_back(k);
 		}
 	}
@@ -512,7 +562,7 @@ oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
 	AppendDecodeChunk(bloom_flow, ctx, pending, rdma, *probe_k,
 	                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::FILTER,
 	                                                                    static_cast<uint32_t>(mat_k.size())),
-	                  (pending.num_rows + 7) / 8, num_projected_columns);
+	                  (pending.num_rows + 7) / 8, projected_columns.size());
 
 	for (auto k : mat_k) {
 		AppendDecodeChunk(bloom_flow, ctx, pending, rdma, k,

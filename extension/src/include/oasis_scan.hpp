@@ -83,6 +83,9 @@ struct OasisScanBindData : public TableFunctionData {
 	// Reader over parquet_metadata that does not open the file. It answers statistics questions at
 	// plan time, and must outlive the partition statistics it hands out (they reference it).
 	shared_ptr<ParquetReader> metadata_reader;
+	// Per file column: delivers exactly one value per row, so the Bloom filter can take it (see
+	// ComputeBloomDenseColumns).
+	std::vector<bool> bloom_dense_columns;
 
 	// Set by the Oasis optimizer extension
 	bool runtime_bloom_enabled = false;
