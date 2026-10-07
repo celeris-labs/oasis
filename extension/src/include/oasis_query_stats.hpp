@@ -25,6 +25,13 @@ class DatabaseInstance;
 //   duckdb_bloom_ms         time evaluating DuckDB's join Bloom filters inside the scans
 //                           (oasis_duckdb_bloom_filter = true), summed over all workers. Unlike the
 //                           others it is CPU time, so it can exceed the scans' wall clock.
+//   join_ms                 DuckDB's own operator timing of the query's join operators (hash, nested
+//                           loop, piecewise merge, IE, as-of, cross and positional joins), the same
+//                           "timing" EXPLAIN ANALYZE shows: CPU time summed over workers, covering
+//                           the build and probe sides of the join itself but not the scans below it.
+//                           NULL when the query has no join, or when oasis_measure_join_time is off
+//                           (it needs DuckDB's profiler, which the collector switches on, silently,
+//                           for the length of each query unless the user already did).
 class OasisQueryStatsLogType : public LogType {
 public:
 	static constexpr const char *NAME = "OasisQueryStats";
@@ -36,7 +43,7 @@ public:
 
 	// A negative value stands for NULL.
 	static string ConstructLogMessage(double total_query_ms, double scan_only_ms, double scan_celeris_bloom_ms,
-	                                  double duckdb_bloom_ms);
+	                                  double duckdb_bloom_ms, double join_ms);
 };
 
 // Per-connection collector of the statistics above. The scans add to it from any thread while the
@@ -73,9 +80,18 @@ public:
 private:
 	void Reset();
 
-	// Written by the connection's own thread, which also runs QueryEnd.
+	// Sums DuckDB's operator timing of the join operators in the finished query's profile, in
+	// milliseconds, or -1 if the query has none or its profile is unavailable.
+	static double JoinTimeMs(ClientContext &context);
+
+	// Written by the connection's own thread, which also runs QueryBegin and QueryEnd.
 	bool active = false;
 	uint64_t query_start_ns = 0;
+	// DuckDB's profiler records this query (the user had it on, or the collector switched it on).
+	bool profiling = false;
+	// The collector switched the profiler on for this query and restores the user's settings.
+	bool profiling_forced = false;
+	string saved_profiler_print_format;
 
 	std::atomic<uint64_t> scan_only_ns {0};
 	std::atomic<uint64_t> scan_celeris_bloom_ns {0};
