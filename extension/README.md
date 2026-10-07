@@ -44,6 +44,26 @@ All values are in milliseconds, and NULL when they do not apply to the query.
 
 A scan's wall clock runs from its first worker starting to its last worker returning.
 
+### Hardware Bloom filter statistics
+
+Each run of the hardware Bloom filter (one per scan that used it, so a query with several such joins
+writes several) also writes one `OasisBloomFilterStats` record when the query ends. They are the
+counters of celeris's `examples/06_bloomfilter`, read once the scan has ended its probe side:
+
+```sql
+SELECT message.* FROM duckdb_logs WHERE type = 'OasisBloomFilterStats';
+```
+
+| Field | |
+| --- | --- |
+| `run` | Index of the run within the query, from 0 |
+| `build`, `probe` | Per phase, counted from its first accepted input beat to its END: `cycles`, `idle_cycles`, `stalled_cycles` (back pressure), `cmd_wait_cycles` (host too slow writing commands), the causes of the stalls (`stalled_mat_cycles`, `stalled_out_cycles`, `stalled_credit_cycles`), and the derived `stalled_internal_cycles` (e.g. bank conflicts), `data_wait_cycles` (host too slow delivering data) and `beats` |
+| `run_perf` | The whole run, first build beat to last handshake on any port: `cycles`, `keys_in_beats`, `values_in_beats`, `kept_out_beats`, `mat_out_beats`, `mask_out_beats`, `out_cycles`, and the latencies `first_out_cycles` and `probe_start_cycles` (measured from the end of the build phase), plus the derived `pipeline_cycles` and `out_bytes` |
+| `command_queue_overflowed` | The hardware's sticky status flag, cleared only by a device reset, so once a run overflows, every later run reports it too. Results of the run that overflowed are not reliable |
+
+Everything is in device clock cycles (250 MHz) and beats of 64 B, except the mask out beats, which are 1 B.
+
+
 ## Building
 
 Needs `Coyote`, `libstf`, `parcore` and `oasis` installed where CMake can find them.

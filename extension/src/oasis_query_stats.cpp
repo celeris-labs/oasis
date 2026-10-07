@@ -49,6 +49,83 @@ string OasisQueryStatsLogType::ConstructLogMessage(double total_query_ms, double
 }
 
 //===--------------------------------------------------------------------===//
+// OasisBloomFilterStatsLogType
+//===--------------------------------------------------------------------===//
+namespace {
+
+using Fields = vector<pair<string, uint64_t>>;
+
+Fields PhaseFields(const BloomPhasePerf &p) {
+	return {{"cycles", p.cycles},
+	        {"idle_cycles", p.idle_cycles},
+	        {"stalled_cycles", p.stalled_cycles},
+	        {"cmd_wait_cycles", p.cmd_wait_cycles},
+	        {"stalled_mat_cycles", p.stalled_mat_cycles},
+	        {"stalled_out_cycles", p.stalled_out_cycles},
+	        {"stalled_credit_cycles", p.stalled_credit_cycles},
+	        {"stalled_internal_cycles", p.StalledInternalCycles()},
+	        {"data_wait_cycles", p.DataWaitCycles()},
+	        {"beats", p.Beats()}};
+}
+
+Fields RunFields(const BloomRunPerf &r) {
+	return {{"cycles", r.cycles},
+	        {"keys_in_beats", r.keys_in_beats},
+	        {"values_in_beats", r.values_in_beats},
+	        {"kept_out_beats", r.kept_out_beats},
+	        {"mat_out_beats", r.mat_out_beats},
+	        {"mask_out_beats", r.mask_out_beats},
+	        {"out_cycles", r.out_cycles},
+	        {"first_out_cycles", r.first_out_cycles},
+	        {"probe_start_cycles", r.probe_start_cycles},
+	        {"pipeline_cycles", r.PipelineCycles()},
+	        {"out_bytes", r.OutBytes()}};
+}
+
+LogicalType FieldsType(const Fields &fields) {
+	child_list_t<LogicalType> children;
+	for (auto &field : fields) {
+		children.emplace_back(field.first, LogicalType::UBIGINT);
+	}
+	return LogicalType::STRUCT(std::move(children));
+}
+
+Value FieldsValue(const Fields &fields) {
+	child_list_t<Value> children;
+	for (auto &field : fields) {
+		children.emplace_back(field.first, Value::UBIGINT(field.second));
+	}
+	return Value::STRUCT(std::move(children));
+}
+
+} // namespace
+
+OasisBloomFilterStatsLogType::OasisBloomFilterStatsLogType() : LogType(NAME, LEVEL, GetLogType()) {
+}
+
+LogicalType OasisBloomFilterStatsLogType::GetLogType() {
+	child_list_t<LogicalType> child_list = {
+	    {"run", LogicalType::UBIGINT},
+	    {"build", FieldsType(PhaseFields({}))},
+	    {"probe", FieldsType(PhaseFields({}))},
+	    {"run_perf", FieldsType(RunFields({}))},
+	    {"command_queue_overflowed", LogicalType::BOOLEAN},
+	};
+	return LogicalType::STRUCT(std::move(child_list));
+}
+
+string OasisBloomFilterStatsLogType::ConstructLogMessage(idx_t run, const BloomPerfCounters &perf) {
+	child_list_t<Value> child_list = {
+	    {"run", Value::UBIGINT(run)},
+	    {"build", FieldsValue(PhaseFields(perf.build))},
+	    {"probe", FieldsValue(PhaseFields(perf.probe))},
+	    {"run_perf", FieldsValue(RunFields(perf.run))},
+	    {"command_queue_overflowed", Value::BOOLEAN(perf.command_queue_overflowed)},
+	};
+	return Value::STRUCT(std::move(child_list)).ToString();
+}
+
+//===--------------------------------------------------------------------===//
 // OasisQueryStats
 //===--------------------------------------------------------------------===//
 namespace {
@@ -129,6 +206,9 @@ void OasisQueryStats::Install(DatabaseInstance &db) {
 	if (!log_manager.LookupLogType(OasisQueryStatsLogType::NAME)) {
 		log_manager.RegisterLogType(make_uniq<OasisQueryStatsLogType>());
 	}
+	if (!log_manager.LookupLogType(OasisBloomFilterStatsLogType::NAME)) {
+		log_manager.RegisterLogType(make_uniq<OasisBloomFilterStatsLogType>());
+	}
 
 	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<OasisQueryStatsInstaller>());
 
@@ -147,6 +227,8 @@ void OasisQueryStats::Reset() {
 	scans_only = 0;
 	scans_celeris_bloom = 0;
 	duckdb_bloom_applicable = false;
+	lock_guard<std::mutex> guard(bloom_runs_mutex);
+	bloom_runs.clear();
 }
 
 void OasisQueryStats::QueryBegin(ClientContext &context) {
@@ -211,6 +293,15 @@ void OasisQueryStats::QueryEnd(ClientContext &context, optional_ptr<ErrorData>) 
 	const double duckdb_bloom_ms =
 	    duckdb_bloom_applicable.load() ? static_cast<double>(duckdb_bloom_ns.load()) / NS_PER_MS : -1;
 	DUCKDB_LOG(context, OasisQueryStatsLogType, total_ms, scan_only_ms, celeris_ms, duckdb_bloom_ms, join_ms);
+
+	vector<BloomPerfCounters> runs;
+	{
+		lock_guard<std::mutex> guard(bloom_runs_mutex);
+		runs = std::move(bloom_runs);
+	}
+	for (idx_t i = 0; i < runs.size(); i++) {
+		DUCKDB_LOG(context, OasisBloomFilterStatsLogType, i, runs[i]);
+	}
 	Reset();
 }
 
@@ -222,6 +313,11 @@ void OasisQueryStats::AddScan(bool celeris_bloom, uint64_t wall_ns) {
 		scan_only_ns += wall_ns;
 		scans_only++;
 	}
+}
+
+void OasisQueryStats::AddBloomRun(const BloomPerfCounters &perf) {
+	lock_guard<std::mutex> guard(bloom_runs_mutex);
+	bloom_runs.push_back(perf);
 }
 
 void OasisQueryStats::MarkDuckDBBloomApplicable() {

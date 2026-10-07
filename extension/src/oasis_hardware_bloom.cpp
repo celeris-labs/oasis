@@ -76,6 +76,51 @@ public:
 	bool command_queue_overflowed() {
 		return (read_register(9).value() & 0b11ULL) != 0;
 	}
+
+	// Mirrors celeris's BFConfig::fetch_perf_counters: build counters at registers 1-4 (+ causes at
+	// 10-12), probe at 5-8 (+ 13-15), the run's at 16-24. They hold the last run's values until the
+	// next run starts.
+	//
+	// A phase's `cycles` increments every cycle until the phase's END beat is accepted, and the
+	// END is written to a command queue just before this is called. So the probe `cycles` is read
+	// once more after everything else: if it moved, the END was not through yet, and we read again.
+	BloomPerfCounters fetch_perf_counters() {
+		BloomPerfCounters perf = fetch_perf_counters_once();
+		for (int retry = 0; retry < 16 && read_register(5).value() != perf.probe.cycles; retry++) {
+			perf = fetch_perf_counters_once();
+		}
+		return perf;
+	}
+
+private:
+	BloomPerfCounters fetch_perf_counters_once() {
+		BloomPerfCounters perf;
+		perf.build = fetch_phase_perf(1, 10);
+		perf.probe = fetch_phase_perf(5, 13);
+		perf.run.cycles = read_register(16).value();
+		perf.run.keys_in_beats = read_register(17).value();
+		perf.run.values_in_beats = read_register(18).value();
+		perf.run.kept_out_beats = read_register(19).value();
+		perf.run.mat_out_beats = read_register(20).value();
+		perf.run.mask_out_beats = read_register(21).value();
+		perf.run.out_cycles = read_register(22).value();
+		perf.run.first_out_cycles = read_register(23).value();
+		perf.run.probe_start_cycles = read_register(24).value();
+		perf.command_queue_overflowed = command_queue_overflowed();
+		return perf;
+	}
+
+	BloomPhasePerf fetch_phase_perf(uint32_t first_reg, uint32_t first_cause_reg) {
+		BloomPhasePerf perf;
+		perf.cycles = read_register(first_reg).value();
+		perf.idle_cycles = read_register(first_reg + 1).value();
+		perf.stalled_cycles = read_register(first_reg + 2).value();
+		perf.cmd_wait_cycles = read_register(first_reg + 3).value();
+		perf.stalled_mat_cycles = read_register(first_cause_reg).value();
+		perf.stalled_out_cycles = read_register(first_cause_reg + 1).value();
+		perf.stalled_credit_cycles = read_register(first_cause_reg + 2).value();
+		return perf;
+	}
 };
 
 // Mirrors celeris's StreamConfig (parcore/libstf/hardware/src/hdl/config/stream_config.sv)
@@ -125,6 +170,10 @@ void PushBloomMaterializeCommand(oasis::OasisContext &ctx, uint32_t num_columns)
 
 bool BloomCommandQueueOverflowed(oasis::OasisContext &ctx) {
 	return ctx.config<BloomFilterConfig>()->command_queue_overflowed();
+}
+
+BloomPerfCounters FetchBloomPerfCounters(oasis::OasisContext &ctx) {
+	return ctx.config<BloomFilterConfig>()->fetch_perf_counters();
 }
 
 void CheckOasisHardwareBloom(oasis::OasisContext &ctx) {
@@ -340,7 +389,8 @@ BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisCo
 }
 
 void TeardownHardwareBloom(oasis::OasisContext *ctx, oasis::SplinterResultHandle &bloom_build,
-                           bool bloom_filter_held, bool bloom_active, bool bloom_build_submitted) {
+                           bool bloom_filter_held, bool bloom_active, bool bloom_build_submitted,
+                           std::optional<BloomPerfCounters> &perf) {
 	if (!bloom_filter_held) {
 		return;
 	}
@@ -352,9 +402,14 @@ void TeardownHardwareBloom(oasis::OasisContext *ctx, oasis::SplinterResultHandle
 			while (bloom_build_submitted && bloom_build.get_next_batch()) {
 			}
 			PushBloomInputCommand(*ctx, BloomInputCommand::END);
-			if (BloomCommandQueueOverflowed(*ctx)) {
+			// The counters hold this run's values until the next build starts, and the filter is ours
+			// until ReleaseBloomFilter, so this is the run's final state.
+			perf = FetchBloomPerfCounters(*ctx);
+			// The flag is sticky until the device is reset, so every later run reports it as well
+			static std::atomic<bool> overflow_reported {false};
+			if (perf->command_queue_overflowed && !overflow_reported.exchange(true)) {
 				fprintf(stderr, "[OASIS] A hardware Bloom filter command queue overflowed, its results are not "
-				                "reliable.\n");
+				                "reliable (reported once, the flag stays set until the device is reset).\n");
 			}
 		} catch (std::exception &e) {
 			fprintf(stderr, "[OASIS] Failed to end the runtime Bloom filter's probe side: %s\n", e.what());

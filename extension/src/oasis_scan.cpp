@@ -302,9 +302,13 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 
 OasisScanGlobalState::~OasisScanGlobalState() {
 	uint64_t teardown_ns = 0;
+	std::optional<BloomPerfCounters> bloom_perf;
 	{
 		ScopedTimer timer(teardown_ns);
-		TeardownHardwareBloom(ctx, bloom_build, bloom_filter_held, bloom_active, bloom_build_submitted);
+		TeardownHardwareBloom(ctx, bloom_build, bloom_filter_held, bloom_active, bloom_build_submitted, bloom_perf);
+	}
+	if (query_stats && bloom_perf) {
+		query_stats->AddBloomRun(*bloom_perf);
 	}
 
 	// DuckDB destroys the scans' states before it ends the query, so this is in time for its report.
