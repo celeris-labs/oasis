@@ -2,9 +2,12 @@
 
 #include "duckdb/logging/log_type.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "oasis_bloom_perf.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <vector>
 
 namespace duckdb {
 
@@ -46,6 +49,30 @@ public:
 	                                  double duckdb_bloom_ms, double join_ms);
 };
 
+// One record per run of the hardware Bloom filter (one per scan that used it; a query with several
+// such joins writes several), written when the query ends, next to the OasisQueryStats record:
+//
+//   SELECT message.* FROM duckdb_logs WHERE type = 'OasisBloomFilterStats';
+//
+// `run` numbers the runs of the query from 0. `build` and `probe` are the phases' counters and `run_perf`
+// the whole run's, as in celeris's examples/06_bloomfilter (all in device clock cycles, 250 MHz, and
+// beats of 64 B except the mask out beats, which are 1 B). See oasis_bloom_perf.hpp for what each
+// counts. The extra fields derive from the raw ones (stalled_internal_cycles, data_wait_cycles, beats,
+// pipeline_cycles, out_bytes). `command_queue_overflowed` is the hardware's sticky status flag: it is only
+// cleared by a device reset, so once set, every later run reports it too. If true, results from the
+// run that overflowed are not reliable.
+class OasisBloomFilterStatsLogType : public LogType {
+public:
+	static constexpr const char *NAME = "OasisBloomFilterStats";
+	static constexpr LogLevel LEVEL = LogLevel::LOG_INFO;
+
+	OasisBloomFilterStatsLogType();
+
+	static LogicalType GetLogType();
+
+	static string ConstructLogMessage(idx_t run, const BloomPerfCounters &perf);
+};
+
 // Per-connection collector of the statistics above. The scans add to it from any thread while the
 // query runs. DuckDB destroys the scans' states before it calls QueryEnd, so by then every scan has
 // reported.
@@ -76,6 +103,8 @@ public:
 	// A scan kept DuckDB's join Bloom filters, so duckdb_bloom_ms applies to this query.
 	void MarkDuckDBBloomApplicable();
 	void AddDuckDBBloom(uint64_t ns);
+	// The counters of one finished run of the hardware Bloom filter.
+	void AddBloomRun(const BloomPerfCounters &perf);
 
 private:
 	void Reset();
@@ -99,6 +128,9 @@ private:
 	std::atomic<uint64_t> scans_only {0};
 	std::atomic<uint64_t> scans_celeris_bloom {0};
 	std::atomic<bool> duckdb_bloom_applicable {false};
+
+	std::mutex bloom_runs_mutex;
+	vector<BloomPerfCounters> bloom_runs;
 };
 
 } // namespace duckdb

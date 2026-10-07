@@ -4,6 +4,7 @@
 #include "oasis/operator.hpp"
 #include "oasis/query_splinter.hpp"
 #include "oasis/splinter_result.hpp"
+#include "oasis_bloom_perf.hpp"
 #include "oasis_scan.hpp"
 #include "parcore/metadata/metadata.hpp"
 
@@ -47,6 +48,11 @@ void PushBloomMaterializeCommand(oasis::OasisContext &ctx, uint32_t num_columns)
 
 // Whether a write to one of the (1024-entry) command queues was ever lost because it was full.
 bool BloomCommandQueueOverflowed(oasis::OasisContext &ctx);
+
+// Reads all of the filter's performance counters (build, probe and run, see oasis_bloom_perf.hpp).
+// They hold the last run's values until the next one starts, so read them after the probe side's
+// END and before the next scan builds.
+BloomPerfCounters FetchBloomPerfCounters(oasis::OasisContext &ctx);
 
 // Pushes one stream-select decision when applied, and for key chunks through the Bloom filter (FILTER,
 // BUILD) also their input command (CONTINUE, see BloomInputCommand) and, for probe key chunks, their
@@ -116,8 +122,11 @@ struct BloomBuildSubmission {
 BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisContext &ctx,
                                          const std::string &build_filename, const BloomBuildPlan &plan);
 
+// Ends the probe side and releases the filter. `perf` receives the run's counters when the probe
+// side was ended (left untouched otherwise).
 void TeardownHardwareBloom(oasis::OasisContext *ctx, oasis::SplinterResultHandle &bloom_build,
-                           bool bloom_filter_held, bool bloom_active, bool bloom_build_submitted);
+                           bool bloom_filter_held, bool bloom_active, bool bloom_build_submitted,
+                           std::optional<BloomPerfCounters> &perf);
 
 // Populates bloom_sel with the indices of rows kept by the Bloom filter mask within the slice
 // [row_offset, row_offset + emit), and returns the count of kept rows.
