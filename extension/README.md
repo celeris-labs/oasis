@@ -18,6 +18,7 @@ reads from the configured RDMA file server.
 | `oasis_scheduler_num_streams` | all available | Streams the scheduler drives |
 | `oasis_scheduler_queue_depth` | hardware FIFO depth | Splinters in flight per stream |
 | `oasis_scan_groups_in_flight` | `16` | Row groups a scan keeps submitted but not yet collected, split across its workers |
+| `oasis_measure_join_time` | `true` | Fill `join_ms` in the query statistics (below). Needs DuckDB's profiler, which is switched on silently for each query and restored afterwards; set to `false` to leave it alone |
 | `oasis_rdma_server` | — | RDMA file server IP; required for `rdma://` |
 | `oasis_rdma_port` | Coyote default | TCP port for the QP exchange |
 
@@ -39,6 +40,7 @@ All values are in milliseconds, and NULL when they do not apply to the query.
 | `scan_only_ms` | Wall clock of the scans that did not use the hardware Bloom filter, summed over scans |
 | `scan_celeris_bloom_ms` | Same for scans that used it, plus the time spent submitting and ending its build side |
 | `duckdb_bloom_ms` | Time evaluating DuckDB's join Bloom filters in the scans (`oasis_duckdb_bloom_filter`), summed over workers. This is CPU time, so it can exceed the scans' wall clock |
+| `join_ms` | DuckDB's operator timing of the query's join operators (hash, nested loop, merge, IE, as-of, cross, positional), as `EXPLAIN ANALYZE` shows it. CPU time summed over workers, for the build and probe sides of the join itself, not the scans below it. NULL without a join or with `oasis_measure_join_time` off |
 
 A scan's wall clock runs from its first worker starting to its last worker returning.
 

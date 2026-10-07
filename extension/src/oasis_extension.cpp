@@ -62,6 +62,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Enable DuckDB's native join Bloom filters on read_oasis scans",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	config.AddExtensionOption("oasis_measure_join_time",
+	                          "Report the time DuckDB's join operators took (join_ms) in the OasisQueryStats log "
+	                          "record. Needs DuckDB's profiler, which is switched on silently for each query",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
 

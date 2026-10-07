@@ -2,10 +2,12 @@
 
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/main/query_profiler.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 
 namespace duckdb {
@@ -24,6 +26,7 @@ LogicalType OasisQueryStatsLogType::GetLogType() {
 	    {"scan_only_ms", LogicalType::DOUBLE},
 	    {"scan_celeris_bloom_ms", LogicalType::DOUBLE},
 	    {"duckdb_bloom_ms", LogicalType::DOUBLE},
+	    {"join_ms", LogicalType::DOUBLE},
 	};
 	return LogicalType::STRUCT(child_list);
 }
@@ -33,12 +36,14 @@ static Value MillisecondsOrNull(double ms) {
 }
 
 string OasisQueryStatsLogType::ConstructLogMessage(double total_query_ms, double scan_only_ms,
-                                                   double scan_celeris_bloom_ms, double duckdb_bloom_ms) {
+                                                   double scan_celeris_bloom_ms, double duckdb_bloom_ms,
+                                                   double join_ms) {
 	child_list_t<Value> child_list = {
 	    {"total_query_ms", MillisecondsOrNull(total_query_ms)},
 	    {"scan_only_ms", MillisecondsOrNull(scan_only_ms)},
 	    {"scan_celeris_bloom_ms", MillisecondsOrNull(scan_celeris_bloom_ms)},
 	    {"duckdb_bloom_ms", MillisecondsOrNull(duckdb_bloom_ms)},
+	    {"join_ms", MillisecondsOrNull(join_ms)},
 	};
 	return Value::STRUCT(std::move(child_list)).ToString();
 }
@@ -60,6 +65,63 @@ public:
 
 shared_ptr<OasisQueryStats> OasisQueryStats::Get(ClientContext &context) {
 	return context.registered_state->GetOrCreate<OasisQueryStats>(STATE_KEY);
+}
+
+namespace {
+
+bool IsJoinOperator(const string &type) {
+	return type == "HASH_JOIN" || type == "NESTED_LOOP_JOIN" || type == "BLOCKWISE_NL_JOIN" ||
+	       type == "PIECEWISE_MERGE_JOIN" || type == "IE_JOIN" || type == "ASOF_JOIN" ||
+	       type == "CROSS_PRODUCT" || type == "POSITIONAL_JOIN";
+}
+
+// The operator metrics keys changed between DuckDB's legacy and current result tree ("type" /
+// "operator_type" / "operator.type", likewise for timing), so accept all of them.
+const QueryProfileResult *FindValue(const QueryProfileResult &node, std::initializer_list<const char *> keys) {
+	for (auto &child : node.children) {
+		if (child->kind != QueryProfileResultKind::VALUE) {
+			continue;
+		}
+		for (auto key : keys) {
+			if (child->key == key) {
+				return child.get();
+			}
+		}
+	}
+	return nullptr;
+}
+
+// Adds the "timing" (seconds) of every join operator below `node` to `seconds`.
+void SumJoinTiming(const QueryProfileResult &node, double &seconds, bool &found) {
+	if (node.kind == QueryProfileResultKind::OBJECT) {
+		auto type = FindValue(node, {"type", "operator_type", "operator.type"});
+		auto timing = FindValue(node, {"timing", "operator_timing", "operator.timing"});
+		if (type && timing && !type->value.IsNull() && !timing->value.IsNull() &&
+		    IsJoinOperator(type->value.ToString())) {
+			seconds += timing->value.GetValue<double>();
+			found = true;
+		}
+	}
+	for (auto &child : node.children) {
+		SumJoinTiming(*child, seconds, found);
+	}
+}
+
+} // namespace
+
+double OasisQueryStats::JoinTimeMs(ClientContext &context) {
+	auto &profiler = QueryProfiler::Get(context);
+	if (!profiler.HasRoot()) {
+		return -1;
+	}
+	try {
+		double seconds = 0;
+		bool found = false;
+		SumJoinTiming(profiler.GetResult(), seconds, found);
+		return found ? seconds * 1e3 : -1;
+	} catch (std::exception &) {
+		return -1;
+	}
 }
 
 void OasisQueryStats::Install(DatabaseInstance &db) {
@@ -87,10 +149,30 @@ void OasisQueryStats::Reset() {
 	duckdb_bloom_applicable = false;
 }
 
-void OasisQueryStats::QueryBegin(ClientContext &) {
+void OasisQueryStats::QueryBegin(ClientContext &context) {
 	Reset();
 	query_start_ns = NowNs();
 	active = true;
+
+	// Join timing comes from DuckDB's operator profiler. If the user has not enabled it, switch it on
+	// for this query without any output; QueryEnd puts the settings back.
+	profiling = false;
+	profiling_forced = false;
+	auto &config = ClientConfig::GetConfig(context);
+	if (config.enable_profiler) {
+		profiling = true;
+		return;
+	}
+	Value measure;
+	if (context.TryGetCurrentSetting("oasis_measure_join_time", measure) && !measure.IsNull() &&
+	    !measure.GetValue<bool>()) {
+		return;
+	}
+	saved_profiler_print_format = config.profiler_print_format;
+	config.enable_profiler = true;
+	config.profiler_print_format = "no_output";
+	profiling = true;
+	profiling_forced = true;
 }
 
 void OasisQueryStats::QueryEnd(ClientContext &context, optional_ptr<ErrorData>) {
@@ -98,9 +180,25 @@ void OasisQueryStats::QueryEnd(ClientContext &context, optional_ptr<ErrorData>) 
 	const bool was_active = active;
 	active = false;
 
+	// DuckDB has already ended its profiler for this query, so the profile can be read now, and the
+	// settings can go back to what the user had.
+	const bool had_profile = profiling;
+	double join_ms = -1;
 	const uint64_t only = scans_only.load();
 	const uint64_t celeris = scans_celeris_bloom.load();
-	if (!was_active || (only == 0 && celeris == 0)) {
+	const bool report = was_active && (only != 0 || celeris != 0);
+	if (report && had_profile) {
+		join_ms = JoinTimeMs(context);
+	}
+	if (profiling_forced) {
+		auto &config = ClientConfig::GetConfig(context);
+		config.enable_profiler = false;
+		config.profiler_print_format = saved_profiler_print_format;
+	}
+	profiling = false;
+	profiling_forced = false;
+
+	if (!report) {
 		// Not a query that scanned a read_oasis table (or one that began before the extension was
 		// loaded), nothing to report.
 		Reset();
@@ -112,7 +210,7 @@ void OasisQueryStats::QueryEnd(ClientContext &context, optional_ptr<ErrorData>) 
 	const double celeris_ms = celeris ? static_cast<double>(scan_celeris_bloom_ns.load()) / NS_PER_MS : -1;
 	const double duckdb_bloom_ms =
 	    duckdb_bloom_applicable.load() ? static_cast<double>(duckdb_bloom_ns.load()) / NS_PER_MS : -1;
-	DUCKDB_LOG(context, OasisQueryStatsLogType, total_ms, scan_only_ms, celeris_ms, duckdb_bloom_ms);
+	DUCKDB_LOG(context, OasisQueryStatsLogType, total_ms, scan_only_ms, celeris_ms, duckdb_bloom_ms, join_ms);
 	Reset();
 }
 
