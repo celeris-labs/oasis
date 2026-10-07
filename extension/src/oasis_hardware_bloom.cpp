@@ -70,10 +70,11 @@ public:
 		write_register(libstf::ConfigRegister(1, static_cast<uint64_t>(cmd)));
 	}
 
-	// Read register 5: sticky command queue overflows, bit 0 input commands, bit 1 materialization
-	// commands
+	// Read register 9 (the last "status" register of celeris's BFConfig, see
+	// celeris/hardware/src/hdl/config/bloomfilter_config.sv): sticky command queue overflows,
+	// bit 0 input commands, bit 1 materialization commands
 	bool command_queue_overflowed() {
-		return (read_register(5).value() & 0b11ULL) != 0;
+		return (read_register(9).value() & 0b11ULL) != 0;
 	}
 };
 
