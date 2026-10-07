@@ -21,6 +21,27 @@ reads from the configured RDMA file server.
 | `oasis_rdma_server` | — | RDMA file server IP; required for `rdma://` |
 | `oasis_rdma_port` | Coyote default | TCP port for the QP exchange |
 
+## Query statistics
+
+Every query that scans a `read_oasis` table writes one record to DuckDB's log when it ends:
+
+```sql
+CALL enable_logging(level = 'info');
+-- run a query
+SELECT message.* FROM duckdb_logs WHERE type = 'OasisQueryStats';
+```
+
+All values are in milliseconds, and NULL when they do not apply to the query.
+
+| Field | |
+| --- | --- |
+| `total_query_ms` | Wall clock of the whole query, planning included |
+| `scan_only_ms` | Wall clock of the scans that did not use the hardware Bloom filter, summed over scans |
+| `scan_celeris_bloom_ms` | Same for scans that used it, plus the time spent submitting and ending its build side |
+| `duckdb_bloom_ms` | Time evaluating DuckDB's join Bloom filters in the scans (`oasis_duckdb_bloom_filter`), summed over workers. This is CPU time, so it can exceed the scans' wall clock |
+
+A scan's wall clock runs from its first worker starting to its last worker returning.
+
 ## Building
 
 Needs `Coyote`, `libstf`, `parcore` and `oasis` installed where CMake can find them.

@@ -108,6 +108,7 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	gstate->filename = bind_data.filename;
 	gstate->total_groups = bind_data.metadata.groups.size();
 	gstate->filters = input.filters;
+	gstate->query_stats = OasisQueryStats::Get(context);
 	if (input.op && input.op->type == PhysicalOperatorType::TABLE_SCAN) {
 		gstate->physical_scan = &input.op->Cast<PhysicalTableScan>();
 	}
@@ -169,6 +170,7 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	// The runtime Bloom filter's build side goes to the hardware once per scan, before any worker
 	// submits a probe key chunk. The filter is only taken if the scan can use it.
 	if (bind_data.runtime_bloom_enabled && !gstate->emit_cardinality_only) {
+		ScopedTimer timer(gstate->bloom_setup_ns);
 		auto plan = PrepareBloomBuild(context, bind_data, *gstate);
 		if (plan && TryAcquireBloomFilter(context, *gstate)) {
 			SubmitBloomBuild(context, ctx, bind_data, *plan, *gstate);
@@ -200,6 +202,8 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	auto &gstate = global_state_p->Cast<OasisScanGlobalState>();
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
 	auto lstate = make_uniq<OasisScanLocalState>();
+	lstate->gstate = &gstate;
+	gstate.NoteStart(OasisQueryStats::NowNs());
 
 	// Merge in the dynamic join filters, which did not exist yet when the global state was
 	// created at schedule time. The build side has completed by now (pipeline dependency), so the
@@ -273,6 +277,13 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 			}
 		}
 		lstate->scan_filters = std::move(new_filters);
+	} else {
+		for (auto &f : lstate->scan_filters) {
+			if (IsDuckDBJoinBloomFilter(f.filter)) {
+				f.is_duckdb_bloom = true;
+				gstate.query_stats->MarkDuckDBBloomApplicable();
+			}
+		}
 	}
 
 	return std::move(lstate);
@@ -290,13 +301,35 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 }
 
 OasisScanGlobalState::~OasisScanGlobalState() {
-	TeardownHardwareBloom(ctx, bloom_build, bloom_filter_held, bloom_active, bloom_build_submitted);
+	uint64_t teardown_ns = 0;
+	{
+		ScopedTimer timer(teardown_ns);
+		TeardownHardwareBloom(ctx, bloom_build, bloom_filter_held, bloom_active, bloom_build_submitted);
+	}
+
+	// DuckDB destroys the scans' states before it ends the query, so this is in time for its report.
+	if (query_stats) {
+		const uint64_t first = first_start_ns.load();
+		const uint64_t last = last_return_ns.load();
+		uint64_t wall_ns = first != std::numeric_limits<uint64_t>::max() && last > first ? last - first : 0;
+		if (bloom_active) {
+			wall_ns += bloom_setup_ns + bloom_drain_ns.load() + teardown_ns;
+		}
+		query_stats->AddScan(bloom_active, wall_ns);
+		query_stats->AddDuckDBBloom(duckdb_bloom_time_ns.load());
+	}
 }
 
 OasisScanLocalState::~OasisScanLocalState() {
 	if (bloom_active) {
-		DrainInFlightBloomProbeSplinters(*this);
+		uint64_t drain_ns = 0;
+		{
+			ScopedTimer timer(drain_ns);
+			DrainInFlightBloomProbeSplinters(*this);
+		}
+		gstate->bloom_drain_ns += drain_ns;
 	}
+	gstate->duckdb_bloom_time_ns += duckdb_bloom_time_ns;
 }
 
 
@@ -825,6 +858,14 @@ void OasisScanFunction(ClientContext &context, TableFunctionInput &data_p, DataC
 	auto &lstate = data_p.local_state->Cast<OasisScanLocalState>();
 	auto &bind = data_p.bind_data->Cast<OasisScanBindData>();
 	auto &ctx = *gstate.ctx;
+
+	// The scan's wall clock ends at the last call to return, see OasisScanGlobalState::NoteReturn.
+	struct ReturnNoter {
+		OasisScanGlobalState &gstate;
+		~ReturnNoter() {
+			gstate.NoteReturn(OasisQueryStats::NowNs());
+		}
+	} return_noter {gstate};
 
 	if (gstate.emit_cardinality_only) {
 		EmitCardinalityOnly(gstate, lstate, bind, output);

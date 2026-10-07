@@ -7,6 +7,7 @@
 #include "oasis/oasis_context.hpp"
 #include "oasis/splinter_result.hpp"
 #include "oasis_context_cache_entry.hpp"
+#include "oasis_query_stats.hpp"
 #include "parcore/metadata/metadata.hpp"
 #include "parquet_reader.hpp"
 
@@ -16,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <limits>
 #include <mutex>
 
 namespace duckdb {
@@ -55,6 +57,9 @@ struct OasisScanFilter {
 	unique_ptr<TableFilter> owned_filter; // null when `filter` references a gstate-owned filter
 	const TableFilter &filter;
 	unique_ptr<TableFilterState> filter_state;
+	// DuckDB's join Bloom filter (kept only with oasis_duckdb_bloom_filter): its evaluation time is
+	// reported separately in OasisQueryStats.
+	bool is_duckdb_bloom = false;
 };
 
 struct OasisScanBindData : public TableFunctionData {
@@ -144,6 +149,29 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	oasis::SplinterResultHandle bloom_build;
 	bool bloom_build_submitted = false; // false if the build side had no rows
 
+	// Statistics reported to the query's OasisQueryStats when this state is destroyed. The scan's
+	// wall clock runs from the first worker's start to the last worker's last return (steady_clock
+	// nanoseconds). The Bloom filter's own work outside the scan calls is added when bloom_active:
+	// bloom_setup_ns (submitting the build side), bloom_drain_ns (workers draining their probe
+	// splinters when they finish) and the teardown that ends the probe side.
+	shared_ptr<OasisQueryStats> query_stats;
+	std::atomic<uint64_t> first_start_ns {std::numeric_limits<uint64_t>::max()};
+	std::atomic<uint64_t> last_return_ns {0};
+	uint64_t bloom_setup_ns = 0;
+	std::atomic<uint64_t> bloom_drain_ns {0};
+	std::atomic<uint64_t> duckdb_bloom_time_ns {0}; // summed over workers, folded in by ~OasisScanLocalState
+
+	void NoteStart(uint64_t now_ns) {
+		auto current = first_start_ns.load(std::memory_order_relaxed);
+		while (now_ns < current && !first_start_ns.compare_exchange_weak(current, now_ns)) {
+		}
+	}
+	void NoteReturn(uint64_t now_ns) {
+		auto current = last_return_ns.load(std::memory_order_relaxed);
+		while (now_ns > current && !last_return_ns.compare_exchange_weak(current, now_ns)) {
+		}
+	}
+
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
 	}
@@ -165,6 +193,9 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 	// Copy of gstate.bloom_active: this worker's groups send probe key chunks through the filter.
 	bool bloom_active = false;
+
+	// The scan's global state, which outlives this worker (see ~OasisScanGlobalState).
+	OasisScanGlobalState *gstate = nullptr;
 
 	unique_ptr<ParquetReader> parquet_reader;
 	unique_ptr<ParquetReaderScanState> scan_state;
@@ -250,6 +281,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// when the worker's scan finishes.
 	uint64_t filter_time_ns = 0;
 	uint64_t string_decode_time_ns = 0;
+	// Time in DuckDB's join Bloom filters (OasisScanFilter::is_duckdb_bloom), a part of filter_time_ns.
+	// Reported through OasisQueryStats, so unlike the counters above it is not folded by
+	// OasisScanGetMetrics.
+	uint64_t duckdb_bloom_time_ns = 0;
 };
 
 void RegisterOasisScanFunction(ExtensionLoader &loader);

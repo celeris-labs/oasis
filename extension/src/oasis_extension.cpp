@@ -4,6 +4,7 @@
 #include "oasis_hardware_bloom.hpp"
 #include "oasis_optimizer.hpp"
 #include "oasis_profile.hpp"
+#include "oasis_query_stats.hpp"
 #include "oasis_scan.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_settings.hpp"
@@ -69,6 +70,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Detects read_oasis-to-read_oasis equi-joins and marks the probe-side scan for runtime Bloom
 	// filter pushdown.
 	RegisterOasisOptimizer(loader);
+
+	// Per-query statistics (total, scan, Bloom filter times), written to DuckDB's log at query end
+	OasisQueryStats::Install(instance);
 
 	// Stream profiler readout table function
 	RegisterOasisProfileFunction(loader);

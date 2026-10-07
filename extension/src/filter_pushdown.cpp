@@ -7,6 +7,8 @@
 #include "duckdb/storage/table/column_segment.hpp"
 #include "parquet_reader.hpp"
 
+#include <optional>
+
 namespace duckdb {
 
 // Appends the leaf conjuncts of a (possibly nested) top-level AND to `conjuncts`. A non-AND
@@ -139,6 +141,10 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 			}
 
 			auto &vec = scan_chunk.data[scan_filter.filter_idx];
+			std::optional<ScopedTimer> bloom_timer;
+			if (scan_filter.is_duckdb_bloom) {
+				bloom_timer.emplace(lstate.duckdb_bloom_time_ns);
+			}
 			ColumnReader::ApplyFilter(vec, scan_filter.filter, *scan_filter.filter_state, scan_count, sel,
 			                          approved_tuple_count);
 		}
@@ -188,8 +194,14 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 			SelectionVector filter_sel;
 			filter_sel.Initialize(nullptr); // (full) identity
 			idx_t prev_count = approved_tuple_count;
-			ColumnReader::ApplyFilter(vec, scan_filter.filter, *scan_filter.filter_state, prev_count,
-			                          filter_sel, approved_tuple_count);
+			{
+				std::optional<ScopedTimer> bloom_timer;
+				if (scan_filter.is_duckdb_bloom) {
+					bloom_timer.emplace(lstate.duckdb_bloom_time_ns);
+				}
+				ColumnReader::ApplyFilter(vec, scan_filter.filter, *scan_filter.filter_state, prev_count,
+				                          filter_sel, approved_tuple_count);
+			}
 			if (approved_tuple_count < prev_count) {
 				// update survivor space
 				sel.Initialize(sel.Slice(filter_sel, approved_tuple_count));
