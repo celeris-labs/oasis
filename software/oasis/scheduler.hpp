@@ -7,7 +7,6 @@
 
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -16,7 +15,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <string>
 #include <thread>
 #include <vector>
 
@@ -76,9 +74,6 @@ struct FlowDemand {
  */
 class Scheduler {
   public:
-    // How long the hardware may stay silent with work outstanding before the watchdog trips.
-    static constexpr std::chrono::milliseconds DEFAULT_WATCHDOG_TIMEOUT{30000};
-
     // `streams` describes all available hardware streams, indexed by hardware stream id.
     Scheduler(OasisContext &ctx, std::vector<StreamDescription> streams);
     ~Scheduler();
@@ -86,14 +81,11 @@ class Scheduler {
     Scheduler(const Scheduler &)            = delete;
     Scheduler &operator=(const Scheduler &) = delete;
 
-    // What `flow` occupies in its stream's FIFOs while in flight.
-    [[nodiscard]] static FlowDemand demand_of(const OperatorFlow &flow);
-
     // Expands the splinter into its flows, determines each flow's required capability (see
     // StreamCapability), and pushes each onto its capability's unbounded queue, returning instantly
     // with a future. The splinter completes (its single result channel closes) only once every flow
     // has drained. Throws if a flow requires a capability no stream provides, or could never fit
-    // any providing stream's bounds, or if the watchdog has tripped.
+    // any providing stream's bounds.
     SplinterResultHandle submit(QuerySplinter splinter);
 
     [[nodiscard]] libstf::stream_t num_streams() const { return num_streams_; }
@@ -104,17 +96,6 @@ class Scheduler {
 
     void                 set_pipeline_depth(size_t depth);
     [[nodiscard]] size_t pipeline_depth() const { return queue_depth_.load(); }
-
-    // Sets the watchdog timeout; zero disables the watchdog. Takes effect immediately.
-    void set_watchdog_timeout(std::chrono::milliseconds timeout);
-    [[nodiscard]] std::chrono::milliseconds watchdog_timeout() const {
-        return std::chrono::milliseconds(watchdog_timeout_ms_.load());
-    }
-
-    // Whether the watchdog tripped. The scheduler is unusable afterwards (the device is presumed
-    // wedged); `failure_message()` says what it saw.
-    [[nodiscard]] bool        failed() const;
-    [[nodiscard]] std::string failure_message() const;
 
     // Flows waiting in the dispatcher queues (not yet enqueued to the hardware).
     [[nodiscard]] size_t queued_flows() const;
@@ -208,19 +189,7 @@ class Scheduler {
     // other. Indexed by StreamCapability.
     std::array<std::deque<Pending>, NUM_STREAM_CAPABILITIES> queues_;
     bool                    stop_ = false;
-    // Set once by the watchdog, under dispatch_mutex_. Nothing is placed afterwards.
-    bool                    failed_ = false;
-    std::string             failure_message_;
     std::thread             dispatcher_;
-
-    // Watchdog. `completions_seen_` counts every hardware interrupt (bumped on the interrupt
-    // thread); the watchdog trips when it stands still while flows are outstanding.
-    std::atomic<uint64_t>    completions_seen_{0};
-    std::atomic<int64_t>     watchdog_timeout_ms_;
-    std::mutex               watchdog_mutex_;
-    std::condition_variable  watchdog_cv_;
-    bool                     watchdog_stop_ = false;
-    std::thread              watchdog_;
 
     // The dispatcher loop: Pops a queue head whose capability has a stream with a free slot, and
     // dispatches there. Parks on dispatch_cv_ when no queued flow is placeable. Reaps finished
