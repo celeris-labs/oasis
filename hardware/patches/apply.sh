@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Re-apply the out-of-tree TOE receive-window clamp to the nested network submodule.
+# Re-apply the out-of-tree TOE patches (0001 receive-window clamp, 0002 seeded ephemeral-port
+# cursor) to the nested network submodule.
 #
 # Idempotent: run it as often as you like. It never resets, stashes or reverts anything --
-# every check is a dry run (`git apply --check`), so a working tree that already carries the
-# clamp is left exactly as it is.
+# every check is a dry run (`git apply --check`), so a working tree that already carries a
+# patch is left exactly as it is. The patches touch disjoint files and apply in any order.
 #
 # See README.md in this directory for what the clamp does and why it lives here.
 
@@ -16,7 +17,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SUBMODULE_REL="parcore/libstf/coyote/hw/services/network"
 SUBMODULE="${REPO_ROOT}/${SUBMODULE_REL}"
 
-PATCH="${SCRIPT_DIR}/0001-toe-rx-window-clamp.patch"
+PATCHES=(
+    "${SCRIPT_DIR}/0001-toe-rx-window-clamp.patch"
+    "${SCRIPT_DIR}/0002-toe-seed-ephemeral-port-cursor.patch"
+)
 BUNDLE="${SCRIPT_DIR}/oasis-cmake-defined-guard.bundle"
 
 EXPECTED_SHA="e9edcc4b2b48b161b17cd60148515130ebeed66a"
@@ -31,7 +35,9 @@ die() { echo "apply.sh: ERROR: $*" >&2; exit 1; }
 git -C "${SUBMODULE}" rev-parse --git-dir >/dev/null 2>&1 \
   || die "${SUBMODULE} is not a git repository (submodule not initialised?)"
 
-[ -f "${PATCH}" ] || die "patch not found: ${PATCH}"
+for PATCH in "${PATCHES[@]}"; do
+    [ -f "${PATCH}" ] || die "patch not found: ${PATCH}"
+done
 
 # --- (a) the submodule must sit on the local-only commit the patch was cut against -------------
 ACTUAL_SHA="$(git -C "${SUBMODULE}" rev-parse HEAD)"
@@ -50,21 +56,23 @@ if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
       bash hardware/patches/apply.sh"
 fi
 
-# --- (b) already applied? then stop, quietly and without touching the tree ---------------------
-if git -C "${SUBMODULE}" apply --check --reverse "${PATCH}" >/dev/null 2>&1; then
-    echo "apply.sh: patch already applied to ${SUBMODULE_REL} -- nothing to do."
-    exit 0
-fi
+# --- (b)+(c) per patch: already applied -> skip; applies cleanly -> apply; otherwise stop ---------
+for PATCH in "${PATCHES[@]}"; do
+    NAME="${PATCH##*/}"
+    if git -C "${SUBMODULE}" apply --check --reverse "${PATCH}" >/dev/null 2>&1; then
+        echo "apply.sh: ${NAME} already applied to ${SUBMODULE_REL} -- nothing to do."
+        continue
+    fi
 
-# --- (c) apply, but only if it applies cleanly -------------------------------------------------
-if ! git -C "${SUBMODULE}" apply --check "${PATCH}" >/dev/null 2>&1; then
-    die "patch neither applies nor is already applied to ${SUBMODULE_REL}.
+    if ! git -C "${SUBMODULE}" apply --check "${PATCH}" >/dev/null 2>&1; then
+        die "${NAME} neither applies nor is already applied to ${SUBMODULE_REL}.
   The working tree is in some third state -- inspect it by hand:
-      git -C ${SUBMODULE_REL} diff -- hls/toe/rx_sar_table/rx_sar_table.cpp
+      git -C ${SUBMODULE_REL} diff --stat
       git -C ${SUBMODULE} apply --check ${PATCH}
-  Nothing has been modified."
-fi
+  Patches before this one in the list may have been applied; nothing else has been modified."
+    fi
 
-git -C "${SUBMODULE}" apply "${PATCH}"
-echo "apply.sh: applied ${PATCH##*/} to ${SUBMODULE_REL}."
-git -C "${SUBMODULE}" diff --stat -- hls/toe/rx_sar_table/rx_sar_table.cpp
+    git -C "${SUBMODULE}" apply "${PATCH}"
+    echo "apply.sh: applied ${NAME} to ${SUBMODULE_REL}."
+done
+git -C "${SUBMODULE}" diff --stat

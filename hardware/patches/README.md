@@ -6,8 +6,9 @@ nowhere else. `git submodule update` silently destroys them. This directory is t
 | file | what it is |
 | --- | --- |
 | `oasis-cmake-defined-guard.bundle` | the two local-only **commits** on branch `oasis/cmake-defined-guard` |
-| `0001-toe-rx-window-clamp.patch` | the **uncommitted** working-tree change that sits on top of them |
-| `apply.sh` | idempotent, non-destructive re-application of the patch |
+| `0001-toe-rx-window-clamp.patch` | **uncommitted** working-tree change on top of them: the receive-window clamp |
+| `0002-toe-seed-ephemeral-port-cursor.patch` | **uncommitted** working-tree change on top of them: the seeded port cursor (build-121 on) |
+| `apply.sh` | idempotent, non-destructive re-application of both patches |
 
 ## The submodule
 
@@ -44,11 +45,12 @@ Then confirm:
 
 ```sh
 git -C $SM rev-parse HEAD            # e9edcc4b2b48b161b17cd60148515130ebeed66a
-git -C $SM diff --stat               # hls/toe/rx_sar_table/rx_sar_table.cpp | 29 +++-
+git -C $SM diff --stat               # 8 files: rx_sar_table.cpp (0001) + port_table, tx_app_if,
+                                     # tx_app_interface, toe.cpp (0002)
 ```
 
 `apply.sh` refuses to do anything unless HEAD is the expected commit, reports "already applied"
-and exits 0 on a second run, and only ever dry-runs (`git apply --check`) before touching the
+per patch and exits 0 on a second run, and only ever dry-runs (`git apply --check`) before touching the
 tree. It never resets, stashes or reverts.
 
 ## Why the clamp exists
@@ -71,6 +73,32 @@ A zero window is the case TCP already handles well: the sender stops, its persis
 every ~200 ms, and it resumes the moment the application drains. Same throttling, no storm. So
 the clamp collapses the entire refuse-band to zero, with one MSS of margin because free space can
 shrink between advertising the window and the segment arriving.
+
+## Why the port-cursor seed exists (0002, from build-121)
+
+`free_port_table` in `hls/toe/port_table/port_table.cpp` hands out ephemeral ports 32768..33279
+from a cursor that is a `static` initialised to 0, and it pre-fills the depth-4
+`portTable2txApp_port_rsp` FIFO a few cycles after reset. So every bitstream load gave its first
+four connections **32768, 32769, 32770, 32771**, always the same four.
+
+An origin server cannot tell that the board was reprogrammed, so it still holds the previous
+load's sockets `ESTAB`. The new load dials identical 4-tuples, the server answers the SYN with an
+ACK for the old connection, the board RSTs, and the SYN retries every ~1.25 s forever
+(`[TCP Port numbers reused]` in Wireshark, captured three times on 2026-09-15). Which lanes lock
+out is decided by which of the old sockets survived.
+
+The patch makes the port table allocate nothing until `tx_app_if` sees the first open request.
+`tx_app_if` then sends one token on the long-commented-out `txApp2portTable_port_req` stream, and
+the table loads its cursor from a free-running counter. The cycle that token arrives on is set by
+host timing, not by reset, so the start port differs from load to load. After that the allocator
+behaves exactly as before. A reprogram still leaves the origin's old sockets behind, but a
+collision now needs the new start to land within a few ports of the old one (~1-2% per
+reprogram with four lanes) instead of happening every time.
+
+Verified in C simulation (`port_table` + `tx_app_if` cycle by cycle): no port leaves the table
+before the first open; the first port is `32768 + ((idle + 2) mod 512)` for any idle time; ports
+stay consecutive and in range; used-port checks and releases still work. The full TOE also goes
+through Vitis HLS 2024.2 `csynth_design` with these changes.
 
 ## The card-memory pool constants (0003) — EN_MEM shells only
 

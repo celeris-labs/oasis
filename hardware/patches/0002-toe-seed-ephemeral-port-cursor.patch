@@ -1,0 +1,239 @@
+diff --git a/hls/toe/port_table/port_table.cpp b/hls/toe/port_table/port_table.cpp
+index 8482a40..f5964ba 100755
+--- a/hls/toe/port_table/port_table.cpp
++++ b/hls/toe/port_table/port_table.cpp
+@@ -113,7 +113,7 @@ void listening_port_table(	stream<ap_uint<16> >&	rxApp2portTable_listen_req,
+  */
+ void free_port_table(	stream<ap_uint<16> >&	sLookup2portTable_releasePort,
+ 						stream<ap_uint<15> >&	pt_portCheckUsed_req_fifo,
+-						//stream<ap_uint<1> >&	txApp2portTable_port_req,
++						stream<ap_uint<1> >&	txApp2portTable_port_req,
+ 						stream<bool>&			pt_portCheckUsed_rsp_fifo,
+ 						stream<ap_uint<16> >&	portTable2txApp_port_rsp)
+ {
+@@ -130,10 +130,20 @@ void free_port_table(	stream<ap_uint<16> >&	sLookup2portTable_releasePort,
+ #endif
+ 
+ 	static ap_uint<FREE_PORT_BITS> pt_cursor = 0;
++	// Every bitstream load resets pt_cursor, and portTable2txApp_port_rsp is pre-filled a few
++	// cycles after reset -- so every load handed out 32768, 32769, ... in the same order. A server
++	// still holding the previous load's sockets answers those SYNs with an ACK for the old
++	// connection, and the open never completes. Nothing is allocated until tx_app_if reports the
++	// first open request, and the cursor starts wherever a free-running counter stands on that
++	// cycle: an instant set by the host, not by reset, so it differs from one load to the next.
++	static ap_uint<FREE_PORT_BITS> pt_seedCounter = 0;
++	static bool pt_seeded = false;
+ 
+ 	ap_uint<16> currPort;
+ 	ap_uint<16> freePort;
+ 
++	pt_seedCounter++;
++
+ 	if (!sLookup2portTable_releasePort.empty())
+ 	{
+ 		sLookup2portTable_releasePort.read(currPort);
+@@ -147,6 +157,15 @@ void free_port_table(	stream<ap_uint<16> >&	sLookup2portTable_releasePort,
+ 		ap_uint<15> checkIdx = pt_portCheckUsed_req_fifo.read();
+ 		pt_portCheckUsed_rsp_fifo.write(freePortTable[checkIdx(FREE_PORT_BITS-1, 0)]);
+ 	}
++	else if (!pt_seeded)
++	{
++		if (!txApp2portTable_port_req.empty())
++		{
++			txApp2portTable_port_req.read();
++			pt_cursor = pt_seedCounter;
++			pt_seeded = true;
++		}
++	}
+ 	else
+ 	{
+ 		bool used = freePortTable[pt_cursor];
+@@ -161,10 +180,6 @@ void free_port_table(	stream<ap_uint<16> >&	sLookup2portTable_releasePort,
+ 			pt_cursor++;
+ 		}
+ 	}
+-	/*if (!txApp2portTable_port_req.empty()) //Fixme this!!!
+-	{
+-		txApp2portTable_port_req.read();
+-	}*/
+ }
+ 
+ 
+@@ -273,7 +288,7 @@ void check_out_multiplexer(	stream<bool>&				pt_dstFifoIn,
+  */
+ void port_table(stream<ap_uint<16> >&		rxEng2portTable_check_req,
+ 				stream<ap_uint<16> >&		rxApp2portTable_listen_req,
+-				//stream<ap_uint<1> >&		txApp2portTable_port_req,
++				stream<ap_uint<1> >&		txApp2portTable_port_req,
+ 				stream<ap_uint<16> >&		sLookup2portTable_releasePort,
+ 				stream<bool>&				portTable2rxEng_check_rsp,
+ 				stream<bool>&				portTable2rxApp_listen_rsp,
+@@ -326,7 +341,7 @@ void port_table(stream<ap_uint<16> >&		rxEng2portTable_check_req,
+ 	 */
+ 	free_port_table(sLookup2portTable_releasePort,
+ 						pt_portCheckUsed_req_fifo,
+-						//txApp2portTable_port_req,
++						txApp2portTable_port_req,
+ 						pt_portCheckUsed_rsp_fifo,
+ 						portTable2txApp_port_rsp);
+ 
+diff --git a/hls/toe/port_table/port_table.hpp b/hls/toe/port_table/port_table.hpp
+index e82da27..82c43f1 100755
+--- a/hls/toe/port_table/port_table.hpp
++++ b/hls/toe/port_table/port_table.hpp
+@@ -45,7 +45,7 @@ struct portTableEntry
+  */
+ void port_table(stream<ap_uint<16> >&		rxEng2portTable_check_req,
+ 				stream<ap_uint<16> >&		rxApp2portTable_listen_req,
+-				//stream<ap_uint<1> >&		txApp2portTable_port_req,
++				stream<ap_uint<1> >&		txApp2portTable_port_req,
+ 				stream<ap_uint<16> >&		sLookup2portTable_releasePort,
+ 				stream<bool>&				portTable2rxEng_check_rsp,
+ 				stream<bool>&				portTable2rxApp_listen_rsp,
+diff --git a/hls/toe/toe.cpp b/hls/toe/toe.cpp
+index bfb060b..691eee4 100755
+--- a/hls/toe/toe.cpp
++++ b/hls/toe/toe.cpp
+@@ -637,14 +637,14 @@ void toe(	// Data & Memory Interface
+ 	static stream<bool>						portTable2rxEng_check_rsp("portTable2rxEng_check_rsp");
+ 	static stream<ap_uint<16> >				rxApp2portTable_listen_req("rxApp2portTable_listen_req");
+ 	static stream<bool>						portTable2rxApp_listen_rsp("portTable2rxApp_listen_rsp");
+-	//static stream<ap_uint<1> >				txApp2portTable_port_req("txApp2portTable_port_req");
++	static stream<ap_uint<1> >				txApp2portTable_port_req("txApp2portTable_port_req");
+ 	static stream<ap_uint<16> >				portTable2txApp_port_rsp("portTable2txApp_port_rsp");
+ 	static stream<ap_uint<16> >				sLookup2portTable_releasePort("sLookup2portTable_releasePort");
+ 	#pragma HLS stream variable=rxEng2portTable_check_req			depth=4
+ 	#pragma HLS stream variable=portTable2rxEng_check_rsp			depth=4
+ 	#pragma HLS stream variable=rxApp2portTable_listen_req			depth=4
+ 	#pragma HLS stream variable=portTable2rxApp_listen_rsp			depth=4
+-	//#pragma HLS stream variable=txApp2portTable_port_req			depth=4
++	#pragma HLS stream variable=txApp2portTable_port_req			depth=4
+ 	#pragma HLS stream variable=portTable2txApp_port_rsp			depth=4
+ 	#pragma HLS stream variable=sLookup2portTable_releasePort		depth=4
+ 
+@@ -794,14 +794,14 @@ void toe(	// Data & Memory Interface
+ 	static stream<bool>						portTable2rxEng_check_rsp("portTable2rxEng_check_rsp");
+ 	static stream<ap_uint<16> >				rxApp2portTable_listen_req("rxApp2portTable_listen_req");
+ 	static stream<bool>						portTable2rxApp_listen_rsp("portTable2rxApp_listen_rsp");
+-	//static stream<ap_uint<1> >				txApp2portTable_port_req("txApp2portTable_port_req");
++	static stream<ap_uint<1> >				txApp2portTable_port_req("txApp2portTable_port_req");
+ 	static stream<ap_uint<16> >				portTable2txApp_port_rsp("portTable2txApp_port_rsp");
+ 	static stream<ap_uint<16> >				sLookup2portTable_releasePort("sLookup2portTable_releasePort");
+ 	#pragma HLS stream variable=rxEng2portTable_check_req			depth=4
+ 	#pragma HLS stream variable=portTable2rxEng_check_rsp			depth=4
+ 	#pragma HLS stream variable=rxApp2portTable_listen_req			depth=4
+ 	#pragma HLS stream variable=portTable2rxApp_listen_rsp			depth=4
+-	//#pragma HLS stream variable=txApp2portTable_port_req			depth=4
++	#pragma HLS stream variable=txApp2portTable_port_req			depth=4
+ 	#pragma HLS stream variable=portTable2txApp_port_rsp			depth=4
+ 	#pragma HLS stream variable=sLookup2portTable_releasePort		depth=4
+ 
+@@ -856,7 +856,7 @@ void toe(	// Data & Memory Interface
+ 	// Port Table
+ 	port_table(		rxEng2portTable_check_req,
+ 					rxApp2portTable_listen_req,
+-					//txApp2portTable_port_req,
++					txApp2portTable_port_req,
+ 					sLookup2portTable_releasePort,
+ 					portTable2rxEng_check_rsp,
+ 					portTable2rxApp_listen_rsp,
+@@ -976,7 +976,7 @@ void toe(	// Data & Memory Interface
+ 						txApp2txSar_push,
+ 						openConnRsp,
+ 						txApp2sLookup_req,
+-						//txApp2portTable_port_req,
++						txApp2portTable_port_req,
+ 						txApp2stateTable_upd_req,
+ 						txApp2eventEng_setEvent,
+ 						timer2txApp_notification,
+diff --git a/hls/toe/tx_app_if/tx_app_if.cpp b/hls/toe/tx_app_if/tx_app_if.cpp
+index 3bd650c..04b7784 100755
+--- a/hls/toe/tx_app_if/tx_app_if.cpp
++++ b/hls/toe/tx_app_if/tx_app_if.cpp
+@@ -62,7 +62,7 @@ void tx_app_if(	stream<ipTuple>&				appOpenConnReq,
+ 				stream<openStatus>&				conEstablishedIn, //alter
+ 				stream<openStatus>&				appOpenConnRsp,
+ 				stream<fourTuple>&				txApp2sLookup_req,
+-				//stream<ap_uint<1> >&			txApp2portTable_port_req,
++				stream<ap_uint<1> >&			txApp2portTable_port_req,
+ 				stream<stateQuery>&				txApp2stateTable_upd_req,
+ 				stream<event>&					txApp2eventEng_setEvent,
+ 				stream<openStatus>&				rtTimer2txApp_notification,
+@@ -74,6 +74,7 @@ void tx_app_if(	stream<ipTuple>&				appOpenConnReq,
+ 	enum taiFsmStateType {IDLE, CLOSE_CONN};
+ 	static taiFsmStateType tai_fsmState = IDLE;
+ 	static ap_uint<16> tai_closeSessionID;
++	static bool tai_portReqSent = false;
+ 
+ 	ipTuple server_addr;
+ 	//fourTuple tuple;
+@@ -90,6 +91,13 @@ void tx_app_if(	stream<ipTuple>&				appOpenConnReq,
+ 		txApp2sLookup_req.write(fourTuple(myIpAddress, reverse(server_addr.ip_address), reverse(freePort), reverse(server_addr.ip_port)));
+ 		//tai_waitFreePort = false;
+ 	}
++	else if (!tai_portReqSent && !appOpenConnReq.empty() && !txApp2portTable_port_req.full())
++	{
++		// The port table allocates nothing before this (see free_port_table): the first open
++		// request is what seeds its cursor. Sent once; after that it keeps the FIFO filled itself.
++		txApp2portTable_port_req.write(1);
++		tai_portReqSent = true;
++	}
+ 
+ 	switch (tai_fsmState)
+ 	{
+diff --git a/hls/toe/tx_app_if/tx_app_if.hpp b/hls/toe/tx_app_if/tx_app_if.hpp
+index 0424ac7..aec2a5d 100755
+--- a/hls/toe/tx_app_if/tx_app_if.hpp
++++ b/hls/toe/tx_app_if/tx_app_if.hpp
+@@ -42,7 +42,7 @@ void tx_app_if(	stream<ipTuple>&				appOpenConnReq,
+ 				stream<openStatus>&				conEstablishedIn, //alter
+ 				stream<openStatus>&				appOpenConnRsp,
+ 				stream<fourTuple>&				txApp2sLookup_req,
+-				//stream<ap_uint<1> >&			txApp2portTable_port_req,
++				stream<ap_uint<1> >&			txApp2portTable_port_req,
+ 				stream<stateQuery>&				txApp2stateTable_upd_req,
+ 				stream<event>&					txApp2eventEng_setEvent,
+ 				stream<openStatus>&				rtTimer2txApp_notification,
+diff --git a/hls/toe/tx_app_interface/tx_app_interface.cpp b/hls/toe/tx_app_interface/tx_app_interface.cpp
+index 727295a..a86f9f2 100755
+--- a/hls/toe/tx_app_interface/tx_app_interface.cpp
++++ b/hls/toe/tx_app_interface/tx_app_interface.cpp
+@@ -209,7 +209,7 @@ void tx_app_interface(	stream<appTxMeta>&			appTxDataReqMetadata,
+ 
+ 					stream<openStatus>&				appOpenConnRsp,
+ 					stream<fourTuple>&				txApp2sLookup_req,
+-					//stream<ap_uint<1> >&			txApp2portTable_port_req,
++					stream<ap_uint<1> >&			txApp2portTable_port_req,
+ 					stream<stateQuery>&				txApp2stateTable_upd_req,
+ 					stream<event>&					txApp2eventEng_setEvent,
+ 					stream<openStatus>&				rtTimer2txApp_notification,
+@@ -305,7 +305,7 @@ void tx_app_interface(	stream<appTxMeta>&			appTxDataReqMetadata,
+ 				conEstablishedFifo,
+ 				appOpenConnRsp,
+ 				txApp2sLookup_req,
+-				//txApp2portTable_port_req,
++				txApp2portTable_port_req,
+ 				txApp2stateTable_upd_req,
+ 				txApp2eventEng_mergeEvent,
+ 				rtTimer2txApp_notification,
+@@ -341,7 +341,7 @@ template void tx_app_interface<DATA_WIDTH>(	stream<appTxMeta>&			appTxDataReqMet
+ 
+ 					stream<openStatus>&				appOpenConnRsp,
+ 					stream<fourTuple>&				txApp2sLookup_req,
+-					//stream<ap_uint<1> >&			txApp2portTable_port_req,
++					stream<ap_uint<1> >&			txApp2portTable_port_req,
+ 					stream<stateQuery>&				txApp2stateTable_upd_req,
+ 					stream<event>&					txApp2eventEng_setEvent,
+ 					stream<openStatus>&				rtTimer2txApp_notification,
+diff --git a/hls/toe/tx_app_interface/tx_app_interface.hpp b/hls/toe/tx_app_interface/tx_app_interface.hpp
+index cd11a91..b42ddeb 100755
+--- a/hls/toe/tx_app_interface/tx_app_interface.hpp
++++ b/hls/toe/tx_app_interface/tx_app_interface.hpp
+@@ -67,6 +67,7 @@ void tx_app_interface(	stream<appTxMeta>&			appTxDataReqMetadata,
+ 
+ 					stream<openStatus>&				appOpenConnRsp,
+ 					stream<fourTuple>&				txApp2sLookup_req,
++					stream<ap_uint<1> >&			txApp2portTable_port_req,
+ 					stream<stateQuery>&				txApp2stateTable_upd_req,
+ 					stream<event>&					txApp2eventEng_setEvent,
+ 					stream<openStatus>&				rtTimer2txApp_notification,
