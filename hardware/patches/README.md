@@ -8,7 +8,8 @@ nowhere else. `git submodule update` silently destroys them. This directory is t
 | `oasis-cmake-defined-guard.bundle` | the two local-only **commits** on branch `oasis/cmake-defined-guard` |
 | `0001-toe-rx-window-clamp.patch` | **uncommitted** working-tree change on top of them: the receive-window clamp |
 | `0002-toe-seed-ephemeral-port-cursor.patch` | **uncommitted** working-tree change on top of them: the seeded port cursor (build-121 on) |
-| `apply.sh` | idempotent, non-destructive re-application of 0001, 0002 (network submodule) and 0006 (libstf) |
+| `0007-toe-rx-ddr-buffer.patch` | **uncommitted** working-tree change on top of 0001+0002: the receive ring in card memory (`RX_DDR_BYPASS = 0`) made to work; a no-op for bypass builds |
+| `apply.sh` | idempotent, non-destructive re-application of 0001, 0002, 0007 (network submodule) and 0006 (libstf) |
 
 ## The submodule
 
@@ -45,13 +46,17 @@ Then confirm:
 
 ```sh
 git -C $SM rev-parse HEAD            # e9edcc4b2b48b161b17cd60148515130ebeed66a
-git -C $SM diff --stat               # 8 files: rx_sar_table.cpp (0001) + port_table, tx_app_if,
-                                     # tx_app_interface, toe.cpp (0002)
+git -C $SM diff --stat               # 14 files: rx_sar_table.cpp (0001) + port_table, tx_app_if,
+                                     # tx_app_interface, toe.cpp (0002) + rx_engine, rx_sar_table.hpp,
+                                     # rx_app_stream_if, toe_internals.hpp, tx_engine, toe.cpp (0007)
 ```
 
 `apply.sh` refuses to do anything unless HEAD is the expected commit, reports "already applied"
-per patch and exits 0 on a second run, and only ever dry-runs (`git apply --check`) before touching the
-tree. It never resets, stashes or reverts.
+per patch and exits 0 on a second run, and only ever dry-runs (`git apply --check`, or a throw-away
+index) before touching the tree. It never resets, stashes or reverts. The patches are a stack in the
+listed order: 0007 rewrites lines 0001 added, so once 0007 is in, 0001 no longer reverse-applies on its
+own; `apply.sh` therefore first rebuilds HEAD + 0001..k in a temporary index and compares it with the
+working tree to find how much of the stack is already there, then falls back to the per-patch check.
 
 ## Why the clamp exists
 
@@ -99,6 +104,39 @@ Verified in C simulation (`port_table` + `tx_app_if` cycle by cycle): no port le
 before the first open; the first port is `32768 + ((idle + 2) mod 512)` for any idle time; ports
 stay consecutive and in range; used-port checks and releases still work. The full TOE also goes
 through Vitis HLS 2024.2 `csynth_design` with these changes.
+
+## The receive ring in card memory (0007)
+
+`0007-toe-rx-ddr-buffer.patch` makes the TOE's non-bypass receive path work at this project's
+configuration (512-bit data path, `WINDOW_BITS` 20, i.e. a 1 MiB ring per session in card memory at
+`{00, sid, seq[19:0]}`). Upstream only ever exercised that path at 64 bits with 64 KiB rings. Every
+change is guarded by `#if !(RX_DDR_BYPASS)` or sits in a function that only exists in that mode, so a
+bypass build (every bitstream so far) is unchanged: csynth of `toe_top` with `RX_DDR_BYPASS 1` gives the
+same resource numbers and the same RTL with and without the patch. What it fixes:
+
+1. app reads split at a hard-coded 64 KiB instead of the 1 MiB ring end (wrong bytes after every 64 KiB);
+2. the read-split stitcher was 64-bit only (now a copy of the tx path's width-generic one);
+3. a retransmission overlapping data held behind a gap took no branch, so no drop decision: every later
+   packet of every session was paired with the wrong decision, write command and status;
+4. sequence numbers compared with plain `<`/`>` (wrong across 2^32);
+5. the gap-fill notification length was truncated to 16 bits (bytes never announced): out-of-order data
+   is now held only while it ends within 0xFFFF bytes of `recvd`;
+6. `free_space > len` refused a segment that exactly fills the advertised window;
+7. 0001's clamp (a bypass-FIFO workaround) closed the window ~28 KiB early: now bypass-only;
+8. a passive open's "opened" notification waited forever for a write status;
+9. a zero-length probe at `recvd - 1` (Linux's zero-window probe and keepalive) got no ACK, so a closed
+   window never reopened;
+10. a peer without window scaling got the free space modulo 65536 instead of at most 0xFFFF;
+11. the second half of a tx retransmission that wraps the tx ring was read from session 0's ring;
+12. the ring space of a read was offered to the peer when the read was *issued*: with a near-full ring
+    and a read slower than one round trip the peer's next bytes overwrote unread data. A second pointer
+    (`appdIssued`) now addresses reads; `appd`, which the window and free space use, moves when the
+    read's last beat leaves the TOE.
+
+Verified in C simulation by `hardware/unit-tests/toe_csim` (`./run.sh`, Vitis HLS 2024.2
+`csim_design`, the TOE's real top `toe_top` against a model of the peer, the application and card
+memory): one case per fix, every case passes with the patch, and reverting any single fix makes its case
+fail. Turning the mode on is a separate step (CMake `TCP_STACK_RX_DDR_BYPASS_EN`, still 1 in the builds).
 
 ## The card-memory pool constants (0003) — EN_MEM shells only
 

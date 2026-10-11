@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # Re-apply the out-of-tree TOE patches (0001 receive-window clamp, 0002 seeded ephemeral-port
-# cursor) to the nested network submodule.
+# cursor, 0007 receive buffer in card memory) to the nested network submodule.
 #
 # Idempotent: run it as often as you like. It never resets, stashes or reverts anything --
-# every check is a dry run (`git apply --check`), so a working tree that already carries a
-# patch is left exactly as it is. The patches touch disjoint files and apply in any order.
+# every check is a dry run (`git apply --check`, or a throw-away index), so a working tree that
+# already carries a patch is left exactly as it is. 0001 and 0002 touch disjoint files and apply in
+# either order; 0007 rewrites lines 0001 added (rx_sar_table.cpp) and goes on top of both.
 # 0006 (StreamProfiler input register) goes to parcore/libstf instead of the network submodule.
 #
 # See README.md in this directory for what the clamp does and why it lives here.
@@ -21,6 +22,7 @@ SUBMODULE="${REPO_ROOT}/${SUBMODULE_REL}"
 PATCHES=(
     "${SCRIPT_DIR}/0001-toe-rx-window-clamp.patch"
     "${SCRIPT_DIR}/0002-toe-seed-ephemeral-port-cursor.patch"
+    "${SCRIPT_DIR}/0007-toe-rx-ddr-buffer.patch"
 )
 LIBSTF_REL="parcore/libstf"
 LIBSTF="${REPO_ROOT}/${LIBSTF_REL}"
@@ -62,10 +64,37 @@ if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
       bash hardware/patches/apply.sh"
 fi
 
-# --- (b)+(c) per patch: already applied -> skip; applies cleanly -> apply; otherwise stop ---------
-for PATCH in "${PATCHES[@]}"; do
+# --- (b) how much of the list is in the tree already, as a stack ----------------------------------
+# A later patch may rewrite lines an earlier one added (0007 does, in 0001's rx_sar_table.cpp hunk);
+# then the earlier patch no longer reverse-applies on its own even though it is in the tree. So first
+# find the longest applied PREFIX: rebuild HEAD + patches 1..k in a throw-away index (the real index
+# and the working tree are not touched) and compare it with the working tree, for k = all .. 1.
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "${TMP_DIR}"' EXIT
+PATCH_FILES=()
+while IFS= read -r f; do PATCH_FILES+=("$f"); done < <(
+    for PATCH in "${PATCHES[@]}"; do git -C "${SUBMODULE}" apply --numstat "${PATCH}" | cut -f3; done | sort -u)
+APPLIED_PREFIX=0
+for ((k = ${#PATCHES[@]}; k > 0; k--)); do
+    export GIT_INDEX_FILE="${TMP_DIR}/index"
+    rm -f "${GIT_INDEX_FILE}"
+    ok=1
+    git -C "${SUBMODULE}" read-tree HEAD || ok=0
+    for ((j = 0; j < k && ok; j++)); do
+        git -C "${SUBMODULE}" apply --cached "${PATCHES[j]}" >/dev/null 2>&1 || ok=0
+    done
+    if [ "${ok}" = 1 ] && git -C "${SUBMODULE}" diff --quiet -- "${PATCH_FILES[@]}"; then
+        APPLIED_PREFIX=$k
+    fi
+    unset GIT_INDEX_FILE
+    [ "${APPLIED_PREFIX}" = 0 ] || break
+done
+
+# --- (c) per patch: already applied -> skip; applies cleanly -> apply; otherwise stop ------------
+for ((i = 0; i < ${#PATCHES[@]}; i++)); do
+    PATCH="${PATCHES[i]}"
     NAME="${PATCH##*/}"
-    if git -C "${SUBMODULE}" apply --check --reverse "${PATCH}" >/dev/null 2>&1; then
+    if [ "${i}" -lt "${APPLIED_PREFIX}" ] || git -C "${SUBMODULE}" apply --check --reverse "${PATCH}" >/dev/null 2>&1; then
         echo "apply.sh: ${NAME} already applied to ${SUBMODULE_REL} -- nothing to do."
         continue
     fi
