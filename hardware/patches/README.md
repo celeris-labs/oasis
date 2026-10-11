@@ -8,7 +8,7 @@ nowhere else. `git submodule update` silently destroys them. This directory is t
 | `oasis-cmake-defined-guard.bundle` | the two local-only **commits** on branch `oasis/cmake-defined-guard` |
 | `0001-toe-rx-window-clamp.patch` | **uncommitted** working-tree change on top of them: the receive-window clamp |
 | `0002-toe-seed-ephemeral-port-cursor.patch` | **uncommitted** working-tree change on top of them: the seeded port cursor (build-121 on) |
-| `apply.sh` | idempotent, non-destructive re-application of both patches |
+| `apply.sh` | idempotent, non-destructive re-application of 0001, 0002 (network submodule) and 0006 (libstf) |
 
 ## The submodule
 
@@ -122,7 +122,7 @@ is 52 MB of `vzalloc`'d chunk metadata instead of 32 MB (`sizeof(struct chunk)` 
 ## The StreamProfiler input register (0006) — libstf
 
 `0006-libstf-stream-profiler-input-register.patch` is, like 0003/0004, not for the network submodule,
-so `apply.sh` does not handle it. It is a working-tree change to **`parcore/libstf`** (expected HEAD
+so it is not applied to that submodule; `apply.sh` applies it to libstf in a second step. It is a working-tree change to **`parcore/libstf`** (expected HEAD
 `31d98eb`), file `hardware/src/hdl/util/stream_profiler.sv`, and unlike 0003/0004 it **is** part of
 every bitstream: the build seals libstf's HDL into `hdl/ext/raw/lib1/`, so a `git submodule update`
 that wipes it silently rebuilds the old profiler. Re-apply from the repo root and confirm:

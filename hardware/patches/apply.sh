@@ -6,6 +6,7 @@
 # Idempotent: run it as often as you like. It never resets, stashes or reverts anything --
 # every check is a dry run (`git apply --check`), so a working tree that already carries a
 # patch is left exactly as it is. The patches touch disjoint files and apply in any order.
+# 0006 (StreamProfiler input register) goes to parcore/libstf instead of the network submodule.
 #
 # See README.md in this directory for what the clamp does and why it lives here.
 
@@ -20,6 +21,11 @@ SUBMODULE="${REPO_ROOT}/${SUBMODULE_REL}"
 PATCHES=(
     "${SCRIPT_DIR}/0001-toe-rx-window-clamp.patch"
     "${SCRIPT_DIR}/0002-toe-seed-ephemeral-port-cursor.patch"
+)
+LIBSTF_REL="parcore/libstf"
+LIBSTF="${REPO_ROOT}/${LIBSTF_REL}"
+LIBSTF_PATCHES=(
+    "${SCRIPT_DIR}/0006-libstf-stream-profiler-input-register.patch"
 )
 BUNDLE="${SCRIPT_DIR}/oasis-cmake-defined-guard.bundle"
 
@@ -76,3 +82,19 @@ for PATCH in "${PATCHES[@]}"; do
     echo "apply.sh: applied ${NAME} to ${SUBMODULE_REL}."
 done
 git -C "${SUBMODULE}" diff --stat
+
+# --- libstf patches (0006): same per-patch logic against parcore/libstf -------------------------
+git -C "${LIBSTF}" rev-parse --git-dir >/dev/null 2>&1 || die "${LIBSTF} is not a git repository"
+for PATCH in "${LIBSTF_PATCHES[@]}"; do
+    NAME="${PATCH##*/}"
+    [ -f "${PATCH}" ] || die "patch not found: ${PATCH}"
+    if git -C "${LIBSTF}" apply --check --reverse "${PATCH}" >/dev/null 2>&1; then
+        echo "apply.sh: ${NAME} already applied to ${LIBSTF_REL} -- nothing to do."
+        continue
+    fi
+    git -C "${LIBSTF}" apply --check "${PATCH}" >/dev/null 2>&1 \
+      || die "${NAME} neither applies nor is already applied to ${LIBSTF_REL} (expected HEAD 31d98eb)."
+    git -C "${LIBSTF}" apply "${PATCH}"
+    echo "apply.sh: applied ${NAME} to ${LIBSTF_REL}."
+done
+git -C "${LIBSTF}" diff --stat -- hardware/src/hdl/util
