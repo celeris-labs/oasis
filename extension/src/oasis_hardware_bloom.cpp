@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -292,7 +293,13 @@ size_t CountBloomKeptRows(const libstf::Buffer &mask, size_t num_rows) {
 	}
 	const auto *bytes = static_cast<const uint8_t *>(mask.ptr);
 	size_t kept = 0;
-	for (size_t b = 0; b < num_rows / 8; b++) {
+	size_t b = 0;
+	for (; b + 8 <= num_rows / 8; b += 8) {
+		uint64_t word;
+		std::memcpy(&word, bytes + b, sizeof(word));
+		kept += static_cast<size_t>(__builtin_popcountll(word));
+	}
+	for (; b < num_rows / 8; b++) {
 		kept += __builtin_popcount(bytes[b]);
 	}
 	if (num_rows % 8 != 0) {
@@ -423,12 +430,31 @@ idx_t ComputeBloomSliceSelection(const libstf::Buffer &mask_buf, size_t row_offs
 	const auto *mask = static_cast<const uint8_t *>(mask_buf.ptr);
 	bloom_sel.Initialize(emit);
 	idx_t bloom_kept = 0;
-	for (idx_t i = 0; i < emit; i++) {
-		const size_t row = row_offset + i;
-		const bool keep = (mask[row / 8] >> (row % 8)) & 1;
-		if (keep) {
-			bloom_sel.set_index(bloom_kept++, i);
+
+	const size_t begin = row_offset;
+	const size_t end = row_offset + emit;
+	size_t row = begin;
+	auto keep_bit = [&](size_t r) {
+		if ((mask[r / 8] >> (r % 8)) & 1) {
+			bloom_sel.set_index(bloom_kept++, r - begin);
 		}
+	};
+	// Bits up to the next byte boundary
+	for (; row < end && (row & 7) != 0; row++) {
+		keep_bit(row);
+	}
+	// Whole 64-row words (bit i of the little-endian word is row + i): a word without a kept row, which
+	// is nearly all of them for a selective filter, costs one load and one compare
+	for (; row + 64 <= end; row += 64) {
+		uint64_t word;
+		std::memcpy(&word, mask + row / 8, sizeof(word));
+		while (word != 0) {
+			bloom_sel.set_index(bloom_kept++, row + static_cast<size_t>(__builtin_ctzll(word)) - begin);
+			word &= word - 1;
+		}
+	}
+	for (; row < end; row++) {
+		keep_bit(row);
 	}
 	return bloom_kept;
 }

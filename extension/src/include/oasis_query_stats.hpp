@@ -73,6 +73,72 @@ public:
 	static string ConstructLogMessage(idx_t run, const BloomPerfCounters &perf);
 };
 
+// What one finished read_oasis scan spent its time on, written when the query ends (one record per
+// scan, next to the OasisQueryStats record):
+//
+//   SELECT message.* FROM duckdb_logs WHERE type = 'OasisScanTimings';
+//
+// `bloom` says the scan used the hardware Bloom filter. Everything is milliseconds of *CPU time summed
+// over the scan's workers* (so it can exceed `wall_ms`), except `wall_ms`, which is the scan's wall
+// clock as in scan_only_ms / scan_celeris_bloom_ms.
+//
+//   read_ms              synchronous coalesced reads of the row groups' column chunks (local path)
+//   flow_prep_ms         building each row group's QuerySplinter: all flows, bloom ones included
+//   submit_ms            handing the splinters to the scheduler
+//   collect_ms           collecting the hardware results of the head row group (polling, and the wait
+//                        when oasis_prefetch_depth = 0)
+//   decode_filter_ms     CPU column decode and pushed-down filters (DecodeAndFilterSlice)
+//   hw_wait_ms           wall time workers spent suspended waiting for the hardware to finish a row
+//                        group (the waits overlap across workers, so it can exceed wall_ms), and
+//   hw_waits             how many such waits there were
+//
+//   Only on a scan that uses the hardware Bloom filter, NULL otherwise:
+//   bloom_flow_ms        building the probe flow (a part of flow_prep_ms)
+//   bloom_verify_ms      checking each group's mask against the materialized buffers (popcount)
+//   bloom_select_ms      turning each slice's mask bits into a selection vector
+//   bloom_slice_ms       applying it: pointing at the materialized values, slicing the other columns
+//   bloom_setup_ms       reading and submitting the build side (wall, on the scheduling thread)
+//   bloom_drain_ms       workers waiting for their in-flight probe flows when they finish
+//   bloom_teardown_ms    ending the probe side, reading the counters, releasing the filter
+//
+//   groups, slices       row groups submitted and slices emitted
+//   rows_in, rows_kept   rows of the slices before and after the Bloom filter's mask
+struct OasisScanTimings {
+	string file;
+	bool bloom = false;
+	uint64_t wall_ns = 0;
+	uint64_t groups = 0;
+	uint64_t slices = 0;
+	uint64_t rows_in = 0;
+	uint64_t rows_kept = 0;
+	uint64_t read_ns = 0;
+	uint64_t flow_prep_ns = 0;
+	uint64_t submit_ns = 0;
+	uint64_t collect_ns = 0;
+	uint64_t decode_filter_ns = 0;
+	uint64_t hw_wait_ns = 0;
+	uint64_t hw_waits = 0;
+	uint64_t bloom_flow_ns = 0;
+	uint64_t bloom_verify_ns = 0;
+	uint64_t bloom_select_ns = 0;
+	uint64_t bloom_slice_ns = 0;
+	uint64_t bloom_setup_ns = 0;
+	uint64_t bloom_drain_ns = 0;
+	uint64_t bloom_teardown_ns = 0;
+};
+
+class OasisScanTimingsLogType : public LogType {
+public:
+	static constexpr const char *NAME = "OasisScanTimings";
+	static constexpr LogLevel LEVEL = LogLevel::LOG_INFO;
+
+	OasisScanTimingsLogType();
+
+	static LogicalType GetLogType();
+
+	static string ConstructLogMessage(const OasisScanTimings &timings);
+};
+
 // Per-connection collector of the statistics above. The scans add to it from any thread while the
 // query runs. DuckDB destroys the scans' states before it calls QueryEnd, so by then every scan has
 // reported.
@@ -105,6 +171,8 @@ public:
 	void AddDuckDBBloom(uint64_t ns);
 	// The counters of one finished run of the hardware Bloom filter.
 	void AddBloomRun(const BloomPerfCounters &perf);
+	// The timers of one finished scan.
+	void AddScanTimings(OasisScanTimings timings);
 
 private:
 	void Reset();
@@ -131,6 +199,9 @@ private:
 
 	std::mutex bloom_runs_mutex;
 	vector<BloomPerfCounters> bloom_runs;
+
+	std::mutex scan_timings_mutex;
+	vector<OasisScanTimings> scan_timings;
 };
 
 } // namespace duckdb

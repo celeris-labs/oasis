@@ -38,15 +38,24 @@ namespace {
 
 class OasisSplinterResultTask : public AsyncTask {
 public:
-	explicit OasisSplinterResultTask(oasis::SplinterResultHandle result) : result(std::move(result)) {
+	// `wait_ns` and `waits` receive the wall time of the wait and their count (the scan's totals).
+	OasisSplinterResultTask(oasis::SplinterResultHandle result, std::atomic<uint64_t> &wait_ns,
+	                        std::atomic<uint64_t> &waits)
+	    : result(std::move(result)), wait_ns(wait_ns), waits(waits) {
 	}
 
 	void Execute() override {
+		const auto start = std::chrono::steady_clock::now();
 		result.wait_ready();
+		const auto elapsed = std::chrono::steady_clock::now() - start;
+		wait_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+		waits++;
 	}
 
 private:
 	oasis::SplinterResultHandle result;
+	std::atomic<uint64_t> &wait_ns;
+	std::atomic<uint64_t> &waits;
 };
 
 } // namespace
@@ -321,6 +330,30 @@ OasisScanGlobalState::~OasisScanGlobalState() {
 		}
 		query_stats->AddScan(bloom_active, wall_ns);
 		query_stats->AddDuckDBBloom(duckdb_bloom_time_ns.load());
+
+		OasisScanTimings timings;
+		timings.file = filename;
+		timings.bloom = bloom_active;
+		timings.wall_ns = wall_ns;
+		timings.groups = counters.groups;
+		timings.slices = counters.slices;
+		timings.rows_in = counters.rows_in;
+		timings.rows_kept = counters.rows_kept;
+		timings.read_ns = counters.read_ns;
+		timings.flow_prep_ns = counters.flow_prep_ns;
+		timings.submit_ns = counters.submit_ns;
+		timings.collect_ns = counters.collect_ns;
+		timings.decode_filter_ns = counters.decode_filter_ns;
+		timings.hw_wait_ns = hw_wait_ns.load();
+		timings.hw_waits = hw_waits.load();
+		timings.bloom_flow_ns = counters.bloom_flow_ns;
+		timings.bloom_verify_ns = counters.bloom_verify_ns;
+		timings.bloom_select_ns = counters.bloom_select_ns;
+		timings.bloom_slice_ns = counters.bloom_slice_ns;
+		timings.bloom_setup_ns = bloom_setup_ns;
+		timings.bloom_drain_ns = bloom_drain_ns.load();
+		timings.bloom_teardown_ns = teardown_ns;
+		query_stats->AddScanTimings(std::move(timings));
 	}
 }
 
@@ -334,6 +367,8 @@ OasisScanLocalState::~OasisScanLocalState() {
 		gstate->bloom_drain_ns += drain_ns;
 	}
 	gstate->duckdb_bloom_time_ns += duckdb_bloom_time_ns;
+	std::lock_guard<std::mutex> guard(gstate->counters_mutex);
+	gstate->counters.Add(counters);
 }
 
 
@@ -381,6 +416,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	}
 
 	if (!rdma) {
+		ScopedTimer read_timer(lstate.counters.read_ns);
 		// Full byte span of the row group: [min chunk offset, max chunk end) over ALL chunks.
 		CoalescedFetcher::GroupSpan group_span {0, 0};
 		uint64_t span_begin = std::numeric_limits<uint64_t>::max();
@@ -414,6 +450,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// Build the QuerySplinter for the whole row group -- one decode flow per hardware column, one
 	// raw bypass flow per CPU column (RDMA only). The scheduler capability-matches and
 	// load-balances the flows across the hardware streams and closes the handle once all finish.
+	std::optional<ScopedTimer> flow_prep_timer;
+	flow_prep_timer.emplace(lstate.counters.flow_prep_ns);
 	oasis::QuerySplinter splinter;
 	splinter.streams.reserve(pending.hw_slot.size() + pending.cpu_slot.size() + 1);
 
@@ -434,6 +472,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// (groups are claimed dynamically and pruned), so the probe side is ended with END once
 	// the whole scan is done (see ~OasisScanGlobalState).
 	if (gstate.bloom_active) {
+		ScopedTimer bloom_flow_timer(lstate.counters.bloom_flow_ns);
 		splinter.streams.push_back(ConstructBloomProbeFlow(ctx, pending, rdma,
 		                                                   gstate.bloom_probe_key_slot, gstate.projected_columns,
 		                                                   bind.bloom_dense_columns, is_bypassed));
@@ -467,6 +506,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		splinter.streams.push_back(std::move(flow));
 	}
 
+	flow_prep_timer.reset();
+
 	pending.hw_buffers.assign(gstate.projected_columns.size(), nullptr);
 	pending.cpu_buffers.assign(gstate.projected_columns.size(), {});
 
@@ -477,8 +518,12 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	}
 
 	const size_t num_flows = splinter.streams.size();
-	pending.result = ctx.scheduler().submit(std::move(splinter));
+	{
+		ScopedTimer submit_timer(lstate.counters.submit_ns);
+		pending.result = ctx.scheduler().submit(std::move(splinter));
+	}
 	pending.submitted = true;
+	lstate.counters.groups++;
 	DUCKDB_LOG_DEBUG(context, "Submitted QuerySplinter (%llu flow(s)) for row group %llu.",
 	                 (unsigned long long)num_flows, (unsigned long long)group);
 }
@@ -632,18 +677,21 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	// A group with nothing to fetch or decode in hardware (string-only projection on the local
 	// path) submitted no splinter, so skip straight to loading the string columns.
 	if (head.submitted) {
+		ScopedTimer collect_timer(lstate.counters.collect_ns);
 		if (gstate.synchronous) {
 			while (!TryCollectGroup(context, gstate, bind, head)) {
 				head.result.wait_ready();
 			}
 		} else {
 			if (gstate.yield_enabled && ctx.try_consume_yield()) {
-				out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
+				out_tasks.push_back(
+				    make_uniq<OasisSplinterResultTask>(head.result, gstate.hw_wait_ns, gstate.hw_waits));
 				return LoadResult::BLOCKED;
 			}
 
 			if (!TryCollectGroup(context, gstate, bind, head)) {
-				out_tasks.push_back(make_uniq<OasisSplinterResultTask>(head.result));
+				out_tasks.push_back(
+				    make_uniq<OasisSplinterResultTask>(head.result, gstate.hw_wait_ns, gstate.hw_waits));
 				return LoadResult::BLOCKED;
 			}
 		}
@@ -651,6 +699,7 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	// The materialized columns have to hold exactly the rows the Bloom filter's mask kept
 	if (head.bloom_mask_buffer) {
+		ScopedTimer verify_timer(lstate.counters.bloom_verify_ns);
 		VerifyBloomMaterializedBuffers(*head.bloom_mask_buffer, head.num_rows, head.group,
 		                               head.materialized, head.hw_buffers);
 	}
@@ -759,10 +808,28 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	SelectionVector bloom_sel;
 	idx_t bloom_kept = emit;
 	if (bloom) {
+		ScopedTimer select_timer(lstate.counters.bloom_select_ns);
 		bloom_kept = ComputeBloomSliceSelection(*lstate.current_bloom_mask, lstate.current_buf_offset, emit, bloom_sel);
 	}
+	lstate.counters.slices++;
+	lstate.counters.rows_in += emit;
+	lstate.counters.rows_kept += bloom_kept;
 
-	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+	// bloom_kept is only reported when the hardware filter's mask is applied to this slice, so a scan
+	// without the filter cannot be mistaken for a filter that keeps every row.
+	if (bloom) {
+		DUCKDB_LOG_INFO(context, "Emitting slice of row group %llu: %llu/%llu rows (bloom_kept=%llu)",
+		                (unsigned long long)lstate.current_group, (unsigned long long)emit,
+		                (unsigned long long)remaining_elements, (unsigned long long)bloom_kept);
+	} else {
+		DUCKDB_LOG_INFO(context, "Emitting slice of row group %llu: %llu/%llu rows (no bloom mask)",
+		                (unsigned long long)lstate.current_group, (unsigned long long)emit,
+		                (unsigned long long)remaining_elements);
+	}
+
+	// A slice whose rows the mask dropped has nothing to point the vectors at
+	const bool slice_empty = bloom && bloom_kept == 0;
+	for (size_t i = 0; i < gstate.projected_columns.size() && !slice_empty; i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
 			continue; // Decoded by DecodeAndFilterSlice below.
@@ -774,6 +841,7 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 			if (bloom_kept == 0) {
 				continue; // The whole slice is dropped, the vector is never read
 			}
+			ScopedTimer materialized_timer(lstate.counters.bloom_slice_ns);
 			auto &vec = scan_chunk.data[i];
 			vec.SetVectorType(VectorType::FLAT_VECTOR);
 			FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_kept_offset * col.elem_size,
@@ -815,14 +883,18 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		                    count_t(emit));
 		vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
 		if (bloom && bloom_kept > 0) {
+			ScopedTimer slice_timer(lstate.counters.bloom_slice_ns);
 			vec.Slice(bloom_sel, bloom_kept);
 		}
 	}
 
 	// Decode the CPU columns and apply the pushed-down filters (late-materialized: Filter columns
 	// first, then the surviving rows of the remaining columns).
-	idx_t const rows_passed =
-	    DecodeAndFilterSlice(gstate, lstate, scan_chunk, emit, bloom ? &bloom_sel : nullptr, bloom_kept);
+	idx_t rows_passed;
+	{
+		ScopedTimer decode_filter_timer(lstate.counters.decode_filter_ns);
+		rows_passed = DecodeAndFilterSlice(gstate, lstate, scan_chunk, emit, bloom ? &bloom_sel : nullptr, bloom_kept);
+	}
 
 	// Advance the cursor. If we have emitted this group's last elements, release the buffers so the
 	// next call's `if` branch loads the next row group. Dropping our refs here lets each buffer free as

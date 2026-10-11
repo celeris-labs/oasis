@@ -39,6 +39,45 @@ private:
 	std::chrono::steady_clock::time_point start;
 };
 
+// What a scan spent CPU time on (steady_clock nanoseconds, summed over workers) and how much data
+// went through it. Each worker owns one, the global state sums them when the worker ends. The
+// bloom_* timers only run on a scan that uses the hardware Bloom filter. Reported per scan as the
+// OasisScanTimings record (see oasis_query_stats.hpp).
+struct OasisScanCounters {
+	// Every scan
+	uint64_t read_ns = 0;          // synchronous coalesced reads of the row group's column chunks
+	uint64_t flow_prep_ns = 0;     // building the row group's QuerySplinter (all its flows)
+	uint64_t submit_ns = 0;        // handing the splinter to the scheduler
+	uint64_t collect_ns = 0;       // collecting the hardware results of the head group
+	uint64_t decode_filter_ns = 0; // DecodeAndFilterSlice: CPU column decode and pushed-down filters
+	uint64_t groups = 0;           // row groups submitted
+	uint64_t slices = 0;           // slices emitted
+	uint64_t rows_in = 0;          // rows of those slices
+	uint64_t rows_kept = 0;        // rows left after the Bloom filter's mask (= rows_in without it)
+
+	// Hardware Bloom filter scans only
+	uint64_t bloom_flow_ns = 0;   // building the probe flow (a part of flow_prep_ns)
+	uint64_t bloom_verify_ns = 0; // checking the mask against the materialized buffers, per group
+	uint64_t bloom_select_ns = 0; // turning the mask into a selection vector, per slice
+	uint64_t bloom_slice_ns = 0;  // applying it: pointing at materialized values, slicing the others
+
+	void Add(const OasisScanCounters &o) {
+		read_ns += o.read_ns;
+		flow_prep_ns += o.flow_prep_ns;
+		submit_ns += o.submit_ns;
+		collect_ns += o.collect_ns;
+		decode_filter_ns += o.decode_filter_ns;
+		groups += o.groups;
+		slices += o.slices;
+		rows_in += o.rows_in;
+		rows_kept += o.rows_kept;
+		bloom_flow_ns += o.bloom_flow_ns;
+		bloom_verify_ns += o.bloom_verify_ns;
+		bloom_select_ns += o.bloom_select_ns;
+		bloom_slice_ns += o.bloom_slice_ns;
+	}
+};
+
 // Per-worker state for one pushed-down TableFilter. TableFilterState is not safe to share across
 // threads, so each worker owns its own (mirrors ParquetReader's per-scan-state scan_filters).
 struct OasisScanFilter {
@@ -160,6 +199,12 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	uint64_t bloom_setup_ns = 0;
 	std::atomic<uint64_t> bloom_drain_ns {0};
 	std::atomic<uint64_t> duckdb_bloom_time_ns {0}; // summed over workers, folded in by ~OasisScanLocalState
+	std::mutex counters_mutex;
+	OasisScanCounters counters; // summed over workers, folded in by ~OasisScanLocalState
+	// Workers suspended on hardware (BLOCKED, see OasisSplinterResultTask): wall time of the waits,
+	// which overlap across workers, and their number.
+	std::atomic<uint64_t> hw_wait_ns {0};
+	std::atomic<uint64_t> hw_waits {0};
 
 	void NoteStart(uint64_t now_ns) {
 		auto current = first_start_ns.load(std::memory_order_relaxed);
@@ -285,6 +330,9 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	// Reported through OasisQueryStats, so unlike the counters above it is not folded by
 	// OasisScanGetMetrics.
 	uint64_t duckdb_bloom_time_ns = 0;
+
+	// This worker's timers and counts for the OasisScanTimings record
+	OasisScanCounters counters;
 };
 
 void RegisterOasisScanFunction(ExtensionLoader &loader);

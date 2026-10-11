@@ -49,6 +49,77 @@ string OasisQueryStatsLogType::ConstructLogMessage(double total_query_ms, double
 }
 
 //===--------------------------------------------------------------------===//
+// OasisScanTimingsLogType
+//===--------------------------------------------------------------------===//
+namespace {
+
+// The millisecond fields, in record order. `bloom_only` fields are NULL on a scan without the filter.
+struct TimingField {
+	const char *name;
+	uint64_t OasisScanTimings::*member;
+	bool bloom_only;
+};
+
+const TimingField TIMING_FIELDS[] = {
+    {"read_ms", &OasisScanTimings::read_ns, false},
+    {"flow_prep_ms", &OasisScanTimings::flow_prep_ns, false},
+    {"submit_ms", &OasisScanTimings::submit_ns, false},
+    {"collect_ms", &OasisScanTimings::collect_ns, false},
+    {"decode_filter_ms", &OasisScanTimings::decode_filter_ns, false},
+    {"hw_wait_ms", &OasisScanTimings::hw_wait_ns, false},
+    {"bloom_flow_ms", &OasisScanTimings::bloom_flow_ns, true},
+    {"bloom_verify_ms", &OasisScanTimings::bloom_verify_ns, true},
+    {"bloom_select_ms", &OasisScanTimings::bloom_select_ns, true},
+    {"bloom_slice_ms", &OasisScanTimings::bloom_slice_ns, true},
+    {"bloom_setup_ms", &OasisScanTimings::bloom_setup_ns, true},
+    {"bloom_drain_ms", &OasisScanTimings::bloom_drain_ns, true},
+    {"bloom_teardown_ms", &OasisScanTimings::bloom_teardown_ns, true},
+};
+
+} // namespace
+
+OasisScanTimingsLogType::OasisScanTimingsLogType() : LogType(NAME, LEVEL, GetLogType()) {
+}
+
+LogicalType OasisScanTimingsLogType::GetLogType() {
+	child_list_t<LogicalType> child_list = {
+	    {"file", LogicalType::VARCHAR},
+	    {"bloom", LogicalType::BOOLEAN},
+	    {"wall_ms", LogicalType::DOUBLE},
+	};
+	for (auto &field : TIMING_FIELDS) {
+		child_list.emplace_back(field.name, LogicalType::DOUBLE);
+	}
+	child_list.emplace_back("hw_waits", LogicalType::UBIGINT);
+	child_list.emplace_back("groups", LogicalType::UBIGINT);
+	child_list.emplace_back("slices", LogicalType::UBIGINT);
+	child_list.emplace_back("rows_in", LogicalType::UBIGINT);
+	child_list.emplace_back("rows_kept", LogicalType::UBIGINT);
+	return LogicalType::STRUCT(std::move(child_list));
+}
+
+string OasisScanTimingsLogType::ConstructLogMessage(const OasisScanTimings &t) {
+	child_list_t<Value> child_list = {
+	    {"file", Value(t.file)},
+	    {"bloom", Value::BOOLEAN(t.bloom)},
+	    {"wall_ms", Value::DOUBLE(static_cast<double>(t.wall_ns) / NS_PER_MS)},
+	};
+	for (auto &field : TIMING_FIELDS) {
+		if (field.bloom_only && !t.bloom) {
+			child_list.emplace_back(field.name, Value(LogicalType::DOUBLE));
+		} else {
+			child_list.emplace_back(field.name, Value::DOUBLE(static_cast<double>(t.*field.member) / NS_PER_MS));
+		}
+	}
+	child_list.emplace_back("hw_waits", Value::UBIGINT(t.hw_waits));
+	child_list.emplace_back("groups", Value::UBIGINT(t.groups));
+	child_list.emplace_back("slices", Value::UBIGINT(t.slices));
+	child_list.emplace_back("rows_in", Value::UBIGINT(t.rows_in));
+	child_list.emplace_back("rows_kept", Value::UBIGINT(t.rows_kept));
+	return Value::STRUCT(std::move(child_list)).ToString();
+}
+
+//===--------------------------------------------------------------------===//
 // OasisBloomFilterStatsLogType
 //===--------------------------------------------------------------------===//
 namespace {
@@ -209,6 +280,9 @@ void OasisQueryStats::Install(DatabaseInstance &db) {
 	if (!log_manager.LookupLogType(OasisBloomFilterStatsLogType::NAME)) {
 		log_manager.RegisterLogType(make_uniq<OasisBloomFilterStatsLogType>());
 	}
+	if (!log_manager.LookupLogType(OasisScanTimingsLogType::NAME)) {
+		log_manager.RegisterLogType(make_uniq<OasisScanTimingsLogType>());
+	}
 
 	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<OasisQueryStatsInstaller>());
 
@@ -227,8 +301,12 @@ void OasisQueryStats::Reset() {
 	scans_only = 0;
 	scans_celeris_bloom = 0;
 	duckdb_bloom_applicable = false;
-	lock_guard<std::mutex> guard(bloom_runs_mutex);
-	bloom_runs.clear();
+	{
+		lock_guard<std::mutex> guard(bloom_runs_mutex);
+		bloom_runs.clear();
+	}
+	lock_guard<std::mutex> guard(scan_timings_mutex);
+	scan_timings.clear();
 }
 
 void OasisQueryStats::QueryBegin(ClientContext &context) {
@@ -302,6 +380,15 @@ void OasisQueryStats::QueryEnd(ClientContext &context, optional_ptr<ErrorData>) 
 	for (idx_t i = 0; i < runs.size(); i++) {
 		DUCKDB_LOG(context, OasisBloomFilterStatsLogType, i, runs[i]);
 	}
+
+	vector<OasisScanTimings> timings;
+	{
+		lock_guard<std::mutex> guard(scan_timings_mutex);
+		timings = std::move(scan_timings);
+	}
+	for (auto &t : timings) {
+		DUCKDB_LOG(context, OasisScanTimingsLogType, t);
+	}
 	Reset();
 }
 
@@ -313,6 +400,11 @@ void OasisQueryStats::AddScan(bool celeris_bloom, uint64_t wall_ns) {
 		scan_only_ns += wall_ns;
 		scans_only++;
 	}
+}
+
+void OasisQueryStats::AddScanTimings(OasisScanTimings timings) {
+	lock_guard<std::mutex> guard(scan_timings_mutex);
+	scan_timings.push_back(std::move(timings));
 }
 
 void OasisQueryStats::AddBloomRun(const BloomPerfCounters &perf) {
