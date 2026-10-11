@@ -61,6 +61,12 @@ SELECT message.* FROM duckdb_logs WHERE type = 'OasisBloomFilterStats';
 | `run_perf` | The whole run, first build beat to last handshake on any port: `cycles`, `keys_in_beats`, `values_in_beats`, `kept_out_beats`, `mat_out_beats`, `mask_out_beats`, `out_cycles`, and the latencies `first_out_cycles` and `probe_start_cycles` (measured from the end of the build phase), plus the derived `pipeline_cycles` and `out_bytes` |
 | `command_queue_overflowed` | The hardware's sticky status flag, cleared only by a device reset, so once a run overflows, every later run reports it too. Results of the run that overflowed are not reliable |
 
+The filter's outputs come back over host streams of their own: the kept probe keys, the mask and the
+materialized columns (`kept_out_beats`, `mask_out_beats` and `mat_out_beats` count their beats), so the
+host reads them in parallel and the probe key column is sent to the hardware once. The output stall
+counters (`stalled_out_cycles`) include back pressure of the kept keys and mask streams, which stalls the
+whole filter when the host is slow to provide output buffers for them.
+
 Everything is in device clock cycles (250 MHz) and beats of 64 B, except the mask out beats, which are 1 B.
 
 

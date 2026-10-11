@@ -460,12 +460,12 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	size_t bloom_mask_flows = 0;
 
 	// The runtime Bloom filter filters the whole row group. Its probe key chunk goes through the
-	// filter (FILTER) for its mask, one bit per row. The 64-bit columns (the key column included)
-	// follow it into the filter's materializer (MATERIALIZE), which only returns their kept rows.
-	// All Bloom filter transfers for this row group (the probe key match mask followed by the
-	// 64-bit materialized columns) are unified into a single OperatorFlow. Because a flow is
-	// scheduled atomically onto a single stream, no other flow can be interleaved between the
-	// FILTER mask transfer and its subsequent MATERIALIZE transfers.
+	// filter (FILTER) once, which returns its mask (one bit per row) and the kept key values, each
+	// over an output channel of its own. The other 64-bit columns follow it into the filter's
+	// materializer (MATERIALIZE), which only returns their kept rows, over a third channel.
+	// All Bloom filter transfers for this row group are unified into a single OperatorFlow. Because
+	// a flow is scheduled atomically onto a single stream, no other flow can be interleaved between
+	// the FILTER transfer and its subsequent MATERIALIZE transfers.
 	// The other columns are decoded as usual and dropped by the mask on the CPU (see EmitOneSlice).
 	//
 	// Every probe chunk is sent with CONTINUE: no worker knows which chunk will be the last one
@@ -589,7 +589,9 @@ static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate
 		size_t const tag = poll.batch->tag;
 		if (tag == gstate.projected_columns.size()) {
 			// Reserved tag for the runtime Bloom filter's probe-key match mask (see PrefetchGroup) --
-			// not a projected column, so it doesn't index into gstate.projected_columns.
+			// not a projected column, so it doesn't index into gstate.projected_columns. It arrives
+			// on its own output channel, in any order relative to the kept keys and columns (which
+			// are tagged with their projected column).
 			DUCKDB_LOG_DEBUG(context, "Row group %llu returned Bloom filter mask batch",
 			                 (unsigned long long)pending.group);
 			pending.bloom_mask_buffer = std::move(poll.batch->buffer);

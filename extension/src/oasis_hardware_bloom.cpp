@@ -184,6 +184,18 @@ void CheckOasisHardwareBloom(oasis::OasisContext &ctx) {
 		                         "(the Bloom filter's stream select is on decoder stream 0), but it has " +
 		                         std::to_string(num_decoders));
 	}
+	if (ctx.num_output_channels() != BLOOM_NUM_OUTPUT_CHANNELS) {
+		throw std::runtime_error("Oasis requires a hardware design with " +
+		                         std::to_string(BLOOM_NUM_OUTPUT_CHANNELS) +
+		                         " output-only host streams for the Bloom filter's separate kept keys, mask and "
+		                         "materialized column outputs, but it has " +
+		                         std::to_string(ctx.num_output_channels()) +
+		                         ". The bitstream is older than this software; rebuild it from hardware/.");
+	}
+}
+
+libstf::stream_t BloomOutputStream(oasis::OasisContext &ctx, BloomOutputChannel channel) {
+	return static_cast<libstf::stream_t>(ctx.num_input_streams() + static_cast<size_t>(channel));
 }
 
 BloomFilterStreamSelectOperator::BloomFilterStreamSelectOperator(BloomStreamSelect select,
@@ -594,14 +606,13 @@ void DrainInFlightBloomProbeSplinters(OasisScanLocalState &lstate) {
 
 namespace {
 
+// The operators that bring column chunk k of the row group into the decoder, with the stream-select
+// decision for it. Its output is taken by the sinks MakeSink makes.
 void AppendDecodeChunk(oasis::OperatorFlow &flow,
-                       oasis::OasisContext &ctx,
                        const OasisScanLocalState::PendingGroup &pending,
                        RDMAFileHandle *rdma,
                        size_t k,
-                       std::unique_ptr<BloomFilterStreamSelectOperator> select,
-                       size_t sink_size,
-                       size_t tag) {
+                       std::unique_ptr<BloomFilterStreamSelectOperator> select) {
 	const auto &cc = *pending.hw_chunks[k];
 	flow.push_back(std::move(select));
 	if (rdma) {
@@ -611,7 +622,13 @@ void AppendDecodeChunk(oasis::OperatorFlow &flow,
 	}
 	flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
 	    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type)));
-	flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(sink_size), tag));
+}
+
+// A sink for one transfer of at most `size` bytes: on the Bloom filter's output channel (or, without
+// one, on the stream of the flow, i.e. decoder-stream 0's own output).
+std::unique_ptr<oasis::LocalSinkOperator> MakeSink(oasis::OasisContext &ctx, size_t size, size_t tag,
+                                                   std::optional<libstf::stream_t> output_stream = std::nullopt) {
+	return std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(size), tag, output_stream);
 }
 
 size_t DecodedChunkSize(const parcore::metadata::ColumnChunk &cc) {
@@ -627,12 +644,13 @@ oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
                                             const std::vector<ProjectedColumn> &projected_columns,
                                             const std::vector<bool> &dense_columns,
                                             std::vector<bool> &is_bypassed) {
+	// The columns to materialize with the key chunk's mask. The key itself is not one of them: the
+	// filter's raw output has its kept values already.
 	std::vector<size_t> mat_k;
 	std::optional<size_t> probe_k;
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		if (pending.hw_slot[k] == bloom_probe_key_slot) {
 			probe_k = k;
-			mat_k.push_back(k);
 		} else if (IsBloomMaterializableColumn(dense_columns, projected_columns[pending.hw_slot[k]].column_id,
 		                                         *pending.hw_chunks[k])) {
 			mat_k.push_back(k);
@@ -641,15 +659,26 @@ oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
 	D_ASSERT(probe_k); // The probe key is a hardware column (see SubmitBloomBuild)
 
 	oasis::OperatorFlow bloom_flow;
-	AppendDecodeChunk(bloom_flow, ctx, pending, rdma, *probe_k,
-	                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::FILTER,
-	                                                                    static_cast<uint32_t>(mat_k.size())),
-	                  (pending.num_rows + 7) / 8, projected_columns.size());
 
+	// The probe key chunk goes through the filter once. It yields two transfers, each on its own
+	// output channel so the host can read them in parallel: its mask (one bit per row), and its
+	// kept values, which are the key column's materialized rows.
+	AppendDecodeChunk(bloom_flow, pending, rdma, *probe_k,
+	                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::FILTER,
+	                                                                    static_cast<uint32_t>(mat_k.size())));
+	bloom_flow.push_back(MakeSink(ctx, (pending.num_rows + 7) / 8, projected_columns.size(),
+	                              BloomOutputStream(ctx, BloomOutputChannel::MASK)));
+	bloom_flow.push_back(MakeSink(ctx, DecodedChunkSize(*pending.hw_chunks[*probe_k]), pending.hw_slot[*probe_k],
+	                              BloomOutputStream(ctx, BloomOutputChannel::RAW)));
+	pending.materialized[pending.hw_slot[*probe_k]] = true;
+	is_bypassed[*probe_k] = false;
+
+	// The other columns follow into the materializer, one transfer each, on a channel of their own
 	for (auto k : mat_k) {
-		AppendDecodeChunk(bloom_flow, ctx, pending, rdma, k,
-		                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::MATERIALIZE),
-		                  DecodedChunkSize(*pending.hw_chunks[k]), pending.hw_slot[k]);
+		AppendDecodeChunk(bloom_flow, pending, rdma, k,
+		                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::MATERIALIZE));
+		bloom_flow.push_back(MakeSink(ctx, DecodedChunkSize(*pending.hw_chunks[k]), pending.hw_slot[k],
+		                              BloomOutputStream(ctx, BloomOutputChannel::MATERIALIZED)));
 		pending.materialized[pending.hw_slot[k]] = true;
 		is_bypassed[k] = false;
 	}
@@ -661,9 +690,9 @@ oasis::OperatorFlow ConstructBypassFlow(oasis::OasisContext &ctx,
                                         RDMAFileHandle *rdma,
                                         size_t k) {
 	oasis::OperatorFlow flow;
-	AppendDecodeChunk(flow, ctx, pending, rdma, k,
-	                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BYPASS),
-	                  DecodedChunkSize(*pending.hw_chunks[k]), pending.hw_slot[k]);
+	AppendDecodeChunk(flow, pending, rdma, k,
+	                  std::make_unique<BloomFilterStreamSelectOperator>(BloomStreamSelect::BYPASS));
+	flow.push_back(MakeSink(ctx, DecodedChunkSize(*pending.hw_chunks[k]), pending.hw_slot[k]));
 	return flow;
 }
 

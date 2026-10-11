@@ -65,6 +65,19 @@ public:
     bool isRDMAEnabled() const { return rdma_enabled_; }
 
     /**
+     * Number of streams that have an input side: the column chunk decoders and, with RDMA, the
+     * bypass stream. The hardware's remaining streams, which have ids from this number up, are
+     * output-only channels (StreamCapability::OUTPUT): sinks can read them, but flows never run
+     * on them.
+     */
+    libstf::stream_t num_input_streams() const { return num_input_streams_; }
+
+    /**
+     * Number of output-only channels, see num_input_streams().
+     */
+    libstf::stream_t num_output_channels() const { return num_output_channels_; }
+
+    /**
      * Establishes one RDMA queue pair (i.e. one cThread) per hardware read-request stream with the
      * remote server, and configures each stream's ctid and remote-region base vaddr (only known
      * once its queue pair has been exchanged). A queue pair per stream keeps each stream's
@@ -116,6 +129,8 @@ private:
     std::shared_ptr<libstf::MemConfig> mem_config_;
 
     bool rdma_enabled_;
+    libstf::stream_t num_input_streams_  = 0;
+    libstf::stream_t num_output_channels_ = 0;
     std::vector<std::shared_ptr<coyote::cThread>> rdma_cthreads_;
 
     std::unique_ptr<Scheduler> scheduler_;

@@ -58,11 +58,22 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     }
 
     auto cc_config = config<parcore::ColumnChunkDecoderConfig>();
-    // The hardware exposes one MemConfig stream per column-chunk decoder plus an extra bypass
-    // stream when RDMA is wired in. If the counts match, RDMA wasn't synthesized into this shell.
-    rdma_enabled_ = mem_config_->num_streams() != cc_config->num_decoders();
-
     auto read_req_config = config<ReadReqConfig>();
+
+    // The streams with an input side are one per column-chunk decoder plus an extra bypass stream
+    // when RDMA is wired in. If the counts match, RDMA wasn't synthesized into this shell. The
+    // MemConfig (output) side has additional output-only channels on top of those.
+    num_input_streams_ = read_req_config->num_streams();
+    rdma_enabled_      = num_input_streams_ != cc_config->num_decoders();
+    if (mem_config_->num_streams() < num_input_streams_) {
+        std::ostringstream msg;
+        msg << "Hardware design has " << static_cast<unsigned>(mem_config_->num_streams())
+            << " output stream(s), fewer than its " << static_cast<unsigned>(num_input_streams_)
+            << " input stream(s)";
+        throw std::runtime_error(msg.str());
+    }
+    num_output_channels_ = mem_config_->num_streams() - num_input_streams_;
+
     for (libstf::stream_t stream = 0; stream < read_req_config->num_streams(); ++stream) {
         read_req_config->set_ctid(stream, cthread_->getCtid());
     }
@@ -91,6 +102,11 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
                                        ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
                                        0,
                                        ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
+                                       mem_config_->maximum_num_enqueued_buffers()});
+    }
+    // The output-only channels: no flow runs on them, they only have an output-writer FIFO.
+    for (libstf::stream_t channel = 0; channel < num_output_channels_; ++channel) {
+        stream_descriptions.push_back({StreamCapability::OUTPUT, 1, 0, 0,
                                        mem_config_->maximum_num_enqueued_buffers()});
     }
     assert(stream_descriptions.size() == mem_config_->num_streams());

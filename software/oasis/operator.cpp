@@ -57,8 +57,11 @@ void LocalSinkOperator::print(std::ostream &os) const {
     for (const auto &buffer : buffers_) {
         bytes += buffer->size;
     }
-    os << "HostBufferSink(tag=" << tag_ << ", buffers=" << buffers_.size() << ", size=" << bytes
-       << ")";
+    os << "HostBufferSink(tag=" << tag_ << ", buffers=" << buffers_.size() << ", size=" << bytes;
+    if (output_stream_) {
+        os << ", output_stream=" << static_cast<unsigned>(*output_stream_);
+    }
+    os << ")";
 }
 
 } // namespace oasis

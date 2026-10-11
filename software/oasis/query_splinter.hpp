@@ -20,10 +20,12 @@ using OperatorFlow = std::vector<std::unique_ptr<Operator>>;
 /**
  * Capability a hardware stream provides (and a flow requires). DECODE streams run flows that
  * decode column chunks. BYPASS streams have no decoder, so the source writes directly into the
- * sink.
+ * sink. OUTPUT streams have no input at all: they are extra host output channels that only receive
+ * the output of sinks of flows running on other streams (see LocalSinkOperator::output_stream), so
+ * no flow requires them and nothing is ever dispatched onto them.
  */
-enum class StreamCapability : uint8_t { DECODE = 0, BYPASS = 1 };
-constexpr size_t NUM_STREAM_CAPABILITIES = 2;
+enum class StreamCapability : uint8_t { DECODE = 0, BYPASS = 1, OUTPUT = 2 };
+constexpr size_t NUM_STREAM_CAPABILITIES = 3;
 
 inline const char *to_string(StreamCapability capability) {
     switch (capability) {
@@ -31,6 +33,8 @@ inline const char *to_string(StreamCapability capability) {
         return "DECODE";
     case StreamCapability::BYPASS:
         return "BYPASS";
+    case StreamCapability::OUTPUT:
+        return "OUTPUT";
     }
     return "UNKNOWN";
 }

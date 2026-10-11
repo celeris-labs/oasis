@@ -30,6 +30,20 @@ enum class BloomStreamSelect : uint64_t {
 
 const char *BloomStreamSelectName(BloomStreamSelect select);
 
+// The Bloom filter's own host output channels, output-only streams the hardware has on top of the ones
+// with an input side (see vfpga_top.svh). Every FILTER transfer yields a transfer on RAW (the kept
+// probe keys) and one on MASK, every MATERIALIZE transfer one on MATERIALIZED (the kept rows of a
+// column). Transfers of BYPASS and BUILD stay on the output of decoder-stream 0.
+enum class BloomOutputChannel : uint8_t {
+	RAW = 0,
+	MASK = 1,
+	MATERIALIZED = 2
+};
+constexpr size_t BLOOM_NUM_OUTPUT_CHANNELS = 3;
+
+// The hardware stream id of an output channel.
+libstf::stream_t BloomOutputStream(oasis::OasisContext &ctx, BloomOutputChannel channel);
+
 // Checks that the hardware design fits the Bloom filter integration in hardware/src/vfpga_top.svh.
 void CheckOasisHardwareBloom(oasis::OasisContext &ctx);
 
@@ -56,8 +70,8 @@ BloomPerfCounters FetchBloomPerfCounters(oasis::OasisContext &ctx);
 
 // Pushes one stream-select decision when applied, and for key chunks through the Bloom filter (FILTER,
 // BUILD) also their input command (CONTINUE, see BloomInputCommand) and, for probe key chunks, their
-// materialization command (the number of MATERIALIZE flows following it, see
-// PushBloomMaterializeCommand). With end_side, it also ends the side after the chunk (END): the
+// materialization command (the number of MATERIALIZE transfers following it, which does not include
+// the key chunk's own kept values, see PushBloomMaterializeCommand). With end_side, it also ends the side after the chunk (END): the
 // last build chunk ends the build side like this.
 class BloomFilterStreamSelectOperator final : public oasis::Operator {
 public:
@@ -152,8 +166,9 @@ void DrainInFlightBloomProbeSplinters(OasisScanLocalState &lstate);
 
 class RDMAFileHandle;
 
-// Constructs the unified Bloom filter probe flow (FILTER mask transfer + MATERIALIZE column transfers)
-// for this row group and marks materialized columns.
+// Constructs the unified Bloom filter probe flow for this row group and marks materialized columns:
+// the probe key chunk (FILTER), whose mask and kept keys come back on their own output channels, and
+// the MATERIALIZE chunks of the other 64-bit columns. The key column is sent only once.
 oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
                                             OasisScanLocalState::PendingGroup &pending,
                                             RDMAFileHandle *rdma,

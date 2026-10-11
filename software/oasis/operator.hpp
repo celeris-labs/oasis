@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <vector>
@@ -99,21 +100,30 @@ class DecodeColumnChunkOperator final : public Operator {
  * transfer size. A transfer larger than a single output-writer buffer spans multiple buffers,
  * which the hardware fills in enqueue order. apply() enqueues every buffer to the FPGA's output
  * writer for `stream`, in order.
+ *
+ * By default the sink takes the output of the stream its flow runs on. With `output_stream` it takes
+ * the output of another hardware stream's output channel instead (an OUTPUT stream, see
+ * StreamCapability), so one flow can receive several outputs that the hardware produces in
+ * parallel. The channel's transfers have to occur in the order in which the flows' sinks for it are
+ * dispatched.
  */
 class LocalSinkOperator final : public Operator {
   public:
     // `buffers` are the right-sized output buffers the hardware will write into, in write order
     // (each capacity must be a multiple of BYTES_PER_FPGA_TRANSFER). `tag` identifies this flow's
     // output to the consumer since a QuerySplinter's flows can return in any order.
-    explicit LocalSinkOperator(std::vector<std::shared_ptr<libstf::Buffer>> buffers, size_t tag = 0)
-        : tag_(tag), buffers_(std::move(buffers)) {
+    explicit LocalSinkOperator(std::vector<std::shared_ptr<libstf::Buffer>> buffers, size_t tag = 0,
+                               std::optional<libstf::stream_t> output_stream = std::nullopt)
+        : tag_(tag), output_stream_(output_stream), buffers_(std::move(buffers)) {
         if (buffers_.empty()) {
             throw std::runtime_error("LocalSinkOperator requires at least one buffer");
         }
     }
 
-    explicit LocalSinkOperator(std::shared_ptr<libstf::Buffer> buffer, size_t tag = 0)
-        : LocalSinkOperator(std::vector<std::shared_ptr<libstf::Buffer>>{std::move(buffer)}, tag) {}
+    explicit LocalSinkOperator(std::shared_ptr<libstf::Buffer> buffer, size_t tag = 0,
+                               std::optional<libstf::stream_t> output_stream = std::nullopt)
+        : LocalSinkOperator(std::vector<std::shared_ptr<libstf::Buffer>>{std::move(buffer)}, tag,
+                            output_stream) {}
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
@@ -123,8 +133,12 @@ class LocalSinkOperator final : public Operator {
     }
     [[nodiscard]] size_t tag() const { return tag_; }
 
+    // The output channel the sink reads, or nullopt for the stream the flow runs on.
+    [[nodiscard]] std::optional<libstf::stream_t> output_stream() const { return output_stream_; }
+
   private:
     size_t                                       tag_;
+    std::optional<libstf::stream_t>              output_stream_;
     std::vector<std::shared_ptr<libstf::Buffer>> buffers_;
 };
 
