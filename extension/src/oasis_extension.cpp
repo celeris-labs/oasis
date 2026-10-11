@@ -37,7 +37,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Number of streams the scheduler drives (0 = all available)", LogicalType::UBIGINT,
 	                          Value::UBIGINT(0), SetSchedulerNumStreams);
 	config.AddExtensionOption("oasis_scheduler_queue_depth",
-	                          "Max splinters in flight per stream (0 = hardware config-FIFO depth, which is also the upper bound)",
+	                          "Max flows in flight per stream (0 = hardware config-FIFO depth, which is also the upper bound). "
+	                          "Independent of this cap, a flow is only placed when its decoder configs, read requests and "
+	                          "output buffers fit the stream's hardware FIFOs",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0), SetSchedulerQueueDepth);
 	config.AddExtensionOption(
 	    "oasis_prefetch_depth",

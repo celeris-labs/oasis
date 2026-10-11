@@ -16,7 +16,7 @@ reads from the configured RDMA file server.
 | --- | --- | --- |
 | `oasis_logging_level` | `ERROR` | libSTF/ParCore/OAL verbosity; records pass through DuckDB's `logging_level` into `duckdb_logs` |
 | `oasis_scheduler_num_streams` | all available | Streams the scheduler drives |
-| `oasis_scheduler_queue_depth` | hardware FIFO depth | Splinters in flight per stream |
+| `oasis_scheduler_queue_depth` | hardware FIFO depth | Cap on flows in flight per stream. The scheduler also never places a flow whose decoder configs, read requests or output buffers do not fit the stream's hardware FIFOs, so a deep value only matters for flows that take a single entry of each |
 | `oasis_scan_groups_in_flight` | `16` | Row groups a scan keeps submitted but not yet collected, split across its workers |
 | `oasis_rdma_server` | — | RDMA file server IP; required for `rdma://` |
 | `oasis_rdma_port` | Coyote default | TCP port for the QP exchange |

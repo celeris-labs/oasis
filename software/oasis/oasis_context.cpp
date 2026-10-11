@@ -80,14 +80,22 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     std::vector<StreamDescription> stream_descriptions;
     stream_descriptions.reserve(mem_config_->num_streams());
     for (libstf::stream_t stream = 0; stream < cc_config->num_decoders(); ++stream) {
+        // The decoder config FIFO and the read request FIFO are each one entry per decode
+        // operator / source of an in-flight flow, so a flow with several chunks (the Bloom probe
+        // flow has four) takes several entries and the flow bound alone cannot protect them.
         stream_descriptions.push_back({StreamCapability::DECODE,
-                                       cc_config->maximum_num_enqueued_configs(),
-                                       mem_config_->maximum_num_enqueued_buffers()});
+                                       /*max_flows=*/cc_config->maximum_num_enqueued_configs(),
+                                       /*max_configs=*/cc_config->maximum_num_enqueued_configs(),
+                                       /*max_reads=*/ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
+                                       /*max_buffers=*/mem_config_->maximum_num_enqueued_buffers()});
     }
     if (rdma_enabled_) {
+        // No decoder on the bypass stream: its flows only queue an RDMA read and a sink.
         stream_descriptions.push_back({StreamCapability::BYPASS,
-                                       ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
-                                       mem_config_->maximum_num_enqueued_buffers()});
+                                       /*max_flows=*/ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
+                                       /*max_configs=*/0,
+                                       /*max_reads=*/ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
+                                       /*max_buffers=*/mem_config_->maximum_num_enqueued_buffers()});
     }
     assert(stream_descriptions.size() == mem_config_->num_streams());
     scheduler_ = std::make_unique<Scheduler>(*this, std::move(stream_descriptions));
