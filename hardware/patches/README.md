@@ -9,7 +9,8 @@ nowhere else. `git submodule update` silently destroys them. This directory is t
 | `0001-toe-rx-window-clamp.patch` | **uncommitted** working-tree change on top of them: the receive-window clamp |
 | `0002-toe-seed-ephemeral-port-cursor.patch` | **uncommitted** working-tree change on top of them: the seeded port cursor (build-121 on) |
 | `0007-toe-rx-ddr-buffer.patch` | **uncommitted** working-tree change on top of 0001+0002: the receive ring in card memory (`RX_DDR_BYPASS = 0`) made to work; a no-op for bypass builds |
-| `apply.sh` | idempotent, non-destructive re-application of 0001, 0002, 0007 (network submodule) and 0006 (libstf) |
+| `0008-network-stack-rx-mem-mux.patch` | **uncommitted** working-tree change to `parcore/libstf/coyote` (not the network submodule): that receive ring wired into the shell (`tcp_mem_mux`, `network_stack.sv`, the CMake flag); a no-op for bypass builds |
+| `apply.sh` | idempotent, non-destructive re-application of 0001, 0002, 0007 (network submodule), 0008 (Coyote) and 0006 (libstf) |
 
 ## The submodule
 
@@ -49,10 +50,14 @@ git -C $SM rev-parse HEAD            # e9edcc4b2b48b161b17cd60148515130ebeed66a
 git -C $SM diff --stat               # 14 files: rx_sar_table.cpp (0001) + port_table, tx_app_if,
                                      # tx_app_interface, toe.cpp (0002) + rx_engine, rx_sar_table.hpp,
                                      # rx_app_stream_if, toe_internals.hpp, tx_engine, toe.cpp (0007)
+git -C parcore/libstf/coyote diff --stat -- . ':!hw/services/network'
+                                     # 4 files (0008): FindCoyoteHW.cmake, network_stack.sv,
+                                     # lynx_pkg_tmplt.txt, base.tcl.in -- plus the new, untracked
+                                     # hw/hdl/network/tcp/tcp_mem_mux.sv
 ```
 
-`apply.sh` refuses to do anything unless HEAD is the expected commit, reports "already applied"
-per patch and exits 0 on a second run, and only ever dry-runs (`git apply --check`, or a throw-away
+`apply.sh` refuses to do anything unless HEAD is the expected commit (for the network submodule and,
+for 0008, Coyote at `b21b4ec6`), reports "already applied" per patch and exits 0 on a second run, and only ever dry-runs (`git apply --check`, or a throw-away
 index) before touching the tree. It never resets, stashes or reverts. The patches are a stack in the
 listed order: 0007 rewrites lines 0001 added, so once 0007 is in, 0001 no longer reverse-applies on its
 own; `apply.sh` therefore first rebuilds HEAD + 0001..k in a temporary index and compares it with the
@@ -136,7 +141,43 @@ same resource numbers and the same RTL with and without the patch. What it fixes
 Verified in C simulation by `hardware/unit-tests/toe_csim` (`./run.sh`, Vitis HLS 2024.2
 `csim_design`, the TOE's real top `toe_top` against a model of the peer, the application and card
 memory): one case per fix, every case passes with the patch, and reverting any single fix makes its case
-fail. Turning the mode on is a separate step (CMake `TCP_STACK_RX_DDR_BYPASS_EN`, still 1 in the builds).
+fail. Turning the mode on is 0008 below (`--toe-buffer`); every other build keeps the bypass.
+
+## The receive ring wired into the shell (0008) — Coyote
+
+`0008-network-stack-rx-mem-mux.patch` is a working-tree change to **`parcore/libstf/coyote`**
+(expected HEAD `b21b4ec6`, which `apply.sh` checks), applied by `apply.sh` after the network stack
+(0001/0002/0007). It is what turns 0007 on in a bitstream; oasis selects it with
+`ENABLE_HTTP_TOE_BUFFER` (`scripts/synthesize.sh --toe-buffer`), which FORCEs
+`TCP_STACK_RX_DDR_BYPASS_EN` to 0 (and to 1 otherwise).
+
+- **One variable for both halves.** `TCP_STACK_RX_DDR_BYPASS_EN` already writes `RX_DDR_BYPASS` into
+  the TOE's `toe_config.hpp` (HLS). 0008 makes the same cache variable drive the shell:
+  `FindCoyoteHW.cmake` declares it (same default/docstring as `hls/toe/CMakeLists.txt`, whose own
+  `set(CACHE)` then does nothing) and refuses anything but the literals `0`/`1` (CMake reads `ON` as
+  true, the C preprocessor reads it as 0); `base.tcl` carries it as `cfg(tcp_rx_ddr_bypass)`; the
+  `lynx_pkg` template emits `` `define EN_TCP_RX_DDR `` only when it is 0. A mismatch that slipped
+  through anyway would not build: the two `toe_ip` variants have different ports.
+- **`network_stack.sv`.** Under `` `ifdef EN_TCP_RX_DDR ``: `tcp_stack #(.RX_DDR_BYPASS_EN(0))`
+  (which drops the 1 MiB `axis_data_fifo_512_d16384` rx FIFO, `tcp_stack.sv:679`) and `tcp_mem_mux`
+  between tcp_stack's memory channels [0] (tx ring) and [1] (rx ring) and the shell's one TCP memory
+  channel. `` `else `` is the original text, so a bypass build compiles exactly the old
+  `network_stack.sv` (only three comment lines differ) and the old `lynx_pkg.sv` (byte-identical).
+- **`tcp_mem_mux.sv`** (new, `hw/hdl/network/tcp/`, picked up by `cr_shell.tcl`'s directory
+  `add_files`): rx addresses get bit 29 (rx rings at [512 MiB, 1 GiB), tx rings stay at [0, 512 MiB);
+  the datamover returns read data, read status and write status in command order, so the channel of
+  every granted command goes into in-order FIFOs and the returns are routed by their heads. Tx writes
+  are store-and-forward (1024 beats = the TOE's largest tx write, 65535 B): the TOE issues a tx write
+  command before the application has delivered its data, and a granted command whose data is missing
+  would stall every later rx write. Write commands are accepted eagerly (the TOE writes a ring-end
+  split's second command together with the first part's last beat), and per-channel write-status FIFOs
+  with credits keep a channel that stops reading its statuses from stopping the other one. Read data
+  is not buffered: a stalled read consumer holds up the other channel's reads (head-of-line, documented
+  in the file; oasis keeps the rx read consumer at tready = 1).
+
+Verified by `hardware/unit-tests/tcp_mem_mux` (`./run.sh`, xsim 2024.2: random traffic on both
+channels against an in-order datamover model, plus three mutants the bench must catch) and by a
+shell synthesis with the flag on (toe-buffer WP2 report, oasis-debug/2026-10-11/toe-buffer/WP2.md).
 
 ## The card-memory pool constants (0003) — EN_MEM shells only
 

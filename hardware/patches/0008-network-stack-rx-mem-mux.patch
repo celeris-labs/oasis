@@ -1,0 +1,726 @@
+OASIS 0008 -- Coyote: the TOE's receive ring in card memory, wired into the shell.
+Working-tree change to parcore/libstf/coyote (expected HEAD b21b4ec6), made 2026-10-11 (toe-buffer
+WP2). Inert unless TCP_STACK_RX_DDR_BYPASS_EN = 0 (oasis: ENABLE_HTTP_TOE_BUFFER / --toe-buffer):
+  - hw/hdl/network/tcp/tcp_mem_mux.sv: new, merges tcp_stack's two memory channels (tx, rx) onto the
+    one exported TCP memory channel; rx addresses get bit 29; tx writes store-and-forward.
+  - hw/hdl/network/stack/network_stack.sv: under `ifdef EN_TCP_RX_DDR, tcp_stack #(.RX_DDR_BYPASS_EN(0))
+    + tcp_mem_mux; otherwise the original text.
+  - cmake/FindCoyoteHW.cmake, scripts/base.tcl.in, hw/templates/common/lynx_pkg_tmplt.txt: the CMake
+    variable that writes RX_DDR_BYPASS into the TOE's HLS config also emits EN_TCP_RX_DDR (only when 0),
+    and must be the literal 0 or 1.
+Apply with hardware/patches/apply.sh (or: git -C parcore/libstf/coyote apply <this file>).
+See hardware/patches/README.md, "The receive ring wired into the shell (0008)".
+
+diff --git a/cmake/FindCoyoteHW.cmake b/cmake/FindCoyoteHW.cmake
+index ec1c4143..758205d3 100644
+--- a/cmake/FindCoyoteHW.cmake
++++ b/cmake/FindCoyoteHW.cmake
+@@ -560,6 +560,20 @@ macro(validation_checks_hw)
+             set(N_TCP_CHAN 0)
+             set(TCP_STACK_EN 0 CACHE BOOL "Enable TCP/IP stack")
+         endif()
++
++        # oasis: one variable decides the TOE's receive buffer for BOTH halves of the design --
++        # hls/toe/toe_config.hpp.in (`#define RX_DDR_BYPASS ${TCP_STACK_RX_DDR_BYPASS_EN}`) and the
++        # shell (base.tcl -> lynx_pkg `define EN_TCP_RX_DDR -> tcp_stack #(.RX_DDR_BYPASS_EN(0)) +
++        # tcp_mem_mux in network_stack.sv). Declared here with the same default and docstring as in
++        # hls/toe/CMakeLists.txt, whose set(CACHE) is then a no-op. Only the literals 0 and 1 are
++        # accepted: CMake would read ON/TRUE as 1, the C preprocessor reads them as 0.
++        if(EN_TCP)
++            set(TCP_STACK_RX_DDR_BYPASS_EN 1 CACHE BOOL "Enabling DDR bypass on the RX path")
++            if(NOT (TCP_STACK_RX_DDR_BYPASS_EN STREQUAL "0" OR TCP_STACK_RX_DDR_BYPASS_EN STREQUAL "1"))
++                message(FATAL_ERROR "TCP_STACK_RX_DDR_BYPASS_EN must be 0 or 1, got '${TCP_STACK_RX_DDR_BYPASS_EN}': toe_config.hpp's #if would read it as 0 while CMake and the shell read it as true.")
++            endif()
++            set(TCP_RX_DDR_BYPASS ${TCP_STACK_RX_DDR_BYPASS_EN})
++        endif()
+         if(EN_RDMA)
+             set(N_RDMA_CHAN 1)
+             set(ROCE_STACK_EN 1 CACHE BOOL "RDMA stack disabled.")
+@@ -877,6 +891,11 @@ endmacro()
+ 
+ # Generate templated scripts, from the parameters configured here
+ macro(gen_scripts)
++    # oasis: base.tcl's cfg(tcp_rx_ddr_bypass); set by validation_checks_hw for shell builds with TCP
++    if(NOT DEFINED TCP_RX_DDR_BYPASS)
++        set(TCP_RX_DDR_BYPASS 1)
++    endif()
++
+     # Python
+     configure_file(${CYT_DIR}/scripts/cr_prjcts/write_hdl.py.in ${CMAKE_BINARY_DIR}/write_hdl.py)
+     configure_file(${CYT_DIR}/scripts/impl/fix_bif.py.in ${CMAKE_BINARY_DIR}/fix_bif.py)
+diff --git a/hw/hdl/network/stack/network_stack.sv b/hw/hdl/network/stack/network_stack.sv
+index bf6bdf3d..516d100f 100644
+--- a/hw/hdl/network/stack/network_stack.sv
++++ b/hw/hdl/network/stack/network_stack.sv
+@@ -913,7 +913,14 @@ set_property -dict [list CONFIG.C_PROBE27_WIDTH {512} CONFIG.C_PROBE23_WIDTH {51
+  * TCP/IP stack
+  */
+ 
++// oasis: EN_TCP_RX_DDR (lynx_pkg, from the CMake variable TCP_STACK_RX_DDR_BYPASS_EN = 0, the same
++// variable that writes RX_DDR_BYPASS into the TOE's toe_config.hpp) builds the TOE with its receive
++// ring in card memory. Without it, everything below is exactly the original text.
++`ifdef EN_TCP_RX_DDR
++tcp_stack #(.RX_DDR_BYPASS_EN(0)) tcp_stack_inst(
++`else
+ tcp_stack tcp_stack_inst(
++`endif
+     .nclk(nclk), // input aclk
+     .nresetn(nresetn), // input aresetn
+     
+@@ -952,12 +959,87 @@ tcp_stack tcp_stack_inst(
+     .session_count_data(session_count_data)
+ );
+ 
++`ifdef EN_TCP_RX_DDR
++// Two TOE memory channels ([0] tx ring, [1] rx ring) onto the shell's one TCP memory channel.
++// tcp_mem_mux puts the rx rings at bit 29 (512 MiB) above the tx rings.
++logic [1:0]                         tmm_rd_cmd_valid, tmm_rd_cmd_ready;
++logic [1:0][MEM_CMD_BITS-1:0]       tmm_rd_cmd_data;
++logic [1:0]                         tmm_wr_cmd_valid, tmm_wr_cmd_ready;
++logic [1:0][MEM_CMD_BITS-1:0]       tmm_wr_cmd_data;
++logic [1:0]                         tmm_rd_sts_valid, tmm_rd_sts_ready;
++logic [1:0][MEM_STS_BITS-1:0]       tmm_rd_sts_data;
++logic [1:0]                         tmm_wr_sts_valid, tmm_wr_sts_ready;
++logic [1:0][MEM_STS_BITS-1:0]       tmm_wr_sts_data;
++logic [1:0]                         tmm_rd_tvalid, tmm_rd_tready;
++logic [AXI_DDR_BITS-1:0]            tmm_rd_tdata;
++logic [AXI_DDR_BITS/8-1:0]          tmm_rd_tkeep;
++logic                               tmm_rd_tlast;
++logic [1:0]                         tmm_wr_tvalid, tmm_wr_tready, tmm_wr_tlast;
++logic [1:0][AXI_DDR_BITS-1:0]       tmm_wr_tdata;
++logic [1:0][AXI_DDR_BITS/8-1:0]     tmm_wr_tkeep;
++
++for (genvar i = 0; i < 2; i++) begin : gen_tcp_mem_ch
++    assign tmm_rd_cmd_valid[i]          = tcp_mem_rd_cmd[i].valid;
++    assign tcp_mem_rd_cmd[i].ready      = tmm_rd_cmd_ready[i];
++    assign tmm_rd_cmd_data[i]           = tcp_mem_rd_cmd[i].data;
++    assign tmm_wr_cmd_valid[i]          = tcp_mem_wr_cmd[i].valid;
++    assign tcp_mem_wr_cmd[i].ready      = tmm_wr_cmd_ready[i];
++    assign tmm_wr_cmd_data[i]           = tcp_mem_wr_cmd[i].data;
++
++    assign tcp_mem_rd_sts[i].valid      = tmm_rd_sts_valid[i];
++    assign tmm_rd_sts_ready[i]          = tcp_mem_rd_sts[i].ready;
++    assign tcp_mem_rd_sts[i].data       = tmm_rd_sts_data[i];
++    assign tcp_mem_wr_sts[i].valid      = tmm_wr_sts_valid[i];
++    assign tmm_wr_sts_ready[i]          = tcp_mem_wr_sts[i].ready;
++    assign tcp_mem_wr_sts[i].data       = tmm_wr_sts_data[i];
++
++    assign axis_tcp_mem_rd[i].tvalid    = tmm_rd_tvalid[i];
++    assign tmm_rd_tready[i]             = axis_tcp_mem_rd[i].tready;
++    assign axis_tcp_mem_rd[i].tdata     = tmm_rd_tdata;
++    assign axis_tcp_mem_rd[i].tkeep     = tmm_rd_tkeep;
++    assign axis_tcp_mem_rd[i].tlast     = tmm_rd_tlast;
++
++    assign tmm_wr_tvalid[i]             = axis_tcp_mem_wr[i].tvalid;
++    assign axis_tcp_mem_wr[i].tready    = tmm_wr_tready[i];
++    assign tmm_wr_tdata[i]              = axis_tcp_mem_wr[i].tdata;
++    assign tmm_wr_tkeep[i]              = axis_tcp_mem_wr[i].tkeep;
++    assign tmm_wr_tlast[i]              = axis_tcp_mem_wr[i].tlast;
++end
++
++tcp_mem_mux #(
++    .CMD_BITS(MEM_CMD_BITS),
++    .STS_BITS(MEM_STS_BITS),
++    .DATA_BITS(AXI_DDR_BITS)
++) inst_tcp_mem_mux (
++    .aclk(nclk),
++    .aresetn(nresetn),
++
++    .s_rd_cmd_valid(tmm_rd_cmd_valid), .s_rd_cmd_ready(tmm_rd_cmd_ready), .s_rd_cmd_data(tmm_rd_cmd_data),
++    .s_wr_cmd_valid(tmm_wr_cmd_valid), .s_wr_cmd_ready(tmm_wr_cmd_ready), .s_wr_cmd_data(tmm_wr_cmd_data),
++    .m_rd_sts_valid(tmm_rd_sts_valid), .m_rd_sts_ready(tmm_rd_sts_ready), .m_rd_sts_data(tmm_rd_sts_data),
++    .m_wr_sts_valid(tmm_wr_sts_valid), .m_wr_sts_ready(tmm_wr_sts_ready), .m_wr_sts_data(tmm_wr_sts_data),
++    .m_rd_tvalid(tmm_rd_tvalid), .m_rd_tready(tmm_rd_tready),
++    .m_rd_tdata(tmm_rd_tdata), .m_rd_tkeep(tmm_rd_tkeep), .m_rd_tlast(tmm_rd_tlast),
++    .s_wr_tvalid(tmm_wr_tvalid), .s_wr_tready(tmm_wr_tready),
++    .s_wr_tdata(tmm_wr_tdata), .s_wr_tkeep(tmm_wr_tkeep), .s_wr_tlast(tmm_wr_tlast),
++
++    .m_rd_cmd_valid(m_tcp_mem_rd_cmd.valid), .m_rd_cmd_ready(m_tcp_mem_rd_cmd.ready), .m_rd_cmd_data(m_tcp_mem_rd_cmd.data),
++    .m_wr_cmd_valid(m_tcp_mem_wr_cmd.valid), .m_wr_cmd_ready(m_tcp_mem_wr_cmd.ready), .m_wr_cmd_data(m_tcp_mem_wr_cmd.data),
++    .s_rd_sts_valid(s_tcp_mem_rd_sts.valid), .s_rd_sts_ready(s_tcp_mem_rd_sts.ready), .s_rd_sts_data(s_tcp_mem_rd_sts.data),
++    .s_wr_sts_valid(s_tcp_mem_wr_sts.valid), .s_wr_sts_ready(s_tcp_mem_wr_sts.ready), .s_wr_sts_data(s_tcp_mem_wr_sts.data),
++    .s_rd_tvalid(s_axis_tcp_mem_rd.tvalid), .s_rd_tready(s_axis_tcp_mem_rd.tready),
++    .s_rd_tdata(s_axis_tcp_mem_rd.tdata), .s_rd_tkeep(s_axis_tcp_mem_rd.tkeep), .s_rd_tlast(s_axis_tcp_mem_rd.tlast),
++    .m_wr_tvalid(m_axis_tcp_mem_wr.tvalid), .m_wr_tready(m_axis_tcp_mem_wr.tready),
++    .m_wr_tdata(m_axis_tcp_mem_wr.tdata), .m_wr_tkeep(m_axis_tcp_mem_wr.tkeep), .m_wr_tlast(m_axis_tcp_mem_wr.tlast)
++);
++`else
+ `META_ASSIGN(tcp_mem_rd_cmd[0], m_tcp_mem_rd_cmd)
+ `META_ASSIGN(tcp_mem_wr_cmd[0], m_tcp_mem_wr_cmd)
+ `META_ASSIGN(s_tcp_mem_rd_sts, tcp_mem_rd_sts[0])
+ `META_ASSIGN(s_tcp_mem_wr_sts, tcp_mem_wr_sts[0])
+ `AXIS_ASSIGN(s_axis_tcp_mem_rd, axis_tcp_mem_rd[0])
+ `AXIS_ASSIGN(axis_tcp_mem_wr[0], m_axis_tcp_mem_wr)
++`endif
+ 
+ `endif
+ 
+diff --git a/hw/hdl/network/tcp/tcp_mem_mux.sv b/hw/hdl/network/tcp/tcp_mem_mux.sv
+new file mode 100644
+index 00000000..56908414
+--- /dev/null
++++ b/hw/hdl/network/tcp/tcp_mem_mux.sv
+@@ -0,0 +1,537 @@
++/**
++ * This file is part of the Coyote <https://github.com/fpgasystems/Coyote>
++ *
++ * MIT Licence
++ * Copyright (c) 2021-2025, Systems Group, ETH Zurich
++ * All rights reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++`timescale 1ns / 1ps
++
++/**
++ * @brief   TCP memory multiplexer (oasis): the TOE's two memory channels onto one
++ *
++ * With RX_DDR_BYPASS_EN = 0 the TOE keeps its receive ring in card memory, next to the transmit
++ * ring, and tcp_stack has two memory channels: [0] = tx (ddrPortNetworkTx), [1] = rx
++ * (ddrPortNetworkRx). The shell has ONE TCP memory channel (N_TCP_CHAN = 1: one datamover, one
++ * HBM port). This module merges the two onto it. Plain ports, no package, so it can be simulated
++ * on its own (hardware/unit-tests/tcp_mem_mux in oasis).
++ *
++ * ADDRESSES. Both channels address {00, sid[9:0], offset[19:0]} (WINDOW_BITS 20, MAX_SESSIONS
++ * 512, so bit 29 = sid[9] is always 0). Rx commands get bit RX_ADDR_BIT (29) set: tx rings live in
++ * [0, 512 MiB), rx rings in [512 MiB, 1 GiB) of the TCP memory region. Simulation checks that
++ * bits [63:29] of every incoming address are 0.
++ *
++ * ONE DATAMOVER, SO EVERYTHING COMES BACK IN COMMAND ORDER. Read data (one tlast-terminated packet
++ * per command, eof = 1), read status and write status return in the order the commands were
++ * issued. So the channel id of every granted command is pushed into in-order FIFOs and the
++ * returns are routed by the FIFO heads: rdq (read data, popped on tlast), rsq (read status), wsq
++ * (write status). Write data must ENTER in command order: wdq holds the channel of every granted
++ * write command and the forwarder drains that channel's data until tlast before the next one.
++ *
++ * TX WRITES ARE STORE-AND-FORWARD. The TOE issues a tx write command BEFORE its data
++ * (tx_app_stream_if.cpp, tasi_pkg_pusher: IMPROVE_TIMING writes txBufferWriteCmd, the data follows
++ * from appTxDataIn), and the data comes from the application. Once a command is granted the
++ * datamover waits for its data, so a tx command granted ahead of its data would park every later
++ * rx write -- for all sessions -- behind an application that stalled mid-send. So tx write data
++ * goes into a FIFO first, and a tx command is only eligible once its whole packet (tlast) is in.
++ * Sizing: appTxMeta.length is 16 bits, tasi_metaLoader issues one command of that length, and
++ * tasi_pkg_pusher splits it in two only at the ring end; each part is packed from byte lane 0, so
++ * no tx write is longer than ceil(65535 / 64) = 1024 beats. TXW_DEPTH = 1024 entries plus the
++ * FIFO's output register hold one complete maximum packet. (Simulation flags a longer one: it
++ * would deadlock the tx write path, never the rx one.)
++ * Rx writes are forwarded cut-through: rx_engine (rxEngMemWrite) also writes the command first,
++ * but its data is already inside the TOE (received from the network, released by the drop
++ * decision) and does not wait for anything outside the TOE's rx path.
++ *
++ * COMMANDS ARE ACCEPTED EAGERLY. Both TOE processes that issue write commands (rxEngMemWrite,
++ * tasi_pkg_pusher) write the second command of a ring-end split IN THE SAME ITERATION as the last
++ * beat of the first part. If that command could not be accepted, the first part would never get
++ * its tlast and, being granted (rx) or waiting for completion (tx), would deadlock. So every
++ * channel has its own command queue (CMDQ_DEPTH >= 2 is the minimum; this argument needs one free
++ * slot behind the oldest ungranted command, and the queue only holds commands the TOE wrote
++ * before that last beat).
++ *
++ * WRITE STATUS CANNOT COUPLE THE CHANNELS. Each channel has a status FIFO of N_WR entries and a
++ * credit counter: a write is granted only while the channel has fewer than N_WR statuses
++ * outstanding or unread. So the shared status stream is always accepted, and a channel that stops
++ * reading its statuses stops only itself.
++ *
++ * READ DATA IS HEAD-OF-LINE COUPLED (documented, not fixed). Read data is not buffered here: the
++ * packet at the head of the shared read stream goes to its channel, and while that channel holds
++ * tready low the other channel's later read data waits behind it. A per-channel read buffer would
++ * cost up to a 64 KiB packet each. It is harmless as long as both read consumers keep draining:
++ * the rx read data feeds the TOE's app read path (m_axis_tcp_rx), which oasis holds at tready = 1,
++ * and the tx read data feeds the tx engine, which is drained by the MAC. If an application ever
++ * stalls m_axis_tcp_rx, tx (re)transmissions that need card memory wait until it resumes.
++ *
++ * Arbitration is round-robin per command on each side. Commands leave through output registers,
++ * write data through a two-entry register slice; nothing here adds a cycle per packet.
++ */
++module tcp_mem_mux #(
++    parameter integer CMD_BITS     = 96,     // {9'h0, btt[22:0], 32'h0, saddr[31:0]}
++    parameter integer STS_BITS     = 8,      // {okay, slverr, decerr, interr, tag[3:0]}
++    parameter integer DATA_BITS    = 512,
++    parameter integer RX_ADDR_BIT  = 29,     // OR-ed into rx addresses
++    parameter integer TXW_DEPTH    = 1024,   // tx write store-and-forward, beats (see above)
++    parameter integer N_RD         = 32,     // reads in flight (both channels)
++    parameter integer N_WR         = 32,     // writes in flight or unread, per channel
++    parameter integer CMDQ_DEPTH   = 16      // per channel and direction; >= 2 (see above)
++) (
++    input  logic                            aclk,
++    input  logic                            aresetn,
++
++    // ---- the TOE side (tcp_stack's memory channels), index 0 = tx, 1 = rx ----------------------
++    input  logic [1:0]                      s_rd_cmd_valid,
++    output logic [1:0]                      s_rd_cmd_ready,
++    input  logic [1:0][CMD_BITS-1:0]        s_rd_cmd_data,
++
++    input  logic [1:0]                      s_wr_cmd_valid,
++    output logic [1:0]                      s_wr_cmd_ready,
++    input  logic [1:0][CMD_BITS-1:0]        s_wr_cmd_data,
++
++    output logic [1:0]                      m_rd_sts_valid,
++    input  logic [1:0]                      m_rd_sts_ready,
++    output logic [1:0][STS_BITS-1:0]        m_rd_sts_data,
++
++    output logic [1:0]                      m_wr_sts_valid,
++    input  logic [1:0]                      m_wr_sts_ready,
++    output logic [1:0][STS_BITS-1:0]        m_wr_sts_data,
++
++    // read data: payload shared, valid per channel
++    output logic [1:0]                      m_rd_tvalid,
++    input  logic [1:0]                      m_rd_tready,
++    output logic [DATA_BITS-1:0]            m_rd_tdata,
++    output logic [DATA_BITS/8-1:0]          m_rd_tkeep,
++    output logic                            m_rd_tlast,
++
++    input  logic [1:0]                      s_wr_tvalid,
++    output logic [1:0]                      s_wr_tready,
++    input  logic [1:0][DATA_BITS-1:0]       s_wr_tdata,
++    input  logic [1:0][DATA_BITS/8-1:0]     s_wr_tkeep,
++    input  logic [1:0]                      s_wr_tlast,
++
++    // ---- the shell side (the one exported TCP memory channel) --------------------------------
++    output logic                            m_rd_cmd_valid,
++    input  logic                            m_rd_cmd_ready,
++    output logic [CMD_BITS-1:0]             m_rd_cmd_data,
++
++    output logic                            m_wr_cmd_valid,
++    input  logic                            m_wr_cmd_ready,
++    output logic [CMD_BITS-1:0]             m_wr_cmd_data,
++
++    input  logic                            s_rd_sts_valid,
++    output logic                            s_rd_sts_ready,
++    input  logic [STS_BITS-1:0]             s_rd_sts_data,
++
++    input  logic                            s_wr_sts_valid,
++    output logic                            s_wr_sts_ready,
++    input  logic [STS_BITS-1:0]             s_wr_sts_data,
++
++    input  logic                            s_rd_tvalid,
++    output logic                            s_rd_tready,
++    input  logic [DATA_BITS-1:0]            s_rd_tdata,
++    input  logic [DATA_BITS/8-1:0]          s_rd_tkeep,
++    input  logic                            s_rd_tlast,
++
++    output logic                            m_wr_tvalid,
++    input  logic                            m_wr_tready,
++    output logic [DATA_BITS-1:0]            m_wr_tdata,
++    output logic [DATA_BITS/8-1:0]          m_wr_tkeep,
++    output logic                            m_wr_tlast
++);
++
++    localparam integer KEEP_BITS = DATA_BITS/8;
++    localparam integer BEAT_BITS = DATA_BITS + KEEP_BITS + 1;
++    localparam integer CRED_BITS = $clog2(N_WR+1);
++    localparam integer PKT_BITS  = $clog2(TXW_DEPTH+2);
++
++    localparam integer TX = 0;
++    localparam integer RX = 1;
++
++    // Rx commands: OR in the rx region bit.
++    function automatic logic [CMD_BITS-1:0] place(input logic [CMD_BITS-1:0] cmd, input logic ch);
++        logic [CMD_BITS-1:0] c;
++        c = cmd;
++        if (ch == RX) c[RX_ADDR_BIT] = 1'b1;
++        return c;
++    endfunction
++
++    // =============================================================================================
++    // Command queues (eager acceptance)
++    // =============================================================================================
++    logic [1:0]                 rq_valid, rq_ready, wq_valid, wq_ready;
++    logic [1:0][CMD_BITS-1:0]   rq_data, wq_data;
++
++    for (genvar c = 0; c < 2; c++) begin : gen_cmdq
++        tcp_mem_mux_fifo #(.WIDTH(CMD_BITS), .DEPTH(CMDQ_DEPTH)) inst_rd_cmdq (
++            .clk(aclk), .rst_n(aresetn),
++            .s_valid(s_rd_cmd_valid[c]), .s_ready(s_rd_cmd_ready[c]), .s_data(s_rd_cmd_data[c]),
++            .m_valid(rq_valid[c]), .m_ready(rq_ready[c]), .m_data(rq_data[c])
++        );
++        tcp_mem_mux_fifo #(.WIDTH(CMD_BITS), .DEPTH(CMDQ_DEPTH)) inst_wr_cmdq (
++            .clk(aclk), .rst_n(aresetn),
++            .s_valid(s_wr_cmd_valid[c]), .s_ready(s_wr_cmd_ready[c]), .s_data(s_wr_cmd_data[c]),
++            .m_valid(wq_valid[c]), .m_ready(wq_ready[c]), .m_data(wq_data[c])
++        );
++    end
++
++    // =============================================================================================
++    // READ side
++    // =============================================================================================
++    // Route FIFOs: channel of every granted read, for its data (popped on tlast) and its status.
++    logic rdq_s_ready, rdq_m_valid, rdq_m_ready, rdq_m_data;
++    logic rsq_s_ready, rsq_m_valid, rsq_m_ready, rsq_m_data;
++
++    logic rd_last_q;                  // channel granted last (round robin)
++    logic rd_pick, rd_grant, rd_out_free;
++    logic m_rd_cmd_valid_q;
++    logic [CMD_BITS-1:0] m_rd_cmd_data_q;
++
++    assign rd_out_free = !m_rd_cmd_valid_q || m_rd_cmd_ready;
++    always_comb begin
++        if (rq_valid[TX] && rq_valid[RX]) rd_pick = !rd_last_q;
++        else                              rd_pick = rq_valid[RX];
++    end
++    assign rd_grant = (|rq_valid) && rd_out_free && rdq_s_ready && rsq_s_ready;
++
++    assign rq_ready[TX] = rd_grant && (rd_pick == TX);
++    assign rq_ready[RX] = rd_grant && (rd_pick == RX);
++
++    always_ff @(posedge aclk) begin
++        if (!aresetn) begin
++            m_rd_cmd_valid_q <= 1'b0;
++            rd_last_q        <= 1'b1;   // tx first
++        end else begin
++            if (rd_out_free) m_rd_cmd_valid_q <= rd_grant;
++            if (rd_grant)    rd_last_q        <= rd_pick;
++        end
++    end
++    always_ff @(posedge aclk) begin
++        if (rd_grant) m_rd_cmd_data_q <= place(rq_data[rd_pick], rd_pick);
++    end
++    assign m_rd_cmd_valid = m_rd_cmd_valid_q;
++    assign m_rd_cmd_data  = m_rd_cmd_data_q;
++
++    tcp_mem_mux_fifo #(.WIDTH(1), .DEPTH(N_RD)) inst_rdq (
++        .clk(aclk), .rst_n(aresetn),
++        .s_valid(rd_grant), .s_ready(rdq_s_ready), .s_data(rd_pick),
++        .m_valid(rdq_m_valid), .m_ready(rdq_m_ready), .m_data(rdq_m_data)
++    );
++    tcp_mem_mux_fifo #(.WIDTH(1), .DEPTH(N_RD)) inst_rsq (
++        .clk(aclk), .rst_n(aresetn),
++        .s_valid(rd_grant), .s_ready(rsq_s_ready), .s_data(rd_pick),
++        .m_valid(rsq_m_valid), .m_ready(rsq_m_ready), .m_data(rsq_m_data)
++    );
++
++    // Read data: to the channel at the head of rdq, one packet (tlast) per read.
++    assign m_rd_tdata  = s_rd_tdata;
++    assign m_rd_tkeep  = s_rd_tkeep;
++    assign m_rd_tlast  = s_rd_tlast;
++    assign m_rd_tvalid[TX] = s_rd_tvalid && rdq_m_valid && (rdq_m_data == TX);
++    assign m_rd_tvalid[RX] = s_rd_tvalid && rdq_m_valid && (rdq_m_data == RX);
++    assign s_rd_tready     = rdq_m_valid && m_rd_tready[rdq_m_data];
++    assign rdq_m_ready     = s_rd_tvalid && s_rd_tready && s_rd_tlast;
++
++    // Read status: to the channel at the head of rsq. (tcp_stack accepts them unconditionally.)
++    assign m_rd_sts_data[TX]  = s_rd_sts_data;
++    assign m_rd_sts_data[RX]  = s_rd_sts_data;
++    assign m_rd_sts_valid[TX] = s_rd_sts_valid && rsq_m_valid && (rsq_m_data == TX);
++    assign m_rd_sts_valid[RX] = s_rd_sts_valid && rsq_m_valid && (rsq_m_data == RX);
++    assign s_rd_sts_ready     = rsq_m_valid && m_rd_sts_ready[rsq_m_data];
++    assign rsq_m_ready        = s_rd_sts_valid && s_rd_sts_ready;
++
++    // =============================================================================================
++    // WRITE side
++    // =============================================================================================
++    // ---- tx write data: store-and-forward -------------------------------------------------------
++    logic                   txf_m_valid, txf_m_ready;
++    logic [BEAT_BITS-1:0]   txf_m_data;
++    logic [PKT_BITS-1:0]    tx_pkts_q;     // complete tx packets in the FIFO whose command is not granted
++    logic                   tx_in_last, tx_grant;
++
++    tcp_mem_mux_fifo #(.WIDTH(BEAT_BITS), .DEPTH(TXW_DEPTH), .BLOCK(1)) inst_txw_fifo (
++        .clk(aclk), .rst_n(aresetn),
++        .s_valid(s_wr_tvalid[TX]), .s_ready(s_wr_tready[TX]),
++        .s_data({s_wr_tlast[TX], s_wr_tkeep[TX], s_wr_tdata[TX]}),
++        .m_valid(txf_m_valid), .m_ready(txf_m_ready), .m_data(txf_m_data)
++    );
++    assign tx_in_last = s_wr_tvalid[TX] && s_wr_tready[TX] && s_wr_tlast[TX];
++
++    always_ff @(posedge aclk) begin
++        if (!aresetn) tx_pkts_q <= '0;
++        else          tx_pkts_q <= tx_pkts_q + PKT_BITS'(tx_in_last) - PKT_BITS'(tx_grant);
++    end
++
++    // ---- write arbitration ------------------------------------------------------------------------
++    logic wdq_s_ready, wdq_m_valid, wdq_m_ready, wdq_m_data;
++    logic wsq_s_ready, wsq_m_valid, wsq_m_ready, wsq_m_data;
++    logic [1:0] cred_ok;              // channel may have another write in flight (see gen_wsts)
++    logic [1:0] w_elig;
++    logic wr_last_q, wr_pick, wr_grant, wr_out_free;
++    logic m_wr_cmd_valid_q;
++    logic [CMD_BITS-1:0] m_wr_cmd_data_q;
++
++    assign w_elig[TX] = wq_valid[TX] && (tx_pkts_q != '0) && cred_ok[TX];
++    assign w_elig[RX] = wq_valid[RX] &&                      cred_ok[RX];
++
++    assign wr_out_free = !m_wr_cmd_valid_q || m_wr_cmd_ready;
++    always_comb begin
++        if (w_elig[TX] && w_elig[RX]) wr_pick = !wr_last_q;
++        else                          wr_pick = w_elig[RX];
++    end
++    assign wr_grant = (|w_elig) && wr_out_free && wdq_s_ready && wsq_s_ready;
++    assign tx_grant = wr_grant && (wr_pick == TX);
++
++    assign wq_ready[TX] = wr_grant && (wr_pick == TX);
++    assign wq_ready[RX] = wr_grant && (wr_pick == RX);
++
++    always_ff @(posedge aclk) begin
++        if (!aresetn) begin
++            m_wr_cmd_valid_q <= 1'b0;
++            wr_last_q        <= 1'b1;
++        end else begin
++            if (wr_out_free) m_wr_cmd_valid_q <= wr_grant;
++            if (wr_grant)    wr_last_q        <= wr_pick;
++        end
++    end
++    always_ff @(posedge aclk) begin
++        if (wr_grant) m_wr_cmd_data_q <= place(wq_data[wr_pick], wr_pick);
++    end
++    assign m_wr_cmd_valid = m_wr_cmd_valid_q;
++    assign m_wr_cmd_data  = m_wr_cmd_data_q;
++
++    // Channel of every granted write: for its data (in) and for its status (out).
++    tcp_mem_mux_fifo #(.WIDTH(1), .DEPTH(2*N_WR)) inst_wdq (
++        .clk(aclk), .rst_n(aresetn),
++        .s_valid(wr_grant), .s_ready(wdq_s_ready), .s_data(wr_pick),
++        .m_valid(wdq_m_valid), .m_ready(wdq_m_ready), .m_data(wdq_m_data)
++    );
++    tcp_mem_mux_fifo #(.WIDTH(1), .DEPTH(2*N_WR)) inst_wsq (
++        .clk(aclk), .rst_n(aresetn),
++        .s_valid(wr_grant), .s_ready(wsq_s_ready), .s_data(wr_pick),
++        .m_valid(wsq_m_valid), .m_ready(wsq_m_ready), .m_data(wsq_m_data)
++    );
++
++    // ---- write data forwarder: the channel at the head of wdq, until tlast ----------------------
++    logic                   fw_valid, fw_ready;
++    logic [BEAT_BITS-1:0]   fw_data;
++
++    always_comb begin
++        if (wdq_m_data == TX) begin
++            fw_valid = wdq_m_valid && txf_m_valid;
++            fw_data  = txf_m_data;
++        end else begin
++            fw_valid = wdq_m_valid && s_wr_tvalid[RX];
++            fw_data  = {s_wr_tlast[RX], s_wr_tkeep[RX], s_wr_tdata[RX]};
++        end
++    end
++    assign txf_m_ready     = wdq_m_valid && (wdq_m_data == TX) && fw_ready;
++    assign s_wr_tready[RX] = wdq_m_valid && (wdq_m_data == RX) && fw_ready;
++    assign wdq_m_ready     = fw_valid && fw_ready && fw_data[BEAT_BITS-1];
++
++    tcp_mem_mux_reg #(.WIDTH(BEAT_BITS)) inst_wr_out (
++        .clk(aclk), .rst_n(aresetn),
++        .s_valid(fw_valid), .s_ready(fw_ready), .s_data(fw_data),
++        .m_valid(m_wr_tvalid), .m_ready(m_wr_tready), .m_data({m_wr_tlast, m_wr_tkeep, m_wr_tdata})
++    );
++
++    // ---- write status: per-channel FIFO + credits -----------------------------------------------
++    logic [1:0] stf_s_valid, stf_s_ready;
++
++    assign stf_s_valid[TX] = s_wr_sts_valid && wsq_m_valid && (wsq_m_data == TX);
++    assign stf_s_valid[RX] = s_wr_sts_valid && wsq_m_valid && (wsq_m_data == RX);
++    assign s_wr_sts_ready  = wsq_m_valid && stf_s_ready[wsq_m_data];
++    assign wsq_m_ready     = s_wr_sts_valid && s_wr_sts_ready;
++
++    for (genvar c = 0; c < 2; c++) begin : gen_wsts
++        tcp_mem_mux_fifo #(.WIDTH(STS_BITS), .DEPTH(N_WR)) inst_sts_fifo (
++            .clk(aclk), .rst_n(aresetn),
++            .s_valid(stf_s_valid[c]), .s_ready(stf_s_ready[c]), .s_data(s_wr_sts_data),
++            .m_valid(m_wr_sts_valid[c]), .m_ready(m_wr_sts_ready[c]), .m_data(m_wr_sts_data[c])
++        );
++
++        // A credit is taken when a write of this channel is granted and returned when the TOE
++        // reads its status, so the status FIFO (N_WR) can never be full when a status arrives.
++        logic                 take, give;
++        logic [CRED_BITS-1:0] cred_q;
++        assign take = wr_grant && (wr_pick == c);
++        assign give = m_wr_sts_valid[c] && m_wr_sts_ready[c];
++        always_ff @(posedge aclk) begin
++            if (!aresetn) cred_q <= CRED_BITS'(N_WR);
++            else          cred_q <= cred_q - CRED_BITS'(take) + CRED_BITS'(give);
++        end
++        assign cred_ok[c] = (cred_q != '0);
++    end
++
++    // =============================================================================================
++    // Simulation-only checks
++    // =============================================================================================
++`ifndef SYNTHESIS
++    integer tx_beats;
++    always_ff @(posedge aclk) begin
++        if (!aresetn) begin
++            tx_beats <= 0;
++        end else begin
++            for (int c = 0; c < 2; c++) begin
++                if (s_rd_cmd_valid[c] && s_rd_cmd_ready[c] && s_rd_cmd_data[c][63:RX_ADDR_BIT] != '0)
++                    $error("tcp_mem_mux: %s read address 0x%0h has bits [63:%0d] set",
++                           c ? "rx" : "tx", s_rd_cmd_data[c][63:0], RX_ADDR_BIT);
++                if (s_wr_cmd_valid[c] && s_wr_cmd_ready[c] && s_wr_cmd_data[c][63:RX_ADDR_BIT] != '0)
++                    $error("tcp_mem_mux: %s write address 0x%0h has bits [63:%0d] set",
++                           c ? "rx" : "tx", s_wr_cmd_data[c][63:0], RX_ADDR_BIT);
++            end
++            if (s_wr_tvalid[TX] && s_wr_tready[TX]) begin
++                if (s_wr_tlast[TX]) tx_beats <= 0;
++                else                tx_beats <= tx_beats + 1;
++                if (tx_beats + 1 > TXW_DEPTH)
++                    $error("tcp_mem_mux: tx write packet longer than TXW_DEPTH = %0d beats (deadlocks the tx write path)", TXW_DEPTH);
++            end
++            if (s_rd_tvalid && !rdq_m_valid)
++                $error("tcp_mem_mux: read data with no read outstanding");
++            if (s_rd_sts_valid && !rsq_m_valid)
++                $error("tcp_mem_mux: read status with no read outstanding");
++            if (s_wr_sts_valid && !wsq_m_valid)
++                $error("tcp_mem_mux: write status with no write outstanding");
++            if (s_wr_sts_valid && wsq_m_valid && !stf_s_ready[wsq_m_data])
++                $error("tcp_mem_mux: write status FIFO full despite credits");
++        end
++    end
++`endif
++
++endmodule
++
++// =================================================================================================
++// First-word-fall-through FIFO. DEPTH entries in memory plus the output register. The memory is
++// read synchronously into the output register, so it infers block RAM (BLOCK = 1) or LUT RAM, and
++// a full-rate drain needs no bubble.
++// =================================================================================================
++module tcp_mem_mux_fifo #(
++    parameter integer WIDTH = 8,
++    parameter integer DEPTH = 16,
++    parameter integer BLOCK = 0
++) (
++    input  logic             clk,
++    input  logic             rst_n,
++    input  logic             s_valid,
++    output logic             s_ready,
++    input  logic [WIDTH-1:0] s_data,
++    output logic             m_valid,
++    input  logic             m_ready,
++    output logic [WIDTH-1:0] m_data
++);
++    localparam integer PTR_BITS = (DEPTH > 1) ? $clog2(DEPTH) : 1;
++    localparam integer LVL_BITS = $clog2(DEPTH+1);
++
++    logic [PTR_BITS-1:0] wr_ptr_q, rd_ptr_q;
++    logic [LVL_BITS-1:0] level_q;
++    logic [WIDTH-1:0]    out_q;
++    logic                out_valid_q;
++
++    logic wr_fire, out_load;
++    assign s_ready  = (level_q != LVL_BITS'(DEPTH));
++    assign wr_fire  = s_valid && s_ready;
++    assign out_load = (level_q != '0) && (!out_valid_q || m_ready);
++
++    if (BLOCK) begin : gen_bram
++        (* ram_style = "block" *) logic [WIDTH-1:0] mem [DEPTH];
++        always_ff @(posedge clk) begin
++            if (wr_fire)  mem[wr_ptr_q] <= s_data;
++            if (out_load) out_q <= mem[rd_ptr_q];
++        end
++    end else begin : gen_lutram
++        (* ram_style = "distributed" *) logic [WIDTH-1:0] mem [DEPTH];
++        always_ff @(posedge clk) begin
++            if (wr_fire)  mem[wr_ptr_q] <= s_data;
++            if (out_load) out_q <= mem[rd_ptr_q];
++        end
++    end
++
++    always_ff @(posedge clk) begin
++        if (!rst_n) begin
++            wr_ptr_q    <= '0;
++            rd_ptr_q    <= '0;
++            level_q     <= '0;
++            out_valid_q <= 1'b0;
++        end else begin
++            if (wr_fire)  wr_ptr_q <= (wr_ptr_q == PTR_BITS'(DEPTH-1)) ? '0 : wr_ptr_q + 1'b1;
++            if (out_load) rd_ptr_q <= (rd_ptr_q == PTR_BITS'(DEPTH-1)) ? '0 : rd_ptr_q + 1'b1;
++            // level counts the memory only; the output register is not part of it
++            case ({wr_fire, out_load})
++                2'b10:   level_q <= level_q + 1'b1;
++                2'b01:   level_q <= level_q - 1'b1;
++                default: ;
++            endcase
++            if (out_load)     out_valid_q <= 1'b1;
++            else if (m_ready) out_valid_q <= 1'b0;
++        end
++    end
++
++    assign m_valid = out_valid_q;
++    assign m_data  = out_q;
++endmodule
++
++// =================================================================================================
++// Two-entry register slice: every output registered, s_ready included.
++// =================================================================================================
++module tcp_mem_mux_reg #(
++    parameter integer WIDTH = 8
++) (
++    input  logic             clk,
++    input  logic             rst_n,
++    input  logic             s_valid,
++    output logic             s_ready,
++    input  logic [WIDTH-1:0] s_data,
++    output logic             m_valid,
++    input  logic             m_ready,
++    output logic [WIDTH-1:0] m_data
++);
++    logic [WIDTH-1:0] main_q, skid_q;
++    logic             main_v, skid_v;
++
++    assign s_ready = !skid_v;
++    assign m_valid = main_v;
++    assign m_data  = main_q;
++
++    always_ff @(posedge clk) begin
++        if (!rst_n) begin
++            main_v <= 1'b0;
++            skid_v <= 1'b0;
++        end else if (!main_v || m_ready) begin
++            if (skid_v) begin
++                main_v <= 1'b1;
++                skid_v <= 1'b0;
++            end else begin
++                main_v <= s_valid;
++            end
++        end else if (s_valid && !skid_v) begin
++            skid_v <= 1'b1;
++        end
++    end
++
++    always_ff @(posedge clk) begin
++        if (!main_v || m_ready) begin
++            main_q <= skid_v ? skid_q : s_data;
++        end else if (s_valid && !skid_v) begin
++            skid_q <= s_data;
++        end
++    end
++endmodule
+diff --git a/hw/templates/common/lynx_pkg_tmplt.txt b/hw/templates/common/lynx_pkg_tmplt.txt
+index 3655842e..acfeb0b3 100644
+--- a/hw/templates/common/lynx_pkg_tmplt.txt
++++ b/hw/templates/common/lynx_pkg_tmplt.txt
+@@ -56,6 +56,9 @@
+ {% if cnfg.en_tcp %}
+ `define EN_TCP
+ {% endif %}
++{% if cnfg.en_tcp and cnfg.tcp_rx_ddr_bypass == 0 %}
++`define EN_TCP_RX_DDR
++{% endif %}
+ {% if cnfg.en_sniffer %}
+ `define EN_SNIFFER
+ {% endif %}
+diff --git a/scripts/base.tcl.in b/scripts/base.tcl.in
+index a78fb73f..906d7f50 100644
+--- a/scripts/base.tcl.in
++++ b/scripts/base.tcl.in
+@@ -100,6 +100,7 @@ set cfg(en_avx)                 ${EN_AVX}
+ set cfg(en_wb)                  ${EN_WB}
+ set cfg(en_rdma)                ${EN_RDMA}
+ set cfg(en_tcp)                 ${EN_TCP}   
++set cfg(tcp_rx_ddr_bypass)      ${TCP_RX_DDR_BYPASS}
+ set cfg(en_sniffer)             ${EN_SNIFFER}
+ set cfg(sniffer_vfpga_id)       ${SNIFFER_VFPGA_ID}
+ set cfg(en_net_0)               ${EN_NET_0}
