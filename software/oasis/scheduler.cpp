@@ -37,7 +37,6 @@ size_t default_pipeline_depth(const std::vector<StreamDescription> &streams) {
     return 1;
 }
 
-// Whether `used + extra` still fits in `capacity` (written so it cannot overflow).
 bool fits(size_t used, size_t extra, size_t capacity) {
     return used <= capacity && extra <= capacity - used;
 }
@@ -170,8 +169,6 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
                 " capability, but this hardware provides no such stream");
         }
 
-        // A flow that exceeds some FIFO's depth on every stream could never be placed, and would
-        // block the head of its queue forever.
         const bool fits_some_stream =
             std::any_of(candidates.begin(), candidates.end(), [&](libstf::stream_t s) {
                 const StreamState &ss = *streams_[s];
