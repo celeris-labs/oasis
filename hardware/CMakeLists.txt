@@ -35,6 +35,15 @@ option(ENABLE_HTTP_SLOTS "Per-connection HBM receive slots (handler_slots)" OFF)
 # Number of TCP connections. Stage 1 of ADR-5 pairs one connection with one decoder; stage 2 (CSR
 # revision 5) gives the decoders a shared pool of up to 32, placed by the host per GET.
 set(N_HTTP_CONNS 0 CACHE STRING "TCP connections for handler_slots (0 = same as N_DECODERS)")
+# The TOE keeps the receive buffer itself: TCP_STACK_RX_DDR_BYPASS_EN = 0, a 1 MiB ring per session
+# in card memory (the TCP stack's existing HBM channel, shared 2:1 with the transmit rings by
+# Coyote's tcp_mem_mux; hardware/patches/0008), notifications only after the bytes have landed, and
+# readPkg for any session in any order. Replaces the shared 1 MiB rx FIFO of the bypass build and,
+# with it, both the arrival-order coupling (rx_dispatch) and the HBM slot buffer (ENABLE_HTTP_SLOTS),
+# with which it is mutually exclusive. Needs patches 0007 (network submodule) and 0008 (Coyote), which
+# hardware/patches/apply.sh puts in; configure refuses to run without them. EN_MEM stays 0: no card
+# AXI stream, no driver card pool.
+option(ENABLE_HTTP_TOE_BUFFER "TOE receive rings in card memory (RX_DDR_BYPASS = 0)" OFF)
 
 if(ENABLE_HTTP AND ENABLE_RDMA)
     message(FATAL_ERROR "ENABLE_HTTP and ENABLE_RDMA are mutually exclusive")
@@ -46,6 +55,35 @@ endif()
 
 if(ENABLE_HTTP_SLOTS AND NOT ENABLE_HTTP_MULTI)
     message(FATAL_ERROR "ENABLE_HTTP_SLOTS needs ENABLE_HTTP_MULTI -- handler_slots keeps handler_multi's session side, one TCP connection per slot")
+endif()
+
+if(ENABLE_HTTP_TOE_BUFFER AND NOT ENABLE_HTTP_MULTI)
+    message(FATAL_ERROR "ENABLE_HTTP_TOE_BUFFER needs ENABLE_HTTP_MULTI -- the TOE's receive rings are per session, and the session side is handler_multi's")
+endif()
+
+if(ENABLE_HTTP_TOE_BUFFER AND ENABLE_HTTP_SLOTS)
+    message(FATAL_ERROR "ENABLE_HTTP_TOE_BUFFER and ENABLE_HTTP_SLOTS are mutually exclusive -- two receive buffers in HBM, and the slot one would add EN_MEM's card stream back")
+endif()
+
+# The one knob for both halves: Coyote derives the TOE's toe_config.hpp (HLS) AND the shell's
+# tcp_stack parameter + memory mux (lynx_pkg EN_TCP_RX_DDR) from this cache variable, and checks it is
+# 0 or 1. FORCE in both directions, so a reconfigured build directory cannot keep a stale value. This
+# runs before validation_checks_hw() and create_hw() below, which is where Coyote reads it and adds
+# the network subproject (hls/toe/CMakeLists.txt's own set(CACHE) default is then a no-op).
+if(ENABLE_HTTP_TOE_BUFFER)
+    # Without 0008 the shell would stay in bypass while the TOE's HLS does not (a port mismatch that
+    # synthesis only reports half an hour in); without 0007 the TOE's receive ring is broken.
+    if(NOT EXISTS ${CYT_DIR}/hw/hdl/network/tcp/tcp_mem_mux.sv)
+        message(FATAL_ERROR "ENABLE_HTTP_TOE_BUFFER: patch 0008 is not applied to ${CYT_DIR} -- run hardware/patches/apply.sh")
+    endif()
+    file(READ ${CYT_DIR}/hw/services/network/hls/toe/toe.cpp OASIS_TOE_CPP)
+    string(FIND "${OASIS_TOE_CPP}" "rxAppReadRelease" OASIS_TOE_0007)
+    if(OASIS_TOE_0007 EQUAL -1)
+        message(FATAL_ERROR "ENABLE_HTTP_TOE_BUFFER: patch 0007 is not applied to the network submodule -- run hardware/patches/apply.sh")
+    endif()
+    set(TCP_STACK_RX_DDR_BYPASS_EN 0 CACHE BOOL "Enabling DDR bypass on the RX path" FORCE)
+else()
+    set(TCP_STACK_RX_DDR_BYPASS_EN 1 CACHE BOOL "Enabling DDR bypass on the RX path" FORCE)
 endif()
 
 if(ENABLE_HTTP_SLOTS)

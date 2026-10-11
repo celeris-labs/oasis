@@ -1,6 +1,7 @@
 #!/bin/bash
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
+orig_args="$*"
 
 cmake_args=()
 decoders=1
@@ -8,6 +9,7 @@ enable_http_multi=0
 enable_http=0
 enable_perf_ila=0
 enable_http_slots=0
+enable_toe_buffer=0
 conns=0
 build_num=0
 while [ $# -gt 0 ]; do
@@ -25,6 +27,12 @@ while [ $# -gt 0 ]; do
         # and HBM crossbar ports) and not just the user region. Do not expect build-119's timing.
         --conns) enable_http_slots=1; conns="$2"; shift ;;
         --conns=*) enable_http_slots=1; conns="${1#*=}" ;;
+        # The TOE keeps the receive buffer itself (TCP_STACK_RX_DDR_BYPASS_EN = 0): a 1 MiB ring per
+        # session in the TCP stack's HBM channel, shared with the transmit rings through Coyote's
+        # tcp_mem_mux (hardware/patches/0008), instead of one 1 MiB rx FIFO for all sessions. Needs
+        # --multi; refused together with --conns (CMake says so). Changes the SHELL: the TOE's
+        # non-bypass HLS, the mux, and the rx FIFO's 256 BRAM gone. EN_MEM stays 0.
+        --toe-buffer) enable_toe_buffer=1 ;;
         # Add the 42-probe TCP/HTTP performance ILA back. OFF by default since it costs ~13.2k
         # LUTs and ~114.5 BRAM in the user region -- affordable at 1-2 lanes, not at 4 (build-110
         # missed timing at WNS -7.43 ns carrying it). Use it to debug the receive path, not to
@@ -69,6 +77,9 @@ cmake_args+=(-DENABLE_PERF_ILA="$([ "$enable_perf_ila" = 1 ] && echo ON || echo 
 # byte-for-byte the build-119 configuration.
 cmake_args+=(-DENABLE_HTTP_SLOTS="$([ "$enable_http_slots" = 1 ] && echo ON || echo OFF)")
 cmake_args+=(-DN_HTTP_CONNS="$conns")
+# TOE receive rings in card memory. OFF unless --toe-buffer, so every other invocation configures
+# exactly as before.
+cmake_args+=(-DENABLE_HTTP_TOE_BUFFER="$([ "$enable_toe_buffer" = 1 ] && echo ON || echo OFF)")
 
 pushd hardware
 
@@ -96,7 +107,24 @@ echo Building bitstream in hardware/$build_dir...
 
 # Fatal, not a warning. Continuing past a collision is what overwrote build-100.
 mkdir "$build_dir" || { echo "refusing to build into an existing directory: $build_dir" >&2; exit 1; }
-cmake -S . -B "$build_dir" "${cmake_args[@]}"
+cmake -S . -B "$build_dir" "${cmake_args[@]}" || { echo "cmake configure failed (see above); nothing launched" >&2; exit 1; }
+
+# PROVENANCE.txt: what this directory was configured from. Operator notes go below the header.
+# Only plumbing commands here -- no `git status` (the main tree's NFS checkout hangs on it).
+{
+    echo "configured : $(date '+%Y-%m-%d %H:%M %Z') on $(hostname) by $(id -un)"
+    echo "command    : scripts/synthesize.sh $orig_args"
+    echo "flags      : http=$enable_http multi=$enable_http_multi decoders=$decoders conns=$conns" \
+         "slots=$enable_http_slots toe_buffer=$enable_toe_buffer perf_ila=$enable_perf_ila"
+    echo "cmake args : ${cmake_args[*]}"
+    echo "oasis      : $(git -C "$script_dir/.." rev-parse HEAD 2>/dev/null)" \
+         "($(git -C "$script_dir/.." rev-parse --abbrev-ref HEAD 2>/dev/null))"
+    echo "coyote     : $(git -C "$script_dir/../parcore/libstf/coyote" rev-parse HEAD 2>/dev/null)" \
+         "uncommitted:$(git -C "$script_dir/../parcore/libstf/coyote" diff --shortstat -- . ':!hw/services/network' 2>/dev/null)"
+    echo "network    : $(git -C "$script_dir/../parcore/libstf/coyote/hw/services/network" rev-parse HEAD 2>/dev/null)" \
+         "uncommitted:$(git -C "$script_dir/../parcore/libstf/coyote/hw/services/network" diff --shortstat 2>/dev/null)"
+    echo "TCP_STACK_RX_DDR_BYPASS_EN = $(grep -E '^TCP_STACK_RX_DDR_BYPASS_EN:' "$build_dir/CMakeCache.txt" | cut -d= -f2)"
+} > "$build_dir/PROVENANCE.txt"
 
 util_dir="$script_dir/util"
 build_cmd="cmake --build $build_dir --target project --target bitgen &> $build_dir/bitgen.log"
