@@ -93,7 +93,18 @@ module tcp_read #(
     //    The framer, the decoupling fifo and the response state machine are IDENTICAL in both
     //    modes: each lane still sees one ordered single-session HTTP byte stream, which is the
     //    whole reason a per-lane strip_http needs no new logic.
-    parameter bit EXTERNAL_DISPATCH = 0
+    parameter bit EXTERNAL_DISPATCH = 0,
+
+    // EXTERNAL_DISPATCH only. 0 (default): the reservation is one MSS segment per readPkg, handed
+    // back at the packet's tlast (rx_dispatch, TOE in bypass mode, where one readPkg returns one
+    // announced segment whatever length it names). handler_multi and every bench that does not ask
+    // are unchanged, and rx_pkg_beats / rx_free_beats are unused (rx_free_beats reads 0).
+    //
+    // 1: the reservation is EXACT (toe_rx, TOE with its per-session receive ring: a readPkg returns
+    // exactly the bytes it names, up to RD_MAX, so a segment is the wrong unit). Every readPkg
+    // reserves rx_pkg_beats, every beat accepted into the fifo hands one back, and rx_free_beats
+    // says how many beats a new readPkg may still be promised -- see the reservation below.
+    parameter bit RSV_EXACT = 0
 ) (
     input  logic                                      clk,
     input  logic                                      rst_n,
@@ -111,6 +122,8 @@ module tcp_read #(
     // readPkg; the bytes it names arrive later. See the reservation below -- without this,
     // rx_space_ok is a promise the fifo cannot keep.
     input  logic                                      rx_pkg_issued,
+    // RSV_EXACT only: the readPkg pulsed on rx_pkg_issued returns this many beats.
+    input  logic [$clog2(RX_FIFO_DEPTH+1)-1:0]        rx_pkg_beats,
 
     // Receive accounting for this session, from tcp_session_table.
     input  logic [TCP_LEN_BITS-1:0]                   rx_req_len, // oldest unread announcement
@@ -161,6 +174,10 @@ module tcp_read #(
     // stall the shared stream, which stalls every other lane too. That is the one failure this
     // whole arrangement exists to avoid, so the margin is deliberate.
     output logic                                      rx_space_ok,
+    // RSV_EXACT only: beats a new readPkg may still be promised, REGISTERED (one cycle behind the
+    // reservation it is computed from; the caller must not grant this lane again before the
+    // readPkg it just charged shows up here -- toe_rx blocks a lane for that long). 0 otherwise.
+    output logic [$clog2(RX_FIFO_DEPTH+1)-1:0]        rx_free_beats,
 
     output logic [3:0]                                debug_rx_write_ptr,
     output logic [AXI_DATA_BITS-1:0]                  debug_rx_buffer_w0,
@@ -289,28 +306,94 @@ module tcp_read #(
     logic rx_pkt_done_w;
     assign rx_pkt_done_w = fifo_s_tvalid && fifo_s_tready && s_axis_rx_data_TLAST;
 
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            rsv_beats_q <= '0;
-        end else if (clear_framing) begin
-            // The session is gone and the fifo is being cleared, so every outstanding promise dies
-            // with it. This is also what stops the one leak: a packet rx_dispatch DROPS (a released
-            // or dead session) never reaches this fifo, so its tlast never arrives and nothing else
-            // would ever hand the reservation back. clear_framing is exactly when that happens.
-            rsv_beats_q <= '0;
-        end else begin
-            case ({rx_pkg_issued, rx_pkt_done_w})
-                // Saturate rather than wrap: a lane the head-of-line watchdog has declared dead is
-                // issued readPkgs with the space check bypassed, so this can otherwise keep climbing.
-                2'b10:   rsv_beats_q <= (rsv_beats_q > RSV_BITS'(RX_FIFO_DEPTH))
-                                            ? rsv_beats_q
-                                            : rsv_beats_q + RSV_BITS'(MSS_BEATS);
-                2'b01:   rsv_beats_q <= (rsv_beats_q >= RSV_BITS'(MSS_BEATS))
-                                            ? rsv_beats_q - RSV_BITS'(MSS_BEATS)
-                                            : '0;
-                default: ;
-            endcase
+    if (!RSV_EXACT) begin : gen_rsv_mss
+        always_ff @(posedge clk) begin
+            if (!rst_n) begin
+                rsv_beats_q <= '0;
+            end else if (clear_framing) begin
+                // The session is gone and the fifo is being cleared, so every outstanding promise dies
+                // with it. This is also what stops the one leak: a packet rx_dispatch DROPS (a released
+                // or dead session) never reaches this fifo, so its tlast never arrives and nothing else
+                // would ever hand the reservation back. clear_framing is exactly when that happens.
+                rsv_beats_q <= '0;
+            end else begin
+                case ({rx_pkg_issued, rx_pkt_done_w})
+                    // Saturate rather than wrap: a lane the head-of-line watchdog has declared dead is
+                    // issued readPkgs with the space check bypassed, so this can otherwise keep climbing.
+                    2'b10:   rsv_beats_q <= (rsv_beats_q > RSV_BITS'(RX_FIFO_DEPTH))
+                                                ? rsv_beats_q
+                                                : rsv_beats_q + RSV_BITS'(MSS_BEATS);
+                    2'b01:   rsv_beats_q <= (rsv_beats_q >= RSV_BITS'(MSS_BEATS))
+                                                ? rsv_beats_q - RSV_BITS'(MSS_BEATS)
+                                                : '0;
+                    default: ;
+                endcase
+            end
         end
+        assign rx_free_beats = '0;
+    end else begin : gen_rsv_exact
+        // ---------------------------------------------------------------------------------------
+        // THE EXACT RESERVATION (RSV_EXACT, toe_rx).
+        //
+        // With the TOE's per-session receive ring a readPkg returns exactly the bytes it names
+        // (ceil(len/64) beats), so the promise can be exact instead of one MSS per packet: a readPkg
+        // reserves its beats, and each beat that enters the fifo hands one back -- it is then
+        // counted by the fifo's own level instead. rsv + level is therefore every beat this fifo has
+        // promised or holds, at every cycle, and
+        //
+        //     free = (DEPTH - ALMOST_FULL_SLACK) - level - rsv
+        //
+        // is what a new readPkg may still be promised. ALMOST_FULL_SLACK is axis_fifo's 4: its
+        // s_axis_tready is !(level >= DEPTH - 4), and level counts the memory only (the output
+        // register needs no memory slot), so DEPTH - 4 beats are what it accepts unconditionally.
+        // A readPkg admitted with need <= free leaves level + rsv <= DEPTH - 4, so even if the
+        // reader takes nothing, the last promised beat arrives at a level of at most DEPTH - 5 and is
+        // accepted: the receive path is never refused.
+        //
+        // REGISTERED. free is one cycle behind rsv_beats_q, which is one cycle behind the pulse;
+        // free only ever SHRINKS at a reservation (a beat moving from rsv into the fifo leaves it
+        // unchanged, the reader taking one grows it), so a late value is wrong only towards the
+        // lane that was just charged, and toe_rx does not grant that lane again until the charge is
+        // visible here.
+        // ---------------------------------------------------------------------------------------
+        localparam int FREE_BITS = $clog2(RX_FIFO_DEPTH+1);
+        localparam int AF_SLACK  = 4;   // axis_fifo's ALMOST_FULL_SLACK (default, not overridden)
+
+        logic                 beat_in_w;
+        logic [RSV_BITS:0]    rsv_next_w;   // one bit wider: rsv + beats before the -1
+        logic [RSV_BITS+1:0]  free_w;       // signed room, two bits wider than its operands
+        logic [FREE_BITS-1:0] free_q;
+
+        assign beat_in_w  = fifo_s_tvalid && fifo_s_tready;
+        assign rsv_next_w = (RSV_BITS+1)'(rsv_beats_q)
+                          + (rx_pkg_issued ? (RSV_BITS+1)'(rx_pkg_beats) : '0);
+
+        always_ff @(posedge clk) begin
+            if (!rst_n) begin
+                rsv_beats_q <= '0;
+            end else if (clear_framing) begin
+                // The session is gone and the fifo is cleared: every promise dies with it. The
+                // handler does not rebind the lane while a readPkg of it is still outstanding, so
+                // nothing promised to the old session can land in the new one's fifo.
+                rsv_beats_q <= '0;
+            end else if (beat_in_w) begin
+                // Never below zero: a beat always arrives after the readPkg that reserved it.
+                rsv_beats_q <= (rsv_next_w == '0) ? '0 : RSV_BITS'(rsv_next_w - 1'b1);
+            end else begin
+                rsv_beats_q <= RSV_BITS'(rsv_next_w);
+            end
+        end
+
+        assign free_w = (RSV_BITS+2)'(RX_FIFO_DEPTH - AF_SLACK)
+                      - (RSV_BITS+2)'(rx_fifo_level)
+                      - (RSV_BITS+2)'(rsv_beats_q);
+
+        always_ff @(posedge clk) begin
+            if (!rst_n || clear_framing) free_q <= '0;
+            else                         free_q <= free_w[RSV_BITS+1] ? '0 : FREE_BITS'(free_w);
+        end
+
+        assign rx_free_beats = free_q;
     end
 
     // Room for everything already promised PLUS the segment this would admit. Written as an

@@ -121,6 +121,45 @@ module tcp_read_tb;
     );
 
     // ---------------------------------------------------------------------------------------------
+    // SECOND DUT: EXTERNAL_DISPATCH=1, RSV_EXACT=1 (toe_rx's lane, TOE in non-bypass mode).
+    //
+    // The caller reserves exactly the beats of each readPkg (rx_pkg_issued + rx_pkg_beats) and
+    // may only do so while rx_free_beats covers them; the data then arrives unconditionally. A
+    // small fifo (XDEPTH) so the case can fill it to the last promised beat with the decoder held
+    // off. See case_rsv_exact.
+    // ---------------------------------------------------------------------------------------------
+    localparam int XDEPTH = 64;
+    localparam int XLB    = $clog2(XDEPTH + 1);
+    logic                     x_start, x_clear, x_pkg, x_closed;
+    logic [XLB-1:0]           x_pkg_beats, x_free, x_level;
+    logic                     x_dvalid, x_dready, x_dlast;
+    logic [AXI_DATA_BITS-1:0] x_ddata;
+    logic [LANES-1:0]         x_dkeep;
+    logic                     x_bvalid, x_bready, x_blast;
+    logic [AXI_DATA_BITS-1:0] x_bdata;
+    logic [LANES-1:0]         x_bkeep;
+    logic                     x_done, x_error, x_fifo_stall;
+
+    tcp_read #(.RX_FIFO_DEPTH(XDEPTH), .WATCHDOG_BITS(16), .EXTERNAL_DISPATCH(1), .RSV_EXACT(1)) dut_x (
+        .clk(clk), .rst_n(rst_n),
+        .start(x_start), .session_id(16'h0200), .body_last(1'b1), .clear_framing(x_clear),
+        .rx_pkg_issued(x_pkg), .rx_pkg_beats(x_pkg_beats),
+        .rx_req_len('0), .rx_closed(x_closed), .rx_take_en(),
+        .m_axis_read_package_TVALID(), .m_axis_read_package_TREADY(1'b0), .m_axis_read_package_TDATA(),
+        .s_axis_rx_metadata_TVALID(1'b0), .s_axis_rx_metadata_TREADY(), .s_axis_rx_metadata_TDATA('0),
+        .s_axis_rx_data_TVALID(x_dvalid), .s_axis_rx_data_TREADY(x_dready),
+        .s_axis_rx_data_TDATA (x_ddata),  .s_axis_rx_data_TKEEP (x_dkeep),
+        .s_axis_rx_data_TLAST (x_dlast),
+        .m_axis_body_tvalid(x_bvalid), .m_axis_body_tready(x_bready),
+        .m_axis_body_tdata (x_bdata),  .m_axis_body_tkeep (x_bkeep), .m_axis_body_tlast(x_blast),
+        .done(x_done), .error(x_error), .error_dirty(), .resp_error(),
+        .status_ascii(), .status_ok(), .content_length(), .body_remaining(), .read_timeout(),
+        .rx_fifo_level(x_level), .rx_fifo_stall(x_fifo_stall),
+        .rx_space_ok(), .rx_free_beats(x_free),
+        .debug_rx_write_ptr(), .debug_rx_buffer_w0(), .debug_rx_buffer_w1(), .state_debug()
+    );
+
+    // ---------------------------------------------------------------------------------------------
     // Back-pressure monitor: the point of the whole decoupling.
     //
     // strip_http walks a header one byte per cycle. It used to drive s_axis_rx_data_TREADY directly,
@@ -502,6 +541,182 @@ module tcp_read_tb;
         end
     endtask
 
+    // ---------------------------------------------------------------------------------------------
+    // RSV_EXACT (dut_x): the exact reservation.
+    //
+    // A readPkg may be issued for n bytes only while rx_free_beats >= ceil(n/64), and the caller
+    // does not look at rx_free_beats again until its charge is visible (3 cycles, as toe_rx). With
+    // the decoder held off, the issuer keeps going until the fifo is promised to the last beat;
+    // then every promised beat must still be ACCEPTED (never refused), and the promise must reach
+    // exactly DEPTH - 4 -- one beat less means the formula wastes space, one more means a refusal.
+    // Then the decoder runs, the body must be byte-exact with one tlast, and clear_framing must
+    // drop every promise.
+    // ---------------------------------------------------------------------------------------------
+    logic [7:0] x_wire[$];
+    int         x_pend[$];       // bytes of each issued-but-undelivered readPkg, in issue order
+    int         x_sent, x_deliv, x_refused, x_max_fill;
+    logic [7:0] x_got[$];
+    int         x_tlasts;
+
+    always @(posedge clk) begin
+        if (rst_n && x_dvalid && !x_dready) x_refused++;
+        if (rst_n && (int'(x_level) + int'(dut_x.rsv_beats_q)) > x_max_fill)
+            x_max_fill = int'(x_level) + int'(dut_x.rsv_beats_q);
+        if (rst_n && x_bvalid && x_bready) begin
+            for (int lane = 0; lane < LANES; lane++) if (x_bkeep[lane]) x_got.push_back(x_bdata[lane*8 +: 8]);
+            if (x_blast) x_tlasts++;
+        end
+    end
+
+    task automatic case_rsv_exact();
+        int body, total, guard, stuck;
+        $display("--- case_rsv_exact (RSV_EXACT=1, DEPTH %0d) ---", XDEPTH);
+        body = 9000;
+        x_wire.delete(); x_pend.delete(); x_got.delete();
+        x_sent = 0; x_deliv = 0; x_refused = 0; x_max_fill = 0; x_tlasts = 0;
+        begin
+            string h;
+            h = $sformatf("HTTP/1.1 206 Partial Content\015\012Content-Length: %0d\015\012\015\012", body);
+            for (int i = 0; i < h.len(); i++) x_wire.push_back(8'(h.getc(i)));
+            for (int i = 0; i < body; i++) x_wire.push_back(8'h40 + i[7:0]);
+        end
+        total = x_wire.size();
+        x_bready = 1'b0;           // the decoder is held off for the first phase
+        x_start  = 1'b1;
+        fork
+            begin : issuer
+                while (x_sent < total) begin
+                    automatic int free, len, maxb;
+                    @(posedge clk);
+                    free = int'(x_free);
+                    if (free < 1 || ($urandom_range(0, 3) == 0)) continue;
+                    maxb = free * LANES;
+                    if (maxb > total - x_sent) maxb = total - x_sent;
+                    len  = ($urandom_range(0, 2) == 0) ? maxb : $urandom_range(1, maxb);
+                    x_pkg       <= 1'b1;
+                    x_pkg_beats <= XLB'((len + LANES - 1) / LANES);
+                    x_pend.push_back(len);
+                    x_sent += len;
+                    @(posedge clk);
+                    x_pkg <= 1'b0;
+                    repeat (3) @(posedge clk);   // until the charge shows up in rx_free_beats
+                end
+            end
+            begin : deliverer
+                while (x_deliv < total) begin
+                    @(posedge clk);
+                    if (x_pend.size() > 0) begin
+                        automatic int len = x_pend.pop_front();
+                        automatic int n   = (len + LANES - 1) / LANES;
+                        repeat ($urandom_range(0, 12)) @(posedge clk);
+                        for (int i = 0; i < n; i++) begin
+                            automatic int nb = ((len - i*LANES) > LANES) ? LANES : (len - i*LANES);
+                            automatic logic [AXI_DATA_BITS-1:0] d = '0;
+                            automatic logic [LANES-1:0]         k = '0;
+                            for (int b = 0; b < nb; b++) begin
+                                d[b*8 +: 8] = x_wire[x_deliv + i*LANES + b];
+                                k[b] = 1'b1;
+                            end
+                            x_ddata <= d; x_dkeep <= k; x_dlast <= (i == n - 1); x_dvalid <= 1'b1;
+                            @(posedge clk);
+                            // The data is NOT held for TREADY: the reservation promised room, and a
+                            // refusal is counted (x_refused) and the beat is lost, exactly as it
+                            // would be behind toe_rx's constant-high TREADY.
+                        end
+                        x_dvalid <= 1'b0; x_dlast <= 1'b0;
+                        x_deliv += len;
+                    end
+                end
+            end
+            begin : stall_watch
+                // Phase 1 ends when nothing has been issued for a long time with the decoder held:
+                // the fifo is promised to the last beat. Then the decoder runs.
+                stuck = 0;
+                guard = 0;
+                while (stuck < 400 && guard < 200000) begin
+                    automatic int s0 = x_sent;
+                    @(posedge clk);
+                    guard++;
+                    if (x_sent == s0 && x_pend.size() == 0 && !x_dvalid) stuck++; else stuck = 0;
+                end
+                if (x_free !== '0 || (int'(x_level) + int'(dut_x.rsv_beats_q)) != XDEPTH - 4) begin
+                    $error("[rsv_exact] held decoder: free=%0d level=%0d rsv=%0d -- the promise must fill to exactly DEPTH-4=%0d",
+                           x_free, x_level, dut_x.rsv_beats_q, XDEPTH - 4);
+                    fails++;
+                end else begin
+                    $display("[PASS] rsv_exact/fills_to_depth_minus_4 (level %0d + reserved %0d, %0d of %0d bytes issued)",
+                             x_level, dut_x.rsv_beats_q, x_sent, total);
+                    passes++;
+                end
+                x_bready = 1'b1;
+            end
+        join
+        guard = 0;
+        while (!x_done && guard < 100000) begin @(posedge clk); guard++; end
+        repeat (10) @(posedge clk);
+        if (x_refused != 0) begin
+            $error("[rsv_exact] %0d promised beat(s) were REFUSED by the fifo", x_refused);
+            fails++;
+        end else if (x_fifo_stall !== 1'b0) begin
+            $error("[rsv_exact] sticky overflow_stall set");
+            fails++;
+        end else if (x_max_fill != XDEPTH - 4) begin
+            $error("[rsv_exact] most promised at once %0d, expected exactly %0d", x_max_fill, XDEPTH - 4);
+            fails++;
+        end else begin
+            $display("[PASS] rsv_exact/never_refused (max level+reserved %0d = DEPTH-4)", x_max_fill);
+            passes++;
+        end
+        if (!x_done || x_error || x_tlasts != 1 || x_got.size() != body) begin
+            $error("[rsv_exact] done=%0b error=%0b tlasts=%0d body bytes %0d of %0d",
+                   x_done, x_error, x_tlasts, x_got.size(), body);
+            fails++;
+        end else begin
+            automatic int bad = -1;
+            for (int i = 0; i < body; i++) if (bad < 0 && x_got[i] !== 8'h40 + i[7:0]) bad = i;
+            if (bad >= 0) begin
+                $error("[rsv_exact] body byte %0d = 0x%02x", bad, x_got[bad]);
+                fails++;
+            end else begin
+                $display("[PASS] rsv_exact/body (%0d bytes byte-exact, one tlast)", body);
+                passes++;
+            end
+        end
+        // clear_framing drops every promise (a torn-down lane), and free reads 0 while it is high
+        x_start = 1'b0;
+        x_pkg <= 1'b1; x_pkg_beats <= XLB'(10);
+        @(posedge clk);
+        x_pkg <= 1'b0;
+        repeat (3) @(posedge clk);
+        if (dut_x.rsv_beats_q != 10 || int'(x_free) != XDEPTH - 4 - 10) begin
+            $error("[rsv_exact] after a 10-beat charge on an empty fifo: rsv=%0d free=%0d", dut_x.rsv_beats_q, x_free);
+            fails++;
+        end
+        x_clear = 1'b1;
+        repeat (3) @(posedge clk);
+        if (dut_x.rsv_beats_q != 0 || x_free !== '0) begin
+            $error("[rsv_exact] under clear_framing: rsv=%0d free=%0d (want 0/0)", dut_x.rsv_beats_q, x_free);
+            fails++;
+        end
+        x_clear = 1'b0;
+        repeat (3) @(posedge clk);
+        if (int'(x_free) != XDEPTH - 4) begin
+            $error("[rsv_exact] after clear_framing: free=%0d, want %0d", x_free, XDEPTH - 4);
+            fails++;
+        end else begin
+            $display("[PASS] rsv_exact/charge_and_clear (10-beat charge seen, clear drops it)");
+            passes++;
+        end
+    endtask
+
+    initial begin
+        x_start = 1'b0; x_clear = 1'b1; x_pkg = 1'b0; x_pkg_beats = '0; x_closed = 1'b0;
+        x_dvalid = 1'b0; x_dlast = 1'b0; x_ddata = '0; x_dkeep = '0; x_bready = 1'b1;
+        @(posedge rst_n);
+        repeat (3) @(posedge clk);
+        x_clear = 1'b0;
+    end
+
     initial begin
         start         = 1'b0;
         clear_framing = 1'b1;
@@ -518,6 +733,8 @@ module tcp_read_tb;
         case_dirty_abort();
         case_split_chunk();
         case_read_watchdog();
+        repeat (5) @(posedge clk);
+        case_rsv_exact();
 
         // Every case above ran a real response through the header parser. If the parser were still
         // in the TCP stack's back-pressure path, each one would have contributed hundreds of stall
