@@ -48,8 +48,7 @@ struct StreamDescription {
  *
  * Two knobs are tunable at runtime and apply to the DECODE streams: the number of *active* streams
  * (the span the dispatcher load-balances across) and the per-stream pipeline depth. Streams of
- * other capabilities are always active, with depths fixed by their hardware FIFO bounds
- * (max_flows/max_buffers).
+ * other capabilities are always active, with depths fixed by their hardware FIFO bounds.
  */
 class Scheduler {
   public:
@@ -187,6 +186,9 @@ class Scheduler {
     // destroy them outside the locks -- keeping flow/buffer teardown off the scheduler locks).
     // Must be called holding ss.mutex.
     void reap(StreamState &ss, std::list<InFlight> &finished);
+
+    // What `flow` occupies in its stream's FIFOs while in flight.
+    [[nodiscard]] static FlowDemand demand_of(const OperatorFlow &flow);
 };
 
 } // namespace oasis

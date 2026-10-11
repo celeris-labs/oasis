@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <sstream>
 #include <stdexcept>
 
 namespace oasis {
@@ -26,7 +27,7 @@ libstf::stream_t count_decode_streams(const std::vector<StreamDescription> &stre
         }));
 }
 
-// The initial pipeline depth: the DECODE streams' hardware flow bound (they all share one).
+// The initial pipeline depth: the DECODE streams' flow bound (they all share one).
 size_t default_pipeline_depth(const std::vector<StreamDescription> &streams) {
     for (const auto &s : streams) {
         if (s.capability == StreamCapability::DECODE) {
@@ -34,6 +35,11 @@ size_t default_pipeline_depth(const std::vector<StreamDescription> &streams) {
         }
     }
     return 1;
+}
+
+// Whether `used + extra` still fits in `capacity` (written so it cannot overflow).
+bool fits(size_t used, size_t extra, size_t capacity) {
+    return used <= capacity && extra <= capacity - used;
 }
 
 } // namespace
@@ -45,8 +51,10 @@ Scheduler::Scheduler(OasisContext &ctx, std::vector<StreamDescription> streams)
       queue_depth_(default_pipeline_depth(streams)) {
     streams_.reserve(streams.size());
     for (libstf::stream_t stream = 0; stream < num_streams_; ++stream) {
-        auto state       = std::make_unique<StreamState>();
+        auto state         = std::make_unique<StreamState>();
         state->max_flows   = std::max<size_t>(streams[stream].max_flows, 1);
+        state->max_configs = streams[stream].max_configs;
+        state->max_reads   = streams[stream].max_reads;
         state->max_buffers = streams[stream].max_buffers;
         streams_by_capability_[capability_index(streams[stream].capability)].push_back(stream);
         streams_.push_back(std::move(state));
@@ -122,47 +130,63 @@ Scheduler::~Scheduler() {
     }
 }
 
+FlowDemand Scheduler::demand_of(const OperatorFlow &flow) {
+    FlowDemand demand;
+    for (const auto &op : flow) {
+        if (dynamic_cast<const DecodeColumnChunkOperator *>(op.get()) != nullptr) {
+            ++demand.configs;
+        } else if (dynamic_cast<const SourceOperator *>(op.get()) != nullptr) {
+            ++demand.reads;
+        } else if (const auto *s = dynamic_cast<const LocalSinkOperator *>(op.get())) {
+            assert(s->buffers().size() > 0 && "flow has a sink with no buffers");
+            demand.buffers += s->buffers().size();
+        }
+    }
+    return demand;
+}
+
 SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
     libstf::Profiler::open_regions({profiler_prefix + "submit"});
     auto channel    = std::make_shared<SplinterResultChannel>();
     auto completion = std::make_shared<SplinterCompletion>();
     completion->channel = channel;
 
-    // Determine every flow's required capability and validate it before touching the queues, so a
-    // rejected splinter leaves no partial trace behind.
+    // Determine every flow's required capability and demand and validate them before touching the
+    // queues, so a rejected splinter leaves no partial trace behind.
     std::vector<Pending> pendings;
     pendings.reserve(splinter.streams.size());
     for (auto &flow : splinter.streams) {
         Pending pending;
         pending.capability = required_capability(flow);
         pending.completion = completion;
-        
-        size_t total_buffers = 0;
-        for (const auto &op : flow) {
-            if (const auto *s = dynamic_cast<const LocalSinkOperator *>(op.get())) {
-                assert(s->buffers().size() > 0 && "flow has a sink with no buffers");
-                total_buffers += s->buffers().size();
-            }
-        }
+        pending.demand     = demand_of(flow);
 
-        pending.num_buffers    = total_buffers;
         const auto &candidates = streams_by_capability_[capability_index(pending.capability)];
         if (candidates.empty()) {
+            libstf::Profiler::close_regions({profiler_prefix + "submit"});
             throw std::runtime_error(
                 std::string("QuerySplinter contains a flow that requires a stream with the ") +
                 to_string(pending.capability) +
                 " capability, but this hardware provides no such stream");
         }
 
+        // A flow that exceeds some FIFO's depth on every stream could never be placed, and would
+        // block the head of its queue forever.
         const bool fits_some_stream =
             std::any_of(candidates.begin(), candidates.end(), [&](libstf::stream_t s) {
-                return pending.num_buffers <= streams_[s]->max_buffers;
+                const StreamState &ss = *streams_[s];
+                return pending.demand.configs <= ss.max_configs &&
+                       pending.demand.reads <= ss.max_reads &&
+                       pending.demand.buffers <= ss.max_buffers;
             });
         if (!fits_some_stream) {
-            throw std::runtime_error(
-                std::string("Flow's sink spans more buffers than any ") +
-                to_string(pending.capability) +
-                " stream's output-writer slots, so it could never be dispatched");
+            libstf::Profiler::close_regions({profiler_prefix + "submit"});
+            std::ostringstream msg;
+            msg << "Flow needs " << pending.demand.configs << " decoder config(s), "
+                << pending.demand.reads << " read request(s) and " << pending.demand.buffers
+                << " output buffer(s), more than any " << to_string(pending.capability)
+                << " stream's FIFOs hold, so it could never be dispatched";
+            throw std::runtime_error(msg.str());
         }
         pending.flow = std::move(flow);
         pendings.push_back(std::move(pending));
@@ -182,12 +206,13 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
 }
 
 std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capability,
-                                                       size_t           num_buffers) const {
+                                                       const FlowDemand &demand) const {
     const auto &candidates = streams_by_capability_[capability_index(capability)];
 
     // Only the DECODE streams have the runtime knobs: the active span caps the candidates and the
-    // pipeline-depth knob lowers the per-stream hardware flow bound (it never raises it: the
-    // hardware's per-flow config queues only hold max_flows entries, and writes beyond are lost).
+    // pipeline-depth knob lowers the per-stream flow bound (it never raises it past max_flows).
+    // The config/read/buffer gates below are the hardware FIFO depths, which are never exceeded:
+    // the FIFOs have no backpressure, and entries written beyond the depth are lost.
     const bool tunable = capability == StreamCapability::DECODE;
     size_t     span    = candidates.size();
     if (tunable) {
@@ -204,7 +229,15 @@ std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capabili
         if (load >= (tunable ? std::min(depth, ss.max_flows) : ss.max_flows)) {
             continue; // Flow gate full.
         }
-        if (ss.max_buffers - ss.enqueued_buffers.load(std::memory_order_relaxed) < num_buffers) {
+        if (!fits(ss.enqueued_configs.load(std::memory_order_relaxed), demand.configs,
+                  ss.max_configs)) {
+            continue; // Not enough free decoder config slots.
+        }
+        if (!fits(ss.enqueued_reads.load(std::memory_order_relaxed), demand.reads, ss.max_reads)) {
+            continue; // Not enough free read request slots.
+        }
+        if (!fits(ss.enqueued_buffers.load(std::memory_order_relaxed), demand.buffers,
+                  ss.max_buffers)) {
             continue; // Not enough free output-writer (buffer) slots.
         }
         if (!best || load < best_load) {
@@ -251,7 +284,7 @@ void Scheduler::dispatch_loop() {
             if (queues_[c].empty()) {
                 continue;
             }
-            stream = pick_stream(static_cast<StreamCapability>(c), queues_[c].front().num_buffers);
+            stream = pick_stream(static_cast<StreamCapability>(c), queues_[c].front().demand);
             queue_idx = c;
         }
 
@@ -269,13 +302,17 @@ void Scheduler::dispatch_loop() {
             continue;
         }
 
-        // Reserve the slot (bump load) and pull the head, then dispatch with the lock released so
-        // the hardware register writes in dispatch_to don't block submitters or callbacks.
+        // Reserve what the flow occupies (bump the counters) and pull the head, then dispatch with
+        // the lock released so the hardware register writes in dispatch_to don't block submitters
+        // or callbacks. Only this thread reserves, so no other placement can invalidate the check
+        // pick_stream just made.
         Pending pending = std::move(queues_[queue_idx].front());
         queues_[queue_idx].pop_front();
-        streams_[*stream]->enqueued.fetch_add(1, std::memory_order_relaxed);
-        streams_[*stream]->enqueued_buffers.fetch_add(pending.num_buffers,
-                                                      std::memory_order_relaxed);
+        StreamState &chosen = *streams_[*stream];
+        chosen.enqueued.fetch_add(1, std::memory_order_relaxed);
+        chosen.enqueued_configs.fetch_add(pending.demand.configs, std::memory_order_relaxed);
+        chosen.enqueued_reads.fetch_add(pending.demand.reads, std::memory_order_relaxed);
+        chosen.enqueued_buffers.fetch_add(pending.demand.buffers, std::memory_order_relaxed);
 
         lock.unlock();
         dispatch_to(*stream, pending);
@@ -304,8 +341,8 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
     StreamState &ss = *streams_[stream];
 
     // Park the flow in the in-flight list; the iterator is stable for handle_completion to flag
-    // `done`. The dispatcher already reserved the slot (atomically bumped
-    // `enqueued`/`enqueued_buffers`).
+    // `done`. The dispatcher already reserved the flow's demand (atomically bumped the stream's
+    // counters).
     std::vector<LocalSinkOperator *> sinks;
     std::list<InFlight>::iterator    slot;
     {
@@ -314,6 +351,7 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         slot             = ss.in_flight.emplace(ss.in_flight.end());
         slot->flow       = std::move(pending.flow);
         slot->completion = pending.completion;
+        slot->demand     = pending.demand;
         for (auto &op : slot->flow) {
             if (auto *s = dynamic_cast<LocalSinkOperator *>(op.get())) {
                 sinks.push_back(s);
@@ -390,14 +428,21 @@ void Scheduler::handle_completion(libstf::stream_t stream, uint32_t bytes_writte
     assert(last == pc.sink_last && "hardware `last` flag disagrees with the sink's final buffer");
 
     if (pc.last) {
-        // Flow done (one interrupt, for the sink's final buffer, concludes each flow): flag the
-        // slot reapable, free the pipeline slot, run the splinter accounting, and wake the
+        // Flow done (one interrupt, for the sink's final buffer, concludes each flow). Everything
+        // the flow queued ahead of its last buffer has been consumed by now, so its config and read
+        // request slots are free again. Take its demand before flagging the slot reapable: the
+        // dispatcher destroys the slot as soon as `done` is set.
+        const FlowDemand demand = pc.slot->demand;
+
+        // Flag the slot reapable, free the pipeline slot, run the splinter accounting, and wake the
         // dispatcher to reap (and destroy the flow) on its own thread. The counters are atomic, so
         // this never nests dispatch_mutex_ with ss.mutex.
         {
             std::lock_guard<std::mutex> slock(ss.mutex);
             pc.slot->done = true;
         }
+        ss.enqueued_configs.fetch_sub(demand.configs, std::memory_order_relaxed);
+        ss.enqueued_reads.fetch_sub(demand.reads, std::memory_order_relaxed);
         ss.enqueued.fetch_sub(1, std::memory_order_relaxed);
 
         // Whole-splinter close: Exactly once, by whichever flow finishes last. acq_rel makes the
