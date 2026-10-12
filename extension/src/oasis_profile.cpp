@@ -7,9 +7,39 @@
 
 #include "duckdb/function/table_function.hpp"
 
+#include <mutex>
+
 namespace duckdb {
 
 namespace {
+
+bool SameCounters(const DecoderProfileCounters &a, const DecoderProfileCounters &b) {
+	return a.in_handshakes_cycles == b.in_handshakes_cycles && a.in_starved_cycles == b.in_starved_cycles &&
+	       a.in_stalled_cycles == b.in_stalled_cycles && a.in_idle_cycles == b.in_idle_cycles &&
+	       a.out_handshakes_cycles == b.out_handshakes_cycles && a.out_starved_cycles == b.out_starved_cycles &&
+	       a.out_stalled_cycles == b.out_stalled_cycles && a.out_idle_cycles == b.out_idle_cycles;
+}
+
+DecoderProfileCounters ToCounters(const parcore::DecoderProfile &profile) {
+	DecoderProfileCounters c;
+	c.in_handshakes_cycles = profile.in.handshakes_cycles;
+	c.in_starved_cycles = profile.in.starved_cycles;
+	c.in_stalled_cycles = profile.in.stalled_cycles;
+	c.in_idle_cycles = profile.in.idle_cycles;
+	c.out_handshakes_cycles = profile.out.handshakes_cycles;
+	c.out_starved_cycles = profile.out.starved_cycles;
+	c.out_stalled_cycles = profile.out.stalled_cycles;
+	c.out_idle_cycles = profile.out.idle_cycles;
+	return c;
+}
+
+// What the profiler returned at its last read (by any reader). After a read the profiler holds its counters until
+// the next beat re-zeroes them, so a read that returns the same values again saw no beat since: nothing was
+// decoded in between, and the held values belong to an earlier period.
+std::mutex last_read_mutex;
+bool have_last_read = false;
+DecoderProfileCounters last_read;
+
 
 // Hardware facts the throughput derivation is based on: every stream handshake transports one
 // 64-byte databeat, and the accelerator runs at 250 MHz (a 4 ns clock period).
@@ -144,7 +174,13 @@ unique_ptr<GlobalTableFunctionState> OasisProfileInitGlobal(ClientContext &conte
 	auto num_decoders = config->num_decoders();
 	gstate->rows.reserve(num_decoders + 1);
 	for (libstf::stream_t decoder = 0; decoder < num_decoders; decoder++) {
-		gstate->rows.push_back(MakeRow(decoder, config->read_profile(decoder)));
+		auto profile = config->read_profile(decoder);
+		if (decoder == 0) {
+			std::lock_guard<std::mutex> guard(last_read_mutex);
+			have_last_read = true;
+			last_read = ToCounters(profile);
+		}
+		gstate->rows.push_back(MakeRow(decoder, profile));
 	}
 
 	// The RDMA bypass stream occupies the last stream slot (== num_decoders) and has its own
@@ -206,6 +242,17 @@ void OasisProfileFunction(ClientContext &context, TableFunctionInput &data_p, Da
 }
 
 } // namespace
+
+DecoderProfileCounters ReadDecoderProfile(oasis::OasisContext &ctx) {
+	const auto c = ToCounters(ctx.config<parcore::ColumnChunkDecoderConfig>()->read_profile(0));
+	std::lock_guard<std::mutex> guard(last_read_mutex);
+	if (have_last_read && SameCounters(c, last_read)) {
+		return DecoderProfileCounters {};
+	}
+	have_last_read = true;
+	last_read = c;
+	return c;
+}
 
 void RegisterOasisProfileFunction(ExtensionLoader &loader) {
 	TableFunction profile_function("oasis_stream_profile", {}, OasisProfileFunction, OasisProfileBind,

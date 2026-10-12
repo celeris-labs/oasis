@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -117,6 +118,11 @@ class Scheduler {
     void                 set_pipeline_depth(size_t depth);
     [[nodiscard]] size_t pipeline_depth() const { return queue_depth_.load(); }
 
+    // Emulates a slower FPGA->host link in software: The dispatcher holds back new flows until the
+    // output bytes written so far would have drained at `gbps` GB/s. 0 disables the emulation.
+    void                 set_egress_limit_gbps(double gbps);
+    [[nodiscard]] double egress_limit_gbps() const { return egress_gbps_.load(); }
+
     // Flows waiting in the dispatcher queues (not yet enqueued to the hardware).
     [[nodiscard]] size_t queued_flows() const;
 
@@ -203,6 +209,10 @@ class Scheduler {
     const libstf::stream_t        num_decode_streams_; // streams providing DECODE (the tunable span)
     std::atomic<libstf::stream_t> active_streams_;
     std::atomic<size_t>           queue_depth_;
+    std::atomic<double>           egress_gbps_{0.0};
+    // Egress emulation: steady-clock time (ns) at which the output written so far would have
+    // drained through the emulated link. Advanced by handle_completion, read by the dispatcher.
+    std::atomic<int64_t>          egress_free_at_ns_{0};
 
     std::vector<std::unique_ptr<StreamState>> streams_;
     // Hardware stream ids providing each capability, in id order. Indexed by StreamCapability.

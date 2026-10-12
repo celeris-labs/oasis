@@ -3,6 +3,7 @@
 #include "duckdb/logging/log_type.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "oasis_bloom_perf.hpp"
+#include "oasis_decoder_perf.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -139,6 +140,40 @@ public:
 	static string ConstructLogMessage(const OasisScanTimings &timings);
 };
 
+// The decoder's StreamProfiler counters split at the start of each read_oasis scan that uses the hardware, written
+// when the query ends (one record per segment, in order, next to the OasisQueryStats record):
+//
+//   SELECT * FROM duckdb_logs_parsed('OasisDecoderProfile') ORDER BY segment;
+//
+// The profiler counts from the first beat after it was read. The extension reads it when a scan's first worker
+// starts (every scan of the query, in the order they start) and once more when the query ends. Segment k is what
+// the decoder did between the previous read and that point:
+//
+//   label 'before_scan'  up to the start of the scan on `file`: everything since the previous read, i.e. the
+//                        Bloom filter's build pass and the scans that ran before (the build side of a join)
+//   label 'final'        from the start of the last scan, the one on `file`, to the end of the query: for a hash
+//                        join, the probe side only (the build pipeline finished before the probe scan started)
+//
+// A profiler that was not read before the query adds everything since its last read (including idle time) to
+// the first segment, so read it before the query to start from a clean state.
+struct OasisDecoderSegment {
+	string label;
+	string file;
+	DecoderProfileCounters counters;
+};
+
+class OasisDecoderProfileLogType : public LogType {
+public:
+	static constexpr const char *NAME = "OasisDecoderProfile";
+	static constexpr LogLevel LEVEL = LogLevel::LOG_INFO;
+
+	OasisDecoderProfileLogType();
+
+	static LogicalType GetLogType();
+
+	static string ConstructLogMessage(idx_t segment, const OasisDecoderSegment &segment_data);
+};
+
 // Per-connection collector of the statistics above. The scans add to it from any thread while the
 // query runs. DuckDB destroys the scans' states before it calls QueryEnd, so by then every scan has
 // reported.
@@ -173,6 +208,8 @@ public:
 	void AddBloomRun(const BloomPerfCounters &perf);
 	// The timers of one finished scan.
 	void AddScanTimings(OasisScanTimings timings);
+	// The decoder's counters up to the start of the scan on `file` (see OasisDecoderSegment).
+	void AddDecoderBoundary(const string &file, const DecoderProfileCounters &counters);
 
 private:
 	void Reset();
@@ -202,6 +239,9 @@ private:
 
 	std::mutex scan_timings_mutex;
 	vector<OasisScanTimings> scan_timings;
+
+	std::mutex decoder_mutex;
+	vector<OasisDecoderSegment> decoder_segments;
 };
 
 } // namespace duckdb

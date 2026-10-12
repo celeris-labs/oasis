@@ -13,4 +13,6 @@ void SetSchedulerNumStreams(ClientContext &context, SetScope scope, Value &param
 
 void SetSchedulerQueueDepth(ClientContext &context, SetScope scope, Value &parameter);
 
+void SetEmulatedEgressGbps(ClientContext &context, SetScope scope, Value &parameter);
+
 } // namespace duckdb

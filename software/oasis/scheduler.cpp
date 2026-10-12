@@ -73,6 +73,12 @@ void Scheduler::set_pipeline_depth(size_t depth) {
     dispatch_cv_.notify_one(); // A deeper pipeline may open a slot the dispatcher can fill.
 }
 
+void Scheduler::set_egress_limit_gbps(double gbps) {
+    egress_gbps_.store(std::max(gbps, 0.0));
+    egress_free_at_ns_.store(0);
+    dispatch_cv_.notify_one(); // Lifting or loosening the cap may unblock a waiting dispatcher.
+}
+
 size_t Scheduler::queued_flows() const {
     std::lock_guard<std::mutex> lock(dispatch_mutex_);
     size_t total = 0;
@@ -336,6 +342,19 @@ void Scheduler::dispatch_loop() {
             continue;
         }
 
+        // Egress emulation: Hold the flow back until the output written so far would have drained
+        // through the emulated link. Flows already in flight keep running, so the cap holds on
+        // average over the pipeline depth rather than per beat.
+        if (egress_gbps_.load(std::memory_order_relaxed) > 0.0) {
+            const auto free_at = std::chrono::steady_clock::time_point(
+                std::chrono::nanoseconds(egress_free_at_ns_.load(std::memory_order_relaxed)));
+            if (std::chrono::steady_clock::now() < free_at) {
+                libstf::Profiler::close_regions({profiler_prefix + "dispatch_loop"});
+                dispatch_cv_.wait_until(lock, free_at);
+                continue;
+            }
+        }
+
         // Reserve what the flow occupies (bump the counters) and pull the head, then dispatch with
         // the lock released so the hardware register writes in dispatch_to don't block submitters
         // or callbacks. Only this thread reserves, so no other placement can invalidate the check
@@ -465,6 +484,17 @@ void Scheduler::handle_completion(libstf::stream_t stream, uint32_t bytes_writte
 
     // This buffer's hardware output-writer slot is free again.
     cs.enqueued_buffers.fetch_sub(1, std::memory_order_relaxed);
+
+    // Egress emulation: Charge the buffer's bytes to the emulated link (GB/s == bytes/ns).
+    if (const double gbps = egress_gbps_.load(std::memory_order_relaxed); gbps > 0.0) {
+        const int64_t now  = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+        const auto    cost = static_cast<int64_t>(static_cast<double>(bytes_written) / gbps);
+        egress_free_at_ns_.store(
+            std::max(egress_free_at_ns_.load(std::memory_order_relaxed), now) + cost,
+            std::memory_order_relaxed);
+    }
 
     // Surface the buffer to the splinter's consumer, tagged so it lands in the right column.
     pc.buffer->size = bytes_written;

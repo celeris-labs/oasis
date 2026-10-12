@@ -1,0 +1,59 @@
+date,dataset,compression,threads,hw_bloom,duckdb_join_filter,duckdb_bloom,query_s,lineitem_scan_ms,decode_filter_cpu_ms,join_cpu_ms,user_cpu_s,rows_kept,notes
+2026-10-12,SF10 lineitem(16 cols)⋈part_q17,snappy,32,off,on,off,1.009,850,780,274,,59986052,decoder out 4.0 GB/s; out starved 75%
+2026-10-12,SF10 lineitem(16 cols)⋈part_q17,snappy,32,on,on,off,1.007,848,165,246,,61437,probe data_wait 96%
+2026-10-12,SF10 lineitem7⋈part_q17,uncompressed,32,off,on,off,0.367,289,792,303,,59986052,decoder out 11.6 GB/s; out stalled 0.25%
+2026-10-12,SF10 lineitem7⋈part_q17,uncompressed,32,on,on,off,0.355,277,162,263,,61437,decoder out 12.1 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,off,0.716,570,1690,615,3.47,119994608,config A
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,off,off,0.715,570,780,1960,3.85,119994608,config B
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.696,550,246,500,1.90,122341,config C
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,on,off,0.696,551,294,486,1.94,122341,config D
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,1,off,on,on,2.171,2026,943,311,1.71,119994608,CPU-bound (hw_wait 0)
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,1,on,off,off,1.277,1135,134,241,0.85,122341,CPU-bound
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,2,off,on,on,1.316,1170,942,337,1.76,119994608,CPU-bound
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,2,on,off,off,0.883,740,140,279,0.87,122341,CPU-bound
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,4,off,on,on,0.762,618,939,345,1.74,119994608,just short of FPGA rate
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,4,on,off,off,0.688,545,174,355,1.20,122341,FPGA-bound
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,8,off,on,on,0.702,558,1349,521,2.61,119994608,FPGA-bound
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,8,on,off,off,0.690,547,219,455,1.52,122341,FPGA-bound
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,1,off,on,on,2.069,1750,935,303,1.91,119994608,runs 2-3 (run 1 cold page cache 26.5 s)
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,1,on,off,off,2.011,1691,184,322,1.31,122341,decoder-bound already at 1 thread
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,2,off,on,on,2.011,1691,1223,394,2.47,119994608,FPGA-bound
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,2,on,off,off,2.019,1690,252,442,1.74,122341,FPGA-bound
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,4,off,on,on,2.013,1692,,,,119994608,FPGA-bound
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,4,on,off,off,2.011,1690,,,,122341,FPGA-bound
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,8,off,on,on,2.019,1693,,,,119994608,FPGA-bound
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,8,on,off,off,2.014,1691,,,,122341,FPGA-bound
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,32,off,on,on,2.022,1696,,,,119994608,FPGA-bound
+2026-10-12,SF20 lineitem(16 cols)⋈part_q17,snappy,32,on,off,off,2.020,1691,,,,122341,FPGA-bound
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,1.339,1185,1568,559,3.20,119994608,emulated egress 6 GB/s (oasis_emulated_egress_gbps); effective 5.65 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.705,551,242,488,1.87,122341,emulated egress 6 GB/s; unaffected
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,0.788,635,,,,119994608,emulated egress 12 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.706,550,,,,122341,emulated egress 12 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,0.900,746,,,,119994608,emulated egress 10 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.704,550,,,,122341,emulated egress 10 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,1.064,913,,,,119994608,emulated egress 8 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.704,551,,,,122341,emulated egress 8 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,1.894,1741,,,,119994608,emulated egress 4 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.704,551,,,,122341,emulated egress 4 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,3.577,3426,,,,119994608,emulated egress 2 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.703,550,,,,122341,emulated egress 2 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,0.724,570,,,,119994608,no egress limit; warmed (cat + 1 warm-up query); egress achieved 11.79 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.702,551,,,,122341,no egress limit; warmed; bloom out 22.1 MB at 0.040 GB/s; bloom in ~12.27 GB/s; probe data_wait ~88%
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,0.783,634,,,,119994608,emulated egress 12 GB/s; warmed (cat + 1 warm-up query); egress achieved 10.60 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.702,552,,,,122341,emulated egress 12 GB/s; warmed; bloom out 22.1 MB at 0.040 GB/s; bloom in ~12.27 GB/s; probe data_wait ~88%
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,0.893,741,,,,119994608,emulated egress 10 GB/s; warmed (cat + 1 warm-up query); egress achieved 9.07 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.701,551,,,,122341,emulated egress 10 GB/s; warmed; bloom out 22.1 MB at 0.040 GB/s; bloom in ~12.27 GB/s; probe data_wait ~88%
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,1.060,909,,,,119994608,emulated egress 8 GB/s; warmed (cat + 1 warm-up query); egress achieved 7.39 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.701,551,,,,122341,emulated egress 8 GB/s; warmed; bloom out 22.1 MB at 0.040 GB/s; bloom in ~12.27 GB/s; probe data_wait ~88%
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,1.334,1183,,,,119994608,emulated egress 6 GB/s; warmed (cat + 1 warm-up query); egress achieved 5.68 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.705,551,,,,122341,emulated egress 6 GB/s; warmed; bloom out 22.1 MB at 0.040 GB/s; bloom in ~12.27 GB/s; probe data_wait ~88%
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,1.892,1741,,,,119994608,emulated egress 4 GB/s; warmed (cat + 1 warm-up query); egress achieved 3.86 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.704,553,,,,122341,emulated egress 4 GB/s; warmed; bloom out 22.1 MB at 0.040 GB/s; bloom in ~12.27 GB/s; probe data_wait ~88%
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,off,on,on,3.574,3422,,,,119994608,emulated egress 2 GB/s; warmed (cat + 1 warm-up query); egress achieved 1.96 GB/s
+2026-10-12,SF20 lineitem7⋈part_q17,uncompressed,32,on,off,off,0.702,552,,,,122341,emulated egress 2 GB/s; warmed; bloom out 22.1 MB at 0.040 GB/s; bloom in ~12.27 GB/s; probe data_wait ~88%
+2026-10-12,SF20 lineitem7⋈part (100% match),uncompressed,32,off,on,on,1.346,1096,241,30326,31.5,119994608,no egress limit; CPU-bound by hash join (join_ms 30 s)
+2026-10-12,SF20 lineitem7⋈part (100% match),uncompressed,32,on,off,off,1.315,1109,17,30140,31.1,119994608,no egress limit; bloom out 6.73 GB at 6.17 GB/s; probe cmd_wait 70% data_wait 24%
+2026-10-12,SF20 lineitem7⋈part (100% match),uncompressed,32,off,on,on,1.503,1249,,,,119994608,emulated egress 6 GB/s
+2026-10-12,SF20 lineitem7⋈part (100% match),uncompressed,32,on,off,off,1.448,1244,,,,119994608,emulated egress 6 GB/s; bloom out 5.37 GB/s
+2026-10-12,SF20 lineitem7⋈part (100% match),uncompressed,32,off,on,on,3.685,3435,,,,119994608,emulated egress 2 GB/s
+2026-10-12,SF20 lineitem7⋈part (100% match),uncompressed,32,on,off,off,3.629,3426,,,,119994608,emulated egress 2 GB/s; bloom out 1.96 GB/s (fills the link)

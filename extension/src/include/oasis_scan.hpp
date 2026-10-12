@@ -157,6 +157,9 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::once_flag dynamic_filter_merge;
 	unique_ptr<TableFilterSet> merged_filters;
 
+	// The decoder profile is read once when the scan's first worker starts (see OasisDecoderSegment).
+	std::once_flag decoder_profile_boundary;
+
 	// Row-group cursor: the next group to hand out. Claimed atomically by workers.
 	std::atomic<size_t> next_group {0};
 	size_t total_groups = 0;

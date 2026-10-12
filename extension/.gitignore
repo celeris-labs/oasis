@@ -14,3 +14,7 @@ vivado*.jou
 .cache
 build_hw
 hs_err_*
+# Benchmark data and results (bench/)
+bench/data/
+bench/results/
+bench/__pycache__/

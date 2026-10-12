@@ -1,5 +1,8 @@
 #include "oasis_query_stats.hpp"
 
+#include "oasis_context_cache_entry.hpp"
+#include "oasis_profile.hpp"
+
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_config.hpp"
@@ -116,6 +119,47 @@ string OasisScanTimingsLogType::ConstructLogMessage(const OasisScanTimings &t) {
 	child_list.emplace_back("slices", Value::UBIGINT(t.slices));
 	child_list.emplace_back("rows_in", Value::UBIGINT(t.rows_in));
 	child_list.emplace_back("rows_kept", Value::UBIGINT(t.rows_kept));
+	return Value::STRUCT(std::move(child_list)).ToString();
+}
+
+//===--------------------------------------------------------------------===//
+// OasisDecoderProfileLogType
+//===--------------------------------------------------------------------===//
+OasisDecoderProfileLogType::OasisDecoderProfileLogType() : LogType(NAME, LEVEL, GetLogType()) {
+}
+
+LogicalType OasisDecoderProfileLogType::GetLogType() {
+	child_list_t<LogicalType> child_list = {
+	    {"segment", LogicalType::UBIGINT},
+	    {"label", LogicalType::VARCHAR},
+	    {"file", LogicalType::VARCHAR},
+	    {"in_handshakes_cycles", LogicalType::UBIGINT},
+	    {"in_starved_cycles", LogicalType::UBIGINT},
+	    {"in_stalled_cycles", LogicalType::UBIGINT},
+	    {"in_idle_cycles", LogicalType::UBIGINT},
+	    {"out_handshakes_cycles", LogicalType::UBIGINT},
+	    {"out_starved_cycles", LogicalType::UBIGINT},
+	    {"out_stalled_cycles", LogicalType::UBIGINT},
+	    {"out_idle_cycles", LogicalType::UBIGINT},
+	};
+	return LogicalType::STRUCT(std::move(child_list));
+}
+
+string OasisDecoderProfileLogType::ConstructLogMessage(idx_t segment, const OasisDecoderSegment &s) {
+	const auto &c = s.counters;
+	child_list_t<Value> child_list = {
+	    {"segment", Value::UBIGINT(segment)},
+	    {"label", Value(s.label)},
+	    {"file", Value(s.file)},
+	    {"in_handshakes_cycles", Value::UBIGINT(c.in_handshakes_cycles)},
+	    {"in_starved_cycles", Value::UBIGINT(c.in_starved_cycles)},
+	    {"in_stalled_cycles", Value::UBIGINT(c.in_stalled_cycles)},
+	    {"in_idle_cycles", Value::UBIGINT(c.in_idle_cycles)},
+	    {"out_handshakes_cycles", Value::UBIGINT(c.out_handshakes_cycles)},
+	    {"out_starved_cycles", Value::UBIGINT(c.out_starved_cycles)},
+	    {"out_stalled_cycles", Value::UBIGINT(c.out_stalled_cycles)},
+	    {"out_idle_cycles", Value::UBIGINT(c.out_idle_cycles)},
+	};
 	return Value::STRUCT(std::move(child_list)).ToString();
 }
 
@@ -280,6 +324,9 @@ void OasisQueryStats::Install(DatabaseInstance &db) {
 	if (!log_manager.LookupLogType(OasisBloomFilterStatsLogType::NAME)) {
 		log_manager.RegisterLogType(make_uniq<OasisBloomFilterStatsLogType>());
 	}
+	if (!log_manager.LookupLogType(OasisDecoderProfileLogType::NAME)) {
+		log_manager.RegisterLogType(make_uniq<OasisDecoderProfileLogType>());
+	}
 	if (!log_manager.LookupLogType(OasisScanTimingsLogType::NAME)) {
 		log_manager.RegisterLogType(make_uniq<OasisScanTimingsLogType>());
 	}
@@ -305,8 +352,12 @@ void OasisQueryStats::Reset() {
 		lock_guard<std::mutex> guard(bloom_runs_mutex);
 		bloom_runs.clear();
 	}
-	lock_guard<std::mutex> guard(scan_timings_mutex);
-	scan_timings.clear();
+	{
+		lock_guard<std::mutex> guard(scan_timings_mutex);
+		scan_timings.clear();
+	}
+	lock_guard<std::mutex> guard(decoder_mutex);
+	decoder_segments.clear();
 }
 
 void OasisQueryStats::QueryBegin(ClientContext &context) {
@@ -358,6 +409,29 @@ void OasisQueryStats::QueryEnd(ClientContext &context, optional_ptr<ErrorData>) 
 	profiling = false;
 	profiling_forced = false;
 
+	// The decoder's counters of the last segment (from the start of the last scan). The scans are done, so the
+	// hardware is idle, and the read re-arms the profiler for the next query
+	if (report) {
+		bool have_boundary;
+		string last_file;
+		{
+			lock_guard<std::mutex> guard(decoder_mutex);
+			have_boundary = !decoder_segments.empty();
+			if (have_boundary) {
+				last_file = decoder_segments.back().file;
+			}
+		}
+		if (have_boundary) {
+			try {
+				auto &oasis_ctx = GetOrCreateOasisContext(context);
+				lock_guard<std::mutex> guard(decoder_mutex);
+				decoder_segments.push_back({"final", last_file, ReadDecoderProfile(oasis_ctx)});
+			} catch (std::exception &) {
+				// No decoder profile for this query; the other statistics are still reported
+			}
+		}
+	}
+
 	if (!report) {
 		// Not a query that scanned a read_oasis table (or one that began before the extension was
 		// loaded), nothing to report.
@@ -379,6 +453,15 @@ void OasisQueryStats::QueryEnd(ClientContext &context, optional_ptr<ErrorData>) 
 	}
 	for (idx_t i = 0; i < runs.size(); i++) {
 		DUCKDB_LOG(context, OasisBloomFilterStatsLogType, i, runs[i]);
+	}
+
+	vector<OasisDecoderSegment> segments;
+	{
+		lock_guard<std::mutex> guard(decoder_mutex);
+		segments = std::move(decoder_segments);
+	}
+	for (idx_t i = 0; i < segments.size(); i++) {
+		DUCKDB_LOG(context, OasisDecoderProfileLogType, i, segments[i]);
 	}
 
 	vector<OasisScanTimings> timings;
@@ -405,6 +488,11 @@ void OasisQueryStats::AddScan(bool celeris_bloom, uint64_t wall_ns) {
 void OasisQueryStats::AddScanTimings(OasisScanTimings timings) {
 	lock_guard<std::mutex> guard(scan_timings_mutex);
 	scan_timings.push_back(std::move(timings));
+}
+
+void OasisQueryStats::AddDecoderBoundary(const string &file, const DecoderProfileCounters &counters) {
+	lock_guard<std::mutex> guard(decoder_mutex);
+	decoder_segments.push_back({"before_scan", file, counters});
 }
 
 void OasisQueryStats::AddBloomRun(const BloomPerfCounters &perf) {

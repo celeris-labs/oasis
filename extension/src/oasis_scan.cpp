@@ -13,6 +13,7 @@
 #include "oasis/operator.hpp"
 #include "oasis/query_splinter.hpp"
 #include "oasis_hardware_bloom.hpp"
+#include "oasis_profile.hpp"
 #include "parcore/configuration.hpp"
 #include "parcore_metadata_util.hpp"
 #include "parquet_reader.hpp"
@@ -212,6 +213,16 @@ unique_ptr<LocalTableFunctionState> OasisScanInitLocal(ExecutionContext &context
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
 	auto lstate = make_uniq<OasisScanLocalState>();
 	lstate->gstate = &gstate;
+	// The scan's pipeline starts here (a hash join's build pipeline has finished): split the decoder's
+	// profiler counters. All workers wait for the read, so none submits a flow before the profiler is re-armed
+	if (!gstate.emit_cardinality_only && gstate.query_stats && gstate.ctx) {
+		std::call_once(gstate.decoder_profile_boundary, [&] {
+			try {
+				gstate.query_stats->AddDecoderBoundary(gstate.filename, ReadDecoderProfile(*gstate.ctx));
+			} catch (std::exception &) {
+			}
+		});
+	}
 	gstate.NoteStart(OasisQueryStats::NowNs());
 
 	// Merge in the dynamic join filters, which did not exist yet when the global state was

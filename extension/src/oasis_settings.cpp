@@ -39,4 +39,15 @@ void SetSchedulerQueueDepth(ClientContext &context, SetScope, Value &parameter) 
 	GetOrCreateOasisContext(context).scheduler().set_pipeline_depth(static_cast<size_t>(depth));
 }
 
+void SetEmulatedEgressGbps(ClientContext &context, SetScope, Value &parameter) {
+	if (parameter.IsNull()) {
+		return;
+	}
+	auto gbps = parameter.GetValue<double>();
+	if (gbps < 0) {
+		throw InvalidInputException("oasis_emulated_egress_gbps must be at least 0 (got %f)", gbps);
+	}
+	GetOrCreateOasisContext(context).scheduler().set_egress_limit_gbps(gbps);
+}
+
 } // namespace duckdb

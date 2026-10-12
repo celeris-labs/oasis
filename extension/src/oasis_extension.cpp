@@ -42,6 +42,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Independent of this cap, a flow is only placed when its decoder configs, read requests and "
 	                          "output buffers fit the stream's hardware FIFOs",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0), SetSchedulerQueueDepth);
+	config.AddExtensionOption("oasis_emulated_egress_gbps",
+	                          "Emulate a slower FPGA->host link: cap the output the hardware writes to this many GB/s by "
+	                          "holding back new flows (0 = off). Software-only, averaged over the flows in flight",
+	                          LogicalType::DOUBLE, Value::DOUBLE(0), SetEmulatedEgressGbps);
 	config.AddExtensionOption(
 	    "oasis_prefetch_depth",
 	    "Row groups each read_oasis worker thread keeps submitted but not yet collected, overlapping "
