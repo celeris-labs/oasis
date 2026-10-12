@@ -116,6 +116,13 @@ if(ENABLE_HTTP_SLOTS)
 else()
     set(OASIS_DEF_HTTP_SLOTS "// HTTP_SLOTS off: build-119's per-lane BRAM fifos, no card memory")
 endif()
+# vfpga_top.svh instantiates handler_toe (toe_rx: readPkg for any session, any order) instead of
+# handler_multi when the TOE keeps the receive rings.
+if(ENABLE_HTTP_TOE_BUFFER)
+    set(OASIS_DEF_HTTP_TOE_BUF "`define HTTP_TOE_BUF")
+else()
+    set(OASIS_DEF_HTTP_TOE_BUF "// HTTP_TOE_BUF off: TOE in bypass mode (one shared rx fifo), handler_multi's rx_dispatch")
+endif()
 # Generated into src/hdl/, NOT src/ -- Coyote's cr_user.tcl copies `src/hdl/*` and `vfpga_top.svh`
 # into the Vivado project and nothing else, so a header generated one level up never reaches
 # synthesis. Until 2026-08-28 an untracked hand-copy at src/hdl/oasis_defines.svh was covering for

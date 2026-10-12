@@ -12,4 +12,6 @@
 
 @OASIS_DEF_HTTP_SLOTS@
 
+@OASIS_DEF_HTTP_TOE_BUF@
+
 `endif
