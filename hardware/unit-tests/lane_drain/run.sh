@@ -15,6 +15,9 @@
 #                 The readers share ONE card read channel, which is the topology the bitstream is
 #                 built with since 2026-09-22 -- build-123 failed route_design with five card AXI
 #                 streams -- so the black-box scenarios cover the real thing.
+#   --dut toe     handler_toe (TOE with a receive ring per session, RX_DDR_BYPASS=0) against the
+#                 bench's NON-BYPASS TOE MODEL (per-session rings, delayed notifications with the
+#                 FIN overtaking them, over-read = failure, window model). Not part of `both`.
 #   --dut both    both, which is what a bare ./run.sh does (plus the s2 set below).
 #   --dut s2      STAGE 2 only: handler_slots at revision 5 with MORE CONNECTIONS THAN DECODERS
 #                 (NUM_CONNS 24 and 32 over NUM_DEC 4, the build-127 shape), the host model placing
@@ -87,6 +90,7 @@ xvlog -sv lynxTypes_stub.sv \
       "$HDL/axis_rewrite_last.sv" "$HDL/tx_arbiter.sv" "$HDL/handler_multi.sv" \
       "$HDL/slot_writer.sv" "$HDL/slot_reader.sv" "$HDL/slot_rd_share.sv" \
       "$HDL/handler_slots.sv" "$MODEL" \
+      "$HDL/toe_rx.sv" "$HDL/handler_toe.sv" \
       rxd_drain_tb.sv lane_drain_tb.sv > xvlog.log 2>&1 \
   || { tail -40 xvlog.log; exit 1; }
 
@@ -107,8 +111,9 @@ CASES=0
 # Scenarios whose passing verdict is not the word PASS. (e) and (s_e) measure containment.
 expected() {
   case "$1" in
-    e|s_e) echo "CONTAINED" ;;
-    *)     echo "PASS" ;;
+    e|s_e)   echo "CONTAINED" ;;
+    win_bad) echo "BUDGET" ;;     # handler_toe: the window rule broken on purpose
+    *)       echo "PASS" ;;
   esac
 }
 is_xfail() { case "$1" in lz1|lz2) return 0 ;; *) return 1 ;; esac; }
@@ -128,14 +133,17 @@ run_rxd() {
 run_hm() { # <dut> <scen> <lanes> [plusargs...]
   local dut="$1" scen="$2" lanes="$3"; shift 3
   local pfx snap exp out verdict
-  if [ "$dut" = slots ]; then pfx=lds; else pfx=ld; fi
+  case "$dut" in slots) pfx=lds ;; toe) pfx=ldt ;; *) pfx=ld ;; esac
   snap="${SNAP_OVERRIDE:-${pfx}${lanes}_snap}"
   # lz2 has to WAIT for the connect watchdog, which defaults to 2^28 cycles -- a second on the
   # board, a week in xsim. Its own snapshot shrinks only that parameter.
   [ "$scen" = "lz2" ] && snap="${pfx}to_snap"
   # ovf has to overrun a slot, so it gets a small one rather than half a megabyte of waiting.
-  # So does cuovf, which overruns it to get a fatal teardown.
-  [ "$scen" = "ovf" ] || [ "$scen" = "cuovf" ] && snap="${pfx}ovf${lanes}_snap"
+  # So does cuovf, which overruns it to get a fatal teardown. (handler_toe has no slot: its cuovf
+  # is a FIN with unread bytes in the ring, on the ordinary snapshot.)
+  if [ "$dut" != toe ]; then
+    [ "$scen" = "ovf" ] || [ "$scen" = "cuovf" ] && snap="${pfx}ovf${lanes}_snap"
+  fi
 
   local a=(-testplusarg "SCEN=$scen"); local p
   for p in "$@"; do a+=(-testplusarg "$p"); done
@@ -146,11 +154,12 @@ run_hm() { # <dut> <scen> <lanes> [plusargs...]
   echo "$out" | grep -E '^  == |^     conn |^     stall bits|^     worst |^  NOTE slots|^  CARD DMA' || true
   # The RTL's own simulation-only invariants. slot_writer asserts that a connection is never
   # released with segments of it still in flight -- the thing BR_DRAIN exists to guarantee -- and
-  # card_dma_model asserts Coyote's contract. Either firing is a failure whatever the verdict says.
+  # card_dma_model asserts Coyote's contract; handler_toe asserts a lane is never rebound with a
+  # readPkg of its old session outstanding. Any firing is a failure whatever the verdict says.
   local asserts
-  asserts="$(echo "$out" | grep -cE '^(slot_writer|card_dma_model): FAIL' || true)"
+  asserts="$(echo "$out" | grep -cE '^(slot_writer|card_dma_model): FAIL|handler_toe: lane [0-9]+ bound' || true)"
   if [ "${asserts:-0}" -gt 0 ]; then
-    echo "$out" | grep -E '^(slot_writer|card_dma_model): FAIL' | head -3
+    echo "$out" | grep -E '^(slot_writer|card_dma_model): FAIL|handler_toe: lane [0-9]+ bound' | head -3
     echo "FAIL  ${dut}[$lanes]  $scen  -- $asserts RTL assertion(s) fired"
     FAILS=$((FAILS + 1))
     return
@@ -158,7 +167,7 @@ run_hm() { # <dut> <scen> <lanes> [plusargs...]
   if echo "$verdict" | grep -q ": $exp"; then
     echo "PASS  ${dut}[$lanes]  $scen  ${*:-}"
   elif is_xfail "$scen"; then
-    echo "XFAIL ${dut}[$lanes]  $scen  -- build-119 has no lazy open (a08b100); identical on both DUTs"
+    echo "XFAIL ${dut}[$lanes]  $scen  -- build-119 has no lazy open (a08b100); identical on every DUT"
   else
     echo "FAIL  ${dut}[$lanes]  $scen  ${*:-}  -- ${verdict:-no verdict line}"
     FAILS=$((FAILS + 1))
@@ -173,7 +182,10 @@ if [ -n "$ONE" ]; then
             > xelab_rxd.log 2>&1 || { tail -30 xelab_rxd.log; exit 1; }
       run_rxd "$ONE" ;;
     *)
-      if [ "$DUT" = slots ]; then
+      if [ "$DUT" = toe ]; then
+        elab "ldt${LANES}_snap" "NUM_CONNS=${LANES}" "DUT_TOE=1" || exit 1
+        [ "$ONE" = "lz2" ] && { elab "ldtto_snap" "NUM_CONNS=${LANES}" "DUT_TOE=1" "STALL_CYCLES=8192" || exit 1; }
+      elif [ "$DUT" = slots ]; then
         elab "lds${LANES}_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" || exit 1
         [ "$ONE" = "lz2" ] && { elab "ldsto_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" "STALL_CYCLES=8192" || exit 1; }
         { [ "$ONE" = "ovf" ] || [ "$ONE" = "cuovf" ]; } && { elab "ldsovf${LANES}_snap" "NUM_CONNS=${LANES}" "DUT_SLOTS=1" "SLOT_LOG2=16" || exit 1; }
@@ -283,6 +295,46 @@ if [ "$DUT" = slots ] || [ "$DUT" = both ]; then
   SNAP_OVERRIDE=$B run_hm slots p3 "$NDEC" DEPTH=4 NRESP=30 SRVLAT=1000 COALESCE
   SNAP_OVERRIDE=$B run_hm slots refatal "$NDEC" RFN=3 HDEPTH=4
   SNAP_OVERRIDE=$B run_hm slots refatal "$NDEC" RFN=3 RFB=20000 RFP=7 HDEPTH=4
+fi
+
+if [ "$DUT" = toe ]; then
+  for N in 1 2 4; do elab "ldt${N}_snap" "NUM_CONNS=${N}" "DUT_TOE=1" || exit 1; done
+  elab ldtto_snap "NUM_CONNS=2" "DUT_TOE=1" "STALL_CYCLES=8192" || exit 1
+  echo "--- handler_toe : the build-119 scenarios on the non-bypass TOE model ---"
+  for s in a a1 a2 a3 a4 a5 a8 a9 a10; do run_hm toe "$s" 2; done
+  for s in b c d f g h;               do run_hm toe "$s" 2; done
+  for s in lz1 lz2;                   do run_hm toe "$s" 2; done
+  for s in s_base s_g s_d s_f;        do run_hm toe "$s" 2; done
+  for N in 1 4; do run_hm toe s_base "$N"; run_hm toe a2 "$N"; done
+  echo "--- handler_toe : new expectations (no head-of-line kill; late bytes never read) ---"
+  # e/s_e: the stalled lane is NOT fatal, its bytes wait in its ring, the other lane is served
+  run_hm toe e 2; run_hm toe s_e 2
+  # cu/cuovf: a lane killed by a mid-response FIN; the origin's late bytes for the closed session
+  # are announced and never read (cuovf: its decoder held, unread bytes in the ring at the FIN)
+  run_hm toe cu 2; run_hm toe cu 2 MIDBODY; run_hm toe cuovf 2; run_hm toe cuovf 2 MIDBODY
+  echo "--- handler_toe : pipelined GETs, the biggest budget, the throttled decoder ---"
+  for D in 1 4; do
+    run_hm toe p1 1 DEPTH=$D NRESP=40 BLEN=16384 SRVLAT=2000
+    run_hm toe p1 1 DEPTH=$D NRESP=60 BLEN=5000 SRVLAT=600 COALESCE MSS=1460
+    run_hm toe p3 2 DEPTH=$D NRESP=40 SRVLAT=1000 COALESCE
+    run_hm toe p4 2 DEPTH=$D NRESP=60 SRVLAT=1000
+    run_hm toe p1 4 DEPTH=$D NRESP=30 BLEN=100 SRVLAT=300 COALESCE
+  done
+  run_hm toe p5 2
+  for N in 1 2 4; do run_hm toe big "$N"; done
+  for N in 2 4; do run_hm toe thr "$N" THRDIV=4; run_hm toe thr "$N" THRDIV=16; done
+  echo "--- handler_toe : the questions only the TOE ring raises ---"
+  run_hm toe fin_overtake 2 NLAT=3000
+  run_hm toe win_ok 2
+  run_hm toe win_bad 2
+  run_hm toe sidreuse 2 SIDREUSE
+  run_hm toe thr_hbm 4
+  # the model's own knobs under older scenarios: slow notifications and reads, session-id reuse
+  run_hm toe h 2 NLAT=2000 RDLAT=400
+  run_hm toe d 4 NLAT=1000 RDLAT=200
+  run_hm toe c 2 NLAT=1500
+  run_hm toe f 2 SIDREUSE
+  run_hm toe b 2 SIDREUSE
 fi
 
 if [ "$DUT" = s2 ] || [ "$DUT" = both ]; then
