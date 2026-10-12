@@ -84,7 +84,9 @@ module lane_drain_tb #(
     // NON-BYPASS TOE MODEL below instead of the shared-fifo one. Needs DUT_SLOTS = 0.
     parameter int DUT_TOE = 0,
     // handler_toe's FIN settle, exposed so a mutant can be run (fin_overtake must fail at ~200).
-    parameter int TOE_CLOSE_SETTLE = 4096
+    parameter int TOE_CLOSE_SETTLE = 4096,
+    // handler_toe's FRAMER_SLICE, exposed so the variant without the 61ad533 slice can be run.
+    parameter bit TOE_FRAMER_SLICE = 1'b1
 );
     localparam int  NL     = (NUM_DEC > 0) ? NUM_DEC : NUM_CONNS;
     localparam bit  STAGE2 = (NL != NUM_CONNS);
@@ -267,7 +269,8 @@ module lane_drain_tb #(
         .QUEUE_DEPTH  (QUEUE_DEPTH),
         .RX_FIFO_DEPTH(RX_FIFO_DEPTH),
         .STALL_CYCLES (STALL_CYCLES),
-        .CLOSE_SETTLE (TOE_CLOSE_SETTLE)
+        .CLOSE_SETTLE (TOE_CLOSE_SETTLE),
+        .FRAMER_SLICE (TOE_FRAMER_SLICE)
     ) dut (
         .ap_clk(clk), .ap_rst_n(rst_n),
         .m_axis_open_connection_TVALID(oc_tvalid),
