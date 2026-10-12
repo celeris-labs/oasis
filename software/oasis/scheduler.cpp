@@ -234,10 +234,6 @@ std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capabili
                                                        const FlowDemand &demand) const {
     const auto &candidates = streams_by_capability_[capability_index(capability)];
 
-    // Only the DECODE streams have the runtime knobs: the active span caps the candidates and the
-    // pipeline-depth knob lowers the per-stream flow bound (it never raises it past max_flows).
-    // The config/read/buffer gates below are the hardware FIFO depths, which are never exceeded:
-    // the FIFOs have no backpressure, and entries written beyond the depth are lost.
     // The output channels the flow's sinks use do not depend on the stream it is placed on, so they
     // either have room for it or no stream does.
     for (const auto &[channel, count] : demand.channel_buffers) {
@@ -247,6 +243,10 @@ std::optional<libstf::stream_t> Scheduler::pick_stream(StreamCapability capabili
         }
     }
 
+    // Only the DECODE streams have the runtime knobs: the active span caps the candidates and the
+    // pipeline-depth knob lowers the per-stream flow bound (it never raises it past max_flows).
+    // The config/read/buffer gates below are the hardware FIFO depths, which are never exceeded:
+    // the FIFOs have no backpressure, and entries written beyond the depth are lost.
     const bool tunable = capability == StreamCapability::DECODE;
     size_t     span    = candidates.size();
     if (tunable) {
