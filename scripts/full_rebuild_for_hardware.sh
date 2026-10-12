@@ -8,11 +8,38 @@
 #
 # Only the hardware artifacts in $PREFIX are replaced, so an installed simulation stack
 # (libcoyotesim.so, see full_rebuild_for_simulation.sh) is left alone.
+#
+# Usage: full_rebuild_for_hardware.sh [-j N]
+#   PREFIX=<dir>  install prefix (default: $HOME/opt)
+#   JOBS=<n>      parallel build jobs, same as -j N (default: number of CPUs)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/opt}"
+JOBS="${JOBS:-$(nproc)}"
+
+while [ "$#" -gt 0 ]; do
+    arg="$1"
+    shift
+    case "$arg" in
+    -j?*) JOBS="${arg#-j}" ;;
+    -j)
+        JOBS="${1:?error: -j needs a number}"
+        shift
+        ;;
+    *)
+        echo "error: unknown argument '$arg' (usage: $0 [-j N])" >&2
+        exit 2
+        ;;
+    esac
+done
+
 COYOTE_DIR="$REPO_ROOT/parcore/libstf/coyote"
+
+# Everything stays a Release (-O3) build; -g1 adds line-table debug info (function names and source
+# lines, enough for perf) to the software stack.
+# The extension adds -g1 to its own sources (extension/CMakeLists.txt); DuckDB is built without it.
+DEBUG_FLAGS="-g1"
 
 if [ ! -f "$PREFIX/lib/libjemalloc.so" ]; then
     echo "error: no libjemalloc.so in $PREFIX/lib: set PREFIX or run parcore/libstf/scripts/install_jemalloc.sh" >&2
@@ -33,20 +60,25 @@ cmake -S "$REPO_ROOT/software" -B "$REPO_ROOT/software/build" \
   -DCMAKE_DISABLE_FIND_PACKAGE_libstf=ON \
   -DCMAKE_DISABLE_FIND_PACKAGE_parcore=ON \
   -DEN_SIMULATION=OFF \
+  -DCMAKE_CXX_FLAGS="$DEBUG_FLAGS" \
   -DJEMALLOC_LIBRARIES="$PREFIX/lib/libjemalloc.so" \
   -DJEMALLOC_INCLUDE_DIRS="$PREFIX/include"
-cmake --build "$REPO_ROOT/software/build" -j
+cmake --build "$REPO_ROOT/software/build" -j"$JOBS"
 cmake --install "$REPO_ROOT/software/build"
 
 # 3. Rebuild the extension against the freshly installed stack
 export CMAKE_PREFIX_PATH="$PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
 export LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 make -C "$REPO_ROOT/extension" clean
-make -C "$REPO_ROOT/extension" EXT_FLAGS="-DEN_SIMULATION=OFF" -j
+# The empty flags clear a -g left in the CMake cache by an earlier build.
+# The jobs go through CMAKE_BUILD_PARALLEL_LEVEL: the extension Makefile runs `cmake --build` from a
+# non-recursive recipe, so a -j on this make would reach the compile as -j1 (or unlimited for a bare -j).
+CMAKE_BUILD_PARALLEL_LEVEL="$JOBS" make -C "$REPO_ROOT/extension" \
+  EXT_FLAGS="-DEN_SIMULATION=OFF -DCMAKE_C_FLAGS= -DCMAKE_CXX_FLAGS="
 
 # 4. Build the Coyote kernel driver
 make -C "$COYOTE_DIR/driver" clean
-make -C "$COYOTE_DIR/driver" -j
+make -C "$COYOTE_DIR/driver" -j"$JOBS"
 
 # The exports above end with this script: running the extension needs them in your own shell.
 cat <<EOF

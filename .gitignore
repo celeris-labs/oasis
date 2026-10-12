@@ -23,3 +23,7 @@ __pycache__
 ._.DS_Store
 **/.DS_Store
 **/._.DS_Store
+
+# Generated data and profiles: large, regenerated locally (files that are already tracked stay tracked)
+extension/tpch_parquet/
+extension/profiles/

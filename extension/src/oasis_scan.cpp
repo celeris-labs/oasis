@@ -817,18 +817,6 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	lstate.counters.rows_in += emit;
 	lstate.counters.rows_kept += bloom_kept;
 
-	// bloom_kept is only reported when the hardware filter's mask is applied to this slice, so a scan
-	// without the filter cannot be mistaken for a filter that keeps every row.
-	if (bloom) {
-		DUCKDB_LOG_INFO(context, "Emitting slice of row group %llu: %llu/%llu rows (bloom_kept=%llu)",
-		                (unsigned long long)lstate.current_group, (unsigned long long)emit,
-		                (unsigned long long)remaining_elements, (unsigned long long)bloom_kept);
-	} else {
-		DUCKDB_LOG_INFO(context, "Emitting slice of row group %llu: %llu/%llu rows (no bloom mask)",
-		                (unsigned long long)lstate.current_group, (unsigned long long)emit,
-		                (unsigned long long)remaining_elements);
-	}
-
 	// A slice whose rows the mask dropped has nothing to point the vectors at
 	const bool slice_empty = bloom && bloom_kept == 0;
 	for (size_t i = 0; i < gstate.projected_columns.size() && !slice_empty; i++) {

@@ -46,6 +46,11 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} Coyote libstf parcore oasis)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} Coyote libstf parcore oasis)
 
+# Line-table debug info (function names and source lines, no types or locals) for the extension's own
+# sources only, enough for perf; DuckDB keeps its plain release flags.
+target_compile_options(${EXTENSION_NAME} PRIVATE -g1)
+target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -g1)
+
 install(
     TARGETS ${EXTENSION_NAME}
     EXPORT "${DUCKDB_EXPORT_SET}"
