@@ -104,7 +104,7 @@ def test_script_and_measures():
         assert data["benchmark"]["status"] == "ok"
         assert len(data["warmups"]) == 1 and len(data["iterations"]) == 3
         it = data["iterations"][0]
-        assert it["host"]["query_ms"] == 10.0 and it["host"]["scan_ms"] == 7.0 and it["host"]["join_ms"] == 3.0
+        assert it["host"]["query_ms"] == 10.0 and it["host"]["scan_ms"] == 7.0 and it["host"]["rest_ms"] == 3.0
         # 1000 beats * 64 B over 2000 cycles * 4 ns = 8 GB/s; excluding the idle cycles over 1100: 14.5 GB/s
         assert abs(it["decoder"]["in_gbps"] - 8.0) < 1e-9
         assert abs(it["decoder"]["in_gbps_excl_idle"] - 64000 / 4400) < 1e-9

@@ -31,7 +31,7 @@ and checks every result against the sums computed while generating the data. Fol
 |---|---|---|
 | total query time `host.query_ms` | host | `OasisQueryStats.total_query_ms`: wall clock of the query, planning included |
 | total scan time `host.scan_ms` | host | `scan_only_ms + scan_celeris_bloom_ms`: wall clock of the `read_oasis` scans (the Bloom one includes submitting its build side and ending it) |
-| join time `host.join_ms` | host | total - scan. (`join_operator_cpu_ms` is DuckDB's own operator timing, CPU time summed over threads; not used) |
+| rest `host.rest_ms` | host | the rest of the query (join operators, aggregation, planning...) = total - scan. (`join_operator_cpu_ms` is DuckDB's own operator timing, CPU time summed over threads; not used) |
 | decoder IN / OUT `decoder.in_gbps`, `out_gbps` | hardware | **probe only.** The extension reads the decoder's StreamProfiler when the last-starting `read_oasis` scan (the probe side; DuckDB's build pipeline has finished) starts, and again when the query ends (`OasisDecoderProfile` log record, label `final`). handshakes x 64 B over (handshake + starved + stalled + idle cycles) x 4 ns: the window runs from the first probe beat to the last handshake, idle cycles between flows included. `*_excl_idle` leaves those out. `scope` says what was measured (`probe`; `run` only for a log of an extension without the record) |
 | decoder, whole run `decoder_run.*` | hardware | the segments of the query added up. Segment boundaries inside a flow lose some output beats on the OUT side (the profiler restarts independently at input and output), so with the Bloom filter on its bytes are about 1.5 % short; `checks.decoder_out_bytes_ratio` says |
 | Bloom IN `bloom.in_gbps` | hardware | probe keys + columns to materialize read by the filter (`keys_in + values_in - build key beats`) x 64 B over the probe window: first probe key beat (`probe_start_cycles`) to the later of the probe phase's END and the last output, x 4 ns |
@@ -89,10 +89,10 @@ Every variant has folders of its own:
     <folder>/plots/both/<measure>.png           both variants as two lines (blue circles / solid: on; vermillion
                                                 squares / dashed: off); not for bloom_in / bloom_out (one line)
     <folder>/plots/both/query_breakdown.png     per point and variant a stacked bar: scan time (bottom) and
-                                                join time (top, hatched), so total = scan + join is visible
+                                                the rest (top, lighter), so total = scan + rest is visible
     <folder>/summary.csv                        one row per point; columns query_ms[bloom_on], query_ms[bloom_off], ...
 
-The measures are `query_ms`, `scan_ms`, `join_ms` (host) and `decoder_in`, `decoder_out` (the decoder during the
+The measures are `query_ms`, `scan_ms`, `rest_ms` (host) and `decoder_in`, `decoder_out` (the decoder during the
 probe), `bloom_in`, `bloom_out` (the filter during the probe); times are in ms, throughputs in GB/s. The printed
 table has one row per point and variant (second column). The y axis of every plot starts at zero.
 

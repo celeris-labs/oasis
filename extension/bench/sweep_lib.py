@@ -3,22 +3,26 @@ sweep_threads.py) have in common.
 
 A sweep varies one parameter of the experiment over a list of points and runs bench.py once per point, one after the
 other (each point is one DuckDB process: warm-up runs, then measured runs). Every sweep collects the same measures
-(so their results can be compared) and writes:
+(so their results can be compared). An experiment is a folder <type>_<date>_<time> in the results directory (type:
+probe_size, build_size, columns, egress or threads), with the results and the plots in separate folders:
 
-    <folder>/
-        bench_results/bloom_on/<point>/     one folder per point and variant, as written by bench.py
-        bench_results/bloom_off/<point>/
+    results/probe_size_20261013_101530/
+        results/bloom_on/<point>/           one folder per point and variant, as written by bench.py
+        results/bloom_off/<point>/
+        results/summary.csv                 one row per point, the measures of both variants side by side
         plots/bloom_on/<measure>.png        one plot per measure and variant
         plots/bloom_off/<measure>.png
         plots/both/<measure>.png            both variants as two lines (Bloom on and off), one picture per measure
-        plots/both/query_breakdown.png      scan and join time, stacked, per point and variant
-        summary.csv                         one row per point, the measures of both variants side by side
+        plots/both/query_breakdown.png      scan and rest of the query, stacked, per point (also in plots/bloom_on and bloom_off)
+
+The Parquet files are generated into a temporary directory when the sweep starts (a point needs them) and removed
+when it ends, also after a failure or Ctrl-C: nothing is kept between sweeps. Within one sweep the points share what
+they can (the two variants of a point, and all points of the columns sweep, which use one probe file).
 
 --bloom {on,off,both} (default: both) chooses the variants: the value of the extension setting
 oasis_runtime_bloom_filter of the points of the sweep. With `both`, the two variants of a point run back to back
 (on, then off, point by point), so that drift of the machine affects both alike. The variants are plotted and
-tabulated side by side. A folder from before this option (bench_results/<point>/ directly, all with the Bloom
-filter on) can still be plotted with --plots-only (as Bloom on), but not continued.
+tabulated side by side.
 
 Measures (every point is the aggregate, by default the median, over the measured runs of that point):
 
@@ -26,7 +30,7 @@ Measures (every point is the aggregate, by default the median, over the measured
                     included                                                             host.query_ms
     scan_ms         total scan time: the host's wall clock of the read_oasis scans (the one with the Bloom
                     filter includes submitting its build side and ending it again)       host.scan_ms
-    join_ms         join time = total - scan: the join operators and what comes after them  host.join_ms
+    rest_ms         the rest of the query = total - scan: planning, the join operators and what follows  host.rest_ms
     decoder_in      the Parquet decoder's input throughput during the probe (hardware StreamProfiler, read when
                     the probe scan starts and when the query ends: the rate over the probe side only, from its
                     first beat to the last handshake, idle cycles between flows included)  decoder.in_gbps
@@ -43,17 +47,18 @@ exist with the filter on, so there is no Bloom-off plot of them) and, if both va
 with both lines in plots/both/ (not for bloom_in and bloom_out: one line, it would be the Bloom-on plot again).
 
 A sweep stops at the first failure (a failed or hung run can leave the device in a bad state). Run it again to
-continue: points that are complete in the folder are skipped (after checking that they were run with the parameters
-of the sweep, the Bloom filter setting included), and the folder of a failed point (it is kept for its logs) has to
-be removed first. `--plots-only` plots what is there, `--generate-only` only generates the Parquet files of all
-points (no FPGA needed).
+continue: `--resume <experiment folder>` runs the points that are missing (complete points are skipped, after
+checking that they were run with the parameters of the sweep, the Bloom filter setting included), and the folder of a
+failed point (it is kept for its logs) has to be removed first. `--plots-only` with `--resume` plots what is there.
 """
 
 import argparse
+import contextlib
 import csv
-import datetime
 import importlib.util
+import signal
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -61,7 +66,9 @@ from typing import Callable, Optional
 import bench
 
 CELERIS_EXAMPLE = bench.OASIS_DIR / "celeris" / "examples" / "06_bloomfilter"
-DEFAULT_RESULTS = bench.BENCH_DIR / "results"
+DEFAULT_RESULTS = bench.DEFAULT_RESULTS
+RESULTS_NAME = "results"  # The results and the plots are separate folders of an experiment
+PLOTS_NAME = "plots"
 
 
 def _load_celeris_module(name):
@@ -94,7 +101,7 @@ BASE_FIXED = {"ssize": 1 << 20, "rsize": 1 << 24, "columns": 2, "matchratio": 1.
 MEASURES = [
     ("query_ms", "host.query_ms", "ms", "Total query time (host)", 2, "query"),
     ("scan_ms", "host.scan_ms", "ms", "Total scan time (host)", 2, "scan"),
-    ("join_ms", "host.join_ms", "ms", "Join time = total - scan (host)", 2, "join"),
+    ("rest_ms", "host.rest_ms", "ms", "Rest of the query = total - scan (host)", 2, "rest"),
     ("decoder_in", "decoder.in_gbps", "GB/s", "Decoder input throughput during probe (hardware)", 3, "decoder in"),
     ("decoder_out", "decoder.out_gbps", "GB/s", "Decoder output throughput during probe (hardware)", 3,
      "decoder out"),
@@ -114,7 +121,7 @@ BLOOM_ONLY = ("bloom_in", "bloom_out")
 class Variant:
     """One value of oasis_runtime_bloom_filter, with how it is told apart in folders and plots"""
     option: str      # the value of --bloom
-    folder: str      # below bench_results/ and plots/, and the tag in summary.csv
+    folder: str      # below results/ and plots/, and the tag in summary.csv
     bloom: bool      # oasis_runtime_bloom_filter
     label: str       # legend and titles of the plots
     color: str       # Okabe-Ito blue (plot_utils' own series color) and vermillion: told apart with all color
@@ -138,12 +145,12 @@ class Sweep:
     """One kind of sweep"""
     script: str                              # File name, for messages
     description: str                         # First paragraph of --help
-    default_folder: str                      # The sweep goes to results/<default_folder>_<date>_<time> by default
+    experiment: str                          # The type of the experiment: the folder <experiment>_<date>_<time>
     swept: str                               # The parameter of bench.PARAMS that varies
     x_header: str                            # Header of the first column of the table
     x_label: str                             # X axis of the plots
     xscale: str                              # "linear" or "log"
-    folder_of: Callable[[float], str]        # Name of the folder of a point, below bench_results/<variant>/
+    folder_of: Callable[[float], str]        # Name of the folder of a point, below results/<variant>/
     fixed: dict = field(default_factory=dict)  # Defaults of the fixed parameters that differ from BASE_FIXED
     doc: str = ""                            # The epilog of --help
     # A point whose value is not where it belongs on the axis (the egress cap 0 is "off", which is the link's own
@@ -213,26 +220,11 @@ def measures(run, reduce):
 # The folder
 # ---------------------------------------------------------------------------
 
-def is_legacy_layout(bench_results):
-    """Whether bench_results/ is from before --bloom: the points directly in it (all run with the filter on)"""
-    path = Path(bench_results)
-    if not path.is_dir() or any((path / v.folder).is_dir() for v in VARIANTS):
-        return False
-    return any((d / "bench.yaml").exists() or (d / "meta.yaml").exists() for d in path.iterdir() if d.is_dir())
-
-
-def load_variant_runs(bench_data, bench_results, variants):
-    """The complete benchmarks in the folder: {variant.option: [Run, ...]} for the given variants. A folder in the
-    legacy layout is read as Bloom on (by the setting its points were run with, if they have it)"""
+def load_variant_runs(bench_data, results_dir, variants):
+    """The complete benchmarks in the folder: {variant.option: [Run, ...]} for the given variants"""
     found = {v.option: [] for v in variants}
-    if is_legacy_layout(bench_results):
-        for run in bench_data.load_runs(bench_results):
-            variant = OFF if run.params.get("runtime_bloom") is False else ON
-            if variant.option in found:
-                found[variant.option].append(run)
-        return found
     for v in variants:
-        path = Path(bench_results) / v.folder
+        path = Path(results_dir) / v.folder
         if path.is_dir():
             found[v.option] = bench_data.load_runs(path)
     return found
@@ -255,11 +247,11 @@ class Results:
                 if self.value(variant, x, name) is not None]
 
 
-def collect(sweep, bench_data, bench_results, agg, variants):
+def collect(sweep, bench_data, results_dir, agg, variants):
     """The measures of every point in the folder, for the given variants"""
-    found = load_variant_runs(bench_data, bench_results, variants)
+    found = load_variant_runs(bench_data, results_dir, variants)
     if not any(found.values()):
-        raise bench.BenchmarkError(f"no complete results in {bench_results}"
+        raise bench.BenchmarkError(f"no complete results in {results_dir}"
                                    + ("" if len(variants) > 1 else f" for {variants[0].label.lower()}"))
     reduce = bench_data.AGGREGATIONS[agg]
     x_of = lambda r: r.params[PARAM_YAML[sweep.swept]]
@@ -297,7 +289,7 @@ def widths():
 
 def print_header(sweep, agg, num_runs):
     print(f"{agg} over {num_runs} measured runs per point; times in ms (host view), throughputs in GB/s (hardware "
-          "view, during the probe); join = total query time - scan time; bloom: oasis_runtime_bloom_filter")
+          "view, during the probe); rest = total query time - scan time; bloom: oasis_runtime_bloom_filter")
     for cells in ([sweep.x_header, "bloom"] + [m[5] for m in MEASURES], ["", ""] + [m[2] for m in MEASURES]):
         print("  ".join(f"{c:>{w}s}" for c, w in zip(cells, widths())))
     print("  ".join("-" * w for w in widths()))
@@ -386,7 +378,7 @@ _BREAKDOWN_TINT = {"on": "#a9c9ee", "off": "#f0b48a"}
 
 
 def plot_breakdown(plot_utils, sweep, results, title, path):
-    """Per point, one stacked bar of scan time (bottom) and join time (top) for each variant, side by side: the
+    """Per point, one stacked bar of scan time (bottom) and the rest (top) for each variant, side by side: the
     height is the total query time. The points are equally spaced and labelled, whatever their values"""
     pu = plot_utils
     path, fmt = pu._check_path(path)
@@ -398,11 +390,11 @@ def plot_breakdown(plot_utils, sweep, results, title, path):
     for j, v in enumerate(variants):
         pos = [i + (j - (k - 1) / 2) * width for i in range(n)]
         scan = [results.value(v, x, "scan_ms") or 0.0 for x in results.xs]
-        join = [results.value(v, x, "join_ms") or 0.0 for x in results.xs]
+        rest = [results.value(v, x, "rest_ms") or 0.0 for x in results.xs]
         ax.bar(pos, scan, width * 0.9, color=v.color, edgecolor=pu.SURFACE, linewidth=0.8, label=f"{v.label}: scan")
-        ax.bar(pos, join, width * 0.9, bottom=scan, color=_BREAKDOWN_TINT[v.option], edgecolor=v.color,
-               hatch="///", linewidth=0.8, label=f"{v.label}: join")
-        top = max([top] + [s + t for s, t in zip(scan, join)])
+        ax.bar(pos, rest, width * 0.9, bottom=scan, color=_BREAKDOWN_TINT[v.option], edgecolor=pu.SURFACE,
+               linewidth=0.8, label=f"{v.label}: rest of the query")
+        top = max([top] + [s + t for s, t in zip(scan, rest)])
     labels = [sweep.text(x) for x in results.xs]
     ax.set_xticks(range(n), labels, rotation=45 if n > 8 and max(map(len, labels)) > 4 else 0,
                   ha="right" if n > 8 and max(map(len, labels)) > 4 else "center")
@@ -417,7 +409,7 @@ def plot_breakdown(plot_utils, sweep, results, title, path):
 
 
 def make_plots(sweep, plot_utils, results, plots_dir, fmt, agg):
-    """plots/<variant>/<measure> for every variant, plots/both/<measure> and plots/both/query_breakdown if
+    """<plots_dir>/<variant>/<measure> for every variant, plots/both/<measure> and plots/both/query_breakdown if
     there are two. Returns the paths written"""
     subtitle = f"{agg} of {results.num_runs} runs"  # A second line: the titles are long
     plots_dir = Path(plots_dir)
@@ -433,6 +425,20 @@ def make_plots(sweep, plot_utils, results, plots_dir, fmt, agg):
             written.append(plot_lines(plot_utils, [(v, [x for x, _ in points], [y for _, y in points])],
                                       sweep.x_label, unit, f"{title}\n{v.label}, {subtitle}",
                                       plots_dir / v.folder / f"{name}.{fmt}", xscale=sweep.xscale))
+    # The breakdown of the query time (scan + rest) is always drawn: one figure per variant and, with both, one
+    # with the two side by side
+    def complete(vs):
+        return all(results.line(sweep, v, "scan_ms") and results.line(sweep, v, "rest_ms") for v in vs)
+    for v in results.variants:
+        if complete([v]):
+            single = Results(results.xs, results.values, [v], results.num_runs)
+            written.append(plot_breakdown(plot_utils, sweep, single,
+                                          f"Where the query time goes: scan + rest (host)\n{v.label}, {subtitle}",
+                                          plots_dir / v.folder / f"query_breakdown.{fmt}"))
+    if len(results.variants) > 1 and complete(results.variants):
+        written.append(plot_breakdown(plot_utils, sweep, results,
+                                      f"Where the query time goes: scan + rest (host)\n{subtitle}",
+                                      plots_dir / "both" / f"query_breakdown.{fmt}"))
     if len(results.variants) > 1:
         for name, _path, unit, title, _d, _h in MEASURES:
             if name in BLOOM_ONLY:
@@ -442,10 +448,6 @@ def make_plots(sweep, plot_utils, results, plots_dir, fmt, agg):
             if len(lines) > 1:
                 written.append(plot_lines(plot_utils, lines, sweep.x_label, unit, f"{title}\n{subtitle}",
                                           plots_dir / "both" / f"{name}.{fmt}", xscale=sweep.xscale))
-        if all(results.line(sweep, v, "scan_ms") and results.line(sweep, v, "join_ms") for v in results.variants):
-            written.append(plot_breakdown(plot_utils, sweep, results,
-                                          f"Total query time = scan + join (host)\n{subtitle}",
-                                          plots_dir / "both" / f"query_breakdown.{fmt}"))
     return written
 
 
@@ -460,42 +462,42 @@ def governor_warning():
               "performance)", file=sys.stderr)
 
 
-def run_sweep(sweep, bench_data, xs, args, fixed, bench_results, variants):
+def run_sweep(sweep, bench_data, xs, args, fixed, results_dir, variants):
     """Runs the missing points, point by point and, within a point, the variants one after the other (so a drift
-    of the machine affects them alike), printing the row of each as soon as it is done"""
+    of the machine affects them alike), printing the row of each as soon as it is done. The Parquet files go into
+    one temporary directory, created when the first point needs it and removed when the sweep ends"""
     reduce = bench_data.AGGREGATIONS[args.agg]
     live = sys.stdout.isatty()
-    for x in xs:
-        for v in variants:
-            folder = Path(bench_results) / v.folder / sweep.folder_of(x)
-            params = dict(point_params(sweep, fixed, xs, x), runtime_bloom=v.bloom)
-            note = ""
-            if check_existing(sweep, bench_data, folder, params):
-                note = "existing"
-            else:
-                if live:  # A placeholder that the row replaces
-                    print(f"{sweep.text(x):>{X_WIDTH}s}  {v.option:>{BLOOM_WIDTH}s}  running ...", end="", flush=True)
-                try:
-                    bench.run_benchmark(folder, params, warmup=args.warmup, iterations=args.iterations,
-                                        binary=args.binary, data_dir=args.data_dir, lib_dir=args.lib_dir,
-                                        timeout=args.timeout, wait_device=args.wait_device, quiet=True)
-                except bench.BenchmarkError:
+    with contextlib.ExitStack() as stack:
+        data_dir = None
+        for x in xs:
+            for v in variants:
+                folder = Path(results_dir) / v.folder / sweep.folder_of(x)
+                params = dict(point_params(sweep, fixed, xs, x), runtime_bloom=v.bloom)
+                note = ""
+                if check_existing(sweep, bench_data, folder, params):
+                    note = "existing"
+                else:
+                    if data_dir is None:
+                        data_dir = stack.enter_context(
+                            tempfile.TemporaryDirectory(prefix=bench.TMP_PREFIX, dir=args.tmp_dir))
+                    if live:  # A placeholder that the row replaces
+                        print(f"{sweep.text(x):>{X_WIDTH}s}  {v.option:>{BLOOM_WIDTH}s}  running ...", end="",
+                              flush=True)
+                    try:
+                        bench.run_benchmark(folder, params, warmup=args.warmup, iterations=args.iterations,
+                                            binary=args.binary, data_dir=data_dir, lib_dir=args.lib_dir,
+                                            timeout=args.timeout, wait_device=args.wait_device, quiet=True)
+                    except bench.BenchmarkError:
+                        if live:
+                            print("\r\033[K", end="")
+                        print_log_tail(folder)
+                        print(f"\nfailed: {sweep.text(x)} with {v.label.lower()}; its folder is kept for the logs: "
+                              f"remove {folder} before running this point again", file=sys.stderr)
+                        raise
                     if live:
                         print("\r\033[K", end="")
-                    print_log_tail(folder)
-                    print(f"\nfailed: {sweep.text(x)} with {v.label.lower()}; its folder is kept for the logs: "
-                          f"remove {folder} before running this point again", file=sys.stderr)
-                    raise
-                if live:
-                    print("\r\033[K", end="")
-            print_row(sweep, x, v, measures(bench_data.load_run(folder), reduce), note)
-
-
-def generate_all(sweep, xs, args, fixed):
-    for x in xs:
-        params = bench.complete_params(point_params(sweep, fixed, xs, x))
-        dataset = bench.make_dataset(params, args.data_dir)
-        print(f"{sweep.text(x):>{X_WIDTH}s}  {dataset.probe_path.name}")
+                print_row(sweep, x, v, measures(bench_data.load_run(folder), reduce), note)
 
 
 def main(sweep, add_args, points_of, argv=None):
@@ -506,15 +508,18 @@ def main(sweep, add_args, points_of, argv=None):
     """
     parser = argparse.ArgumentParser(description=sweep.description, epilog=sweep.doc or "See the top of this file.",
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--folder", "-f", type=Path,
-                        help="the main folder: it gets bench_results/ and plots/ (created if needed). Default: a new "
-                             f"folder {DEFAULT_RESULTS}/{sweep.default_folder}_<date>_<time>, so a sweep never lands "
-                             "in the results of an earlier one. Give the folder of an earlier sweep to continue it")
+    parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS,
+                        help="where a new experiment's folder <type>_<date>_<time> is created (default: "
+                             "%(default)s)")
+    parser.add_argument("--resume", type=Path, metavar="FOLDER",
+                        help="the folder of an earlier experiment of this type: run its missing points (complete "
+                             "points are skipped) and plot, or with --plots-only only plot. Without it a new "
+                             "experiment folder is created, so a sweep never lands in the results of an earlier one")
     parser.add_argument("--bloom", choices=BLOOM_CHOICES, default="both",
                         help="oasis_runtime_bloom_filter of the points: on, off, or both (default: %(default)s: "
                              "the two variants of a point run back to back, every point has two results, and "
                              "there are plots of each variant and of both together). The variants have folders "
-                             "of their own (bench_results/bloom_on, bloom_off). With --plots-only it selects "
+                             "of their own (results/bloom_on, bloom_off). With --plots-only it selects "
                              "what is plotted")
     add_args(parser)
     group = parser.add_argument_group("the parameters this sweep keeps fixed")
@@ -542,16 +547,19 @@ def main(sweep, add_args, points_of, argv=None):
                             "(default: %(default)s)")
     group.add_argument("--format", choices=("png", "pdf", "svg"), default="png", help="of the plots (default: png)")
     group.add_argument("--binary", type=Path, default=bench.DEFAULT_BINARY, help="the DuckDB CLI with the extension")
-    group.add_argument("--data-dir", type=Path, default=bench.DEFAULT_DATA_DIR,
-                       help="where the generated Parquet files are kept (default: %(default)s)")
+    group.add_argument("--tmp-dir", type=Path, default=None,
+                       help="where the temporary directory with the generated Parquet files is created (removed when "
+                            "the sweep ends; default: the system's temporary directory; the largest point needs "
+                            "8 B x probe rows x (1 + columns))")
     group.add_argument("--lib-dir", type=Path, default=bench.DEFAULT_LIB_DIR)
     group.add_argument("--plots-only", action="store_true", help="plot the results in the folder, run nothing")
     group.add_argument("--no-plots", action="store_true", help="only run, do not plot (matplotlib is not needed)")
-    group.add_argument("--generate-only", action="store_true",
-                       help="only generate the Parquet files of all points (no FPGA is touched)")
     args = parser.parse_args(argv)
     if args.plots_only and args.no_plots:
         parser.error("--plots-only and --no-plots leave nothing to do")
+    # SIGTERM unwinds like Ctrl-C, so the temporary data is removed (the CLI is waited for, see bench.run_cli)
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
+    main_folder = None
     xs = points_of(args, parser)
     fixed = {name: getattr(args, name) for name in BASE_FIXED if hasattr(args, name)}
     fixed.pop("runtime_bloom", None)  # The variant's, set per point
@@ -571,41 +579,35 @@ def main(sweep, add_args, points_of, argv=None):
                       "plot later with --plots-only", file=sys.stderr)
                 return 1
 
-        if args.generate_only:
-            generate_all(sweep, xs, args, fixed)
-            return 0
-
-        if args.folder is None:
-            if args.plots_only:
-                parser.error("--plots-only needs the --folder of the results to plot")
-            args.folder = DEFAULT_RESULTS / f"{sweep.default_folder}_{datetime.datetime.now():%Y%m%d_%H%M%S}"
-        main_folder = args.folder.resolve()
-        bench_results, plots_dir = main_folder / "bench_results", main_folder / "plots"
+        if args.resume is not None:
+            main_folder = args.resume.resolve()
+            if not main_folder.is_dir():
+                parser.error(f"--resume: {main_folder} is not a folder")
+        elif args.plots_only:
+            parser.error("--plots-only needs the experiment folder to plot: --resume FOLDER")
+        else:
+            main_folder = bench.create_experiment_folder(sweep.experiment, args.results_dir).resolve()
+        results_dir, plots_dir = main_folder / RESULTS_NAME, main_folder / PLOTS_NAME
 
         if not args.plots_only:
-            if is_legacy_layout(bench_results):
-                raise bench.BenchmarkError(
-                    f"{bench_results} has the points of an older sweep directly in it (all run with the Bloom "
-                    "filter on), not below bloom_on/ and bloom_off/. Plot it with --plots-only, or move them into "
-                    "bench_results/bloom_on/ to continue it, or use another --folder")
-            bench_results.mkdir(parents=True, exist_ok=True)
-            print(f"folder: {main_folder}")
+            results_dir.mkdir(parents=True, exist_ok=True)
+            print(f"experiment: {main_folder}")
             governor_warning()
             print_header(sweep, args.agg, args.iterations)
-            run_sweep(sweep, bench_data, xs, args, fixed, bench_results, variants)
+            run_sweep(sweep, bench_data, xs, args, fixed, results_dir, variants)
         if not args.no_plots:
-            results = collect(sweep, bench_data, bench_results, args.agg, variants)
+            results = collect(sweep, bench_data, results_dir, args.agg, variants)
             if args.plots_only:
                 print_header(sweep, args.agg, results.num_runs)
                 print_results(sweep, results)
             print()
-            print(f"summary: {write_summary(sweep, results, main_folder / 'summary.csv')}")
+            print(f"summary: {write_summary(sweep, results, results_dir / 'summary.csv')}")
             for path in make_plots(sweep, plot_utils, results, plots_dir, args.format, args.agg):
                 print(f"plot: {path}")
     except bench.BenchmarkError as e:
         print(f"error: {e}", file=sys.stderr)
         if not args.plots_only:
-            print(f"To continue this sweep (complete points are skipped): ./{sweep.script} --folder "
-                  f"{args.folder.resolve() if args.folder else '<folder>'} [the same options]", file=sys.stderr)
+            print(f"To continue this sweep (complete points are skipped): ./{sweep.script} --resume "
+                  f"{main_folder or '<experiment folder>'} [the same options]", file=sys.stderr)
         return 1
     return 0

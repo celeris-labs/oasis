@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Query time and Bloom filter / decoder throughput over the number of INT64 columns to materialize.
 
-    ./sweep_columns.py                               # into a new folder results/columns_<date>_<time>
-    ./sweep_columns.py --folder results/columns      # or into the folder you name
+    ./sweep_columns.py                                  # a new folder results/columns_<date>_<time>
+    ./sweep_columns.py --resume results/columns_20261013_101530   # continue that experiment
 
 runs the benchmark (bench.py) for MIN_COLUMNS ... MAX_COLUMNS payload columns of the probe side that the query
 reads and the hardware materializes besides the key (default 0 ... 16), one after the other, with build size 2^20
 and probe size 2^24 rows, uniform probe keys (zipf 0) and all keys matching. Then it plots the results
-(plot_utils.py). The folder gets this structure:
+(plot_utils.py). The experiment folder gets this structure (results and plots are separate folders):
 
-    results/columns/
-        bench_results/bloom_on/columns_00/ ... columns_16/      one folder per point, as written by bench.py
-        bench_results/bloom_off/columns_00/ ...                 the same points with the Bloom filter off
-        plots/bloom_on/, plots/bloom_off/                       one plot per measure and variant
-        plots/both/                                             both variants in one picture per measure,
-                                                                and query_breakdown.png
-        summary.csv                                             one row per point, both variants side by side
+    results/columns_<date>_<time>/
+        results/bloom_on/columns_00/ ... columns_16/      one folder per point, as written by bench.py
+        results/bloom_off/columns_00/ ...                 the same points with the Bloom filter off
+        results/summary.csv                               one row per point, both variants side by side
+        plots/bloom_on/, plots/bloom_off/                 one plot per measure and variant
+        plots/both/                                       both variants in one picture per measure,
+                                                          and query_breakdown.png
 
 All points use one probe file with MAX_COLUMNS payload columns (columns the query does not reference are not read),
 so the data is generated once. Every column is 8 bytes per probe row in and, for the kept rows, out. Every point is
@@ -25,10 +25,12 @@ the median over the measured runs (--agg changes that).
 read_oasis scans), or both, which runs the two variants of a point back to back and plots them side by side
 (plots/both/). Bloom off has no Bloom filter throughput (bloom_in, bloom_out), so those are only plotted for on.
 
-The sweep stops at the first failure. Run it again to continue: complete points are skipped, and the folder of a
-failed point (kept for its logs) has to be removed first. `--plots-only` plots what is there without running (a
-folder from before --bloom, with the points directly in bench_results/, is plotted as Bloom on); `--generate-only`
-only writes the Parquet files.
+The Parquet files are generated into a temporary directory (--tmp-dir) when the sweep starts and removed when it
+ends; nothing is kept between sweeps.
+
+The sweep stops at the first failure. Run it again with `--resume <experiment folder>` to continue: complete points
+are skipped, and the folder of a failed point (kept for its logs) has to be removed first. `--resume FOLDER
+--plots-only` plots what is there without running.
 """
 
 import sys
@@ -38,7 +40,7 @@ import sweep_lib
 SWEEP = sweep_lib.Sweep(
     script="sweep_columns.py",
     description=__doc__.split("\n\n")[0],
-    default_folder="columns",
+    experiment="columns",
     swept="columns",
     x_header="columns",
     x_label="Materialized INT64 columns (besides the key)",

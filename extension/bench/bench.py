@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """Runs one point of the oasis Bloom filter benchmark through the extension's DuckDB CLI.
 
-    ./bench.py --folder results/one_point --ssize 65536 --rsize 16777216 --columns 2 --zipffactor 0
+    ./bench.py --ssize 65536 --rsize 16777216 --columns 2 --zipffactor 0
 
-generates the synthetic Parquet files if they are not there yet (gen_data.py: a build file S with a sequential key,
-a probe file R with a foreign key and `columns` INT64 payload columns, all OPTIONAL without NULLs), then runs
+generates the synthetic Parquet files in a temporary directory (gen_data.py: a build file S with a sequential key,
+a probe file R with a foreign key and `columns` INT64 payload columns, all OPTIONAL without NULLs; the directory is
+removed when the run ends, so nothing is reused between runs), then runs
 
     SELECT count(*), sum(p.key), sum(p.c1), ... FROM read_oasis(S) b JOIN read_oasis(R) p ON p.key = b.key
 
-(warm-up runs, then measured runs, all in one DuckDB process) and writes into the folder, exactly as given (it is
-created if needed and must not hold results already; no timestamp or label is added):
+(warm-up runs, then measured runs, all in one DuckDB process). The experiment gets a folder of its own,
+<results-dir>/<experiment>_<date>_<time> (default: results/bench_20261013_101530), with the results in `results/`
+(and `plots/`, which a single run has none of; the sweeps fill both):
 
-    run.sql       the script that was fed to the CLI (settings, the query, the readout of the statistics)
-    stdout.log    everything the CLI printed: the raw statistics of every run, parsed from here
-    stderr.log    what it printed to stderr
-    meta.yaml     how it was run: command, parameters, dataset, git state of the repositories, libraries, host
-    bench.yaml    the parsed values of the measured runs (and of the warm-ups), see README.md
+    results/run.sql       the script that was fed to the CLI (settings, the query, the readout of the statistics)
+    results/stdout.log    everything the CLI printed: the raw statistics of every run, parsed from here
+    results/stderr.log    what it printed to stderr
+    results/meta.yaml     how it was run: command, parameters, dataset, git state of the repositories, libraries
+    results/bench.yaml    the parsed values of the measured runs (and of the warm-ups), see README.md
 
 What is measured, per run (see README.md for the exact definitions):
 
-    host   total query time, total scan time, join time = total - scan: the host's wall clock (the extension's
+    host   total query time, total scan time, rest = total - scan: the host's wall clock (the extension's
            OasisQueryStats record)
     decoder   IN and OUT throughput of the Parquet decoder during the PROBE only: the hardware's
            StreamProfiler counters, which the extension reads when the probe scan starts and when the query ends
@@ -31,6 +33,7 @@ The same is available from other scripts (this file is the foundation of the swe
 
     from bench import run_benchmark
     run_benchmark("results/x/2pow20", {"ssize": 1 << 16, "rsize": 1 << 20, "zipffactor": 0})
+    # the folder is used as given; without data_dir the data is generated in a temporary directory and removed
 
 NEVER run two benchmarks at once, and stop at the first failure. The FPGA is shared with other users: a run waits
 for (--wait-device) or refuses to start while another process has the device open, every run is under a time limit
@@ -48,6 +51,7 @@ import platform
 import re
 import signal
 import statistics
+import tempfile
 import subprocess
 import sys
 import threading
@@ -58,7 +62,8 @@ BENCH_DIR = Path(__file__).resolve().parent
 EXTENSION_DIR = BENCH_DIR.parent
 OASIS_DIR = EXTENSION_DIR.parent
 DEFAULT_BINARY = EXTENSION_DIR / "build" / "release" / "duckdb"
-DEFAULT_DATA_DIR = BENCH_DIR / "data"
+DEFAULT_RESULTS = BENCH_DIR / "results"  # An experiment is a folder <kind>_<date>_<time> in it
+TMP_PREFIX = "oasis_bench_data_"
 DEFAULT_LIB_DIR = Path.home() / "opt" / "lib"  # libcoyote, libjemalloc, liboasis, ...: not found through RUNPATH
 
 DEVICE = Path("/dev/coyote_fpga_0_v0")
@@ -109,6 +114,26 @@ PARAM_NAMES = [p[0] for p in PARAMS]
 
 class BenchmarkError(RuntimeError):
     pass
+
+
+def experiment_folder(kind, results_dir=None, when=None):
+    """The folder of an experiment: <results_dir>/<kind>_<YYYYMMDD>_<HHMMSS> (not created)"""
+    when = when or datetime.datetime.now()
+    return Path(results_dir if results_dir is not None else DEFAULT_RESULTS) / f"{kind}_{when:%Y%m%d_%H%M%S}"
+
+
+def create_experiment_folder(kind, results_dir=None):
+    """Creates the folder of a new experiment and returns it. Two experiments of a kind started in the same second
+    get a _2, _3 ... suffix; an existing folder is never reused"""
+    base = experiment_folder(kind, results_dir)
+    for n in range(1, 1000):
+        folder = base if n == 1 else base.with_name(f"{base.name}_{n}")
+        try:
+            folder.mkdir(parents=True)
+            return folder
+        except FileExistsError:
+            continue
+    raise BenchmarkError(f"cannot create a folder like {base}")
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +246,9 @@ def wait_for_device(wait_s, quiet=False):
                 raise BenchmarkError(f"no free 1 GiB hugepages ({who}; lost on reboot?): {HUGEPAGES_CMD}")
             raise BenchmarkError(f"the FPGA is in use by another process ({who}); not starting. Use "
                                  "--wait-device SECONDS to wait for it")
-        if not quiet and not announced:
-            print(f"waiting for the FPGA (in use: {who}) for up to {wait_s:.0f} s ...", file=sys.stderr, flush=True)
+        if not announced:  # Also when quiet: a sweep that waits for hours must not look hung
+            why = "no free 1 GiB hugepage" if free == 0 and not users else f"in use: {who}"
+            print(f"\nwaiting for the FPGA ({why}) for up to {wait_s:.0f} s ...", file=sys.stderr, flush=True)
             announced = True
         time.sleep(2.0)
 
@@ -467,17 +493,17 @@ def bloom_measures(record):
 
 
 def host_measures(qs):
-    """Total, scan and join time of the host's wall clock. The scan time is that of the read_oasis scans (the one
-    with the Bloom filter includes submitting its build side and ending it again); the join time is the rest
+    """Total, scan and rest time of the host's wall clock. The scan time is that of the read_oasis scans (the one
+    with the Bloom filter includes submitting its build side and ending it again); the rest is what is left
     of the query: planning, the join operators and everything after them"""
     total = float(qs["total_query_ms"])
     only = qs.get("scan_only_ms")
     bloom = qs.get("scan_celeris_bloom_ms")
     scan = (float(only) if only is not None else 0.0) + (float(bloom) if bloom is not None else 0.0)
-    return {"query_ms": total, "scan_ms": scan, "join_ms": total - scan,
+    return {"query_ms": total, "scan_ms": scan, "rest_ms": total - scan,
             "scan_only_ms": None if only is None else float(only),
             "scan_bloom_ms": None if bloom is None else float(bloom),
-            # DuckDB's own timing of its join operators, CPU time summed over its threads: not the join time above
+            # DuckDB's own timing of its join operators, CPU time summed over its threads: not the rest above
             "join_operator_cpu_ms": None if qs.get("join_ms") is None else float(qs["join_ms"])}
 
 
@@ -665,7 +691,7 @@ def run_cli(cmd, script_path, run_dir, env, timeout, quiet):
         except subprocess.TimeoutExpired:
             timed_out = True
             _stop(proc)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
             # Ctrl-C reached the CLI as well (same process group). Do not kill it: wait for it to exit
             print("\ninterrupted: waiting for the CLI to exit (killing a hung run wedges the device)",
                   file=sys.stderr)
@@ -686,7 +712,7 @@ def stats(values):
 SUMMARY = [
     ("total query time [ms]", ("host", "query_ms")),
     ("total scan time [ms]", ("host", "scan_ms")),
-    ("join time = total - scan [ms]", ("host", "join_ms")),
+    ("rest of the query = total - scan [ms]", ("host", "rest_ms")),
     ("decoder IN [GB/s]", ("decoder", "in_gbps")),
     ("decoder OUT [GB/s]", ("decoder", "out_gbps")),
     ("Bloom filter IN [GB/s]", ("bloom", "in_gbps")),
@@ -713,7 +739,7 @@ def print_summary(runs, file=sys.stdout):
 
 
 def run_benchmark(folder, params=None, *, warmup=BENCH_DEFAULTS["warmup"], iterations=BENCH_DEFAULTS["iterations"],
-                  binary=DEFAULT_BINARY, data_dir=DEFAULT_DATA_DIR, lib_dir=DEFAULT_LIB_DIR,
+                  binary=DEFAULT_BINARY, data_dir=None, tmp_dir=None, lib_dir=DEFAULT_LIB_DIR,
                   timeout=BENCH_DEFAULTS["timeout"], wait_device=BENCH_DEFAULTS["wait_device"],
                   extra_settings=None, dataset=None, quiet=False, guard_device=True):
     """Runs one point of the benchmark and returns the directory with its results.
@@ -725,13 +751,24 @@ def run_benchmark(folder, params=None, *, warmup=BENCH_DEFAULTS["warmup"], itera
              SIGKILL), the run fails, and the device has to be checked
     wait_device: seconds to wait for another process to let go of the FPGA (0: fail at once if it is in use)
     extra_settings: more DuckDB settings to SET, {name: value}
-    dataset: the gen_data.Dataset to use, to skip generating/looking it up (the sweeps do that before waiting)
+    data_dir: where the Parquet files are generated (and reused, if a file of the same parameters is there). By
+              default (None) a new temporary directory is created below `tmp_dir` (the system's temporary
+              directory if that is None) and removed when the run ends, also after a failure
+    dataset: the gen_data.Dataset to use, to skip generating it
     quiet: print nothing (stdout.log still has everything)
     guard_device: take the lock and wait for / refuse a busy FPGA (what a real run needs). Only for tests with a
                   fake CLI, which never touches the device: False, or the environment variable
                   OASIS_BENCH_NO_DEVICE_GUARD=1
     Raises BenchmarkError if anything is wrong or the run fails.
     """
+    if dataset is None and data_dir is None:
+        complete_params(params or {})  # Fail on bad parameters before generating anything
+        with tempfile.TemporaryDirectory(prefix=TMP_PREFIX, dir=tmp_dir) as tmp:
+            return run_benchmark(folder, params, warmup=warmup, iterations=iterations, binary=binary,
+                                 data_dir=tmp, tmp_dir=tmp_dir, lib_dir=lib_dir, timeout=timeout,
+                                 wait_device=wait_device, extra_settings=extra_settings, dataset=None, quiet=quiet,
+                                 guard_device=guard_device)
+
     params = complete_params(params or {})
     extra_settings = dict(extra_settings or {})
     binary = Path(binary).resolve()
@@ -864,6 +901,8 @@ def finish(folder, params, dataset, meta, quiet=False):
 # ---------------------------------------------------------------------------
 
 def main(argv=None):
+    # SIGTERM unwinds like Ctrl-C, so the temporary data is removed (the CLI is waited for, see run_cli)
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                      epilog="See the top of this file and README.md.", add_help=False)
     parser.add_argument("--help", action="help", help="show this help message and exit")
@@ -880,20 +919,23 @@ def main(argv=None):
                        help="runs not stored (default: %(default)s)")
     group.add_argument("--iterations", "-i", type=int, default=BENCH_DEFAULTS["iterations"],
                        help="runs stored (default: %(default)s)")
-    group.add_argument("--folder", "-f", required=True,
-                       help="the folder the results go to, used exactly as given (created if needed; must not hold "
-                            "results already)")
+    group.add_argument("--experiment", default="bench", metavar="TYPE",
+                       help="the experiment's type: its folder is <results-dir>/<TYPE>_<date>_<time> (default: "
+                            "%(default)s)")
+    group.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS,
+                       help="where the experiment's folder is created (default: %(default)s)")
     group.add_argument("--timeout", type=float, default=BENCH_DEFAULTS["timeout"],
                        help="seconds the CLI may take in all, then it is stopped (default: %(default)s)")
     group.add_argument("--wait-device", type=float, default=BENCH_DEFAULTS["wait_device"], metavar="SECONDS",
                        help="wait this long for another process to let go of the FPGA (default: do not wait)")
     group.add_argument("--binary", type=Path, default=DEFAULT_BINARY, help="the DuckDB CLI with the extension "
                                                                           "(default: %(default)s)")
-    group.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
-                       help="where the generated Parquet files are kept and reused (default: %(default)s)")
+    group.add_argument("--tmp-dir", type=Path, default=None,
+                       help="where the temporary directory with the generated Parquet files is created, and removed "
+                            "at the end of the run (default: the system's temporary directory; needs room for the "
+                            "probe file, 8 B x rows x (1 + columns))")
     group.add_argument("--lib-dir", type=Path, default=DEFAULT_LIB_DIR,
                        help="added to LD_LIBRARY_PATH (default: %(default)s)")
-    group.add_argument("--generate-only", action="store_true", help="only generate the Parquet files")
     args = parser.parse_args(argv)
 
     extra = {}
@@ -912,12 +954,12 @@ def main(argv=None):
 
     params = {name: getattr(args, name) for name in PARAM_NAMES}
     try:
-        if args.generate_only:
-            dataset = make_dataset(complete_params(params), args.data_dir)
-            print(f"build: {dataset.build_path}\nprobe: {dataset.probe_path}")
-            return 0
-        run_benchmark(args.folder, params, warmup=args.warmup, iterations=args.iterations, binary=args.binary,
-                      data_dir=args.data_dir, lib_dir=args.lib_dir, timeout=args.timeout,
+        complete_params(params)  # Before creating the experiment's folder
+        folder = create_experiment_folder(args.experiment, args.results_dir)
+        (folder / "plots").mkdir()
+        print(f"experiment: {folder}", file=sys.stderr)
+        run_benchmark(folder / "results", params, warmup=args.warmup, iterations=args.iterations,
+                      binary=args.binary, tmp_dir=args.tmp_dir, lib_dir=args.lib_dir, timeout=args.timeout,
                       wait_device=args.wait_device, extra_settings=extra)
     except BenchmarkError as e:
         print(f"error: {e}", file=sys.stderr)

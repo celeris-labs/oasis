@@ -5,7 +5,10 @@
   runs the threads sweep, whose points do not change what bench.py checks the fake's output against. Dataset stubs
   and no device guard (no fuser, no lock file shared with other runs: OASIS_BENCH_NO_DEVICE_GUARD);
 * from results folders written here in the format bench.py writes (bench.yaml/meta.yaml), for what only needs the
-  folder: the plots, the table and the summary of all five sweeps, the old layout.
+  folder: the plots, the table and the summary of all five sweeps.
+
+An experiment folder is <type>_<date>_<time> with `results/` and `plots/` in it; the data is generated in a
+temporary directory that is gone when the sweep ends.
 
 Run: python test_sweeps.py (or pytest). Needs matplotlib and PyYAML: source ~/plotting/bin/activate"""
 
@@ -72,12 +75,20 @@ class Env:
         self.cli = self.tmp / "fake_duckdb"
         self.cli.write_text(WRAPPER)
         self.cli.chmod(self.cli.stat().st_mode | stat.S_IEXEC)
-        self.folder = self.tmp / "sweep"
+        self.folder = self.tmp / "sweep"      # An experiment folder (as --resume wants it), empty
+        self.folder.mkdir()
+        self.results = self.folder / "results"
+        self.plots = self.folder / "plots"
+        self.tmp_base = self.tmp / "tmpbase"  # Where the temporary data directories go (--tmp-dir)
+        self.tmp_base.mkdir()
+        self.data_dirs = []                   # The data_dir of every point that was run
         self.wrong_off = wrong_off  # The off variant gets a dataset that the (right) result does not match
         self._saved = {}
 
     def __enter__(self):
         def make_dataset(params, data_dir, log=print):
+            assert Path(data_dir).is_dir(), data_dir
+            self.data_dirs.append(Path(data_dir))
             stub = test_bench.dataset(params["columns"])
             if self.wrong_off and not params["runtime_bloom"]:
                 stub.expected_rows += 1
@@ -105,10 +116,10 @@ class Env:
 
     def sweep(self, module, *args, folder=True, run=True):
         """Runs a sweep script's main with the fake CLI; returns (exit code, stdout, stderr)"""
-        argv = list(args) + ["--binary", str(self.cli), "--lib-dir", str(self.tmp), "--data-dir", str(self.tmp / "d"),
+        argv = list(args) + ["--binary", str(self.cli), "--lib-dir", str(self.tmp), "--tmp-dir", str(self.tmp_base),
                              "--warmup", "1", "--iterations", "3"]
         if folder:
-            argv += ["--folder", str(self.folder)]
+            argv += ["--resume", str(self.folder)]
         return run_main(module, argv)
 
     def threads(self, *args, **kw):
@@ -138,9 +149,9 @@ def run_main(module, argv):
 
 MEASURE_NAMES = [m[0] for m in sweep_lib.MEASURES]
 ON_ONLY = {"bloom_in", "bloom_out"}
-ON_PLOTS = sorted(f"{m}.png" for m in MEASURE_NAMES)
-OFF_PLOTS = sorted(f"{m}.png" for m in MEASURE_NAMES if m not in ON_ONLY)
-BOTH_PLOTS = sorted(OFF_PLOTS + ["query_breakdown.png"])
+OFF_PLOTS = sorted([f"{m}.png" for m in MEASURE_NAMES if m not in ON_ONLY] + ["query_breakdown.png"])
+ON_PLOTS = sorted([f"{m}.png" for m in MEASURE_NAMES] + ["query_breakdown.png"])  # the breakdown is always drawn
+BOTH_PLOTS = OFF_PLOTS
 
 
 def pngs(folder):
@@ -152,7 +163,7 @@ def names(folder):
 
 
 def read_summary(folder):
-    with open(Path(folder) / "summary.csv", newline="") as f:
+    with open(Path(folder) / "results" / "summary.csv", newline="") as f:
         return list(csv.reader(f))
 
 
@@ -170,8 +181,8 @@ def test_both_layout_table_and_summary():
     with Env() as env:
         code, out, err = env.threads()
         assert code == 0, err
-        br = env.folder / "bench_results"
-        assert names(br) == ["bloom_off", "bloom_on"]
+        br = env.results
+        assert names(br) == ["bloom_off", "bloom_on", "summary.csv"]
         for variant in ("bloom_on", "bloom_off"):
             assert names(br / variant) == ["threads_01", "threads_02"]
         # The variants of a point run back to back: point by point, on then off
@@ -198,11 +209,11 @@ def test_both_layout_table_and_summary():
         row = dict(zip(header, table[1]))
         assert abs(float(row["query_ms[bloom_on]"]) - 11.0) < 1e-9
         assert abs(float(row["query_ms[bloom_off]"]) - 22.0) < 1e-9
-        assert abs(float(row["join_ms[bloom_off]"]) - 16.0) < 1e-9
+        assert abs(float(row["rest_ms[bloom_off]"]) - 16.0) < 1e-9
         assert row["decoder_in[bloom_on]"] != "" and row["decoder_in[bloom_off]"] != ""
         assert row["bloom_in[bloom_on]"] != ""
         # The plots: a set per variant (none of bloom_in/out for Bloom off) and the pictures with both
-        plots = env.folder / "plots"
+        plots = env.plots
         assert names(plots) == ["bloom_off", "bloom_on", "both"]
         assert pngs(plots / "bloom_on") == ON_PLOTS
         assert pngs(plots / "bloom_off") == OFF_PLOTS
@@ -229,13 +240,13 @@ def test_resume_skips_complete_points():
 def test_a_variant_added_later_runs_only_that_one():
     with Env() as env:
         assert env.threads("--bloom", "on")[0] == 0
-        assert names(env.folder / "bench_results") == ["bloom_on"]
-        assert names(env.folder / "plots") == ["bloom_on"]  # No picture of both with one variant
+        assert names(env.results) == ["bloom_on", "summary.csv"]
+        assert names(env.plots) == ["bloom_on"]  # No picture of both with one variant
         assert [c[0] for c in env.calls()] == ["on", "on"]
         code, out, err = env.threads("--bloom", "both")
         assert code == 0, err
         assert [c[0] for c in env.calls()] == ["on", "on", "off", "off"]
-        assert pngs(env.folder / "plots" / "both") == BOTH_PLOTS
+        assert pngs(env.plots / "both") == BOTH_PLOTS
 
 
 def test_bloom_off_only():
@@ -243,7 +254,7 @@ def test_bloom_off_only():
         code, out, err = env.threads("--bloom", "off")
         assert code == 0, err
         assert [c[0] for c in env.calls()] == ["off", "off"]
-        plots = env.folder / "plots"
+        plots = env.plots
         assert names(plots) == ["bloom_off"] and pngs(plots / "bloom_off") == OFF_PLOTS
         assert "no plot of bloom" not in err  # expected without the filter: silent
         assert read_summary(env.folder)[0][1:] == [f"{m}[bloom_off]" for m in MEASURE_NAMES if m not in ON_ONLY]
@@ -253,20 +264,20 @@ def test_plots_only_replots_without_running():
     with Env() as env:
         assert env.threads()[0] == 0
         n = len(env.calls())
-        shutil.rmtree(env.folder / "plots")
-        (env.folder / "summary.csv").unlink()
-        code, out, err = env.sweep(sweep_threads, "--plots-only", "--folder", str(env.folder), folder=False)
+        shutil.rmtree(env.plots)
+        (env.results / "summary.csv").unlink()
+        code, out, err = env.sweep(sweep_threads, "--plots-only", "--resume", str(env.folder), folder=False)
         assert code == 0, err
         assert len(env.calls()) == n
-        assert pngs(env.folder / "plots" / "both") == BOTH_PLOTS and pngs(env.folder / "plots" / "bloom_on")
-        assert (env.folder / "summary.csv").exists()
+        assert pngs(env.plots / "both") == BOTH_PLOTS and pngs(env.plots / "bloom_on")
+        assert (env.results / "summary.csv").exists()
         assert len(table_rows(out, ("1", "2"))) == 4
         # --bloom selects what is plotted
-        shutil.rmtree(env.folder / "plots")
-        code, out, err = env.sweep(sweep_threads, "--plots-only", "--bloom", "off", "--folder", str(env.folder),
+        shutil.rmtree(env.plots)
+        code, out, err = env.sweep(sweep_threads, "--plots-only", "--bloom", "off", "--resume", str(env.folder),
                                    folder=False)
         assert code == 0, err
-        assert names(env.folder / "plots") == ["bloom_off"]
+        assert names(env.plots) == ["bloom_off"]
 
 
 def test_failure_stops_and_resumes():
@@ -276,11 +287,11 @@ def test_failure_stops_and_resumes():
         assert "wrong result" in err and "remove" in err
         # The first point's on variant is done, its off variant failed (its folder is kept), nothing after it ran
         assert env.calls() == [["on", "1"], ["off", "1"]]
-        assert (env.folder / "bench_results" / "bloom_on" / "threads_01" / "bench.yaml").exists()
-        failed = env.folder / "bench_results" / "bloom_off" / "threads_01"
+        assert (env.results / "bloom_on" / "threads_01" / "bench.yaml").exists()
+        failed = env.results / "bloom_off" / "threads_01"
         assert (failed / "stdout.log").exists()
-        assert not (env.folder / "bench_results" / "bloom_on" / "threads_02").exists()
-        assert not (env.folder / "plots").exists()
+        assert not (env.results / "bloom_on" / "threads_02").exists()
+        assert not (env.plots).exists()
         # Running again says the failed folder has to be removed; nothing runs
         code, out, err = env.threads()
         assert code == 1 and "remove" in err and len(env.calls()) == 2
@@ -300,45 +311,79 @@ def test_other_parameters_or_wrong_variant_are_refused():
         code, out, err = env.sweep(sweep_threads, "--threads-list", "1", "2", "--ssize", "200", "--rsize", "1000")
         assert code == 1 and "other parameters" in err and len(env.calls()) == n
         # Results of Bloom on that sit where Bloom off belongs (runtime_bloom is compared)
-        br = env.folder / "bench_results"
+        br = env.results
         shutil.copytree(br / "bloom_on", br / "bloom_off")
         code, out, err = env.threads("--bloom", "off")
         assert code == 1 and "runtime_bloom" in err and len(env.calls()) == n
 
 
-def test_old_layout_from_a_run_plots_as_bloom_on_and_is_not_continued():
+def test_new_experiment_folder_is_type_date_time_with_results_and_plots_apart():
     with Env() as env:
-        assert env.threads("--bloom", "on")[0] == 0
-        br = env.folder / "bench_results"
-        for d in (br / "bloom_on").iterdir():  # What the sweeps wrote before --bloom
-            shutil.move(str(d), str(br / d.name))
-        (br / "bloom_on").rmdir()
-        shutil.rmtree(env.folder / "plots")
-        (env.folder / "summary.csv").unlink()
-        n = len(env.calls())
-        code, out, err = env.sweep(sweep_threads, "--plots-only", "--folder", str(env.folder), folder=False)
+        out_dir = env.tmp / "experiments"
+        code, out, err = env.sweep(sweep_threads, "--threads-list", "1", "2", "--ssize", "100", "--rsize", "1000",
+                                   "--results-dir", str(out_dir), folder=False)
         assert code == 0, err
-        assert names(env.folder / "plots") == ["bloom_on"] and pngs(env.folder / "plots" / "bloom_on") == ON_PLOTS
-        assert read_summary(env.folder)[0][1] == "query_ms[bloom_on]" and len(read_summary(env.folder)) == 3
-        # --bloom off: nothing to plot, an error and not a crash
-        code, out, err = env.sweep(sweep_threads, "--plots-only", "--bloom", "off", "--folder", str(env.folder),
-                                   folder=False)
-        assert code == 1 and "no complete results" in err
-        # Not continued: it would mix the layouts
+        (folder,) = list(out_dir.iterdir())
+        assert re.fullmatch(r"threads_\d{8}_\d{6}", folder.name), folder.name
+        assert names(folder) == ["plots", "results"]
+        assert names(folder / "results") == ["bloom_off", "bloom_on", "summary.csv"]
+        assert names(folder / "plots") == ["bloom_off", "bloom_on", "both"]
+        assert f"experiment: {folder}" in out
+        # Nothing but the plots in plots/, nothing but results in results/
+        assert {p.suffix for p in (folder / "plots").rglob("*") if p.is_file()} == {".png"}
+        assert not list((folder / "results").rglob("*.png"))
+    # Two experiments of a type started in the same second do not share a folder
+    with tempfile.TemporaryDirectory() as tmp:
+        a = bench.create_experiment_folder("egress", tmp)
+        b = bench.create_experiment_folder("egress", tmp)
+        assert a != b and b.name.startswith(a.name) and a.is_dir() and b.is_dir()
+        assert re.fullmatch(r"egress_\d{8}_\d{6}", a.name)
+
+
+def test_data_is_generated_in_a_temporary_directory_that_is_removed():
+    with Env() as env:
+        assert env.threads()[0] == 0
+        # One directory below --tmp-dir for the whole sweep, shared by its points (and variants), gone afterwards
+        assert len(env.data_dirs) == 4 and len(set(env.data_dirs)) == 1
+        (data_dir,) = set(env.data_dirs)
+        assert data_dir.parent == env.tmp_base and data_dir.name.startswith(bench.TMP_PREFIX)
+        assert not data_dir.exists() and names(env.tmp_base) == []
+        # Another sweep: another directory, again removed
+        assert env.sweep(sweep_threads, "--threads-list", "1", "2", "4", "--ssize", "100", "--rsize", "1000")[0] == 0
+        assert len(env.data_dirs) == 6 and env.data_dirs[-1] != data_dir and names(env.tmp_base) == []
+        # Nothing to run (all points exist): no temporary directory is even created
+        n = len(env.data_dirs)
+        assert env.sweep(sweep_threads, "--threads-list", "1", "2", "4", "--ssize", "100", "--rsize", "1000")[0] == 0
+        assert len(env.data_dirs) == n
+
+
+def test_temporary_data_is_removed_after_a_failure():
+    with Env(wrong_off=True) as env:
         code, out, err = env.threads()
-        assert code == 1 and "older sweep" in err and len(env.calls()) == n
-        assert names(br) == ["threads_01", "threads_02"]
+        assert code == 1 and len(env.data_dirs) == 2
+        assert not env.data_dirs[0].exists() and names(env.tmp_base) == []
 
 
-def test_generate_only_touches_nothing_else():
-    """A real tiny dataset (gen_data, no FPGA): the files of every point, no results folder"""
+def test_real_generation_goes_to_the_temporary_directory_and_is_removed():
+    """gen_data for real (tiny, no FPGA): the fake CLI's numbers do not match, so the point fails, and the files
+    are gone with the directory"""
     with Env() as env:
         bench.make_dataset = env._saved["make_dataset"]  # the real one
-        code, out, err = env.sweep(sweep_probe_size, "--min-exp", "12", "--max-exp", "13", "--ssize", "1000",
-                                   "--generate-only", "--bloom", "both", folder=False)
-        assert code == 0, err
-        assert len(list((env.tmp / "d").glob("probe_*.parquet"))) == 2
-        assert not env.folder.exists() and env.calls() == []
+        seen = []
+        real = bench.make_dataset
+
+        def spy(params, data_dir, log=print):
+            dataset = real(params, data_dir, log=log)
+            seen.append((Path(data_dir), dataset.build_path, dataset.probe_path))
+            assert dataset.build_path.exists() and dataset.probe_path.parent == Path(data_dir)
+            return dataset
+        bench.make_dataset = spy
+        code, out, err = env.sweep(sweep_probe_size, "--min-exp", "12", "--max-exp", "12", "--ssize", "1000",
+                                   "--threads", "1", "--bloom", "on")
+        assert code == 1 and seen, err
+        data_dir, build, probe = seen[0]
+        assert data_dir.parent == env.tmp_base and not data_dir.exists()
+        assert not build.exists() and not probe.exists() and names(env.tmp_base) == []
 
 
 def test_help_mentions_bloom_in_every_script():
@@ -381,19 +426,19 @@ def point_measures(i, bloom):
     """Fake numbers of the i-th point: the filter makes the query faster, the decoder is slower without it"""
     base = 10.0 + 4 * i
     if bloom:
-        host = {"query_ms": base, "scan_ms": 0.4 * base, "join_ms": 0.6 * base}
+        host = {"query_ms": base, "scan_ms": 0.4 * base, "rest_ms": 0.6 * base}
         return {"host": host, "decoder": {"in_gbps": 3.0 + 0.1 * i, "out_gbps": 4.0 + 0.1 * i},
                 "bloom": {"in_gbps": 6.0 + 0.1 * i, "out_gbps": 2.0}}
-    host = {"query_ms": 1.8 * base, "scan_ms": 0.5 * base, "join_ms": 1.3 * base}
+    host = {"query_ms": 1.8 * base, "scan_ms": 0.5 * base, "rest_ms": 1.3 * base}
     return {"host": host, "decoder": {"in_gbps": 2.5 + 0.2 * i, "out_gbps": 3.0 + 0.2 * i}, "bloom": None}
 
 
-def write_sweep(folder, module, xs, other, variants=("bloom_on", "bloom_off"), legacy=False):
-    """The bench_results/ of a sweep of `module` with the points xs, point i as point_measures(i, ...)"""
+def write_sweep(folder, module, xs, other, variants=("bloom_on", "bloom_off")):
+    """The results/ of a sweep of `module` with the points xs, point i as point_measures(i, ...)"""
     yaml_name = sweep_lib.PARAM_YAML[module.SWEEP.swept]
     for variant in variants:
         for i, x in enumerate(xs):
-            where = Path(folder) / "bench_results" / ("" if legacy else variant) / module.SWEEP.folder_of(x)
+            where = Path(folder) / "results" / variant / module.SWEEP.folder_of(x)
             params = dict(other, **{yaml_name: x, "runtime_bloom": variant == "bloom_on"})
             write_point(where, params, point_measures(i, variant == "bloom_on"))
 
@@ -403,7 +448,7 @@ def test_all_five_sweeps_plot_from_results():
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp) / "f"
             write_sweep(folder, module, xs, other)
-            code, out, err = run_main(module, ["--plots-only", "--folder", str(folder)] + (
+            code, out, err = run_main(module, ["--plots-only", "--resume", str(folder)] + (
                 ["--link-gbps", "12.5"] if module is sweep_egress else []))
             assert code == 0, (module.__name__, err)
             plots = folder / "plots"
@@ -429,9 +474,9 @@ def test_variant_missing_for_some_points_and_empty_bloom_off_measures():
         write_sweep(folder, module, xs, other, variants=("bloom_on",))
         # off: only the first point
         yaml_name = sweep_lib.PARAM_YAML[module.SWEEP.swept]
-        write_point(folder / "bench_results" / "bloom_off" / module.SWEEP.folder_of(xs[0]),
+        write_point(folder / "results" / "bloom_off" / module.SWEEP.folder_of(xs[0]),
                     dict(other, **{yaml_name: xs[0], "runtime_bloom": False}), point_measures(0, False))
-        code, out, err = run_main(module, ["--plots-only", "--folder", str(folder)])
+        code, out, err = run_main(module, ["--plots-only", "--resume", str(folder)])
         assert code == 0, err
         table = read_summary(folder)
         header = table[0]
@@ -439,38 +484,6 @@ def test_variant_missing_for_some_points_and_empty_bloom_off_measures():
         assert row["query_ms[bloom_on]"] != "" and row["query_ms[bloom_off]"] == ""
         assert pngs(folder / "plots" / "both") == BOTH_PLOTS
         assert len(table_rows(out, {"131072", "262144", "1048576"})) == 4
-
-
-def test_old_layout_results_plot_as_bloom_on():
-    for module, xs, other in CASES:
-        with tempfile.TemporaryDirectory() as tmp:
-            folder = Path(tmp) / "f"
-            write_sweep(folder, module, xs, other, variants=("bloom_on",), legacy=True)
-            assert sweep_lib.is_legacy_layout(folder / "bench_results")
-            code, out, err = run_main(module, ["--plots-only", "--folder", str(folder)])
-            assert code == 0, (module.__name__, err)
-            assert names(folder / "plots") == ["bloom_on"]
-            assert pngs(folder / "plots" / "bloom_on") == ON_PLOTS
-            header = read_summary(folder)[0]
-            assert header[1] == "query_ms[bloom_on]" and not any("bloom_off" in h for h in header)
-
-
-def test_old_layout_of_the_real_results_if_present():
-    """The folders of earlier sweeps in results/ (written before --bloom) still plot, in a copy"""
-    modules = {"probe_size": sweep_probe_size, "build_size": sweep_build_size, "columns": sweep_columns,
-               "egress": sweep_egress, "threads": sweep_threads}
-    for src in sorted((BENCH_DIR / "results").glob("*_2*")):
-        if not (src / "bench_results").is_dir() or sweep_lib.is_legacy_layout(src / "bench_results") is False:
-            continue
-        module = next((m for k, m in modules.items() if src.name.startswith(k + "_")), None)
-        if module is None:
-            continue
-        with tempfile.TemporaryDirectory() as tmp:
-            shutil.copytree(src / "bench_results", Path(tmp) / "bench_results")
-            code, out, err = run_main(module, ["--plots-only", "--folder", tmp])
-            assert code == 0, (src.name, err)
-            assert (Path(tmp) / "plots" / "bloom_on" / "query_ms.png").exists()
-        return  # one is enough
 
 
 def _capture_figures(plot_utils):
@@ -526,7 +539,7 @@ def test_egress_uncapped_point_is_plotted_at_the_link_speed():
         bench_data = sweep_lib._load_celeris_module("bench_data")
         module.LINK_GBPS = 10.0  # as --link-gbps sets it
         try:
-            results = sweep_lib.collect(module.SWEEP, bench_data, Path(tmp) / "bench_results", "median",
+            results = sweep_lib.collect(module.SWEEP, bench_data, Path(tmp) / "results", "median",
                                         sweep_lib.VARIANTS)
             assert results.xs == [1.0, 2.0, 4.0, 0.0] and results.num_runs == 3
             for v in sweep_lib.VARIANTS:
@@ -539,8 +552,8 @@ def test_egress_uncapped_point_is_plotted_at_the_link_speed():
 def test_breakdown_figure_content():
     plot_utils = sweep_lib._load_celeris_module("plot_utils")
     sweep = sweep_probe_size.SWEEP
-    values = {"on": {x: {"scan_ms": 5.0 + i, "join_ms": 3.0} for i, x in enumerate((1024, 2048, 4096))},
-              "off": {x: {"scan_ms": 6.0, "join_ms": 10.0 + i} for i, x in enumerate((1024, 2048, 4096))}}
+    values = {"on": {x: {"scan_ms": 5.0 + i, "rest_ms": 3.0} for i, x in enumerate((1024, 2048, 4096))},
+              "off": {x: {"scan_ms": 6.0, "rest_ms": 10.0 + i} for i, x in enumerate((1024, 2048, 4096))}}
     results = sweep_lib.Results([1024, 2048, 4096], values, list(sweep_lib.VARIANTS), 3)
     captured, restore = _capture_figures(plot_utils)
     try:
