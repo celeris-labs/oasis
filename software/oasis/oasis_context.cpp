@@ -170,20 +170,31 @@ std::shared_ptr<libstf::Buffer> OasisContext::allocate_output_buffer(size_t size
     size_t capacity = ((std::max<size_t>(size, 1) + libstf::BYTES_PER_FPGA_TRANSFER - 1) /
                        libstf::BYTES_PER_FPGA_TRANSFER) *
                       libstf::BYTES_PER_FPGA_TRANSFER;
+    auto           pool = output_memory_pool_ ? output_memory_pool_ : memory_pool_;
     void          *ptr;
-    libstf::Status status = memory_pool_->allocate(capacity, &ptr);
+    libstf::Status status = pool->allocate(capacity, &ptr);
     if (!status.ok()) {
         std::ostringstream msg;
         msg << "OasisContext::allocate_output_buffer could not allocate a " << capacity
             << " byte output buffer: " << status.message();
         throw std::runtime_error(msg.str());
     }
-    return libstf::make_buffer(memory_pool_, ptr, size, capacity);
+    return libstf::make_buffer(pool, ptr, size, capacity);
 }
 
 void OasisContext::enqueue_output_buffer(libstf::stream_t stream, libstf::Buffer &buffer) {
-    tlb_manager_->ensure_tlb_mapping(reinterpret_cast<std::byte *>(buffer.ptr), buffer.capacity);
+    auto &tlb = output_tlb_manager_ ? output_tlb_manager_ : tlb_manager_;
+    tlb->ensure_tlb_mapping(reinterpret_cast<std::byte *>(buffer.ptr), buffer.capacity);
     mem_config_->enqueue_buffer(stream, buffer);
+}
+
+void OasisContext::set_output_memory_pool(std::shared_ptr<libstf::MemoryPool> pool) {
+    output_memory_pool_ = pool;
+    output_tlb_manager_ = pool ? std::make_shared<libstf::TLBManager>(cthread_, pool) : nullptr;
+}
+
+std::shared_ptr<libstf::TLBManager> OasisContext::output_tlb_manager() {
+    return output_tlb_manager_;
 }
 
 void OasisContext::handle_interrupt(int value) {
