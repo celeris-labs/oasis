@@ -5,8 +5,8 @@
     ./sweep_egress.py --resume results/egress_20261013_101530   # continue that experiment
 
 runs the benchmark (bench.py) with oasis_emulated_egress_gbps set to each of --caps GB/s (default 1 2 3 4 6 8 10),
-then once without a cap, one after the other, with build size 2^20 and probe size 2^24 rows, uniform probe keys
-(zipf 0), all keys matching (so everything is output) and 2 payload columns. Then it plots the results
+then once without a cap, one after the other, with build size 2^16 and probe size 2^24 rows, uniform probe keys
+(zipf 0), 1% of the keys matching (so the Bloom filter can remove most of the output) and 2 payload columns. Then it plots the results
 (plot_utils.py) over the cap in GB/s; the point without a cap is the link's own speed and is plotted as the last
 point at --link-gbps (default 12.5). The experiment folder gets this structure (results and plots are separate folders):
 
@@ -16,16 +16,17 @@ point at --link-gbps (default 12.5). The experiment folder gets this structure (
         results/summary.csv                               one row per point, both variants side by side
         plots/bloom_on/, plots/bloom_off/                 one plot per measure and variant
         plots/both/                                       both variants in one picture per measure,
-                                                          and query_breakdown.png
+                                                          decoder_in_out.pdf (input and output in one
+                                                          plot) and query_breakdown.pdf
 
 The cap is software-only: the scheduler holds back new flows so that the output the hardware writes averages at
 most that many GB/s. Every point is the median over the measured runs (--agg changes that).
 
---bloom {on,off,both} (default: both) chooses the variants: the Bloom filter on, off (a plain join of two
-read_oasis scans), or both, which runs the two variants of a point back to back and plots them side by side
+--bloom {on,off,both} (default: both) chooses the variants: the hardware Bloom filter on, off (then DuckDB's own join
+Bloom filter filters the scans: oasis_duckdb_bloom_filter), or both, which runs the two variants of a point back to back and plots them side by side
 (plots/both/). Bloom off has no Bloom filter throughput (bloom_in, bloom_out), so those are only plotted for on.
 
-The Parquet files are generated into a temporary directory (--tmp-dir) when the sweep starts and removed when it
+The Parquet files are generated into a temporary directory (--tmp-dir, default /dev/shm: RAM) when the sweep starts and removed when it
 ends; nothing is kept between sweeps.
 
 The sweep stops at the first failure. Run it again with `--resume <experiment folder>` to continue: complete points
@@ -45,7 +46,7 @@ SWEEP = sweep_lib.Sweep(
     experiment="egress",
     swept="egress_gbps",
     x_header="egress GB/s",
-    x_label="Egress cap (GB/s; last point: no cap, plotted at the link speed)",
+    x_label="Egress cap (GB/s)",  # the last point, "off", is the link speed (--link-gbps)
     xscale="linear",
     folder_of=lambda cap: "egress_off" if cap == 0 else f"egress_{cap:g}",
     x_text=lambda cap: "off" if cap == 0 else f"{cap:g}",

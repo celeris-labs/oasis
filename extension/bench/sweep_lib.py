@@ -10,10 +10,13 @@ probe_size, build_size, columns, egress or threads), with the results and the pl
         results/bloom_on/<point>/           one folder per point and variant, as written by bench.py
         results/bloom_off/<point>/
         results/summary.csv                 one row per point, the measures of both variants side by side
-        plots/bloom_on/<measure>.png        one plot per measure and variant
-        plots/bloom_off/<measure>.png
-        plots/both/<measure>.png            both variants as two lines (Bloom on and off), one picture per measure
-        plots/both/query_breakdown.png      scan and rest of the query, stacked, per point (also in plots/bloom_on and bloom_off)
+        plots/bloom_on/<measure>.pdf        one plot per measure and variant (all plots are PDF)
+        plots/bloom_off/<measure>.pdf
+        plots/bloom_on/decoder_in_out.pdf   the input and output of the decoder (and, with Bloom on, of the Bloom
+        plots/bloom_on/bloom_in_out.pdf     filter: bloom_in_out.pdf) in one plot; also in plots/bloom_off
+        plots/both/<measure>.pdf            both variants as two lines (Bloom on and off), one picture per measure
+        plots/both/decoder_in_out.pdf       input and output of both variants: four lines
+        plots/both/query_breakdown.pdf      scan and rest of the query, stacked, per point (also in plots/bloom_on and bloom_off)
 
 The Parquet files are generated into a temporary directory when the sweep starts (a point needs them) and removed
 when it ends, also after a failure or Ctrl-C: nothing is kept between sweeps. Within one sweep the points share what
@@ -35,6 +38,16 @@ Measures (every point is the aggregate, by default the median, over the measured
                     the probe scan starts and when the query ends: the rate over the probe side only, from its
                     first beat to the last handshake, idle cycles between flows included)  decoder.in_gbps
     decoder_out     the same for its output                                               decoder.out_gbps
+    decoder_starved the decoder's cycles during the probe in which it had no input beat (waiting for the
+                    host's data; the decoder's StreamProfiler, input side)               decoder.in.starved_cycles
+    decoder_stalled the cycles in which it had an input beat but its consumer did not take the output (back
+                    pressure from the Bloom filter / output writer)                       decoder.in.stalled_cycles
+    decoder_wait    the share of the decoder's cycles during the probe in which it waited for input: starved
+                    (no beat within a column chunk) + idle (between column chunks), in % of all its cycles
+                    (handshake + starved + stalled + idle, the whole profiled window)    decoder_wait_pct()
+    egress_mb       the bytes the FPGA sends to the host for the probe side, in MB: with the filter on, its own
+                    output (kept keys, materialized columns, mask); off, everything the decoder outputs. The
+                    difference between the variants is the egress the filter saves (plots/both/egress_saved_*)  egress_mb()
     bloom_in        the Bloom filter's input (probe keys and columns to materialize) during the probe: from the
                     first probe key beat to the last output (hardware performance counters; only with the
                     filter on)                                                            bloom.in_gbps
@@ -45,6 +58,8 @@ Times are the host's view, throughputs the hardware's. README.md has the exact d
 Plots: the y axis starts at zero. Every measure gets a plot per variant that has it (bloom_in and bloom_out only
 exist with the filter on, so there is no Bloom-off plot of them) and, if both variants have results, one picture
 with both lines in plots/both/ (not for bloom_in and bloom_out: one line, it would be the Bloom-on plot again).
+An input and its output (decoder_in/decoder_out, bloom_in/bloom_out) are also drawn together in one plot, with the
+legend at the bottom right. Every axis has its label, in the font of the title.
 
 A sweep stops at the first failure (a failed or hung run can leave the device in a bad state). Run it again to
 continue: `--resume <experiment folder>` runs the points that are missing (complete points are skipped, after
@@ -88,30 +103,67 @@ PARAM_YAML = {
     "ssize": "s_size", "rsize": "r_size", "matchratio": "match_ratio", "zipffactor": "zipf_factor",
     "columns": "materialized_columns", "batchsize": "batch_size", "numbatches": "num_batches",
     "compression": "compression", "encoding": "encoding", "runtime_bloom": "runtime_bloom",
-    "egress_gbps": "emulated_egress_gbps", "threads": "threads",
+    "egress_gbps": "emulated_egress_gbps", "threads": "threads", "scale_factor": "scale_factor",
 }
 
 # What every sweep fixes unless it sweeps it itself (the options of every sweep change them): uniform probe keys
 # (Zipf 1 is one hot bank, which limits the probe), all probe keys match, uncompressed files
-BASE_FIXED = {"ssize": 1 << 20, "rsize": 1 << 24, "columns": 2, "matchratio": 1.0, "zipffactor": 0.0,
+BASE_FIXED = {"ssize": 1 << 16, "rsize": 1 << 24, "columns": 2, "matchratio": 0.01, "zipffactor": 0.0,
               "compression": "uncompressed", "encoding": "auto", "egress_gbps": 0.0, "threads": None,
               "batchsize": 120000, "runtime_bloom": True}
 
-# name of the measure, the dotted path in a measured run, unit (the y label of the plot), title, decimals, header
+# The fixed parameters of the synthetic sweeps that have an option (the swept one has none); the same number of
+# columns as the options of bench.py
+FIXED_OPTIONS = ("ssize", "rsize", "columns", "matchratio", "zipffactor", "compression", "egress_gbps", "threads",
+                  "batchsize")
+
+
+def decoder_wait_pct(run):
+    """Starved + idle cycles of the decoder's input in % of all its cycles in the probe window (a measured run)"""
+    c = run["decoder"]["in"]
+    return 100.0 * (c["starved_cycles"] + c["idle_cycles"]) / c["cycles"] if c["cycles"] else 0.0
+
+
+def egress_mb(run):
+    """What the FPGA sends to the host for the probe side, in MB (10^6 B), of a measured run. With the Bloom filter on:
+    the filter's own output (kept keys, materialized columns, the mask). Off: everything the decoder outputs for
+    the probe. (The build side is the same in both and not counted. A column that the filter does not materialize
+    would come as a decoded bypass transfer and is not in the Bloom-on number: the benchmark has none.)"""
+    bloom = run.get("bloom")
+    if bloom:
+        return bloom["out_bytes"] / 1e6
+    return run["decoder"]["out"]["bytes"] / 1e6
+
+
+# name of the measure, the dotted path in a measured run (or a function of one), unit (the y label of the plot),
+# title, decimals, header
 MEASURES = [
-    ("query_ms", "host.query_ms", "ms", "Total query time (host)", 2, "query"),
-    ("scan_ms", "host.scan_ms", "ms", "Total scan time (host)", 2, "scan"),
-    ("rest_ms", "host.rest_ms", "ms", "Rest of the query = total - scan (host)", 2, "rest"),
-    ("decoder_in", "decoder.in_gbps", "GB/s", "Decoder input throughput during probe (hardware)", 3, "decoder in"),
-    ("decoder_out", "decoder.out_gbps", "GB/s", "Decoder output throughput during probe (hardware)", 3,
+    ("query_ms", "host.query_ms", "ms", "Total query time", 2, "query"),
+    ("scan_ms", "host.scan_ms", "ms", "Total scan time", 2, "scan"),
+    ("rest_ms", "host.rest_ms", "ms", "Rest of the query (total - scan)", 2, "rest"),
+    ("decoder_in", "decoder.in_gbps", "GB/s", "Decoder input throughput", 3, "decoder in"),
+    ("decoder_out", "decoder.out_gbps", "GB/s", "Decoder output throughput", 3,
      "decoder out"),
-    ("bloom_in", "bloom.in_gbps", "GB/s", "Bloom filter input throughput during probe (hardware)", 3, "bloom in"),
-    ("bloom_out", "bloom.out_gbps", "GB/s", "Bloom filter output throughput during probe (hardware)", 3,
+    ("decoder_starved", "decoder.in.starved_cycles", "cycles", "Decoder starved cycles", 0, "dec starved"),
+    ("decoder_stalled", "decoder.in.stalled_cycles", "cycles", "Decoder stalled cycles", 0, "dec stalled"),
+    ("decoder_wait", decoder_wait_pct, "% of cycles", "Decoder waiting for input", 1,
+     "dec wait %"),
+    ("egress_mb", egress_mb, "MB", "Data sent from the FPGA to the host", 2, "egress MB"),
+    ("bloom_in", "bloom.in_gbps", "GB/s", "Bloom filter input throughput", 3, "bloom in"),
+    ("bloom_out", "bloom.out_gbps", "GB/s", "Bloom filter output throughput", 3,
      "bloom out"),
 ]
 X_WIDTH = 12
 WIDTH = 12
 BLOOM_WIDTH = 5  # the column of the variant in the table
+MEASURES_UNIT = {m[0]: m[2] for m in MEASURES}
+
+# Plots of an input and an output measure in one picture: (file name, input measure, output measure, title, name
+# of the legend entries)
+IN_OUT_PLOTS = [
+    ("decoder_in_out", "decoder_in", "decoder_out", "Decoder throughput", "Decoder"),
+    ("bloom_in_out", "bloom_in", "bloom_out", "Bloom filter throughput", "Bloom filter"),
+]
 
 # Only measured with the Bloom filter on: there is no plot of them for Bloom off, and no picture with both variants
 BLOOM_ONLY = ("bloom_in", "bloom_out")
@@ -129,8 +181,17 @@ class Variant:
     linestyle: str
 
 
-ON = Variant("on", "bloom_on", True, "Bloom filter on", "#2a78d6", "o", "-")
-OFF = Variant("off", "bloom_off", False, "Bloom filter off", "#d55e00", "s", "--")
+@dataclass(frozen=True)
+class Style:
+    """How a line that is not a variant is drawn (plot_lines only needs these four)"""
+    label: str
+    color: str
+    marker: str
+    linestyle: str
+
+
+ON = Variant("on", "bloom_on", True, "HW Bloom filter on", "#2a78d6", "o", "-")
+OFF = Variant("off", "bloom_off", False, "HW Bloom filter off", "#d55e00", "s", "--")
 VARIANTS = (ON, OFF)
 BLOOM_CHOICES = ("on", "off", "both")
 
@@ -153,6 +214,7 @@ class Sweep:
     folder_of: Callable[[float], str]        # Name of the folder of a point, below results/<variant>/
     fixed: dict = field(default_factory=dict)  # Defaults of the fixed parameters that differ from BASE_FIXED
     doc: str = ""                            # The epilog of --help
+    x_pow2: bool = False                     # Label the X axis 2^n: for sizes in rows, not for counts or caps
     # A point whose value is not where it belongs on the axis (the egress cap 0 is "off", which is the link's own
     # speed): the text of a point in the table, where to plot it, and the order of the points
     x_text: Optional[Callable[[float], str]] = None
@@ -160,6 +222,12 @@ class Sweep:
     sort_key: Optional[Callable[[float], object]] = None
     # Parameters of every point that depend on all points: {name: value} from the list of points
     extra_params_of: Optional[Callable[[list], dict]] = None
+    # What the points run (bench.Workload, default: the synthetic join), which of its parameters the sweep keeps
+    # fixed with an option of the command line, and what the temporary directory needs room for
+    workload: bench.Workload = bench.SYNTHETIC
+    options: tuple = FIXED_OPTIONS
+    timeout: Optional[float] = None  # default of --timeout (None: bench.BENCH_DEFAULTS), for points that run long
+    tmp_need: str = "8 B x probe rows x (1 + columns)"
 
     def text(self, x):
         if self.x_text:
@@ -252,7 +320,7 @@ def collect(sweep, bench_data, results_dir, agg, variants):
     found = load_variant_runs(bench_data, results_dir, variants)
     if not any(found.values()):
         raise bench.BenchmarkError(f"no complete results in {results_dir}"
-                                   + ("" if len(variants) > 1 else f" for {variants[0].label.lower()}"))
+                                   + ("" if len(variants) > 1 else f" for {variants[0].label}"))
     reduce = bench_data.AGGREGATIONS[agg]
     x_of = lambda r: r.params[PARAM_YAML[sweep.swept]]
     values, xs, num_runs = {}, set(), None
@@ -332,45 +400,19 @@ def write_summary(sweep, results, path):
 # Plots (plot_utils.py draws one line; these draw one or two, in the same style)
 # ---------------------------------------------------------------------------
 
-def _check_xs(xs, xscale):
-    if xscale not in ("linear", "log"):
-        raise ValueError(f"xscale has to be 'linear' or 'log', not {xscale!r}")
-    if xscale == "log" and min(xs) <= 0:
-        raise ValueError(f"a log x scale needs x > 0, but x has {min(xs)}")
+# The title, the axis labels and the tick labels are all drawn in one font size, plot_utils.TITLE_FONTSIZE. The legend of
+# the stacked bars has four entries and sits above the bars: it was 8 pt, too small to read
+BREAKDOWN_LEGEND_SIZE = 10
 
 
-def plot_lines(plot_utils, lines, xlabel, ylabel, title, path, xscale="linear"):
-    """Variants over x, one line with markers each, written to `path` (the format is its extension). The figure
-    size, style, ticks and the y axis from zero are those of plot_utils.
+def plot_lines(plot_utils, lines, xlabel, ylabel, title, path, xscale="linear", legend_loc="best", pow2_x=False):
+    """Variants over x, one line with markers each, written to `path` (a .pdf). Drawn by plot_utils.plot_lines, so
+    these plots look like those of the celeris example's sweeps.
 
-    lines: [(Variant, x values, y values), ...]. With more than one a legend names them. Returns the Path"""
-    lines = [(v, list(x), list(y)) for v, x, y in lines]
-    if not lines or any(not x or len(x) != len(y) for _v, x, y in lines):
-        raise ValueError("nothing to plot, or x and y of a line differ in length")
-    all_x = [x for _v, xs, _y in lines for x in xs]
-    _check_xs(all_x, xscale)
-    path, fmt = plot_utils._check_path(path)
-    pu = plot_utils
-
-    fig, ax = pu.plt.subplots(figsize=pu.FIGURE_SIZE, facecolor=pu.SURFACE)
-    for v, x, y in lines:
-        ax.plot(x, y, color=v.color, linestyle=v.linestyle, linewidth=1.8, marker=v.marker, markersize=7,
-                markerfacecolor=v.color, markeredgecolor=pu.SURFACE, markeredgewidth=1.5, label=v.label)
-    ax.set_xscale(xscale)  # Before the ticks: it resets them
-    if len(set(all_x)) <= pu.MAX_LABELLED_TICKS:
-        ticks = sorted(set(all_x))  # Few points: label each of them, rather than a round number nearby
-        labels = [pu._number_label(t) for t in ticks]
-        crowded = len(ticks) > 5 and max(map(len, labels)) > 5  # 131,072 ... 67,108,864 would overlap
-        ax.set_xticks(ticks, labels, rotation=45 if crowded else 0, ha="right" if crowded else "center")
-        ax.minorticks_off()
-    ax.set_ylim(0, max(max(y) for _v, _x, y in lines) * 1.1 or 1e-9)
-    pu._style_axes(ax, xlabel, ylabel, title)
-    if len(lines) > 1:
-        legend = ax.legend(loc="best", frameon=True, facecolor=pu.SURFACE, edgecolor=pu.GRID, fontsize=9)
-        for text in legend.get_texts():
-            text.set_color(pu.INK_PRIMARY)
-    fig.tight_layout()
-    return pu._save(fig, path, fmt)
+    lines: [(Variant or Style, x values, y values), ...]. With more than one a legend names them. Returns the Path"""
+    series = [(v.label, x, y, v.color, v.marker, v.linestyle) for v, x, y in lines]
+    return plot_utils.plot_lines(series, xlabel, ylabel, title, path, xscale=xscale, legend_loc=legend_loc,
+                                 pow2_x=pow2_x)
 
 
 # The parts of a query in the breakdown: the tint of the variant's color, hatched, for the join
@@ -381,7 +423,7 @@ def plot_breakdown(plot_utils, sweep, results, title, path):
     """Per point, one stacked bar of scan time (bottom) and the rest (top) for each variant, side by side: the
     height is the total query time. The points are equally spaced and labelled, whatever their values"""
     pu = plot_utils
-    path, fmt = pu._check_path(path)
+    path = pu._check_path(path)
     variants = results.variants
     n, k = len(results.xs), len(variants)
     width = 0.8 / k
@@ -393,25 +435,42 @@ def plot_breakdown(plot_utils, sweep, results, title, path):
         rest = [results.value(v, x, "rest_ms") or 0.0 for x in results.xs]
         ax.bar(pos, scan, width * 0.9, color=v.color, edgecolor=pu.SURFACE, linewidth=0.8, label=f"{v.label}: scan")
         ax.bar(pos, rest, width * 0.9, bottom=scan, color=_BREAKDOWN_TINT[v.option], edgecolor=pu.SURFACE,
-               linewidth=0.8, label=f"{v.label}: rest of the query")
+               linewidth=0.8, label=f"{v.label}: rest")  # "rest of the query" at the larger legend size does not fit
         top = max([top] + [s + t for s, t in zip(scan, rest)])
-    labels = [sweep.text(x) for x in results.xs]
-    ax.set_xticks(range(n), labels, rotation=45 if n > 8 and max(map(len, labels)) > 4 else 0,
-                  ha="right" if n > 8 and max(map(len, labels)) > 4 else "center")
-    ax.tick_params(axis="x", labelsize=9 if n > 10 else 10)
+    pow2 = pu._pow2_labels(results.xs) if sweep.x_pow2 else None
+    labels = pow2 or [sweep.text(x) for x in results.xs]
+    ax.set_xticks(range(n), labels)  # Labels that overlap are turned afterwards (plot_utils._finish)
     ax.set_ylim(0, max(top * 1.3, 1e-9))  # Headroom for the legend
     pu._style_axes(ax, sweep.x_label, "ms", title)
-    legend = ax.legend(loc="upper left", ncol=2, frameon=True, facecolor=pu.SURFACE, edgecolor=pu.GRID, fontsize=8)
+    legend = ax.legend(loc="upper left", ncol=2, frameon=True, facecolor=pu.SURFACE, edgecolor=pu.GRID,
+                       fontsize=BREAKDOWN_LEGEND_SIZE)
     for text in legend.get_texts():
         text.set_color(pu.INK_PRIMARY)
-    fig.tight_layout()
-    return pu._save(fig, path, fmt)
+    pu._finish(fig, ax)
+    return pu._save(fig, path)
 
 
-def make_plots(sweep, plot_utils, results, plots_dir, fmt, agg):
+def _in_out_lines(plot_utils, results, sweep, variants, in_name, out_name, label):
+    """The lines of an input and an output measure of the given variants: [(Style, xs, ys), ...], input first. One
+    variant: the lines are named by direction; several: by direction and variant, with the variant's line style"""
+    pu = plot_utils
+    lines = []
+    for v in variants:
+        for name, word, color, marker in ((in_name, "in", pu.IN_COLOR, pu.IN_MARKER),
+                                          (out_name, "out", pu.OUT_COLOR, pu.OUT_MARKER)):
+            points = results.line(sweep, v, name)
+            if points:
+                several = len(variants) > 1
+                text = f"{label} {word}, {v.label}" if several else f"{label} {word}"
+                style = Style(text, color, marker, v.linestyle if several else "-")
+                lines.append((style, [x for x, _ in points], [y for _, y in points]))
+    return lines
+
+
+def make_plots(sweep, plot_utils, results, plots_dir, agg):
     """<plots_dir>/<variant>/<measure> for every variant, plots/both/<measure> and plots/both/query_breakdown if
-    there are two. Returns the paths written"""
-    subtitle = f"{agg} of {results.num_runs} runs"  # A second line: the titles are long
+    there are two, and the input and output measures together (IN_OUT_PLOTS) in the same folders. Returns the
+    paths written"""
     plots_dir = Path(plots_dir)
     written = []
     for v in results.variants:
@@ -419,12 +478,47 @@ def make_plots(sweep, plot_utils, results, plots_dir, fmt, agg):
             points = results.line(sweep, v, name)
             if not points:
                 if not (v is OFF and name in BLOOM_ONLY):  # The filter was off: nothing to plot, as expected
-                    print(f"warning: no plot of {name} for {v.label.lower()}: the results do not have it",
+                    print(f"warning: no plot of {name} for {v.label}: the results do not have it",
                           file=sys.stderr)
                 continue
             written.append(plot_lines(plot_utils, [(v, [x for x, _ in points], [y for _, y in points])],
-                                      sweep.x_label, unit, f"{title}\n{v.label}, {subtitle}",
-                                      plots_dir / v.folder / f"{name}.{fmt}", xscale=sweep.xscale))
+                                      sweep.x_label, unit,
+                                      # Only the Bloom-on variant has the filter's own measures: no variant line
+                                      title if name in BLOOM_ONLY else f"{title}\n{v.label}",
+                                      plots_dir / v.folder / f"{name}.pdf", xscale=sweep.xscale,
+                                      pow2_x=sweep.x_pow2))
+    # An input and its output in one picture, with the legend at the bottom right (where the lines are not)
+    for file_name, in_name, out_name, title, label in IN_OUT_PLOTS:
+        groups = [([v], f"{title}\n{v.label}") for v in results.variants]
+        if len(results.variants) > 1 and not (in_name in BLOOM_ONLY or out_name in BLOOM_ONLY):
+            groups.append((results.variants, title))
+        for variants, group_title in groups:
+            lines = _in_out_lines(plot_utils, results, sweep, variants, in_name, out_name, label)
+            if len(lines) < 2 * len(variants):
+                continue  # Not all of the measures are there (Bloom off has no filter): the single plots are enough
+            folder = variants[0].folder if len(variants) == 1 else "both"
+            # The title of a Bloom-only measure has no variant line: the filter is only there with Bloom on
+            written.append(plot_lines(plot_utils, lines, sweep.x_label, MEASURES_UNIT[in_name],
+                                      title if in_name in BLOOM_ONLY else group_title,
+                                      plots_dir / folder / f"{file_name}.pdf", xscale=sweep.xscale,
+                                      legend_loc="lower right", pow2_x=sweep.x_pow2))
+    # The egress the Bloom filter saves: the probe bytes sent to the host with the filter off minus with it on, in
+    # MB and as a share of the off bytes. Needs both variants
+    if len(results.variants) > 1:
+        saved = []
+        for x in results.xs:
+            on, off = results.value(ON, x, "egress_mb"), results.value(OFF, x, "egress_mb")
+            if on is not None and off:
+                saved.append((x, off - on, 100.0 * (1.0 - on / off)))
+        if saved:
+            xs = [x for x, _mb, _pct in saved]
+            for file_name, title, unit, ys in (
+                    ("egress_saved_mb", "Egress saved by the HW Bloom filter", "MB", [mb for _x, mb, _p in saved]),
+                    ("egress_saved_pct", "Egress bytes saved by the HW Bloom filter", "% of the bytes",
+                     [p for _x, _mb, p in saved])):
+                written.append(plot_lines(plot_utils, [(ON, xs, ys)], sweep.x_label, unit, title,
+                                          plots_dir / "both" / f"{file_name}.pdf", xscale=sweep.xscale,
+                                          pow2_x=sweep.x_pow2))
     # The breakdown of the query time (scan + rest) is always drawn: one figure per variant and, with both, one
     # with the two side by side
     def complete(vs):
@@ -433,12 +527,12 @@ def make_plots(sweep, plot_utils, results, plots_dir, fmt, agg):
         if complete([v]):
             single = Results(results.xs, results.values, [v], results.num_runs)
             written.append(plot_breakdown(plot_utils, sweep, single,
-                                          f"Where the query time goes: scan + rest (host)\n{v.label}, {subtitle}",
-                                          plots_dir / v.folder / f"query_breakdown.{fmt}"))
+                                          v.label,  # The title only names the variant: the legend and axes say the rest
+                                          plots_dir / v.folder / f"query_breakdown.pdf"))
     if len(results.variants) > 1 and complete(results.variants):
         written.append(plot_breakdown(plot_utils, sweep, results,
-                                      f"Where the query time goes: scan + rest (host)\n{subtitle}",
-                                      plots_dir / "both" / f"query_breakdown.{fmt}"))
+                                      "",  # No title: the legend names both variants
+                                      plots_dir / "both" / f"query_breakdown.pdf"))
     if len(results.variants) > 1:
         for name, _path, unit, title, _d, _h in MEASURES:
             if name in BLOOM_ONLY:
@@ -446,8 +540,12 @@ def make_plots(sweep, plot_utils, results, plots_dir, fmt, agg):
             lines = [(v, [x for x, _ in pts], [y for _, y in pts]) for v in results.variants
                      for pts in [results.line(sweep, v, name)] if pts]
             if len(lines) > 1:
-                written.append(plot_lines(plot_utils, lines, sweep.x_label, unit, f"{title}\n{subtitle}",
-                                          plots_dir / "both" / f"{name}.{fmt}", xscale=sweep.xscale))
+                # A throughput (or share) plot starts at zero and has its lines near the top: the legend goes
+                # to the empty lower right corner
+                written.append(plot_lines(plot_utils, lines, sweep.x_label, unit, title,
+                                          plots_dir / "both" / f"{name}.pdf", xscale=sweep.xscale,
+                                          legend_loc="lower right" if unit in ("GB/s", "% of cycles") else "best",
+                                          pow2_x=sweep.x_pow2))
     return written
 
 
@@ -487,17 +585,20 @@ def run_sweep(sweep, bench_data, xs, args, fixed, results_dir, variants):
                     try:
                         bench.run_benchmark(folder, params, warmup=args.warmup, iterations=args.iterations,
                                             binary=args.binary, data_dir=data_dir, lib_dir=args.lib_dir,
-                                            timeout=args.timeout, wait_device=args.wait_device, quiet=True)
+                                            timeout=args.timeout, wait_device=args.wait_device, quiet=True,
+                                            workload=sweep.workload)
                     except bench.BenchmarkError:
                         if live:
                             print("\r\033[K", end="")
                         print_log_tail(folder)
-                        print(f"\nfailed: {sweep.text(x)} with {v.label.lower()}; its folder is kept for the logs: "
+                        print(f"\nfailed: {sweep.text(x)} with {v.label}; its folder is kept for the logs: "
                               f"remove {folder} before running this point again", file=sys.stderr)
                         raise
                     if live:
                         print("\r\033[K", end="")
                 print_row(sweep, x, v, measures(bench_data.load_run(folder), reduce), note)
+            if data_dir is not None:  # Both variants are done: a workload that makes data per point drops it
+                sweep.workload.release(data_dir, point_params(sweep, fixed, xs, x))
 
 
 def main(sweep, add_args, points_of, argv=None):
@@ -524,9 +625,8 @@ def main(sweep, add_args, points_of, argv=None):
     add_args(parser)
     group = parser.add_argument_group("the parameters this sweep keeps fixed")
     fixed_defaults = {**BASE_FIXED, **sweep.fixed}
-    types = {p[0]: p[2] for p in bench.PARAMS}
-    for name in ("ssize", "rsize", "columns", "matchratio", "zipffactor", "compression", "egress_gbps", "threads",
-                 "batchsize"):
+    types = {p[0]: p[2] for p in sweep.workload.params}
+    for name in sweep.options:
         if name == sweep.swept:
             continue
         group.add_argument(f"--{name}", type=types[name], default=fixed_defaults[name], metavar=name.upper(),
@@ -539,18 +639,18 @@ def main(sweep, add_args, points_of, argv=None):
     group.add_argument("--agg", default="median",
                        help="how the measured runs of a point become one value: median, mean, min, max (default: "
                             "%(default)s)")
-    group.add_argument("--timeout", type=float, default=bench.BENCH_DEFAULTS["timeout"],
+    group.add_argument("--timeout", type=float, default=sweep.timeout or bench.BENCH_DEFAULTS["timeout"],
                        help="seconds one point's DuckDB process may take, then it is stopped and the sweep fails "
                             "(default: %(default)s)")
     group.add_argument("--wait-device", type=float, default=900.0, metavar="SECONDS",
                        help="how long to wait for another process to let go of the FPGA before a point "
                             "(default: %(default)s)")
-    group.add_argument("--format", choices=("png", "pdf", "svg"), default="png", help="of the plots (default: png)")
     group.add_argument("--binary", type=Path, default=bench.DEFAULT_BINARY, help="the DuckDB CLI with the extension")
-    group.add_argument("--tmp-dir", type=Path, default=None,
+    group.add_argument("--tmp-dir", type=Path, default=bench.DEFAULT_TMP_DIR,
                        help="where the temporary directory with the generated Parquet files is created (removed when "
-                            "the sweep ends; default: the system's temporary directory; the largest point needs "
-                            "8 B x probe rows x (1 + columns))")
+                            "the sweep ends; default: /dev/shm, a tmpfs, i.e. RAM; the system's temporary directory "
+                            "if that is not usable; the largest point needs "
+                            f"{sweep.tmp_need})")
     group.add_argument("--lib-dir", type=Path, default=bench.DEFAULT_LIB_DIR)
     group.add_argument("--plots-only", action="store_true", help="plot the results in the folder, run nothing")
     group.add_argument("--no-plots", action="store_true", help="only run, do not plot (matplotlib is not needed)")
@@ -561,7 +661,7 @@ def main(sweep, add_args, points_of, argv=None):
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     main_folder = None
     xs = points_of(args, parser)
-    fixed = {name: getattr(args, name) for name in BASE_FIXED if hasattr(args, name)}
+    fixed = {name: getattr(args, name) for name in sweep.options if hasattr(args, name)}
     fixed.pop("runtime_bloom", None)  # The variant's, set per point
     variants = variants_of(args.bloom)
 
@@ -602,7 +702,7 @@ def main(sweep, add_args, points_of, argv=None):
                 print_results(sweep, results)
             print()
             print(f"summary: {write_summary(sweep, results, results_dir / 'summary.csv')}")
-            for path in make_plots(sweep, plot_utils, results, plots_dir, args.format, args.agg):
+            for path in make_plots(sweep, plot_utils, results, plots_dir, args.agg):
                 print(f"plot: {path}")
     except bench.BenchmarkError as e:
         print(f"error: {e}", file=sys.stderr)

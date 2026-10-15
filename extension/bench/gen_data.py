@@ -84,7 +84,7 @@ ENC_NAMES = {0: "PLAIN", 2: "PLAIN_DICTIONARY", 3: "RLE", 4: "BIT_PACKED", 5: "D
 class DataParams:
     ssize: int
     rsize: int
-    matchratio: float = 1.0
+    matchratio: float = 0.01
     zipffactor: float = 1.0
     columns: int = 2  # payload columns the query will use
     file_columns: int | None = None  # payload columns in the probe file (None -> columns)
@@ -678,9 +678,9 @@ def ensure_dataset(data_dir, params: DataParams, *, log=print) -> Dataset:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--data-dir", required=True, type=Path)
-    ap.add_argument("--ssize", "-s", type=int, default=1 << 18, help="rows of S (build), default 2^18")
+    ap.add_argument("--ssize", "-s", type=int, default=1 << 16, help="rows of S (build), default 2^16")
     ap.add_argument("--rsize", "-r", type=int, default=1 << 18, help="rows of R (probe), default 2^18")
-    ap.add_argument("--matchratio", "-m", type=float, default=1.0)
+    ap.add_argument("--matchratio", "-m", type=float, default=0.01)
     ap.add_argument("--zipffactor", "-z", type=float, default=1.0)
     ap.add_argument("--columns", "-c", type=int, default=2, help="payload columns the run uses")
     ap.add_argument("--file-columns", type=int, default=None,

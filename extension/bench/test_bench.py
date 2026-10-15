@@ -98,6 +98,10 @@ def test_script_and_measures():
         folder = run(tmp, columns=2, threads=4, egress_gbps=6.0)
         sql = (folder / "run.sql").read_text()
         assert "SET threads = 4;" in sql and "SET oasis_emulated_egress_gbps = 6.0;" in sql
+        # The hardware Bloom filter is on: DuckDB's own is off, and the other way round
+        assert "SET oasis_runtime_bloom_filter = true;" in sql and "SET oasis_duckdb_bloom_filter = false;" in sql
+        off = (run(tmp, name="off", runtime_bloom=False) / "run.sql").read_text()
+        assert "SET oasis_runtime_bloom_filter = false;" in off and "SET oasis_duckdb_bloom_filter = true;" in off
         assert sql.count("@@ITER") == 4 and "sum(p.c2)" in sql and "sum(p.c3)" not in sql
         assert sql.index("read_oasis('/x/build.parquet')") < sql.index("read_oasis('/x/probe.parquet')")
         data = load(folder)
@@ -109,9 +113,10 @@ def test_script_and_measures():
         assert abs(it["decoder"]["in_gbps"] - 8.0) < 1e-9
         assert abs(it["decoder"]["in_gbps_excl_idle"] - 64000 / 4400) < 1e-9
         assert abs(it["decoder"]["out_gbps"] - 16.0) < 1e-9  # 375 beats in 375 cycles
-        # probe in: (2999 + 2000 - 999 build key beats) * 64 B over the probe window max(4000, 4000 - 1000)
-        assert abs(it["bloom"]["in_gbps"] - 4000 * 64 / 16000) < 1e-9
-        assert abs(it["bloom"]["out_gbps"] - 64000 / 16000) < 1e-9
+        # probe in: (2999 + 2000 - 999 build key beats) * 64 B over the probe window 4000 - 1000 cycles (first
+        # probe beat to the last output; the probe phase's own 4000 cycles, up to the host's END, are not used)
+        assert abs(it["bloom"]["in_gbps"] - 4000 * 64 / 12000) < 1e-9
+        assert abs(it["bloom"]["out_gbps"] - 64000 / 12000) < 1e-9
         assert it["decoder"]["scope"] == "probe" and it["decoder"]["segments"] == 2
         # The whole run: both segments added up (1200 + 150 + 0 + 50 cycles in, 300 + 2000 out)
         assert it["decoder_run"]["in"]["handshakes"] == 1200 and it["decoder_run"]["out"]["handshakes"] == 675

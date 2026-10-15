@@ -132,6 +132,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 				}
 			}
 		}
+		scan_chunk.Reset();
 		scan_chunk.SetChildCardinality(0);
 		return 0;
 	}
@@ -251,6 +252,9 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 	}
 
 	if (approved_tuple_count == 0) {
+		// The hardware columns were sliced to the Bloom filter's kept rows (dictionary vectors of that size): a
+		// vector that is not flat cannot be resized to 0, so drop the slices first
+		scan_chunk.Reset();
 		scan_chunk.SetChildCardinality(0);
 		return 0;
 	}

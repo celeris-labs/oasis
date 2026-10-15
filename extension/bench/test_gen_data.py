@@ -435,13 +435,14 @@ def test_verifier_rejects_unusable_files():
 
 
 def test_timing_large():
-    """ssize 2^20, rsize 2^24, 4 payload columns (defaults z=1, m=1, batch 120000) in a fresh process."""
+    """ssize 2^20, rsize 2^24, 4 payload columns (defaults z=1, batch 120000; m=1 so that every row is a match,
+    the default is 0.01) in a fresh process."""
     if os.environ.get("OASIS_SKIP_TIMING"):
         return
     with tmpdir() as d:
         script = Path(gd.__file__)
         r = subprocess.run([sys.executable, str(script), "--data-dir", str(d), "--ssize", str(1 << 20),
-                            "--rsize", str(1 << 24), "--columns", "4", "--json"],
+                            "--rsize", str(1 << 24), "--columns", "4", "--matchratio", "1.0", "--json"],
                            capture_output=True, text=True, check=True)
         res = json.loads(r.stdout.strip().splitlines()[-1])
         print(f"  timing: ssize=2^20 rsize=2^24 columns=4: {res['seconds']:.1f} s, "
@@ -452,7 +453,7 @@ def test_timing_large():
         assert res["peak_rss_mb"] < 12 * 1024
         # second call is a pure cache hit
         r2 = subprocess.run([sys.executable, str(script), "--data-dir", str(d), "--ssize", str(1 << 20),
-                             "--rsize", str(1 << 24), "--columns", "4", "--json"],
+                             "--rsize", str(1 << 24), "--columns", "4", "--matchratio", "1.0", "--json"],
                             capture_output=True, text=True, check=True)
         res2 = json.loads(r2.stdout.strip().splitlines()[-1])
         assert res2["expected_sums"] == res["expected_sums"] and res2["seconds"] < 5.0

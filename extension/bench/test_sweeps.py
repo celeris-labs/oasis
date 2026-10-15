@@ -128,34 +128,26 @@ class Env:
 
 
 def run_main(module, argv):
-    """sweep_lib.main of a sweep script: (exit code, stdout, stderr). The plots get a low resolution (speed)"""
-    load = sweep_lib._load_celeris_module
-
-    def load_fast(name):
-        loaded = load(name)
-        if name == "plot_utils":
-            loaded.DPI = 40
-        return loaded
-
+    """sweep_lib.main of a sweep script: (exit code, stdout, stderr)"""
     out, err = io.StringIO(), io.StringIO()
-    sweep_lib._load_celeris_module = load_fast
-    try:
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = sweep_lib.main(module.SWEEP, module.add_args, module.points_of, argv)
-    finally:
-        sweep_lib._load_celeris_module = load
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = sweep_lib.main(module.SWEEP, module.add_args, module.points_of, argv)
     return code, out.getvalue(), err.getvalue()
 
 
 MEASURE_NAMES = [m[0] for m in sweep_lib.MEASURES]
 ON_ONLY = {"bloom_in", "bloom_out"}
-OFF_PLOTS = sorted([f"{m}.png" for m in MEASURE_NAMES if m not in ON_ONLY] + ["query_breakdown.png"])
-ON_PLOTS = sorted([f"{m}.png" for m in MEASURE_NAMES] + ["query_breakdown.png"])  # the breakdown is always drawn
-BOTH_PLOTS = OFF_PLOTS
+# An input and its output in one plot (the Bloom filter's only with the filter on); the breakdown is always drawn
+OFF_PLOTS = sorted([f"{m}.pdf" for m in MEASURE_NAMES if m not in ON_ONLY] + ["decoder_in_out.pdf",
+                                                                               "query_breakdown.pdf"])
+ON_PLOTS = sorted([f"{m}.pdf" for m in MEASURE_NAMES] + ["decoder_in_out.pdf", "bloom_in_out.pdf",
+                                                         "query_breakdown.pdf"])
+# With both variants: the egress the Bloom filter saves, in MB and in % (derived from the two variants)
+BOTH_PLOTS = sorted(OFF_PLOTS + ["egress_saved_mb.pdf", "egress_saved_pct.pdf"])
 
 
-def pngs(folder):
-    return sorted(p.name for p in Path(folder).glob("*.png"))
+def pngs(folder):  # the plots of a folder (all are PDF; the name is historical)
+    return sorted(p.name for p in Path(folder).glob("*.pdf"))
 
 
 def names(folder):
@@ -330,8 +322,8 @@ def test_new_experiment_folder_is_type_date_time_with_results_and_plots_apart():
         assert names(folder / "plots") == ["bloom_off", "bloom_on", "both"]
         assert f"experiment: {folder}" in out
         # Nothing but the plots in plots/, nothing but results in results/
-        assert {p.suffix for p in (folder / "plots").rglob("*") if p.is_file()} == {".png"}
-        assert not list((folder / "results").rglob("*.png"))
+        assert {p.suffix for p in (folder / "plots").rglob("*") if p.is_file()} == {".pdf"}
+        assert not list((folder / "results").rglob("*.pdf"))
     # Two experiments of a type started in the same second do not share a folder
     with tempfile.TemporaryDirectory() as tmp:
         a = bench.create_experiment_folder("egress", tmp)
@@ -416,21 +408,26 @@ def write_point(folder, params, measures, runs=3):
 CASES = [
     (sweep_probe_size, [1 << 17, 1 << 18, 1 << 20], {"s_size": 65536}),
     (sweep_build_size, [1 << 10, 1 << 14, 1 << 18], {"r_size": 1 << 25}),
-    (sweep_columns, [0, 1, 2, 8, 16], {"s_size": 1 << 20, "r_size": 1 << 24}),
-    (sweep_egress, [1.0, 2.0, 4.0, 0.0], {"s_size": 1 << 20, "r_size": 1 << 24}),
-    (sweep_threads, [1, 2, 4, 8], {"s_size": 1 << 20, "r_size": 1 << 24}),
+    (sweep_columns, [0, 1, 2, 8, 16], {"s_size": 1 << 16, "r_size": 1 << 24}),
+    (sweep_egress, [1.0, 2.0, 4.0, 0.0], {"s_size": 1 << 16, "r_size": 1 << 24}),
+    (sweep_threads, [1, 2, 4, 8], {"s_size": 1 << 16, "r_size": 1 << 24}),
 ]
 
 
 def point_measures(i, bloom):
     """Fake numbers of the i-th point: the filter makes the query faster, the decoder is slower without it"""
     base = 10.0 + 4 * i
+    counters = {"starved_cycles": 300 + 10 * i, "stalled_cycles": 5, "idle_cycles": 20 + i, "cycles": 1000 + 100 * i}
     if bloom:
         host = {"query_ms": base, "scan_ms": 0.4 * base, "rest_ms": 0.6 * base}
-        return {"host": host, "decoder": {"in_gbps": 3.0 + 0.1 * i, "out_gbps": 4.0 + 0.1 * i},
-                "bloom": {"in_gbps": 6.0 + 0.1 * i, "out_gbps": 2.0}}
+        return {"host": host, "decoder": {"in_gbps": 3.0 + 0.1 * i, "out_gbps": 4.0 + 0.1 * i, "in": counters,
+                                          "out": {"bytes": 8_000_000 * (i + 1)}},
+                # The filter keeps 1/20 of the bytes the decoder outputs: the egress it saves is the rest
+                "bloom": {"in_gbps": 6.0 + 0.1 * i, "out_gbps": 2.0, "out_bytes": 400_000 * (i + 1)}}
     host = {"query_ms": 1.8 * base, "scan_ms": 0.5 * base, "rest_ms": 1.3 * base}
-    return {"host": host, "decoder": {"in_gbps": 2.5 + 0.2 * i, "out_gbps": 3.0 + 0.2 * i}, "bloom": None}
+    return {"host": host, "decoder": {"in_gbps": 2.5 + 0.2 * i, "out_gbps": 3.0 + 0.2 * i, "in": counters,
+                                      "out": {"bytes": 8_000_000 * (i + 1)}},
+            "bloom": None}
 
 
 def write_sweep(folder, module, xs, other, variants=("bloom_on", "bloom_off")):
@@ -489,7 +486,7 @@ def test_variant_missing_for_some_points_and_empty_bloom_off_measures():
 def _capture_figures(plot_utils):
     captured = []
     real = plot_utils._save
-    plot_utils._save = lambda fig, path, fmt: (captured.append(fig), real(fig, path, fmt))[1]
+    plot_utils._save = lambda fig, path: (captured.append(fig), real(fig, path))[1]
     return captured, lambda: setattr(plot_utils, "_save", real)
 
 
@@ -506,30 +503,75 @@ def test_combined_figure_content():
         with tempfile.TemporaryDirectory() as tmp:
             path = sweep_lib.plot_lines(
                 plot_utils, [(sweep_lib.ON, [1, 2, 4], [10.0, 12.0, 20.0]), (sweep_lib.OFF, [1, 2, 4], [30, 25, 50.0])],
-                "Rows", "ms", "Title\nsub", Path(tmp) / "x" / "both.png", xscale="log")
+                "Rows", "ms", "Title\nsub", Path(tmp) / "x" / "both.pdf", xscale="log")
             assert path.exists()
             ax = captured[0].axes[0]
             lines = _lines(ax)
-            assert [l[0] for l in lines] == ["Bloom filter on", "Bloom filter off"]
+            assert [l[0] for l in lines] == ["HW Bloom filter on", "HW Bloom filter off"]
             assert len({l[3] for l in lines}) == 2 and len({l[4] for l in lines}) == 2
             assert len({l[5] for l in lines}) == 2
             assert ax.get_xscale() == "log" and ax.get_ylim()[0] == 0 and ax.get_ylim()[1] >= 50
             assert [t.get_text() for t in ax.get_xticklabels()] == ["1", "2", "4"]
-            assert [t.get_text() for t in ax.get_legend().get_texts()] == ["Bloom filter on", "Bloom filter off"]
+            assert [t.get_text() for t in ax.get_legend().get_texts()] == ["HW Bloom filter on", "HW Bloom filter off"]
+            # Title, axis labels and tick labels share the title's font size; the x axis has its label
+            size = ax._left_title.get_fontsize()
+            assert ax.get_xlabel() == "Rows" and ax.get_ylabel() == "ms"
+            assert ax.xaxis.label.get_fontsize() == ax.yaxis.label.get_fontsize() == size
+            assert {t.get_fontsize() for t in ax.get_xticklabels() + ax.get_yticklabels()} == {size}
+            # Only PDF
+            try:
+                sweep_lib.plot_lines(plot_utils, [(sweep_lib.ON, [1, 2], [1.0, 2.0])], "x", "y", "t",
+                                     Path(tmp) / "x.png")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("accepted a .png path")
             # One variant: no legend
             sweep_lib.plot_lines(plot_utils, [(sweep_lib.OFF, [1, 2], [3.0, 4.0])], "x", "GB/s", "t",
-                                 Path(tmp) / "one.png")
+                                 Path(tmp) / "one.pdf")
             assert captured[1].axes[0].get_legend() is None
             for bad in (dict(lines=[], xscale="linear"), dict(lines=[(sweep_lib.ON, [0, 1], [1, 2])], xscale="log"),
                         dict(lines=[(sweep_lib.ON, [1, 2], [1])], xscale="linear")):
                 try:
-                    sweep_lib.plot_lines(plot_utils, bad["lines"], "x", "y", "t", Path(tmp) / "bad.png",
+                    sweep_lib.plot_lines(plot_utils, bad["lines"], "x", "y", "t", Path(tmp) / "bad.pdf",
                                          xscale=bad["xscale"])
                 except ValueError:
                     continue
                 raise AssertionError(f"accepted {bad}")
     finally:
         restore()
+
+
+def test_in_out_figures():
+    """The input and the output of the decoder (and the filter) in one plot, legend at the bottom right; with both
+    variants four lines. Bloom off has no filter: no bloom_in_out there"""
+    plot_utils = sweep_lib._load_celeris_module("plot_utils")
+    sweep = sweep_probe_size.SWEEP
+    xs = [1024, 2048, 4096]
+    values = {"on": {x: {"decoder_in": 3.0 + i, "decoder_out": 1.0 + i, "bloom_in": 4.0, "bloom_out": 2.0}
+                     for i, x in enumerate(xs)},
+              "off": {x: {"decoder_in": 2.0 + i, "decoder_out": 0.5 + i} for i, x in enumerate(xs)}}
+    results = sweep_lib.Results(xs, values, list(sweep_lib.VARIANTS), 3)
+    captured, restore = _capture_figures(plot_utils)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            written = sweep_lib.make_plots(sweep, plot_utils, results, Path(tmp), "median")
+            rel = {str(p.relative_to(tmp)) for p in written}
+            for name in ("bloom_on/decoder_in_out.pdf", "bloom_off/decoder_in_out.pdf", "both/decoder_in_out.pdf",
+                         "bloom_on/bloom_in_out.pdf"):
+                assert name in rel, name
+            assert "bloom_off/bloom_in_out.pdf" not in rel and "both/bloom_in_out.pdf" not in rel
+    finally:
+        restore()
+    by_title = {fig.axes[0].get_title(loc="left"): fig.axes[0] for fig in captured}
+    single = by_title["Decoder throughput\nHW Bloom filter on"]
+    assert [l.get_label() for l in single.lines] == ["Decoder in", "Decoder out"]
+    assert single.get_legend()._loc == 4  # lower right
+    assert single.get_xlabel() == sweep.x_label
+    four = by_title["Decoder throughput"]
+    assert len(four.lines) == 4 and len({l.get_linestyle() for l in four.lines}) == 2
+    assert four.get_legend()._loc == 4
+    assert [l.get_label() for l in by_title["Bloom filter throughput"].lines] == ["Bloom filter in", "Bloom filter out"]
 
 
 def test_egress_uncapped_point_is_plotted_at_the_link_speed():
@@ -558,13 +600,14 @@ def test_breakdown_figure_content():
     captured, restore = _capture_figures(plot_utils)
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            path = sweep_lib.plot_breakdown(plot_utils, sweep, results, "t", Path(tmp) / "b.png")
+            path = sweep_lib.plot_breakdown(plot_utils, sweep, results, "t", Path(tmp) / "b.pdf")
             assert path.exists()
     finally:
         restore()
     ax = captured[0].axes[0]
     assert len(ax.patches) == 12  # 3 points x 2 variants x (scan, join)
-    assert [t.get_text() for t in ax.get_xticklabels()] == ["1024", "2048", "4096"]
+    # sweep_probe_size labels its sizes 2^n (x_pow2), as mathtext
+    assert [t.get_text() for t in ax.get_xticklabels()] == ["$2^{10}$", "$2^{11}$", "$2^{12}$"]
     assert ax.get_ylim()[0] == 0
     assert len(ax.get_legend().get_texts()) == 4
 
