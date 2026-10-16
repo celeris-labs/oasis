@@ -1,5 +1,6 @@
 #include "oasis_scan.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 
 #include "coalesced_fetcher.hpp"
@@ -303,9 +304,26 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 		// Ordering stays decode-then-source, unlike RDMA's source-then-decode: the GET fires a real
 		// request whose body streams in on the server's schedule, so the decoder config has to be
 		// enqueued before the trigger rather than after it.
-		static const bool http_batch = [] {
+		//
+		// The DEFAULT follows the decoder count. A row-group batch carries ONE lane for all of its
+		// chunks, so with more than one decoder any row group with two hardware columns is refused
+		// at dispatch (RefuseCrossStreamBatch in operator.cpp) -- batching is only ever usable on a
+		// single-decoder bitstream. Unset therefore means: batch on 1 decoder, one source per chunk
+		// on more. An explicit OASIS_HTTP_BATCH=0 / =1 still wins (and =1 on several decoders is
+		// still refused, never silently rerouted).
+		static const bool http_batch = [&ctx] {
 			const char *e = std::getenv("OASIS_HTTP_BATCH");
-			return !(e && e[0] == '0');
+			if (e && *e) {
+				return e[0] != '0';
+			}
+			const auto decoders = ctx.config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
+			if (decoders > 1) {
+				std::fprintf(stderr,
+				             "[oasis] OASIS_HTTP_BATCH unset: one HTTP source per column chunk (%u "
+				             "decoders; a row-group batch is single-decoder only)\n",
+				             static_cast<unsigned>(decoders));
+			}
+			return decoders <= 1;
 		}();
 
 		if (http && !http_batch) {
