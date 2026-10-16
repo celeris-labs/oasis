@@ -9,24 +9,18 @@
 #include "oasis/oasis_context.hpp"
 #include "oasis_context_cache_entry.hpp"
 
-#include <libstf/buffer.hpp>
-#include <libstf/output_buffer_manager.hpp>
-#include <libstf/output_handle.hpp>
-
 #include <coyote/cDefs.hpp>
 
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
 #include <cctype>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <netdb.h>
 #include <sys/socket.h>
-#include <thread>
 #include <cstdlib>
 #include <unistd.h>
 
@@ -96,26 +90,6 @@ string NormalizeHttpPath(const string &path) {
 	return "/" + path;
 }
 
-// Decodes the packed FSM status word (HttpConfig read CSR 2). Layout is defined by `totalWord` in
-// hardware/src/hdl/http_read/handler.sv. Every sub-FSM gets its own field here, which the 4-bit
-// client_state cannot give you: state_debug multiplexes one value, so 2, 6, 9 and 10 each alias two
-// different states.
-string DecodeHttpFpgaStatus(uint32_t status) {
-	// Mirrors `coarse_state` in hardware/src/hdl/http_read/handler.sv. RECONNECT replaced CLOSE
-	// when the client stopped tearing the connection down after every response.
-	static const char *handler_states[] = {"IDLE", "CONNECT", "SEND", "READ", "RECONNECT"};
-	const auto top = status & 0xF;
-	char buf[256];
-	std::snprintf(buf, sizeof(buf),
-	              "handler=%s(%u) init=%u send=%u read=%u | done i/s/r=%u/%u/%u "
-	              "err i/s/r=%u/%u/%u busy=%u sid=%u",
-	              top < 5 ? handler_states[top] : "?", top, (status >> 4) & 0xF,
-	              (status >> 8) & 0xF, (status >> 12) & 0xF, (status >> 16) & 1,
-	              (status >> 18) & 1, (status >> 20) & 1, (status >> 17) & 1, (status >> 19) & 1,
-	              (status >> 21) & 1, (status >> 22) & 1, (status >> 24) & 0xFF);
-	return string(buf);
-}
-
 // Case-insensitive prefix check for HTTP header lines.
 bool StartsWithIgnoreCase(const string &line, const char *prefix) {
 	const auto prefix_len = std::strlen(prefix);
@@ -182,74 +156,6 @@ HttpReply ParseHttpReply(string raw, const char *what, const string &resource) {
 	}
 	return reply;
 }
-
-// The handler is busy (totalWord bit 22 = state != ST_IDLE).
-bool HandlerBusy(uint32_t status) {
-	return (status & (1u << 22)) != 0;
-}
-
-// Polls the handler status for as long as it is alive and prints a summary every three seconds.
-// get_next_stream_output blocks with NO timeout, so without this a stalled FPGA is a silent hang
-// with nothing on stderr at all.
-//
-// Tracks the PEAK handler state and whether it was ever busy across the whole read, which separates
-// "START never fired" (peak stays 0 => a control/trigger bug, no GET on the wire) from "the handler
-// ran but the body was dropped after receive" (peak reaches 1..4 => datapath/DMA bug).
-class HandlerWatchdog {
-public:
-	HandlerWatchdog(oasis::HTTPReadConfig &cfg, size_t expected) : cfg_(cfg), expected_(expected) {
-		thread_ = std::thread([this] { Run(); });
-	}
-	~HandlerWatchdog() {
-		done_.store(true, std::memory_order_relaxed);
-		if (thread_.joinable()) {
-			thread_.join();
-		}
-	}
-	HandlerWatchdog(const HandlerWatchdog &) = delete;
-	HandlerWatchdog &operator=(const HandlerWatchdog &) = delete;
-
-	void Progress(size_t copied) {
-		copied_.store(copied, std::memory_order_relaxed);
-	}
-
-private:
-	void Run() {
-		uint32_t peak_state = 0;
-		bool ever_busy = false;
-		int ms = 0;
-		int next_bark_ms = 3000;
-		// Poll fast so we catch the handler in flight even if it runs and returns to IDLE in well
-		// under a second.
-		while (!done_.load(std::memory_order_relaxed)) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			ms++;
-			uint32_t status = 0;
-			try {
-				status = cfg_.debug_status();
-			} catch (...) {
-				continue;
-			}
-			peak_state = std::max(peak_state, status & 0xFu);
-			ever_busy = ever_busy || HandlerBusy(status);
-			if (ms >= next_bark_ms) {
-				next_bark_ms += 3000;
-				std::fprintf(stderr,
-				             "[httpfpga] WATCHDOG %ds: waiting, copied=%llu/%llu | THIS READ peak: "
-				             "handler_max=%u ever_busy=%d | now=[%s]\n",
-				             ms / 1000, (unsigned long long)copied_.load(),
-				             (unsigned long long)expected_, peak_state, ever_busy ? 1 : 0,
-				             DecodeHttpFpgaStatus(status).c_str());
-			}
-		}
-	}
-
-	oasis::HTTPReadConfig &cfg_;
-	size_t expected_;
-	std::atomic<bool> done_ {false};
-	std::atomic<size_t> copied_ {0};
-	std::thread thread_;
-};
 
 } // namespace
 
@@ -613,145 +519,13 @@ void OasisHTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, siz
 		throw IOException("HTTP read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 
-	// Raw, undecoded bytes have NO hardware return path on an ENABLE_HTTP bitstream. The HTTP body
-	// now feeds the ColumnChunkDecoder directly and axi_out[BYPASS_ID] is tied off
-	// (hardware/src/vfpga_top.svh) — enqueuing on the old bypass stream just blocks forever on an
-	// interrupt that can never fire.
-	//
-	// So the two remaining raw-byte consumers go over an ordinary host socket:
+	// Raw, undecoded bytes have no hardware return path: the HTTP body feeds the ColumnChunkDecoder
+	// directly. So the two raw-byte consumers go over an ordinary host socket:
 	//   - the Parquet footer/metadata read in OasisScanBind, and
 	//   - the CPU/string (BYTE_ARRAY) column path in read_oasis, which reads pages via this handle.
-	// Both are small and off the hot path. The FPGA data path is exercised by read_oasis's
-	// HTTPSourceOperator, which streams whole column chunks into the decoder.
-	//
-	// The legacy raw-bypass path below is kept for bringing up a pre-decoder bitstream and is
-	// reachable only via `SET httpfpga_raw_bypass = true`.
-	if (!HttpFpgaRawBypassEnabled() || HttpFpgaCpuFallbackEnabled()) {
-		HTTPReadRangeCpu(path, offset, size, dst);
-		return;
-	}
-
-	auto &ctx = oasis::OasisContext::ctx();
-	auto http_cfg = ctx.config<oasis::HTTPReadConfig>();
-	auto obm = ctx.output_buffer_manager();
-	const auto bypass_stream = ctx.httpBypassStream();
-	const uint64_t range_end = offset + size - 1;
-
-	// The HTTP side is a single-session FSM: one set of parameter CSRs, one START, one client_state.
-	// A second request fired while one is in flight would overwrite the CSRs and interleave bodies on
-	// the shared bypass stream. So hold the lock across the whole transfer — trigger, enqueue, drain —
-	// which serializes httpfpga:// reads. With the HW drain-to-close fix (tcp_read), a single request
-	// returns the whole body across however many TCP segments it spans.
-	std::lock_guard<std::mutex> lock(mtx);
-
-	// The handler samples runTx only in ST_IDLE (hardware/src/hdl/http_read/handler.sv). runTx is a
-	// one-cycle pulse, so a START written while the handler is mid-transfer is dropped on the floor
-	// and never retried -- the read below would then block forever on a buffer nothing will ever
-	// fill. A previous request that stalled (or a query cancelled with Ctrl-C between trigger and
-	// drain) leaves it exactly there, and there is no reset CSR: nothing short of reprogramming the
-	// bitstream returns it to IDLE. Detect it here instead of hanging, since the wedge outlives the
-	// process and every later run inherits it -- the tell is an unchanged sid across runs, because
-	// session_id_q only moves when a fresh tcp_init completes.
-	const auto pre_status = http_cfg->debug_status();
-	if (HandlerBusy(pre_status)) {
-		throw IOException("httpfpga: the FPGA HTTP handler is still busy from an earlier request "
-		                  "[%s], and it only accepts a new request from its IDLE state -- this read "
-		                  "would be silently dropped and then hang. There is no reset register; "
-		                  "reprogram the bitstream to clear it.",
-		                  DecodeHttpFpgaStatus(pre_status));
-	}
-
-	// Enqueue the destination buffer BEFORE triggering the request. The trigger is a posted CSR
-	// write, so the FPGA can start writing body bytes as soon as the response arrives; if no buffer
-	// has been enqueued for the bypass stream at that point, the StreamWriter targets whatever
-	// allocation the hardware still holds from an earlier read. Acquire-then-trigger closes that
-	// window at the cost of nothing but a few microseconds of connection-setup overlap.
-	//
-	// The bypass stream is unmanaged on the OBM. The HW strips the HTTP header, so exactly `size`
-	// body bytes land here — pass that so the OBM allocates a right-sized buffer. Note the OBM
-	// rounds capacity up to BYTES_PER_FPGA_TRANSFER (64 KiB), so the hardware is always permitted
-	// to write up to 64 KiB regardless of `size`; the drain loop below is the only thing that
-	// detects over-delivery.
-	auto handle = obm->acquire_output_handle(bypass_stream, size);
-
-	// Now trigger: the handler opens the TCP connection and issues the ranged GET.
-	http_cfg->read(bypass_stream, server_ip_, server_port_, path, offset, range_end, /*session*/ 0);
-
-	if (HttpFpgaDebugEnabled()) {
-		std::fprintf(stderr, "[httpfpga] read path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
-		             (unsigned long long)offset, (unsigned long long)range_end, (unsigned long long)size);
-		// Read the parameters back out of the hardware. The write CSRs are write-only, so this echo
-		// is the only confirmation that the values reached the FPGA and were not, say, still in
-		// flight when START sampled them.
-		std::fprintf(stderr, "[httpfpga]   latched: %s\n",
-		             http_cfg->request_echo().describe().c_str());
-	}
-
-	// Reports which state a stall is parked in (the `read` nibble: 7=WAIT_NOTIFY, 9=RECV_DATA,
-	// 10=FINISH) and how many body bytes have landed. Stops and joins on every exit path.
-	unique_ptr<HandlerWatchdog> watchdog;
-	if (HttpFpgaDebugEnabled()) {
-		watchdog = make_uniq<HandlerWatchdog>(*http_cfg, size);
-	}
-
-	// Drain all buffers for this transfer. A body that fits one FPGA buffer is one iteration; larger
-	// ranges are chunked across multiple buffers, each surfaced via its own interrupt. These calls
-	// block until the FPGA writes (or discards) the allocation.
-	size_t copied = 0;
-	while (handle->stream_has_more_output(bypass_stream)) {
-		auto buf = handle->get_next_stream_output(bypass_stream);
-		if (!buf) {
-			break;
-		}
-		if (copied + buf->size > size) {
-			throw IOException("HTTP read overran requested size: requested %llu, already got %llu, "
-			                  "next chunk %llu [%s]",
-			                  (unsigned long long)size, (unsigned long long)copied,
-			                  (unsigned long long)buf->size,
-			                  DecodeHttpFpgaStatus(http_cfg->debug_status()));
-		}
-		std::memcpy(static_cast<uint8_t *>(dst) + copied, buf->ptr, buf->size);
-		copied += buf->size;
-		if (watchdog) {
-			watchdog->Progress(copied);
-		}
-	}
-	if (copied != size) {
-		// Debug triage: dump the bytes the FPGA actually delivered so they can be diffed against the
-		// server's ground truth for this exact range. `cmp` on the two files localizes the loss:
-		//   - identical up to `copied`, true file longer  -> bytes lost at the BACK (close/last-beat)
-		//   - first difference at offset 0                 -> bytes lost/shifted at the FRONT (header strip)
-		//   - first difference somewhere in the middle     -> a seam/framing drop (TOE/normalizer)
-		char dump_path[512];
-		std::snprintf(dump_path, sizeof(dump_path), "/tmp/httpfpga_short_%llu_%llu.bin",
-		              (unsigned long long)offset, (unsigned long long)range_end);
-		if (FILE *df = std::fopen(dump_path, "wb")) {
-			if (copied > 0) {
-				std::fwrite(dst, 1, copied, df);
-			}
-			std::fclose(df);
-			std::fprintf(stderr,
-			             "[httpfpga] SHORT: wrote %llu received bytes to %s\n"
-			             "[httpfpga] triage: curl -s -r %llu-%llu 'http://%s:%u%s' -o /tmp/httpfpga_true.bin "
-			             "&& cmp %s /tmp/httpfpga_true.bin\n",
-			             (unsigned long long)copied, dump_path, (unsigned long long)offset,
-			             (unsigned long long)range_end, server_host_.c_str(),
-			             static_cast<unsigned>(server_port_), path.c_str(), dump_path);
-		} else {
-			std::fprintf(stderr, "[httpfpga] SHORT: could not open %s for dump\n", dump_path);
-		}
-		throw IOException("HTTP read short transfer for '%s' range=[%llu,%llu]: requested %llu bytes, "
-		                  "got %llu [%s] [latched: %s]",
-		                  path, (unsigned long long)offset, (unsigned long long)range_end,
-		                  (unsigned long long)size, (unsigned long long)copied,
-		                  DecodeHttpFpgaStatus(http_cfg->debug_status()),
-		                  http_cfg->request_echo().describe());
-	}
-
-	if (HttpFpgaDebugEnabled()) {
-		std::fprintf(stderr, "[httpfpga] done path=%s copied=%llu client_state=%u\n", path.c_str(),
-		             (unsigned long long)copied, static_cast<unsigned>(http_cfg->client_state()));
-	}
+	// Both are small and off the hot path. The FPGA data path is read_oasis's HTTPBatchSourceOperator,
+	// which streams whole column chunks into the decoder.
+	HTTPReadRangeCpu(path, offset, size, dst);
 }
 
 } // namespace duckdb

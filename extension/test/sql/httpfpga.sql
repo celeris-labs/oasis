@@ -8,7 +8,6 @@
 INSTALL parquet; LOAD parquet;
 SET http_server='10.253.74.74';
 SET http_port=9000;
-SET httpfpga_cpu_fallback=false;
 SET httpfpga_debug=true;
 
 -- 1. connectivity + scale-independent goldens (region=5, nation=25)
@@ -16,7 +15,7 @@ SELECT count(*) AS region_rows FROM read_parquet('httpfpga://testbench/tpch-30/r
 SELECT r_name FROM read_parquet('httpfpga://testbench/tpch-30/region.parquet') ORDER BY r_regionkey;
 SELECT count(*) AS nation_rows FROM read_parquet('httpfpga://testbench/tpch-30/nation.parquet');
 
--- 2. per-file smoke: can the FPGA path read each object at all?
+-- 2. per-file smoke: can each object be read at all?
 SELECT count(*) FROM read_parquet('httpfpga://testbench/tpch-30/supplier.parquet');
 SELECT count(*), min(p_partkey), max(p_partkey) FROM read_parquet('httpfpga://testbench/tpch-30/part.parquet');
 SELECT count(*), min(c_custkey), max(c_custkey) FROM read_parquet('httpfpga://testbench/tpch-30/customer.parquet');

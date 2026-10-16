@@ -61,9 +61,8 @@ private:
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst);
 	void ReadBuffered(OasisHTTPFileHandle &h, void *dst, size_t size, uint64_t location);
-	// CPU fallback: fetch the range over an ordinary host socket, bypassing the FPGA entirely.
-	// Enabled with `SET httpfpga_cpu_fallback = true;`. Reliable but does not exercise the FPGA
-	// data path — a scaffolding aid while the HW receive path is validated.
+	// Fetch the range over an ordinary host socket. Every raw httpfpga:// byte read goes this way;
+	// column chunks reach the decoder through read_oasis instead.
 	void HTTPReadRangeCpu(const string &path, uint64_t offset, size_t size, void *dst);
 	uint64_t ProbeContentLength(const string &resource_path);
 	// Connect to the configured server, send `request`, read the full response until the peer
@@ -75,7 +74,6 @@ private:
 
 	DatabaseInstance &instance;
 	std::mutex init_mtx;
-	std::mutex mtx;
 	bool initialized = false;
 
 	std::string server_host_;

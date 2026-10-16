@@ -1,10 +1,9 @@
 # name: test/sql/httpfpga.test
-# description: httpfpga:// reads against the MinIO test server, via the FPGA raw bypass
+# description: httpfpga:// reads against the MinIO test server, raw bytes over a host socket
 #
 # SCOPE: these queries use read_parquet(), which treats httpfpga:// purely as a byte source and
-# parses on the CPU. On a decoder bitstream axi_out[BYPASS_ID] is tied off, so those raw reads are
-# served over a host socket and the FPGA never sees them -- passing here proves the object server
-# and the Parquet plumbing work, nothing more. test/sql/httpfpga_decode.test is the one that
+# parses on the CPU. Raw reads are served over a host socket and the FPGA never sees them -- passing
+# here proves the object server and the Parquet plumbing work, nothing more. test/sql/httpfpga_decode.test is the one that
 # exercises the hardware, via read_oasis().
 # group: [sql]
 #
@@ -26,11 +25,7 @@ SET http_server='10.253.74.74';
 statement ok
 SET http_port=9000;
 
-statement ok
-SET httpfpga_cpu_fallback=false;
-
-# 690 bytes, path 24 characters -- the only case that fits the pre-build-88 32-character GET path
-# budget, so it passes even if the widening is broken. If this is the sole survivor, suspect the path.
+# 690 bytes.
 query I
 SELECT numbers FROM read_parquet('httpfpga:///testbench/dummy.parquet') ORDER BY numbers;
 ----
@@ -39,7 +34,7 @@ SELECT numbers FROM read_parquet('httpfpga:///testbench/dummy.parquet') ORDER BY
 3
 4
 
-# 1060 bytes, path 33 -- cheapest case that requires a path longer than 32 characters.
+# 1060 bytes.
 query II
 SELECT r_regionkey, r_name FROM read_parquet('httpfpga:///throughput/tpch-1/region.parquet') ORDER BY r_regionkey;
 ----

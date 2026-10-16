@@ -59,7 +59,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<RDMAFileSystem>());
 
-	// HTTP ranged-GET file system (FPGA bypass stream; requires -DENABLE_HTTP=ON bitstream)
+	// httpfpga:// file system: read_oasis has the FPGA fetch column chunks itself (requires a bitstream
+	// built with --http); raw byte reads go over a host socket
 	config.AddExtensionOption(
 	    "http_server",
 	    "HTTP file server IP address for httpfpga:// reads (set via `SET http_server = '<ip-address>';`)",
@@ -69,14 +70,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("httpfpga_debug",
 	                          "Print HTTP FPGA FSM status to stderr during httpfpga:// reads", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false), SetHttpFpgaDebug);
-	config.AddExtensionOption("httpfpga_cpu_fallback",
-	                          "Fetch httpfpga:// reads over an ordinary host socket instead of the FPGA "
-	                          "(correct but bypasses the FPGA data path)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetHttpFpgaCpuFallback);
-	config.AddExtensionOption("httpfpga_raw_bypass",
-	                          "Route raw httpfpga:// byte reads through the FPGA bypass stream. Legacy: only "
-	                          "valid on a pre-decoder bitstream, blocks forever on current ones",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetHttpFpgaRawBypass);
 
 	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<OasisHTTPFileSystem>(instance));
 
