@@ -5,7 +5,8 @@ import lynxTypes::*;
 // =================================================================================================
 // Arrival-order receive dispatcher for N concurrent TCP connections.
 //
-// Replaces tcp_session_table's per-slot announcement queues. See ARCHITECTURE.md, ADR-1 and ADR-3.
+// Replaced the retired session table's per-slot announcement queues. See ARCHITECTURE.md, ADR-1 and
+// ADR-3.
 //
 // THE CONTRACT
 // ------------
@@ -18,7 +19,7 @@ import lynxTypes::*;
 //     readPkg must be issued in GLOBAL ARRIVAL ORDER across all sessions,
 //     and the drain must never stop.
 //
-// tcp_session_table queued announcements per slot and let the reader take them in REQUEST order.
+// The session table queued announcements per slot and let the reader take them in REQUEST order.
 // That reorders, and reordering hands one session's bytes to another session's reader -- builds
 // 90/91/92. Coyote's own full-throughput receiver satisfies the contract by never buffering at all
 // (examples/13_perf_tcp/.../tcp_perf_server.cpp): read a notification, issue the readPkg, consume to
@@ -171,7 +172,7 @@ module rx_dispatch #(
     output logic [NUM_CONNS-1:0]       dbg_lane_dead
 );
 
-    // Packed appNotification layout (mirrors tcp_read.sv / tcp_session_table.sv):
+    // Packed appNotification layout (Coyote's tcp_notify_t):
     //   sessionID[15:0], length[31:16], ipAddress[63:32], dstPort[79:64], closed[80], opened[81]
     localparam int CLOSED_BIT = TCP_SESSION_BITS + TCP_LEN_BITS + 32 + 16; // = 80
 

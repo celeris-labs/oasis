@@ -11,7 +11,7 @@ import lynxTypes::*;
 // used the server's FIN as the end-of-body marker. That is only correct when the request carries
 // `Connection: close`, which is exactly what forced a fresh TCP connection per ranged GET -- and a
 // connection per GET is what exhausts the TOE's 512-entry ephemeral port pool partway through a
-// benchmark run (see handler.sv and the port_table notes in the README).
+// benchmark run.
 //
 // To reuse one connection the framer has to know where each body ends by itself, because on a
 // persistent connection there is no FIN between responses: body k is followed immediately by the

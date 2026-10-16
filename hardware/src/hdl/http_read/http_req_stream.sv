@@ -8,7 +8,7 @@ import lynxTypes::*;
 // ----------------------------------
 // The handler used to hold a ring of NUM_SLOTS request DESCRIPTORS -- server IP, host string, 16
 // path words, both range endpoints -- and rebuild the GET text in hardware from them for every
-// request (http_req_builder). That put a hard ceiling on how many requests could be queued: each one
+// request. That put a hard ceiling on how many requests could be queued: each one
 // costs 1160 bits of registers, so the ring was 4 deep and the elaboration guard stopped at 8. The
 // host then had to poll for a free slot before every GET.
 //

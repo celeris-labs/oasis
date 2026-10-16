@@ -59,7 +59,7 @@ module tcp_init (
                     // success == 1 means the connection was established (cThread::openConnTcp
                     // throws when this bit is clear), so an error is success == 0. The polarity
                     // used to be inverted.
-                    // handler.sv acts on this now: an open that fails leaves nothing bound and
+                    // The handler acts on this: an open that fails leaves nothing bound and
                     // nothing sent, so it simply retries after a backoff and latches init_err_q.
                     // Note the common connect failure -- ephemeral-port reuse against the peer's
                     // TIME_WAIT -- does NOT land here: there openStatus never arrives at all, the

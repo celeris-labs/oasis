@@ -439,7 +439,7 @@ module handler_toe #(
     // ANY chunk entry is queued in axis_rewrite_last, so with two or more requests outstanding on a
     // lane -- which is the whole point of pipelining, and what the board actually runs -- it never
     // fell. The reader framed the first response, parked in ST_DONE, and the lane went silent while
-    // the wire kept delivering. handler_stream had this stage (a 2-state FSM around the same
+    // the wire kept delivering. The old handler had this stage (a 2-state FSM around the same
     // condition) and it was lost in the port to N lanes; lane_drain p1/p4/p5/a2/a10 are what found
     // it missing.
     //
@@ -628,7 +628,7 @@ module handler_toe #(
 
     // A lane may be reconnected only when there is NOTHING TO REPLAY.
     //
-    // handler_stream learned this the expensive way: streamed request text is consumed as it is
+    // The old handler learned this the expensive way: streamed request text is consumed as it is
     // sent and the hardware cannot reproduce it, so reopening a session with requests outstanding
     // gives a connection nobody will ever ask anything on. The read errors again, reconnects again,
     // and each iteration burns one of the TOE's 512 ephemeral ports -- observed as SYN/FIN on
@@ -937,7 +937,7 @@ module handler_toe #(
     end
 
     // =============================================================================================
-    // Readback. Same field positions as handler_stream wherever a field still means the same thing,
+    // Readback. Same field positions as the old handler wherever a field still means the same,
     // so an existing host reads something sensible; the per-lane bits are folded with OR because a
     // 32-bit window cannot carry N lanes' worth and "any lane is stalled" is what the host acts on.
     // =============================================================================================
@@ -958,9 +958,8 @@ module handler_toe #(
 
     // EXACTLY 32 BITS. The first draft packed 30 and relied on the lvalue width, which zero-extends
     // on the LEFT -- so every field still landed where it should but the lane count was
-    // CONN_BITS'(NUM_CONNS), i.e. 4 truncated into 2 bits, reading back as 0. handler_stream carries
-    // the same warning for the same reason: a concat that does not add up is not a compile error,
-    // it is a host that decodes the wrong bits.
+    // CONN_BITS'(NUM_CONNS), i.e. 4 truncated into 2 bits, reading back as 0. A concat that does
+    // not add up is not a compile error, it is a host that decodes the wrong bits.
     //   [7:0] occupancy (max over lanes, saturating)  [15:8] queue depth
     //   [16] any lane has an unread announcement      [17] any peer FINed
     //   [18] every lane is connected                  [19] req_ready for the lane last addressed
