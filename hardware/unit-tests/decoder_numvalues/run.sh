@@ -7,7 +7,9 @@
 #   ./run.sh <SCEN> <OUTDIV> [BIG]   one case (SCEN 0..4, see the tb header)
 #
 # The DUT is the REAL decoder: parcore + libstf SystemVerilog and vhsnunzip's VHDL, elaborated with
-# the lynx_pkg a Coyote build generated (LYNX_PKG=..., default build-124's).
+# the lynx_pkg.sv a Coyote build generated: LYNX_PKG=<file>, or else the most recently written
+# hardware/build-*/{oasis_shell,oasis_config_0/user_c0_0}/hdl/lynx_pkg.sv of this checkout (any
+# configured build whose project step ran; the decoder only reads its data widths).
 # PARCORE=<dir> points at another parcore tree (e.g. a pre-fix copy for a before/after run).
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -16,7 +18,16 @@ PARCORE="${PARCORE:-$REPO/parcore}"
 LIBSTF="$PARCORE/libstf"
 COYOTE="$LIBSTF/coyote/hw/hdl"
 VHS="$PARCORE/vhsnunzip/src/hdl"
-LYNX_PKG="${LYNX_PKG:-$REPO/hardware/build-124/oasis_shell/hdl/lynx_pkg.sv}"
+if [ -z "${LYNX_PKG:-}" ]; then
+  LYNX_PKG="$(ls -t "$REPO"/hardware/build-*/oasis_shell/hdl/lynx_pkg.sv \
+                    "$REPO"/hardware/build-*/oasis_config_0/user_c0_0/hdl/lynx_pkg.sv 2>/dev/null | head -1)"
+fi
+if [ -z "$LYNX_PKG" ] || [ ! -f "$LYNX_PKG" ]; then
+  echo "decoder_numvalues: no lynx_pkg.sv found -- set LYNX_PKG=<build dir>/oasis_shell/hdl/lynx_pkg.sv" >&2
+  echo "  (a build directory of hardware/ that has been configured and had its project created)" >&2
+  exit 1
+fi
+echo "lynx_pkg: $LYNX_PKG"
 
 if ! command -v xvlog >/dev/null 2>&1; then
   # shellcheck disable=SC1091
