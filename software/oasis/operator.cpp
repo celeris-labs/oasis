@@ -123,8 +123,9 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
         }
         // Revision 3 pads every GET on its own in emit_batch_slots(): there each GET is a transfer
         // of its own, and padding only the last one would leave the others with a DMA tail that the
-        // hardware's drain would swallow together with the start of the next request.
-        if (!config->slot_mode()) {
+        // hardware's drain would swallow together with the start of the next request. Revision 6
+        // takes the same per-GET path (one GET per arm), so it is not padded here either.
+        if (!config->one_arm_per_get()) {
             const size_t before = batch.text.size();
             oasis::PadRequestTextToBeat(batch.text);
             // Keep the per-request lengths adding up to the text: the padding is inserted into
@@ -234,6 +235,14 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     }
     auto config = ctx.config<HTTPReadConfig>();
     RefuseCrossStreamBatch(ctx, batch);
+
+    // CSR revision 6 (TOE receive rings, handler_toe): one arm per GET as well -- the GET credit
+    // counts arms -- on the revision-2 register map. emit_batch_slots() is the per-GET path; on this
+    // revision it runs only its revision-2-register steps (see the note above it).
+    if (config->toe_ring()) {
+        emit_batch_slots(ctx, *config, batch, config->lane_for_stream(stream));
+        return;
+    }
 
     // CSR revision 3 (HBM slots): one arm per GET, each waiting for its connection's slot to be
     // drained. Everything below this branch is the revision-2 path, unchanged.
@@ -387,6 +396,17 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
 //
 // The chunk-length entries go first, all of them, exactly as on revision 2: one per COLUMN CHUNK,
 // however many GETs it was split into, because axis_rewrite_last marks tlast by byte count.
+//
+// REVISION 6 (handler_toe) uses this function for its per-GET shape and nothing else. There the
+// revision reads as 2 (HTTPReadConfig::revision()), so slot_pipelined() and conn_placement() are
+// false and every step below is a revision-2-register step: push_entries (reads 15/16/17, writes
+// 41/40/39), arm_transfer on the lane's own connection (writes 0/1/41/40/39, polls 17),
+// await_arm_consumed (ARM_READY must fall: reads 16/17), and the DMA. Why one arm per GET there:
+// the GET credit counts arms (gets_out +1 per arm, -1 per framed response). Why the arm may WAIT:
+// ARM_READY also requires gets_out < GET_CREDIT, so the (GET_CREDIT+1)-th GET of a lane is armed
+// only after that lane's oldest response has been framed -- on this (dispatcher) thread, so other
+// lanes get no new work for that long. It cannot deadlock: the response's decoder config and output
+// buffer were placed before its GET. Every GET is at most toe_get_cap() (read_streamed splits).
 void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig &config,
                                                const HTTPReadConfig::RequestBatch &batch,
                                                uint8_t lane) {
@@ -486,12 +506,14 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
     // depth-1 credit, so the same wait would block this (dispatcher) thread until the whole
     // RESPONSE had been drained, serialising every lane behind this one. And it is not needed: the
     // arm was proven consumed above, and the buffer lives until the flow retires (see above).
+    // Revision 6 likewise: its ARM_READY carries the GET credit.
     if (http_debug_enabled()) {
         std::fprintf(stderr,
-                     "[oasis-http] slot batch: lane %u, %zu column chunk(s), %zu GET(s), %zu bytes of "
+                     "[oasis-http] %s batch: lane %u, %zu column chunk(s), %zu GET(s), %zu bytes of "
                      "request text | %s\n",
-                     unsigned(lane), batch.chunk_bytes.size(), requests.size(), total,
-                     config.conns().describe().c_str());
+                     config.toe_ring() ? "toe" : "slot", unsigned(lane), batch.chunk_bytes.size(), requests.size(), total,
+                     (config.toe_ring() ? config.lanes().describe() : config.conns().describe())
+                         .c_str());
     }
 }
 
