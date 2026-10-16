@@ -213,17 +213,16 @@ void OasisContext::setup_http_slots() {
             "/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages -- and the driver's card "
             "pool must hold pool + 1 pages (patch 0003).");
     }
-    // Only the slots, not the whole page, and in MAX_TRANSFER_SIZE (128 MiB) pieces: the ioctl takes
-    // the length as 32 bits and cThread::invoke THROWS on a sync/offload longer than that rather than
-    // truncating it. Since CSR revision 4 the slots fill the whole 1 GiB page (4 x 256 MiB; 32 x
-    // 32 MiB on revision 5), and one capped offload left every slot above the first 128 MiB to be
-    // page-faulted in by the first segment the writer DMAs into it -- on the shared receive path.
-    // So every piece is offloaded, first to last.
-    for (uint64_t off = 0; off < region; off += coyote::MAX_TRANSFER_SIZE) {
-        const uint64_t len = std::min<uint64_t>(region - off, coyote::MAX_TRANSFER_SIZE);
-        cthread_->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD,
-                         coyote::syncSg{static_cast<char *>(page) + off, len});
-    }
+    // ONE offload, at the page start, whatever the region. The driver (offload_user_pages) finds the
+    // buffer this process mapped at that address -- it keys them by their START address -- and
+    // migrates the WHOLE buffer: all 1 GiB of this page, every slot, in one migration and one TLB
+    // entry. The length only has to get past cThread::invoke, which THROWS above MAX_TRANSFER_SIZE
+    // (128 MiB; the ioctl carries the length as 32 bits), so it is capped. Never offload the page in
+    // pieces: an address past the start matches no buffer, and the patch-0004 driver then loops in
+    // the kernel forever (build-131, 2026-09-25: soft lockup in offload_user_pages, board rebooted);
+    // a patch-0005 driver refuses the call instead and invoke throws.
+    const uint64_t offload_len = std::min<uint64_t>(region, coyote::MAX_TRANSFER_SIZE);
+    cthread_->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{page, offload_len});
     http_slot_page_ = page;
     http->set_slot_base(reinterpret_cast<uint64_t>(page));
 
