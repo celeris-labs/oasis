@@ -203,64 +203,6 @@ constexpr const uint8_t  HTTP_DEFAULT_MAX_INFLIGHT = 0;
 // was the previous default and is the known-good fallback; scripts/sweep.sh walks the range.
 constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 0;
 
-// Effective request-ring depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override), and
-// both 0 and any value >= the ring size mean "use the whole ring". No longer clamped by a
-// bytes-in-flight product -- see HttpMaxInflight for why that cap was removed.
-// The TCP window the stack advertises: 1 << WINDOW_BITS with WINDOW_BITS = 16 + WINDOW_SCALE_BITS
-// and WINDOW_SCALE_BITS = 4 (toe_config.hpp.in), i.e. 1 MiB -- NOT the 256 KiB that a WINDOW_SCALE_BITS
-// of 2 would give, which is what this comment said until 2026-08-18. Since build-95 the receive fifo
-// (axis_data_fifo_512_d16384 in tcp_stack.sv, 16384 x 64 B) is the same size, so this one number is
-// both what the peer is invited to send and what can actually be held. If either moves, move both.
-//
-// MEASURED, against MinIO on 10.253.74.74, one keep-alive connection, 48 MB per point. The budget
-// is chunk x depth and every row inside it spends the same 256 KiB:
-//
-//     chunk  depth  in-flight    MB/s
-//      192K      1       192K   148.2   <- the default
-//      256K      1       256K   179.3   best that fits today
-//      128K      2       256K   137.3
-//       64K      4       256K    68.1
-//       32K      8       256K    42.9
-//      512K      1       512K   293.6   needs a bigger window
-//     1024K      1      1024K   423.1   needs a bigger window
-//      512K      2      1024K   384.1
-//
-// Two things follow, and the second one is the surprise. First, throughput is very nearly LINEAR in
-// chunk size, because a request costs ~1.4 ms of MinIO time-to-first-byte whatever its size, so
-// doubling the chunk halves how often that is paid. Second, DEPTH IS ACTIVELY HARMFUL under a fixed
-// budget: 64K x 4 is 2.2x SLOWER than 192K x 1 for exactly the same bytes in flight. HTTP/1.1
-// pipelining is strictly ordered and MinIO overlaps only ~1.5x of the queued work, which never pays
-// for the 4x smaller requests it was bought with. One big request beats several small ones at every
-// budget tested -- 512K x 1 > 256K x 2, 1024K x 1 > 512K x 2.
-//
-// So the ONE thing that raises single-connection throughput is a bigger window, and the only reason
-// the chunk is not already larger is that this number caps it.
-constexpr const uint64_t HTTP_RX_WINDOW_BYTES = 262144;
-
-// Overridable because the window is a property of the BITSTREAM, not of this build: a bitstream with
-// WINDOW_SCALE_BITS raised can hold more, and there is no CSR that reports it. Setting this HIGHER
-// than the running bitstream's real window re-creates the failure d0224ee fixed -- the peer is
-// invited to send more than the fifo holds, the overflow is dropped, and the wire fills with genuine
-// retransmissions and duplicate ACKs seconds apart. Raise it only together with the bitstream.
-uint64_t HttpRxWindowBytes() {
-    static const uint64_t configured = [] {
-        const char *env = std::getenv("OASIS_HTTP_RX_WINDOW_BYTES");
-        if (env == nullptr || *env == '\0') {
-            return HTTP_RX_WINDOW_BYTES;
-        }
-        const long long parsed = std::atoll(env);
-        if (parsed <= 0) {
-            return HTTP_RX_WINDOW_BYTES;
-        }
-        std::fprintf(stderr,
-                     "oasis: OASIS_HTTP_RX_WINDOW_BYTES=%lld overrides the built-in %llu. This must "
-                     "not exceed 1 << WINDOW_BITS of the PROGRAMMED bitstream.\n",
-                     parsed, static_cast<unsigned long long>(HTTP_RX_WINDOW_BYTES));
-        return static_cast<uint64_t>(parsed);
-    }();
-    return configured;
-}
-
 // Chunk entries ONE LANE may owe at a time. Read once from OASIS_HTTP_LANE_DEPTH; the caller clamps
 // it to [1, max_batch_chunks()].
 //
@@ -298,6 +240,9 @@ std::string DescribeLaneState(uint64_t state_word, uint8_t lane) {
     return oss.str();
 }
 
+// Effective request-queue depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override),
+// and both 0 and any value >= the queue size mean "use the whole queue". No longer clamped by a
+// bytes-in-flight product -- see below for why that cap was removed.
 uint8_t HttpMaxInflight(uint8_t slots) {
     static const int configured = [] {
         const char *env = std::getenv("OASIS_HTTP_MAX_INFLIGHT");
@@ -312,7 +257,7 @@ uint8_t HttpMaxInflight(uint8_t slots) {
                     ? static_cast<int>(slots)
                     : configured;
 
-    // THE BYTES-IN-FLIGHT CAP IS GONE. It used to clamp depth to HttpRxWindowBytes()/chunk_bytes(),
+    // THE BYTES-IN-FLIGHT CAP IS GONE. It used to clamp depth to the receive window / chunk_bytes(),
     // which at the 768 KiB chunk evaluates to 262144/786432 = 0 -> 1: the hardware's whole request
     // ring reduced to one outstanding GET, so every request paid the server's full service latency
     // serially.
