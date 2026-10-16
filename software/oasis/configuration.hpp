@@ -51,39 +51,11 @@ constexpr const uint8_t HTTP_CSR_REVISION_LANES = 2;
 /// swapped for a 4-lane one. See the read map in hardware/src/hdl/http_read/http_config.sv.
 constexpr const uint8_t HTTP_LANE_SLOTS = 8;
 
-/// CSR revision at which the bitstream is the HBM-SLOT handler (handler_slots, ADR-5): every
-/// connection owns a slot in card memory, the host must hand the hardware that memory
-/// (SLOT_BASE_LO/HI, write ids 42/43) before the first arm, and each connection holds ONE
-/// outstanding GET at a time (read ids 21..32 exist). Reported in inflightWord[31:24] like revision 2.
-///
-/// Everything revision 3 needs is gated on this at RUN TIME, never at build time: the same library
-/// must drive a revision-2 bitstream (build-119, build-125) exactly as it did before. Revision 3 keeps
-/// read ids 16..20 in their revision-2 shape (connections 0..7), so everything gated on
-/// HTTP_CSR_REVISION_LANES keeps working on it unchanged; what changes is what the host may ASK for.
-constexpr const uint8_t HTTP_CSR_REVISION_SLOTS = 3;
-
-/// CSR revision at which the slot handler takes PIPELINED GETs (2026-09-23): same register map as
-/// revision 3, but ARM_READY no longer carries a depth-1 credit, several GETs may be armed on one
-/// connection, and their responses land back to back in its slot. The host's rule moves from
-/// "one GET per connection" to a BYTE BUDGET per connection: the responses armed since CONN_DRAINED
-/// was last read set must fit in the slot (slot_budget_bytes()). CONN_DRAINED now means "slot empty
-/// and nothing armed on it". Revision 3 is driven exactly as before.
-constexpr const uint8_t HTTP_CSR_REVISION_PIPE = 4;
-
-/// CSR revision at which the slot handler has MORE CONNECTIONS THAN DECODERS (stage 2, 2026-09-23).
-/// The host places every GET on a connection of its choice: the ARM names it (REQ_CHUNK_BYTES
-/// [44:40]) beside the decoder ([35:32]). A "lane" is then a DECODER (lane_count() = N_DECODERS, and
-/// the per-lane admission/fatal bits come from DEC_STATE, read id 33), and a connection is admitted
-/// for decoder d only while it is FREE (CONN_DRAINED, nothing pending) or d's TAIL (the last
-/// connection d took an arm for) -- see pick_conn(). Revisions 2..4 are driven exactly as before.
-constexpr const uint8_t HTTP_CSR_REVISION_CONNS = 5;
-
-/// CSR revision of the TOE-RING handler (handler_toe, stage 1 of the TOE-buffer redesign,
-/// 2026-10-11): the TOE is built with TCP_STACK_RX_DDR_BYPASS_EN = 0 and keeps a 1 MiB receive ring
-/// per session in card memory itself, so there is no slot, no slot page and no card-memory buffer of
-/// ours (EN_MEM = 0). The REGISTER MAP IS REVISION 2's -- HttpConfig is instantiated with its default
-/// CSR_REV = 2, so read ids 21..38 are a resp_error and write ids 42/43 do not exist -- which is why
-/// the host drives it as PROTOCOL revision 2 (HTTPRevision::Classify). What differs from revision 2:
+/// CSR revision of the TOE-RING handler (handler_toe): the TOE is built with
+/// TCP_STACK_RX_DDR_BYPASS_EN = 0 and keeps a 1 MiB receive ring per session in card memory itself,
+/// so the host maps and offloads no card-memory buffer of its own. The REGISTER MAP IS REVISION 2's
+/// -- HttpConfig's read ids end at 20 and its write map is the same -- which is why the host drives
+/// it as PROTOCOL revision 2 (HTTPRevision::Classify). What differs from revision 2:
 ///   * ONE GET PER ARM. The handler counts GETs by arms (gets_out +1 per arm, -1 per framed
 ///     response); an arm announcing two GETs would be counted once and retired twice.
 ///   * THE GET CREDIT. ARM_READY = !stream_busy && gets_out < GET_CREDIT (LANE_POLICY[55:32]).
@@ -92,8 +64,8 @@ constexpr const uint8_t HTTP_CSR_REVISION_CONNS = 5;
 ///     by capping every GET at toe_get_cap() -- ((2^RING_LOG2 - 64 KiB) / GET_CREDIT) - 4 KiB of body,
 ///     236 KiB at a 1 MiB ring and credit 4 -- and splitting every larger column chunk, whatever
 ///     OASIS_HTTP_CHUNK_BYTES says. toe_rx flags a lane past the budget (STALL[24], budget_err).
-/// Anything numerically above this is NOT treated as "at least revision 6": the host refuses a
-/// revision it does not know (HTTPRevision::Classify) instead of guessing its register map.
+/// Revisions 3..5 (the HBM-slot handler, no longer built) and anything above 6 are refused
+/// (HTTPRevision::Classify) instead of guessing their register map.
 constexpr const uint8_t HTTP_CSR_REVISION_TOE = 6;
 
 /// Revision 6: what the window budget keeps free of the ring (2^RING_LOG2) per lane -- the hardware's
@@ -104,9 +76,8 @@ constexpr const uint64_t HTTP_TOE_GET_OVERHEAD = 4ULL * 1024ULL;
 
 /**
  * What a raw CSR revision (inflightWord[31:24]) means to this library. Pure; HTTPReadConfig::
- * revision() returns `protocol`, so every `revision() >= HTTP_CSR_REVISION_X` gate in the code -- the
- * register map and the rules -- sees a revision-6 bitstream as the revision 2 its register map is,
- * and nothing slot-related (revisions 3..5) can run on it.
+ * revision() returns `protocol`, so every `revision() >= HTTP_CSR_REVISION_X` gate in the code sees a
+ * revision-6 bitstream as the revision 2 its register map is.
  */
 struct HTTPRevision {
     uint8_t raw      = 0;     // as read from inflightWord[31:24]
@@ -114,34 +85,12 @@ struct HTTPRevision {
     bool    toe_ring = false; // revision 6: handler_toe (see HTTP_CSR_REVISION_TOE)
 
     bool lane_csrs() const { return protocol >= HTTP_CSR_REVISION_LANES; }
-    bool slot_mode() const { return protocol >= HTTP_CSR_REVISION_SLOTS; }
-    bool slot_pipelined() const { return protocol >= HTTP_CSR_REVISION_PIPE; }
-    bool conn_placement() const { return protocol >= HTTP_CSR_REVISION_CONNS; }
 
-    /// Throws std::runtime_error on a revision above HTTP_CSR_REVISION_TOE: its register map is not
-    /// known here, and reading or writing by a guess is how a host corrupts a bitstream's state.
+    /// Throws std::runtime_error on a revision this library does not drive: 3..5 (the HBM-slot
+    /// handler) and anything above HTTP_CSR_REVISION_TOE. Reading or writing a register map by a
+    /// guess is how a host corrupts a bitstream's state.
     static HTTPRevision Classify(uint8_t raw);
 };
-
-/// Lane depth on a revision-4 bitstream when OASIS_HTTP_LANE_DEPTH is not set, and the most it may
-/// be set to. Two already hides the per-request round trip behind the previous transfer (the
-/// build-119 depth sweep: per-GET time 1020 -> 848 -> 822 us at depth 1 -> 2 -> 4).
-constexpr const size_t HTTP_PIPE_DEFAULT_DEPTH = 2;
-constexpr const size_t HTTP_PIPE_MAX_DEPTH     = 4;
-
-/// What the byte budget charges per GET on top of its body: the response header (MinIO ~630 bytes)
-/// plus room for a server that sends a longer one.
-constexpr const uint64_t HTTP_SLOT_GET_OVERHEAD = 4ULL * 1024ULL;
-
-/// Connections the revision-3 per-connection words address at their fixed stride (8 per 64-bit word
-/// for OCC/ERR, 16 per word for READY; 4 + 2 + 4 words). Connections the bitstream lacks read 0.
-constexpr const uint8_t HTTP_CONN_SLOTS = 32;
-
-/// Header slack the host leaves in a connection's slot: one GET's BODY may be at most
-/// 2^SLOT_LOG2 - this, so the response headers (~630 bytes from MinIO) always fit behind it. The
-/// hardware's rule, stated in http_config.sv's SLOT_POLICY field; a response that overruns its slot
-/// is dropped whole and the connection goes FATAL (CONN_ERR bit 7).
-constexpr const uint64_t HTTP_SLOT_HEADER_SLACK = 64ULL * 1024ULL;
 
 /**
  * Configues a hardware RDMARead module to properly process the next page
@@ -224,13 +173,14 @@ class HTTPReadConfig : public libstf::Config {
         std::vector<uint32_t> chunk_bytes;
         /// One entry per GET: its length in bytes within `text`, in order, so that the requests can
         /// be told apart again. A revision-2 bitstream never needs this -- the whole text is one arm
-        /// -- but a revision-3 one takes ONE ARM PER GET (depth 1 per connection), so each request
-        /// has to be armed, padded and DMA'd on its own. Empty means "the text is one request".
+        /// -- but a revision-6 one takes ONE ARM PER GET (the GET credit counts arms), so each
+        /// request has to be armed, padded and DMA'd on its own. Empty means "the text is one
+        /// request".
         std::vector<uint32_t> request_bytes;
     };
 
     /// Append one column chunk's GETs to `batch`, splitting at split_bytes() -- chunk_bytes(), and on
-    /// a revision-3 or revision-6 bitstream never more than max_get_bytes().
+    /// a revision-6 bitstream never more than max_get_bytes().
     void read_streamed(uint32_t server_ip, uint16_t server_port, const std::string &path,
                        uint64_t range_begin, uint64_t range_end, RequestBatch &batch);
 
@@ -274,11 +224,9 @@ class HTTPReadConfig : public libstf::Config {
     /// could disagree; and the arm carried no lane of its own at all, inheriting whatever the last
     /// entry left in the register. Both are now one explicit parameter.
     ///
-    /// On a revision-3 bitstream this is legal only for a batch of ONE request: every GET needs its
-    /// own arm there (see arm_transfer()), and one arm announcing several GETs would put several
-    /// responses into a slot the hardware drains as one. It throws rather than corrupt; the operator
-    /// drives revision 3 through push_entries() + arm_transfer() per request instead. The same holds
-    /// on revision 6 (one_arm_per_get()), where the GET credit counts arms.
+    /// On a revision-6 bitstream this is legal only for a batch of ONE request: the GET credit counts
+    /// arms, so every GET needs its own arm. It throws rather than corrupt; the operator drives
+    /// revision 6 through push_entries() + arm_transfer() per request instead.
     void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch,
                       uint8_t lane);
 
@@ -289,31 +237,23 @@ class HTTPReadConfig : public libstf::Config {
     /// The second half: arm ONE transfer of `text_bytes` bytes of request text on `lane` (write the
     /// arm registers, wait for ARM_READY, pulse START). The caller DMAs the text afterwards.
     ///
-    /// On a revision-3 bitstream ARM_READY includes the connection's DEPTH-1 CREDIT, so this blocks
-    /// until the previous response on that connection has been drained out of its slot -- which is
-    /// what makes one-GET-per-connection a hardware guarantee instead of a host convention.
+    /// On a revision-6 bitstream ARM_READY includes the lane's GET credit, so this blocks while the
+    /// lane already has GET_CREDIT GETs unfinished.
     void arm_transfer(uint32_t server_ip, uint16_t server_port, uint32_t text_bytes, uint8_t lane);
-    /// Revision 5: the same, on connection `conn` (from pick_conn()). Below revision 5 `conn` must
-    /// be the lane's own connection and is not written.
-    void arm_transfer(uint32_t server_ip, uint16_t server_port, uint32_t text_bytes, uint8_t lane,
-                      uint8_t conn);
 
-    /// Revision 3 only: block until the arm just written has been CONSUMED, i.e. CONN_DRAINED for
-    /// the lane's connection has fallen. START does not back-pressure and the handler samples the
-    /// LIVE registers, so writing the next beat's registers before the arm is consumed would change
-    /// what it arms. Revisions 4 and 6: until ARM_READY has fallen (the arm made the lane's request
-    /// stream busy, and the caller sends that text only after this returns). A no-op on revision 2.
-    void await_arm_consumed(uint8_t lane);
+    /// Revision 6: block until the arm just written has been TAKEN, i.e. ARM_READY of `lane` has
+    /// fallen. START does not back-pressure and the handler samples the LIVE registers, so writing
+    /// the next beat's registers before the arm is taken would change what it arms. The arm makes the
+    /// lane's request stream busy, and the caller sends that text only after this returns.
+    void await_arm_taken(uint8_t lane);
 
     // ---- CSR revision 6 (TOE receive rings, handler_toe) ----------------------------------------
 
-    /// True on a revision-6 bitstream (see HTTP_CSR_REVISION_TOE). revision() reports 2 there.
+    /// True on a revision-6 bitstream (see HTTP_CSR_REVISION_TOE). revision() reports 2 there. Every
+    /// GET then needs an arm of its own: the operator arms, pads and DMAs each GET separately.
     bool toe_ring();
     /// The revision byte exactly as the bitstream reports it (6 on handler_toe), for messages.
     uint8_t raw_revision();
-    /// True where every GET needs an arm of its own: the slot handler (revision >= 3) and the TOE-ring
-    /// handler (revision 6). The operator then arms, pads and DMAs each GET separately.
-    bool one_arm_per_get() { return slot_mode() || toe_ring(); }
 
     /// Revision 6: the largest GET body that keeps a lane inside the window rule, from LANE_POLICY
     /// (GET_CREDIT, RING_LOG2). Throws if the policy word is unusable. 0 on every other revision.
@@ -324,176 +264,18 @@ class HTTPReadConfig : public libstf::Config {
     /// room left for a body).
     static uint64_t ToeGetCap(uint8_t ring_log2, uint32_t get_credit);
 
-    // ---- CSR revision 3 (HBM slots) ----------------------------------------------------------
-
-    /// True when the programmed bitstream is the slot handler (revision >= HTTP_CSR_REVISION_SLOTS).
-    /// Read once and cached with revision(); nothing below revision 3 changes behaviour.
-    bool slot_mode();
-
-    /**
-     * Read id 32 (SLOT_POLICY), revision 3 only: what handler_slots was elaborated with.
-     */
-    struct HTTPSlotPolicy {
-        uint8_t  revision     = 0; // [7:0]
-        uint8_t  n_conns      = 0; // [15:8]
-        uint8_t  n_decoders   = 0; // [23:16]
-        uint8_t  slot_log2    = 0; // [29:24], one slot is 2^this bytes
-        uint8_t  rd_max_log2  = 0; // [35:30], largest single card read
-        uint16_t entry_depth  = 0; // [51:36], armed GETs queued per decoder
-        uint8_t  wr_fifo_log2 = 0; // [57:52], shared writer fifo, in 64-byte beats
-
-        bool     valid() const { return revision >= HTTP_CSR_REVISION_SLOTS && slot_log2 != 0; }
-        uint64_t slot_bytes() const { return valid() ? (1ULL << slot_log2) : 0; }
-        /// Bytes of card memory the slot array spans: n_conns slots, back to back.
-        uint64_t region_bytes() const { return slot_bytes() * n_conns; }
-        /// Largest legal GET body: slot minus HTTP_SLOT_HEADER_SLACK. 0 when not valid.
-        uint64_t max_get_bytes() const {
-            return slot_bytes() > HTTP_SLOT_HEADER_SLACK ? slot_bytes() - HTTP_SLOT_HEADER_SLACK : 0;
-        }
-        std::string describe() const;
-    };
-    /// Cached after the first read. Empty (invalid) below revision 3 -- read id 32 is a resp_error
-    /// there, so it is never read.
-    HTTPSlotPolicy slot_policy();
-    static HTTPSlotPolicy DecodeSlotPolicy(uint64_t word);
-
-    /// Largest byte range one GET may ask for, from the bitstream: slot_policy().max_get_bytes() on
-    /// revision 3..5, toe_get_cap() on revision 6, 0 ("no limit") on revision 2 and below.
+    /// Largest byte range one GET may ask for, from the bitstream: toe_get_cap() on revision 6, 0
+    /// ("no limit") on revision 2 and below.
     uint64_t max_get_bytes();
 
-    // ---- CSR revision 4 (pipelined GETs on the slot handler) ------------------------------------
-
-    /// True on revision >= HTTP_CSR_REVISION_PIPE: several GETs may be armed on one connection.
-    bool slot_pipelined();
-
-    /// The per-connection byte budget: slot size minus HTTP_SLOT_HEADER_SLACK. 0 below revision 4.
-    uint64_t slot_budget_bytes();
-
-    /// Revision 4: block until `body_bytes` (+ HTTP_SLOT_GET_OVERHEAD) more response bytes fit in
-    /// the slot of `lane`'s connection, then charge them. The charge is cleared whenever CONN_DRAINED
-    /// reads set (slot released, nothing armed), which is the only moment the host knows the slot's
-    /// cursor is back at 0. A no-op below revision 4. Throws on a fatal lane or after the credit
-    /// timeout. Must be called by the one thread that arms this lane, immediately before the arm.
-    void reserve_slot_bytes(uint8_t lane, uint64_t body_bytes);
-
-    /// Pure form of reserve_slot_bytes()'s admission: `used` already charged, `need` to add. A need
-    /// larger than the whole budget is admitted only into an empty slot (used == 0) -- it cannot be
-    /// made to fit by waiting, and max_get_bytes() already bounds a single GET below the slot size.
-    static bool SlotBudgetOk(uint64_t used, uint64_t need, uint64_t budget);
-
-    /// The body length a ranged GET asks for, from its "Range: bytes=a-b" header (b - a + 1).
-    /// 0 when the text carries no parsable closed range.
-    static uint64_t RequestRangeBytes(const std::string &request);
-
-    /// Write SLOT_BASE_LO/HI (write ids 42/43): the virtual address of slot 0, as the card DMA's TLB
-    /// resolves it. Throws below revision 3, where those addresses do not exist.
-    void set_slot_base(uint64_t vaddr);
-
-    /**
-     * One connection's view from the revision-3 words (read ids 21..31). In stage 1 connection c is
-     * decoder c, so `occ` is the chunk occupancy of decoder c (CONN_OCC is indexed by DECODER).
-     */
-    struct HTTPConn {
-        uint8_t occ         = 0;     // CONN_OCC, chunk entries of the decoder with this index
-        bool    arm_ready   = false; // CONN_READY +0, INCLUDES the depth-1 credit
-        bool    entry_ready = false; // CONN_READY +1
-        bool    conn_up     = false; // CONN_READY +2
-        bool    fatal       = false; // CONN_READY +3
-        bool    drained     = false; // CONN_DRAINED[c]: slot empty, will accept an arm
-        bool    overflow    = false; // CONN_DRAINED[32+c]: sticky slot overflow (= err bit 7)
-        uint8_t err_raw     = 0;     // CONN_ERR byte: bits 0..6 as LANE_ERR, bit 7 SLOT_OVERFLOW
-        // Revision 5 (CONN_MAP, read ids 34..37; CONN_CAUSE, 38). Zero below it.
-        uint8_t pend        = 0;     // entries armed on this connection, not yet retired (sat. 15)
-        uint8_t cur_dec     = 0;     // the decoder they are queued on (its home decoder before)
-        bool    is_tail     = false; // it is its decoder's tail: another arm there pipelines on it
-        bool    residue     = false; // CONN_CAUSE[c]: bytes left in its slot at a release
-        bool    tainter     = false; // CONN_CAUSE[32+c]: went fatal with entries pending
-        std::string describe() const;
-    };
-    struct HTTPConns {
-        uint8_t                                count = 0;
-        std::array<HTTPConn, HTTP_CONN_SLOTS>  conn {};
-        bool empty() const { return count == 0; }
-        const HTTPConn &at(uint8_t c) const;
-        std::string describe() const;
-    };
-    /// All eleven revision-3 readback words, decoded. Empty below revision 3. Diagnostics only --
-    /// the admission paths read the one or two words they need.
-    HTTPConns conns();
-    static HTTPConns DecodeConns(const std::array<uint64_t, 4> &occ_words,
-                                 const std::array<uint64_t, 2> &ready_words,
-                                 const std::array<uint64_t, 4> &err_words, uint64_t drained_word,
-                                 uint8_t count);
-
-    /// The connection a lane's GETs travel on. Stage 1 (N_CONNS == N_DECODERS): the lane itself.
-    uint8_t conn_for_lane(uint8_t lane);
-
-    // ---- CSR revision 5 (stage 2: the host places GETs on connections) --------------------------
-
-    /// True on revision >= HTTP_CSR_REVISION_CONNS.
-    bool conn_placement();
-
-    /// Connections this process spreads GETs over: OASIS_HTTP_CONNS clamped to [1, N_CONNS]
-    /// (default all of them). The bitstream opens every connection it has either way; the unused
-    /// ones simply stay idle -- so a 32-connection bitstream measures 4, 8, 16, 24 and 32 without a
-    /// rebuild.
-    uint8_t active_conns();
-
-    /// GETs one connection may have armed at once when the host pipelines on it (only when no
-    /// connection is free): OASIS_HTTP_CONN_DEPTH, default HTTP_PIPE_DEFAULT_DEPTH, at most
-    /// HTTP_PIPE_MAX_DEPTH.
-    size_t conn_depth();
-
-    /// Revision 5: choose the connection the next GET of `lane` (a decoder) goes on, charge its
-    /// `body_bytes` (+ HTTP_SLOT_GET_OVERHEAD) to that connection's slot, and return it. Blocks until
-    /// one can take it; throws on a tainted decoder or after the credit timeout. Prefers a FREE
-    /// connection (round robin over active_conns() -- more connections in flight is the whole point
-    /// of stage 2), and otherwise pipelines on the lane's tail up to conn_depth() GETs within the
-    /// slot's byte budget. Must be called by the one thread that arms, immediately before the arm.
-    uint8_t pick_conn(uint8_t lane, uint64_t body_bytes);
-
-    /// Everything pick_conn() decides on, so the rule can be checked without a board.
-    struct ConnPickInputs {
-        uint8_t  lane        = 0;
-        uint8_t  active      = 0;       // connections to use, 0..active-1
-        uint8_t  rr          = 0;       // round-robin cursor
-        int      host_tail   = -1;      // the connection the host last armed on this lane
-        size_t   conn_depth  = 1;
-        uint64_t budget      = 0;       // slot byte budget
-        uint64_t need        = 0;       // this GET's charge
-        std::array<bool, HTTP_CONN_SLOTS>     drained {};
-        std::array<bool, HTTP_CONN_SLOTS>     fatal {};
-        std::array<uint8_t, HTTP_CONN_SLOTS>  pend {};
-        std::array<uint8_t, HTTP_CONN_SLOTS>  cur_dec {};
-        std::array<bool, HTTP_CONN_SLOTS>     is_tail {};
-        std::array<uint64_t, HTTP_CONN_SLOTS> used {};
-    };
-    struct ConnPick {
-        int     conn    = -1;     // -1: nothing can take it now (poll)
-        bool    free    = false;  // a free connection (its byte charge restarts at 0)
-        uint8_t next_rr = 0;
-    };
-    static ConnPick PickConn(const ConnPickInputs &in);
-
-    /// Pure decoder of CONN_MAP (34..37) + CONN_CAUSE (38) into `conns` (revision 5).
-    static void DecodeConnMap(const std::array<uint64_t, 4> &map_words, uint64_t cause_word,
-                              HTTPConns &conns);
-
-    /// Read id 31 bit `conn`: the depth-1 credit on revision 3; "slot empty and nothing armed" on
-    /// revision 4 (the byte budget's reset).
-    bool conn_drained(uint8_t conn);
-
-    /// Pure form of await_lane_credit()'s admission rule, so it can be checked without a board:
-    /// revision 3 additionally requires the connection's slot to be drained (`drained`); revision 4
-    /// does not (its slot rule is the byte budget, taken at the arm).
-    static bool LaneCreditOk(uint8_t revision, size_t occ, size_t needed, size_t limit, bool drained);
+    /// Pure form of await_lane_credit()'s admission rule, so it can be checked without a board: the
+    /// lane owes `occ` responses and may owe at most `limit` once `needed` more are admitted.
+    static bool LaneCreditOk(size_t occ, size_t needed, size_t limit);
 
     /// Pure form of lane_depth_limit(): `want` (OASIS_HTTP_LANE_DEPTH) clamped to [1, hw]; 1 below
-    /// revision 2 (no per-lane occupancy) and at revision 3 (depth 1 per connection); clamped to
-    /// [1, min(hw, HTTP_PIPE_MAX_DEPTH)] at revision 4, where the caller passes
-    /// HTTP_PIPE_DEFAULT_DEPTH as `want` when the variable is unset. `get_credit` (revision 6, where
-    /// `revision` is the protocol revision 2): when non-zero the depth is also clamped to it, since
-    /// every column chunk is at least one GET and the hardware holds at most GET_CREDIT per lane.
+    /// revision 2 (no per-lane occupancy). `get_credit` (revision 6, where `revision` is the protocol
+    /// revision 2): when non-zero the depth is also clamped to it, since every column chunk is at
+    /// least one GET and the hardware holds at most GET_CREDIT per lane.
     static size_t LaneDepthFor(uint8_t revision, size_t want, size_t hw, size_t get_credit = 0);
 
     /// Block until `lane` will accept a beat of this kind, or throw naming the lane and why it will
@@ -653,10 +435,6 @@ class HTTPReadConfig : public libstf::Config {
         std::string describe() const;
     };
     HTTPLanes lanes();
-    /// Revision 5 (pure): lanes are DECODERS -- occupancy from LANE_OCC (16, per decoder) and the
-    /// admission/fatal bits from DEC_STATE (33): ARM_READY +0, ENTRY_READY +1, fatal = TAINTED +2.
-    /// conn_up reads true: a decoder has no session of its own.
-    static HTTPLanes DecodeDecState(uint64_t occ_word, uint64_t dec_state_word, uint8_t count);
 
     /**
      * One lane's STICKY failure causes, from read id 19. Sticky since reset -- a reconnect does not
@@ -677,13 +455,9 @@ class HTTPReadConfig : public libstf::Config {
         bool status_bad    = false; // [8L+4] a response retired with neither 200 nor 206
         bool tx_refused    = false; // [8L+5] the TOE refused a transmit reservation (informational)
         bool read_timeout  = false; // [8L+6] the read watchdog expired -- nothing arrived at all
-        /// [8L+7] on REVISION 2: this lane's decoupling fifo back-pressured the stack. Revision 3
-        /// REDEFINES bit 7 (there is no per-lane fifo any more) -- see slot_overflow.
+        /// [8L+7] this lane's decoupling fifo back-pressured the stack (revision 2), or refused a
+        /// beat toe_rx had routed to it (revision 6).
         bool rx_fifo_stall = false;
-        /// [8L+7] on REVISION 3: a segment would have run past the end of this connection's slot and
-        /// was dropped whole; the connection is FATAL. Exactly one of rx_fifo_stall / slot_overflow
-        /// is decoded from bit 7, by the revision passed to DecodeLaneErrors().
-        bool slot_overflow = false;
         /// The byte exactly as read, for comparing a condition already reported against a new one.
         uint8_t raw        = 0;
 
@@ -752,8 +526,7 @@ class HTTPReadConfig : public libstf::Config {
     /// Pure decoders for the per-lane registers, exposed so a caller that already has the words --
     /// a pre-flight dump, a test -- can decode without a board. `count` is lane_count().
     static HTTPLanes       DecodeLanes(uint64_t occ_word, uint64_t ready_word, uint8_t count);
-    static HTTPLaneErrors  DecodeLaneErrors(uint64_t err_word, uint8_t count,
-                                            uint8_t revision = HTTP_CSR_REVISION_LANES);
+    static HTTPLaneErrors  DecodeLaneErrors(uint64_t err_word, uint8_t count);
     static HTTPLanePolicy  DecodePolicy(uint64_t policy_word);
 
     /**
@@ -841,16 +614,6 @@ class HTTPReadConfig : public libstf::Config {
         /// the stack, this one says the ROUTER was blocked behind it, which is what starves the
         /// other lanes.
         bool route_stall = false;
-        /// REVISION 3 ONLY (bits 29..31 were a literal 0 before it, so these decode as false on an
-        /// older bitstream without any gating).
-        /// [29] the slot writer throttled readPkg issue because the shared fifo was filling. NOT a
-        /// failure -- it is the design working -- so it is not part of any().
-        bool space_stall = false;
-        /// [30] some connection's response ran past the end of its slot (dropped, connection fatal).
-        bool slot_overflow = false;
-        /// [31] some decoder found bytes in a slot that belong to no response it was told about:
-        /// two GETs armed on one connection, or a server overrunning its Content-Length.
-        bool residue_err = false;
         /// REVISION 6 (handler_toe) REDEFINES [24]: toe_rx's sticky order_err | len_err | budget_err,
         /// ORed in hardware (software cannot tell the three apart). order_err: an rx_meta/data beat
         /// with no readPkg outstanding, or naming another session; len_err: a packet's tlast not on
@@ -869,8 +632,7 @@ class HTTPReadConfig : public libstf::Config {
         bool any() const {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
                    || resp_unframeable || dirty_abort || status_bad || notify_overflow
-                   || rx_fifo_stall || read_timeout || align_starved || route_stall
-                   || slot_overflow || residue_err || toe_rx_err;
+                   || rx_fifo_stall || read_timeout || align_starved || route_stall || toe_rx_err;
         }
         std::string describe() const;
     };
@@ -936,11 +698,9 @@ class HTTPReadConfig : public libstf::Config {
     static uint64_t chunk_bytes();
 
     /// Every readback register this bitstream has, raw and decoded, as one multi-line string: the
-    /// status/stall/response words (1..15), the per-lane words (16..20, revision >= 2; on revision 6
-    /// with the GET credit, ring size and GET cap), and the per-connection words (21..32, revision 3,
-    /// never on revision 6). Reads only; safe from any thread. This is the
-    /// in-process state capture -- a second process cannot attach on a revision-3 board (it would be
-    /// ctid 1, and the slot descriptors carry pid 0).
+    /// status/stall/response words (1..15) and the per-lane words (16..20, revision >= 2; on revision
+    /// 6 with the GET credit, ring size and GET cap). Reads only; safe from any thread. This is the
+    /// in-process state capture.
     std::string debug_dump();
 
     /// Read CSRs 3..8: the request parameters currently latched in hardware.
@@ -968,9 +728,6 @@ class HTTPReadConfig : public libstf::Config {
     /// toe_get_cap(), cached. 0 means "not computed yet" (a usable cap is never 0).
     uint64_t toe_cap_ {0};
 
-    /// Revision 6 half of await_arm_consumed(): block until ARM_READY of `lane` has fallen.
-    void await_arm_taken_toe(uint8_t lane);
-
     /// lane_depth_limit(), cached. 0 means "not computed yet"; the limit itself is never 0.
     size_t lane_depth_ {0};
 
@@ -997,23 +754,6 @@ class HTTPReadConfig : public libstf::Config {
 
     /// -1 until the first inflight() read; then the bitstream's slot count.
     int num_slots_ = -1;
-
-    /// slot_policy(), cached. `slot_policy_read_` distinguishes "not read yet" from "read, invalid".
-    HTTPSlotPolicy slot_policy_ {};
-    bool           slot_policy_read_ {false};
-
-    /// Revision 4: response bytes charged against each connection's slot since CONN_DRAINED was
-    /// last seen set. Touched only by the thread that arms (the dispatcher).
-    std::array<uint64_t, HTTP_CONN_SLOTS> slot_used_ {};
-
-    /// Revision 5 placement state (the arming thread only): the connection last armed per lane,
-    /// the round-robin cursor, and the cached OASIS_HTTP_CONNS / OASIS_HTTP_CONN_DEPTH.
-    std::array<int, HTTP_LANE_SLOTS> host_tail_ {-1, -1, -1, -1, -1, -1, -1, -1};
-    uint8_t conn_rr_ {0};
-    /// "; N of M connections over D decoders ..." for the revision-5 startup line.
-    std::string conn_line();
-    uint8_t active_conns_ {0};
-    size_t  conn_depth_ {0};
 };
 
 } // namespace oasis

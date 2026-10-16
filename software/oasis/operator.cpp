@@ -121,11 +121,10 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
                 " queue entries, more than the hardware holds (" + std::to_string(max_per_batch) +
                 ").");
         }
-        // Revision 3 pads every GET on its own in emit_batch_slots(): there each GET is a transfer
-        // of its own, and padding only the last one would leave the others with a DMA tail that the
-        // hardware's drain would swallow together with the start of the next request. Revision 6
-        // takes the same per-GET path (one GET per arm), so it is not padded here either.
-        if (!config->one_arm_per_get()) {
+        // Revision 6 pads every GET on its own in emit_one_get_per_arm(): there each GET is a
+        // transfer of its own, and padding only the last one would leave the others with a DMA tail
+        // that the hardware's drain would swallow together with the start of the next request.
+        if (!config->toe_ring()) {
             const size_t before = batch.text.size();
             oasis::PadRequestTextToBeat(batch.text);
             // Keep the per-request lengths adding up to the text: the padding is inserted into
@@ -236,18 +235,10 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     auto config = ctx.config<HTTPReadConfig>();
     RefuseCrossStreamBatch(ctx, batch);
 
-    // CSR revision 6 (TOE receive rings, handler_toe): one arm per GET as well -- the GET credit
-    // counts arms -- on the revision-2 register map. emit_batch_slots() is the per-GET path; on this
-    // revision it runs only its revision-2-register steps (see the note above it).
+    // CSR revision 6 (TOE receive rings, handler_toe): one arm per GET -- the GET credit counts
+    // arms -- on the revision-2 register map. Everything below this branch is the revision-2 path.
     if (config->toe_ring()) {
-        emit_batch_slots(ctx, *config, batch, config->lane_for_stream(stream));
-        return;
-    }
-
-    // CSR revision 3 (HBM slots): one arm per GET, each waiting for its connection's slot to be
-    // drained. Everything below this branch is the revision-2 path, unchanged.
-    if (config->slot_mode()) {
-        emit_batch_slots(ctx, *config, batch, config->lane_for_stream(stream));
+        emit_one_get_per_arm(ctx, *config, batch, config->lane_for_stream(stream));
         return;
     }
 
@@ -372,44 +363,27 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     config->await_cfg_ready("request text to finish sending", lane, HTTPReadConfig::LaneAdmit::Arm);
 }
 
-// CSR revision 3 (HBM slots, handler_slots): the same protocol as the revision-2 path above, one GET
-// at a time.
+// CSR revision 6 (TOE receive rings, handler_toe): the same protocol as the revision-2 path above,
+// one GET at a time, on the revision-2 registers: push_entries (reads 15/16/17, writes 41/40/39),
+// arm_transfer on the lane (writes 0/1/41/40/39, polls 17), await_arm_taken (ARM_READY must fall:
+// reads 16/17), and one DMA per GET.
 //
-// WHY ONE ARM PER GET. A connection's slot in card memory holds ONE response: the reader drains it
-// into the decoder's framer and may only move on once the slot is empty (strip_http keeps mid-beat
-// residue across responses). The hardware enforces that by giving each arm exactly one reader entry
-// and by holding ARM_READY low until the slot is released. So a text announcing several GETs under
-// one arm -- which is all the revision-2 path ever does -- would land several responses in a slot the
-// reader drains as one, and the connection would go FATAL on the residue. Each GET is therefore its
-// own arm, its own DMA and, because the hardware drains its request stream to the DMA's TLAST, its
+// WHY ONE ARM PER GET. The GET credit counts arms (gets_out +1 per arm, -1 per framed response), so an
+// arm announcing several GETs would be charged once and retired several times. Each GET is therefore
+// its own arm, its own DMA and, because the hardware drains its request stream to the DMA's TLAST, its
 // own beat-padded region of the buffer.
 //
-// REVISION 4 (pipelined slots) keeps the one-arm-per-GET shape but drops the drain wait: arm k+1 is
-// taken as soon as GET k's text has gone out, and the slot is metered by bytes (reserve_slot_bytes,
-// charged before each arm) instead of by occupancy. The rest of this note is about revision 3.
-//
-// When there is more than one GET (a column chunk larger than max_get_bytes(), or an
-// OASIS_HTTP_CHUNK_BYTES split), arm k+1 waits inside arm_transfer() for response k to drain, and
-// that wait runs on the dispatcher thread. It is correct and it is slow: other lanes get no NEW work
-// placed while it lasts. At the default row-group sizes every chunk is one GET, so this path is the
-// exception; the fix, if it ever matters, is host-side splitting into separate flows (stage 2, WP6).
+// WHY THE ARM MAY WAIT. ARM_READY also requires gets_out < GET_CREDIT, so the (GET_CREDIT+1)-th GET
+// of a lane is armed only after that lane's oldest response has been framed -- on this (dispatcher)
+// thread, so other lanes get no new work for that long. It cannot deadlock: the response's decoder
+// config and output buffer were placed before its GET. Every GET is at most toe_get_cap()
+// (read_streamed splits).
 //
 // The chunk-length entries go first, all of them, exactly as on revision 2: one per COLUMN CHUNK,
 // however many GETs it was split into, because axis_rewrite_last marks tlast by byte count.
-//
-// REVISION 6 (handler_toe) uses this function for its per-GET shape and nothing else. There the
-// revision reads as 2 (HTTPReadConfig::revision()), so slot_pipelined() and conn_placement() are
-// false and every step below is a revision-2-register step: push_entries (reads 15/16/17, writes
-// 41/40/39), arm_transfer on the lane's own connection (writes 0/1/41/40/39, polls 17),
-// await_arm_consumed (ARM_READY must fall: reads 16/17), and the DMA. Why one arm per GET there:
-// the GET credit counts arms (gets_out +1 per arm, -1 per framed response). Why the arm may WAIT:
-// ARM_READY also requires gets_out < GET_CREDIT, so the (GET_CREDIT+1)-th GET of a lane is armed
-// only after that lane's oldest response has been framed -- on this (dispatcher) thread, so other
-// lanes get no new work for that long. It cannot deadlock: the response's decoder config and output
-// buffer were placed before its GET. Every GET is at most toe_get_cap() (read_streamed splits).
-void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig &config,
-                                               const HTTPReadConfig::RequestBatch &batch,
-                                               uint8_t lane) {
+void HTTPBatchSourceOperator::emit_one_get_per_arm(OasisContext &ctx, HTTPReadConfig &config,
+                                                   const HTTPReadConfig::RequestBatch &batch,
+                                                   uint8_t lane) {
     auto requests = HTTPReadConfig::SplitRequests(batch);
     if (requests.empty()) {
         return;
@@ -457,33 +431,12 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
     const libstf::stream_t req_dest = (lanes > 1) ? static_cast<libstf::stream_t>(lane)
                                                   : static_cast<libstf::stream_t>(0);
     for (size_t i = 0; i < requests.size(); i++) {
-        // Revision 4: charge this GET's response against its connection's slot before arming it
-        // (a no-op on revision 3, where the hardware holds the arm until the slot is empty). A GET
-        // whose range cannot be read back is charged as the largest legal one, which only ever
-        // makes the wait longer.
-        //
-        // Revision 5 (stage 2): the host PLACES the GET -- pick_conn() chooses a free connection (or
-        // pipelines on this decoder's tail) and charges it the same way -- and the arm names it.
-        // The request text still goes to the decoder's stream: one streamer per decoder sends it on
-        // whichever connection the arm named.
-        uint8_t conn = lane;
-        if (config.slot_pipelined()) {
-            uint64_t body = HTTPReadConfig::RequestRangeBytes(requests[i]);
-            if (body == 0) {
-                body = config.max_get_bytes();
-            }
-            if (config.conn_placement()) {
-                conn = config.pick_conn(lane, body);
-            } else {
-                config.reserve_slot_bytes(lane, body);
-            }
-        }
         // The REAL length, not the padded one: the hardware sends exactly this many bytes and
         // swallows the rest of the transfer up to TLAST.
-        config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(lens[i]), lane, conn);
+        config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(lens[i]), lane);
         // Proof the arm was taken before anything else is written -- the next GET's arm, or the
         // next flow's entries, would otherwise rewrite the registers it is sampled from.
-        config.await_arm_consumed(lane);
+        config.await_arm_taken(lane);
         gets_armed_.fetch_add(1);
 
         const size_t padded = ((lens[i] + beat - 1) / beat) * beat;
@@ -502,18 +455,16 @@ void HTTPBatchSourceOperator::emit_batch_slots(OasisContext &ctx, HTTPReadConfig
     }
 
     // No wait for "the text has gone out" here, unlike the revision-2 path. There that wait is
-    // ARM_READY, which is !stream_busy on handler_multi. On handler_slots ARM_READY also carries the
-    // depth-1 credit, so the same wait would block this (dispatcher) thread until the whole
-    // RESPONSE had been drained, serialising every lane behind this one. And it is not needed: the
-    // arm was proven consumed above, and the buffer lives until the flow retires (see above).
-    // Revision 6 likewise: its ARM_READY carries the GET credit.
+    // ARM_READY, which is !stream_busy on handler_multi. On handler_toe ARM_READY also carries the
+    // GET credit, so the same wait would block this (dispatcher) thread until a RESPONSE had been
+    // framed, serialising every lane behind this one. And it is not needed: the arm was proven taken
+    // above, and the buffer lives until the flow retires (see above).
     if (http_debug_enabled()) {
         std::fprintf(stderr,
-                     "[oasis-http] %s batch: lane %u, %zu column chunk(s), %zu GET(s), %zu bytes of "
+                     "[oasis-http] toe batch: lane %u, %zu column chunk(s), %zu GET(s), %zu bytes of "
                      "request text | %s\n",
-                     config.toe_ring() ? "toe" : "slot", unsigned(lane), batch.chunk_bytes.size(), requests.size(), total,
-                     (config.toe_ring() ? config.lanes().describe() : config.conns().describe())
-                         .c_str());
+                     unsigned(lane), batch.chunk_bytes.size(), requests.size(), total,
+                     config.lanes().describe().c_str());
     }
 }
 

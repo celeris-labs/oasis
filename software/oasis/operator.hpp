@@ -144,10 +144,10 @@ class HTTPBatchSourceOperator final : public SourceOperator {
     void build_chunk(HTTPReadConfig &config, const Chunk &c, HTTPReadConfig::RequestBatch &batch);
     void emit_batch(libstf::stream_t stream, OasisContext &ctx,
                     const HTTPReadConfig::RequestBatch &batch);
-    /// emit_batch() on a CSR revision-3 (HBM slot) bitstream: one arm, one padded region and one
-    /// DMA per GET. See the definition.
-    void emit_batch_slots(OasisContext &ctx, HTTPReadConfig &config,
-                          const HTTPReadConfig::RequestBatch &batch, uint8_t lane);
+    /// emit_batch() on a CSR revision-6 (TOE receive ring) bitstream: one arm, one padded region and
+    /// one DMA per GET. See the definition.
+    void emit_one_get_per_arm(OasisContext &ctx, HTTPReadConfig &config,
+                              const HTTPReadConfig::RequestBatch &batch, uint8_t lane);
 };
 
 /**

@@ -1,6 +1,6 @@
 // Board-free check of the HttpConfig readback decoders and the revision-dependent host rules, against
-// register words built the way the RTL builds them (hardware/src/hdl/http_read/handler_slots.sv,
-// handler_multi.sv and handler_toe.sv readback sections, http_config.sv read map). No cThread, no device: only the pure
+// register words built the way the RTL builds them (hardware/src/hdl/http_read/handler_multi.sv and
+// handler_toe.sv readback sections, http_config.sv read map). No cThread, no device: only the pure
 // static members of HTTPReadConfig are exercised.
 //
 // Build: cmake -DOASIS_BUILD_TESTS=ON, target csr_decode_check. Exit status 0 iff every check passes.
@@ -33,20 +33,12 @@ void check(bool ok, const char *what) {
 
 #define CHECK(expr) check((expr), #expr)
 
-// One lane/connection nibble as handler_{multi,slots} pack it: {fatal, conn_up, entry, arm}.
+// One lane nibble as handler_multi / handler_toe pack it: {fatal, conn_up, entry, arm}.
 uint64_t nib(bool fatal, bool up, bool entry, bool arm) {
     return (uint64_t(fatal) << 3) | (uint64_t(up) << 2) | (uint64_t(entry) << 1) | uint64_t(arm);
 }
 
-// SLOT_POLICY exactly as handler_slots assigns slotPolicyWord.
-uint64_t slot_policy_word(unsigned rev, unsigned conns, unsigned decs, unsigned slot_log2,
-                          unsigned rd_log2, unsigned entry_depth, unsigned fifo_log2) {
-    return uint64_t(rev & 0xFF) | (uint64_t(conns & 0xFF) << 8) | (uint64_t(decs & 0xFF) << 16) |
-           (uint64_t(slot_log2 & 0x3F) << 24) | (uint64_t(rd_log2 & 0x3F) << 30) |
-           (uint64_t(entry_depth & 0xFFFF) << 36) | (uint64_t(fifo_log2 & 0x3F) << 52);
-}
-
-// LANE_POLICY as both handlers assign lanePolicyWord.
+// LANE_POLICY as handler_multi assigns lanePolicyWord.
 uint64_t lane_policy_word(unsigned rev, unsigned conns, unsigned qdepth, unsigned stall_cyc,
                           unsigned stall_log2) {
     return uint64_t(rev & 0xFF) | (uint64_t(conns & 0xFF) << 8) | (uint64_t(qdepth & 0xFFFF) << 16) |
@@ -74,97 +66,24 @@ void rev2_decoders() {
 
     // LANE_ERR bit 7 means RX_FIFO_STALL at revision 2.
     const uint64_t err = 0x81ULL | (0x08ULL << 8);
-    const auto     e   = HTTPReadConfig::DecodeLaneErrors(err, 4, 2);
-    CHECK(e.at(0).lane_dead && e.at(0).rx_fifo_stall && !e.at(0).slot_overflow);
+    const auto     e   = HTTPReadConfig::DecodeLaneErrors(err, 4);
+    CHECK(e.at(0).lane_dead && e.at(0).rx_fifo_stall);
     CHECK(e.at(1).resp_err && e.at(1).any());
     CHECK(!e.at(2).any());
-    // The default revision argument is 2, which is what every pre-WP4 caller meant.
-    CHECK(HTTPReadConfig::DecodeLaneErrors(err, 4).at(0).rx_fifo_stall);
 
     const auto p = HTTPReadConfig::DecodePolicy(lane_policy_word(2, 4, 64, 65536, 16));
     CHECK(p.valid() && p.revision == 2 && p.num_conns == 4 && p.queue_depth == 64);
     CHECK(p.lane_stall_cycles == 65536 && p.lane_stall_log2 == 16);
 
-    // Revision-2 host rules are what shipped: depth = OASIS_HTTP_LANE_DEPTH clamped to the queue,
-    // no drained term, no GET cap.
+    // Revision-2 host rules: depth = OASIS_HTTP_LANE_DEPTH clamped to the queue, no GET cap.
     CHECK(HTTPReadConfig::LaneDepthFor(2, 4, 64) == 4);
     CHECK(HTTPReadConfig::LaneDepthFor(2, 100, 64) == 64);
     CHECK(HTTPReadConfig::LaneDepthFor(2, 0, 64) == 1);
     CHECK(HTTPReadConfig::LaneDepthFor(0, 4, 64) == 1);   // pre-lane bitstream
-    CHECK(HTTPReadConfig::LaneCreditOk(2, 3, 1, 4, false)); // drained is ignored below rev 3
-    CHECK(!HTTPReadConfig::LaneCreditOk(2, 4, 1, 4, true));
+    CHECK(HTTPReadConfig::LaneCreditOk(3, 1, 4));
+    CHECK(!HTTPReadConfig::LaneCreditOk(4, 1, 4));
     CHECK(HTTPReadConfig::EffectiveSplit(0, 0) == 0);
     CHECK(HTTPReadConfig::EffectiveSplit(196608, 0) == 196608);
-
-    // A policy word from a revision-2 bitstream is not a slot policy.
-    CHECK(!HTTPReadConfig::DecodeSlotPolicy(lane_policy_word(2, 4, 64, 65536, 16)).valid());
-}
-
-void rev3_decoders() {
-    // build-124: rev 3, 4 conns, 4 decoders, 4 MiB slots, RD_MAX 16 KiB, ENTRY_DEPTH 64, 1024-beat fifo.
-    const auto sp = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(3, 4, 4, 22, 14, 64, 10));
-    CHECK(sp.valid());
-    CHECK(sp.revision == 3 && sp.n_conns == 4 && sp.n_decoders == 4);
-    CHECK(sp.slot_log2 == 22 && sp.rd_max_log2 == 14 && sp.entry_depth == 64 && sp.wr_fifo_log2 == 10);
-    CHECK(sp.slot_bytes() == (4ULL << 20));
-    CHECK(sp.region_bytes() == (16ULL << 20));
-    CHECK(sp.max_get_bytes() == (4ULL << 20) - (64ULL << 10));
-    // Stage 2 shape decodes too (24 conns), and field boundaries do not bleed.
-    const auto s2 = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(3, 24, 4, 22, 14, 65535, 63));
-    CHECK(s2.n_conns == 24 && s2.entry_depth == 65535 && s2.wr_fifo_log2 == 63 && s2.slot_log2 == 22);
-
-    // Per-connection words, 32-wide form: conn 0 drained+arm+entry+up, conn 1 busy (armed, not
-    // drained), conn 2 fatal with SLOT_OVERFLOW, conn 17 lives in READY word 1 / ERR word 2.
-    std::array<uint64_t, 4> occ {}, err {};
-    std::array<uint64_t, 2> ready {};
-    occ[0]   = 0ULL | (1ULL << 8) | (2ULL << 16);
-    ready[0] = nib(false, true, true, true) | (nib(false, true, true, false) << 4) |
-               (nib(true, false, false, false) << 8);
-    ready[1] = nib(false, true, false, true) << (4 * (17 - 16));
-    err[0]   = (0x80ULL << 16);        // conn 2: bit 7 = SLOT_OVERFLOW at rev 3
-    err[2]   = (0x40ULL << (8 * (17 - 16))); // conn 17: READ_TIMEOUT
-    const uint64_t drained = (1ULL << 0) | (1ULL << 17) | (1ULL << (32 + 2));
-    const auto c = HTTPReadConfig::DecodeConns(occ, ready, err, drained, 24);
-    CHECK(c.count == 24);
-    CHECK(c.at(0).drained && c.at(0).arm_ready && c.at(0).entry_ready && c.at(0).conn_up);
-    CHECK(c.at(1).occ == 1 && !c.at(1).drained && !c.at(1).arm_ready && c.at(1).conn_up);
-    CHECK(c.at(2).fatal && c.at(2).overflow && c.at(2).err_raw == 0x80 && c.at(2).occ == 2);
-    CHECK(c.at(17).drained && c.at(17).arm_ready && !c.at(17).entry_ready && c.at(17).err_raw == 0x40);
-    CHECK(!c.at(16).drained && c.at(16).err_raw == 0 && !c.at(16).arm_ready);
-    bool threw = false;
-    try {
-        (void)c.at(24);
-    } catch (const std::out_of_range &) {
-        threw = true;
-    }
-    CHECK(threw);
-    CHECK(HTTPReadConfig::DecodeConns(occ, ready, err, drained, 40).count == 32); // clamped
-
-    // Revision 3 keeps 16..20 in their revision-2 shape for conns 0..7: laneReadyWord is
-    // {32'd0, connReadyWord[0][31:0]} and laneErrWord is connErrWord[0]. Decoding them with the
-    // revision-2 decoder must agree with the revision-3 one -- except bit 7, which is REDEFINED.
-    const auto l = HTTPReadConfig::DecodeLanes(occ[0], ready[0] & 0xFFFFFFFFULL, 4);
-    for (uint8_t i = 0; i < 4; i++) {
-        CHECK(l.at(i).arm_ready == c.at(i).arm_ready && l.at(i).fatal == c.at(i).fatal &&
-              l.at(i).occ == c.at(i).occ);
-    }
-    const auto e3 = HTTPReadConfig::DecodeLaneErrors(err[0], 4, 3);
-    CHECK(e3.at(2).slot_overflow && !e3.at(2).rx_fifo_stall);
-    const auto e2 = HTTPReadConfig::DecodeLaneErrors(err[0], 4, 2);
-    CHECK(e2.at(2).rx_fifo_stall && !e2.at(2).slot_overflow);
-
-    // Revision-3 host rules: depth 1 per connection whatever the environment asks, credit needs
-    // the slot drained, GETs capped at slot - 64 KiB.
-    CHECK(HTTPReadConfig::LaneDepthFor(3, 4, 64) == 1);
-    CHECK(HTTPReadConfig::LaneDepthFor(3, 1, 64) == 1);
-    CHECK(HTTPReadConfig::LaneCreditOk(3, 0, 1, 1, true));
-    CHECK(!HTTPReadConfig::LaneCreditOk(3, 0, 1, 1, false)); // armed, response still in the slot
-    CHECK(!HTTPReadConfig::LaneCreditOk(3, 1, 1, 1, true));  // previous chunk not retired
-    CHECK(HTTPReadConfig::LaneCreditOk(3, 0, 3, 3, true));   // a 3-chunk batch gets the lane alone
-    const uint64_t cap = sp.max_get_bytes();
-    CHECK(HTTPReadConfig::EffectiveSplit(0, cap) == cap);          // default: one GET per chunk, capped
-    CHECK(HTTPReadConfig::EffectiveSplit(196608, cap) == 196608);  // explicit smaller split wins
-    CHECK(HTTPReadConfig::EffectiveSplit(8ULL << 20, cap) == cap); // explicit larger split is capped
 }
 
 void request_split() {
@@ -211,9 +130,9 @@ void request_split() {
 }
 
 
-// The scheduler is unchanged by WP4; what changes is the lane depth it is handed. At revision 3 that
-// is 1, so a lane still owing a chunk is NOT a placement candidate -- the flow waits in the queue
-// (lane_bound_wait) instead of being admitted and then blocking the dispatcher inside its arm.
+// At lane depth 1 (OASIS_HTTP_LANE_DEPTH=1) a lane still owing a chunk is NOT a placement candidate --
+// the flow waits in the queue (lane_bound_wait) instead of being admitted and then blocking the
+// dispatcher inside its arm.
 void placement_at_depth() {
     const uint64_t occ   = 1ULL | (0ULL << 8) | (0ULL << 16) | (1ULL << 24);
     const uint64_t ready = nib(false, true, true, false) | (nib(false, true, true, true) << 4) |
@@ -225,7 +144,7 @@ void placement_at_depth() {
     in.active     = 4;
     in.rr         = 0;
 
-    in.lane_depth = HTTPReadConfig::LaneDepthFor(3, 4, 64);
+    in.lane_depth = HTTPReadConfig::LaneDepthFor(2, 1, 64);
     auto out      = oasis::Scheduler::PlaceOnLane(in);
     CHECK(out.stream && *out.stream == 1); // first idle lane from the cursor
 
@@ -241,235 +160,6 @@ void placement_at_depth() {
 
 } // namespace
 
-// CSR revision 4 (pipelined GETs on the slot handler): same map, new host rules.
-void rev4_rules() {
-    // build-126-shape policy: rev 4, 4 conns, 4 decoders, 256 MiB slots = the whole 1 GiB page.
-    const auto sp = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(4, 4, 4, 28, 14, 64, 10));
-    CHECK(sp.valid() && sp.revision == 4 && sp.slot_log2 == 28);
-    CHECK(sp.slot_bytes() == (256ULL << 20));
-    CHECK(sp.region_bytes() == (1ULL << 30));          // exactly the one huge page, not more
-    CHECK(sp.max_get_bytes() == (256ULL << 20) - (64ULL << 10));
-    // Stage 2 would publish 25 (24 x 32 MiB = 768 MiB).
-    const auto s2 = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(4, 24, 4, 25, 14, 64, 10));
-    CHECK(s2.region_bytes() == 24ULL * (32ULL << 20) && s2.region_bytes() <= (1ULL << 30));
-
-    // Depth: the caller passes HTTP_PIPE_DEFAULT_DEPTH when the variable is unset.
-    CHECK(oasis::HTTP_PIPE_DEFAULT_DEPTH == 2 && oasis::HTTP_PIPE_MAX_DEPTH == 4);
-    CHECK(HTTPReadConfig::LaneDepthFor(4, oasis::HTTP_PIPE_DEFAULT_DEPTH, 64) == 2);
-    CHECK(HTTPReadConfig::LaneDepthFor(4, 3, 64) == 3);
-    CHECK(HTTPReadConfig::LaneDepthFor(4, 4, 64) == 4);
-    CHECK(HTTPReadConfig::LaneDepthFor(4, 16, 64) == 4);   // clamped to HTTP_PIPE_MAX_DEPTH
-    CHECK(HTTPReadConfig::LaneDepthFor(4, 0, 64) == 1);
-    CHECK(HTTPReadConfig::LaneDepthFor(4, 4, 2) == 2);     // and to the hardware queue
-    CHECK(HTTPReadConfig::LaneDepthFor(3, 4, 64) == 1);    // revision 3 unchanged
-    CHECK(HTTPReadConfig::LaneDepthFor(2, 4, 64) == 4);    // revision 2 unchanged
-
-    // Credit: revision 4 does not wait for the slot; occupancy still bounds it.
-    CHECK(HTTPReadConfig::LaneCreditOk(4, 1, 1, 2, false)); // one GET in the slot, room for another
-    CHECK(!HTTPReadConfig::LaneCreditOk(4, 2, 1, 2, true)); // at depth
-    CHECK(!HTTPReadConfig::LaneCreditOk(3, 0, 1, 1, false)); // revision 3 still keys on drained
-
-    // Byte budget.
-    const uint64_t B = sp.max_get_bytes();
-    CHECK(HTTPReadConfig::SlotBudgetOk(0, 1000, B));
-    CHECK(HTTPReadConfig::SlotBudgetOk(B - 1000, 1000, B));
-    CHECK(!HTTPReadConfig::SlotBudgetOk(B - 999, 1000, B));
-    CHECK(HTTPReadConfig::SlotBudgetOk(0, B + 5, B));         // an empty slot takes an oversize one
-    CHECK(!HTTPReadConfig::SlotBudgetOk(1, B + 5, B));        // ...but only an empty one
-    CHECK(!HTTPReadConfig::SlotBudgetOk(B, 1, B));
-    // 424 KiB GETs (the board's byte-weighted request): ~600 fit before a drain is needed.
-    uint64_t used = 0; int n = 0;
-    while (HTTPReadConfig::SlotBudgetOk(used, (424ULL << 10) + oasis::HTTP_SLOT_GET_OVERHEAD, B)) {
-        used += (424ULL << 10) + oasis::HTTP_SLOT_GET_OVERHEAD;
-        n++;
-    }
-    CHECK(n == 612);
-
-    // Range parsing, off the text the host itself builds.
-    const std::string g = "GET /b/f.parquet HTTP/1.1\r\nHost: 10.253.74.74:9000\r\n"
-                          "Range: bytes=1000-434175\r\nConnection: keep-alive\r\n\r\n";
-    CHECK(HTTPReadConfig::RequestRangeBytes(g) == 433176);
-    CHECK(HTTPReadConfig::RequestRangeBytes("GET / HTTP/1.1\r\n\r\n") == 0);
-    CHECK(HTTPReadConfig::RequestRangeBytes("Range: bytes=5-\r\n") == 0);      // open range
-    CHECK(HTTPReadConfig::RequestRangeBytes("Range: bytes=9-3\r\n") == 0);     // reversed
-    CHECK(HTTPReadConfig::RequestRangeBytes("Range: bytes=0-0\r\n") == 1);
-
-    // Placement at revision-4 depth 2: a lane owing one chunk is still a candidate, one owing two
-    // is not.
-    const uint64_t ready = nib(false, true, true, true) | (nib(false, true, true, true) << 4) |
-                           (nib(false, true, true, true) << 8) | (nib(false, true, true, true) << 12);
-    oasis::Scheduler::LaneInputs in;
-    in.host_depth = 64;
-    in.needed     = 1;
-    in.active     = 4;
-    in.rr         = 0;
-    in.lane_depth = HTTPReadConfig::LaneDepthFor(4, oasis::HTTP_PIPE_DEFAULT_DEPTH, 64);
-    in.lanes      = HTTPReadConfig::DecodeLanes(1ULL | (1ULL << 8) | (1ULL << 16) | (1ULL << 24), ready, 4);
-    auto out      = oasis::Scheduler::PlaceOnLane(in);
-    CHECK(out.stream.has_value() && !out.lane_bound_wait);
-    in.lanes = HTTPReadConfig::DecodeLanes(2ULL | (2ULL << 8) | (2ULL << 16) | (2ULL << 24), ready, 4);
-    out      = oasis::Scheduler::PlaceOnLane(in);
-    CHECK(!out.stream && out.lane_bound_wait);
-}
-
-// Revision 5 (stage 2): words as handler_slots packs them -- DEC_STATE byte per decoder
-// {rdr_state[3:0], stream_busy, tainted, entry_ready, arm_ready}; CONN_MAP byte per connection
-// {pend[3:0], tail, cur_dec[2:0]}; CONN_CAUSE [c] residue, [32+c] tainter.
-uint64_t dec_byte(bool arm, bool entry, bool tainted, bool busy, unsigned st) {
-    return uint64_t(arm) | (uint64_t(entry) << 1) | (uint64_t(tainted) << 2) | (uint64_t(busy) << 3) |
-           (uint64_t(st & 0xF) << 4);
-}
-uint64_t map_byte(unsigned dec, bool tail, unsigned pend) {
-    return uint64_t(dec & 7) | (uint64_t(tail) << 3) | (uint64_t(pend & 0xF) << 4);
-}
-
-void rev5_rules() {
-    // build-127 shape: rev 5, 32 connections, 4 decoders, 2^25 = 32 MiB slots = the 1 GiB page.
-    const auto sp = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(5, 32, 4, 25, 14, 64, 10));
-    CHECK(sp.valid() && sp.revision == 5 && sp.n_conns == 32 && sp.n_decoders == 4);
-    CHECK(sp.slot_bytes() == (32ULL << 20) && sp.region_bytes() == (1ULL << 30));
-    CHECK(sp.max_get_bytes() == (32ULL << 20) - (64ULL << 10));
-    CHECK(oasis::HTTP_CSR_REVISION_CONNS == 5);
-    // 24 connections also take 25 (30 - clog2(24)): 768 MiB of the page.
-    const auto s24 = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(5, 24, 4, 25, 14, 64, 10));
-    CHECK(s24.region_bytes() == 24ULL * (32ULL << 20));
-
-    // DEC_STATE: decoder 0 armable, 1 only entries, 2 TAINTED, 3 busy sending.
-    const uint64_t ds = dec_byte(true, true, false, false, 0) | (dec_byte(false, true, false, false, 3) << 8) |
-                        (dec_byte(false, true, true, false, 0) << 16) | (dec_byte(false, false, false, true, 4) << 24);
-    const uint64_t occ = 1ULL | (5ULL << 8) | (9ULL << 16) | (64ULL << 24);
-    const auto l = HTTPReadConfig::DecodeDecState(occ, ds, 4);
-    CHECK(l.count == 4);
-    CHECK(l.at(0).arm_ready && l.at(0).entry_ready && !l.at(0).fatal && l.at(0).occ == 1);
-    CHECK(!l.at(1).arm_ready && l.at(1).entry_ready && !l.at(1).fatal && l.at(1).occ == 5);
-    CHECK(l.at(2).fatal && l.at(2).occ == 9);                 // tainted = the host's fatal lane
-    CHECK(!l.at(3).arm_ready && !l.at(3).entry_ready && l.at(3).occ == 64);
-    CHECK(l.at(0).conn_up && l.at(3).conn_up);                // a decoder is never "connecting"
-
-    // CONN_MAP / CONN_CAUSE, including connections 8, 17 and 31 (other words, top slot).
-    std::array<uint64_t, 4> map {};
-    map[0] = map_byte(2, true, 3) | (map_byte(1, false, 0) << 8);
-    map[1] = map_byte(3, false, 15);                          // conn 8, saturated
-    map[2] = map_byte(0, true, 1) << 8;                       // conn 17
-    map[3] = map_byte(3, true, 2) << 56;                      // conn 31
-    const uint64_t cause = (1ULL << 1) | (1ULL << (32 + 17));
-    std::array<uint64_t, 4> o4 {}, e4 {};
-    std::array<uint64_t, 2> r2 {};
-    auto cs = HTTPReadConfig::DecodeConns(o4, r2, e4, 0, 32);
-    HTTPReadConfig::DecodeConnMap(map, cause, cs);
-    CHECK(cs.at(0).cur_dec == 2 && cs.at(0).is_tail && cs.at(0).pend == 3);
-    CHECK(cs.at(1).cur_dec == 1 && !cs.at(1).is_tail && cs.at(1).pend == 0 && cs.at(1).residue);
-    CHECK(cs.at(8).cur_dec == 3 && cs.at(8).pend == 15);
-    CHECK(cs.at(17).is_tail && cs.at(17).pend == 1 && cs.at(17).tainter && !cs.at(17).residue);
-    CHECK(cs.at(31).cur_dec == 3 && cs.at(31).is_tail && cs.at(31).pend == 2);
-    CHECK(!cs.at(30).tainter && cs.at(30).pend == 0);
-
-    // Lane depth at revision 5: only the decoder's queue bounds it (no HTTP_PIPE_MAX_DEPTH cap).
-    CHECK(HTTPReadConfig::LaneDepthFor(5, 16, 64) == 16);
-    CHECK(HTTPReadConfig::LaneDepthFor(5, 100, 64) == 64);
-    CHECK(HTTPReadConfig::LaneDepthFor(5, 0, 64) == 1);
-    CHECK(HTTPReadConfig::LaneCreditOk(5, 10, 1, 16, false)); // no slot key, occupancy only
-
-    // PLACEMENT (PickConn). 8 active connections; 0..2 busy on other decoders, 3 free.
-    HTTPReadConfig::ConnPickInputs in;
-    in.lane = 1; in.active = 8; in.rr = 0; in.conn_depth = 2;
-    in.budget = sp.max_get_bytes(); in.need = 500000;
-    for (int c = 0; c < 32; c++) { in.drained[c] = true; in.pend[c] = 0; }
-    for (int c = 0; c < 3; c++) { in.drained[c] = false; in.pend[c] = 1; in.cur_dec[c] = 0; }
-    auto p = HTTPReadConfig::PickConn(in);
-    CHECK(p.conn == 3 && p.free && p.next_rr == 4);           // first free from the cursor
-    in.rr = 6;
-    p = HTTPReadConfig::PickConn(in);
-    CHECK(p.conn == 6 && p.free && p.next_rr == 7);           // round robin
-    in.rr = 7; in.fatal[7] = true;
-    p = HTTPReadConfig::PickConn(in);
-    CHECK(p.conn == 3);                                       // a fatal connection is never free
-    in.fatal[7] = false;
-    // Nothing free: the lane's tail may pipeline -- only if it is really this lane's tail.
-    for (int c = 0; c < 32; c++) { in.drained[c] = false; in.pend[c] = 1; in.cur_dec[c] = 0; }
-    in.host_tail = 5; in.cur_dec[5] = 1; in.is_tail[5] = true; in.used[5] = 600000;
-    p = HTTPReadConfig::PickConn(in);
-    CHECK(p.conn == 5 && !p.free);
-    in.pend[5] = 2;                                           // at conn_depth
-    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
-    in.pend[5] = 1; in.is_tail[5] = false;                    // another lane armed since: not tail
-    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
-    in.is_tail[5] = true; in.cur_dec[5] = 2;                  // its entries are on decoder 2
-    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
-    in.cur_dec[5] = 1; in.used[5] = in.budget - 1000;         // slot budget exhausted
-    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
-    in.used[5] = 0; in.fatal[5] = true;
-    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
-    in.fatal[5] = false; in.host_tail = -1;
-    CHECK(HTTPReadConfig::PickConn(in).conn == -1);           // no tail recorded: wait
-    // A connection beyond `active` is never used even when free (OASIS_HTTP_CONNS).
-    in.drained[20] = true; in.pend[20] = 0;
-    CHECK(HTTPReadConfig::PickConn(in).conn == -1);
-    in.active = 32;
-    CHECK(HTTPReadConfig::PickConn(in).conn == 20);
-    // active = 4 of 32: the cursor wraps inside the first four.
-    in.active = 4; in.rr = 3;
-    for (int c = 0; c < 32; c++) { in.drained[c] = true; in.pend[c] = 0; }
-    p = HTTPReadConfig::PickConn(in);
-    CHECK(p.conn == 3 && p.next_rr == 0);
-
-    // Scheduler placement over DECODER lanes: decoder 2 tainted, the rest by occupancy.
-    oasis::Scheduler::LaneInputs li;
-    li.host_depth = 64; li.needed = 1; li.active = 4; li.rr = 0; li.lane_depth = 16;
-    const uint64_t ds2 = dec_byte(true, true, false, false, 0) | (dec_byte(true, true, false, false, 0) << 8) |
-                         (dec_byte(false, true, true, false, 0) << 16) | (dec_byte(true, true, false, false, 0) << 24);
-    li.lanes = HTTPReadConfig::DecodeDecState(9ULL | (3ULL << 8) | (0ULL << 16) | (7ULL << 24), ds2, 4);
-    auto po = oasis::Scheduler::PlaceOnLane(li);
-    CHECK(po.stream.has_value() && *po.stream == 1);          // least loaded healthy decoder, not 2
-}
-
-// Revision 5 with THREE decoders (build-131: 32 connections over 3 decoders). The host has no
-// decoder count of its own: lane_count() is SLOT_POLICY[23:16] and the scheduler's streams are
-// ColumnChunkDecoderConfig's read register 1, both from the bitstream. What must hold is that a
-// count that is not a power of two decodes as itself and that nothing is ever placed on a fourth.
-void rev5_three_decoders() {
-    const auto sp = HTTPReadConfig::DecodeSlotPolicy(slot_policy_word(5, 32, 3, 25, 14, 64, 10));
-    CHECK(sp.valid() && sp.revision == 5 && sp.n_conns == 32 && sp.n_decoders == 3);
-    CHECK(sp.slot_bytes() == (32ULL << 20) && sp.max_get_bytes() == (32ULL << 20) - (64ULL << 10));
-
-    // DEC_STATE with a byte in position 3 that no 3-decoder bitstream drives: it is not a lane.
-    const uint64_t ds = dec_byte(true, true, false, false, 0) | (dec_byte(true, true, false, false, 0) << 8) |
-                        (dec_byte(true, true, false, false, 0) << 16) | (dec_byte(true, true, false, false, 0) << 24);
-    const uint64_t occ = 4ULL | (6ULL << 8) | (2ULL << 16) | (0ULL << 24);
-    const auto l = HTTPReadConfig::DecodeDecState(occ, ds, sp.n_decoders);
-    CHECK(l.count == 3 && l.at(2).occ == 2 && l.at(2).arm_ready);
-    bool threw = false;
-    try { (void)l.at(3); } catch (const std::exception &) { threw = true; }
-    CHECK(threw);
-
-    // Placement over three decoder lanes with four host streams active: the span is three, the
-    // least-loaded decoder (2) wins, and the rotation wraps at three, never onto a fourth.
-    oasis::Scheduler::LaneInputs li;
-    li.host_depth = 64; li.needed = 1; li.active = 4; li.rr = 0;
-    // conn depth 2 x ceil(32 / 3) = 22: lane_depth_limit()'s default on this bitstream.
-    li.lane_depth = HTTPReadConfig::LaneDepthFor(5, 2 * ((32 + 3 - 1) / 3), 64);
-    CHECK(li.lane_depth == 22);
-    li.lanes = l;
-    auto po = oasis::Scheduler::PlaceOnLane(li);
-    CHECK(po.span == 3 && po.stream.has_value() && *po.stream == 2 && po.next_rr == 0);
-    li.rr = 2;
-    li.lanes = HTTPReadConfig::DecodeDecState(22ULL | (22ULL << 8) | (21ULL << 16), ds, 3);
-    po = oasis::Scheduler::PlaceOnLane(li);
-    CHECK(po.stream.has_value() && *po.stream == 2 && po.next_rr == 0);
-    li.lanes = HTTPReadConfig::DecodeDecState(22ULL | (22ULL << 8) | (22ULL << 16), ds, 3);
-    po = oasis::Scheduler::PlaceOnLane(li);
-    CHECK(!po.stream && po.lane_bound_wait);                  // all three full: wait, no fourth
-
-    // A connection pipelined on decoder 2 is still that decoder's tail.
-    HTTPReadConfig::ConnPickInputs in;
-    in.lane = 2; in.active = 32; in.rr = 0; in.conn_depth = 2;
-    in.budget = sp.max_get_bytes(); in.need = 500000;
-    for (int c = 0; c < 32; c++) { in.drained[c] = false; in.pend[c] = 1; in.cur_dec[c] = 0; }
-    in.host_tail = 29; in.cur_dec[29] = 2; in.is_tail[29] = true; in.used[29] = 0;
-    CHECK(HTTPReadConfig::PickConn(in).conn == 29);
-}
-
-
 // CSR revision 6 (handler_toe, the TOE keeps a receive ring per session): words as handler_toe.sv
 // packs them. LANE_POLICY = {2'd0, 6'(RING_LOG2), 24'(GET_CREDIT), 16'(QUEUE_DEPTH), 8'(NUM_CONNS),
 // 8'(CSR_REV)}; the rest of the readback is the revision-2 layout.
@@ -479,8 +169,7 @@ uint64_t toe_policy_word(unsigned conns, unsigned qdepth, unsigned credit, unsig
            (uint64_t(credit & 0xFFFFFF) << 32) | (uint64_t(ring_log2 & 0x3F) << 56);
 }
 
-// "Range: bytes=a-b" -> a (or UINT64_MAX when absent). The end and the length come from
-// HTTPReadConfig::RequestRangeBytes.
+// "Range: bytes=a-b" -> a (or UINT64_MAX when absent).
 uint64_t range_begin_of(const std::string &request) {
     const std::string key = "Range: bytes=";
     const size_t at = request.find(key);
@@ -488,6 +177,24 @@ uint64_t range_begin_of(const std::string &request) {
         return UINT64_MAX;
     }
     return std::strtoull(request.c_str() + at + key.size(), nullptr, 10);
+}
+
+// "Range: bytes=a-b" -> b - a + 1 (0 when there is no closed range).
+uint64_t range_bytes_of(const std::string &request) {
+    const std::string key = "Range: bytes=";
+    const size_t at = request.find(key);
+    if (at == std::string::npos) {
+        return 0;
+    }
+    char *end = nullptr;
+    const char *p = request.c_str() + at + key.size();
+    const unsigned long long a = std::strtoull(p, &end, 10);
+    if (end == p || *end != '-') {
+        return 0;
+    }
+    const char *q = end + 1;
+    const unsigned long long b = std::strtoull(q, &end, 10);
+    return (end == q || b < a) ? 0 : static_cast<uint64_t>(b - a + 1);
 }
 
 // One column chunk [begin, begin+size) through AppendChunkGets at `split`: every GET at most `split`
@@ -502,7 +209,7 @@ size_t check_chunk_split(uint64_t begin, uint64_t size, uint64_t split) {
     ok = ok && reqs.size() == b.request_bytes.size();
     uint64_t next = begin, sum = 0;
     for (auto r : reqs) {
-        const uint64_t n = HTTPReadConfig::RequestRangeBytes(r);
+        const uint64_t n = range_bytes_of(r);
         ok = ok && n >= 1 && (split == 0 || n <= split) && range_begin_of(r) == next;
         ok = ok && r.rfind("GET /tpch-30/lineitem.parquet HTTP/1.1\r\n", 0) == 0;
         next += n;
@@ -517,8 +224,9 @@ size_t check_chunk_split(uint64_t begin, uint64_t size, uint64_t split) {
 }
 
 void rev6_rules() {
-    // --- revision mapping: 6 is driven as 2 (its register map); 0..5 are themselves; 7+ refused ---
-    for (unsigned raw = 0; raw <= 5; raw++) {
+    // --- revision mapping: 6 is driven as 2 (its register map); 0..2 are themselves; 3..5 (the
+    //     HBM-slot handler) and 7+ refused ---
+    for (unsigned raw = 0; raw <= 2; raw++) {
         const auto r = oasis::HTTPRevision::Classify(static_cast<uint8_t>(raw));
         CHECK(r.raw == raw && r.protocol == raw && !r.toe_ring);
     }
@@ -526,10 +234,15 @@ void rev6_rules() {
     CHECK(oasis::HTTP_CSR_REVISION_TOE == 6);
     CHECK(r6.raw == 6 && r6.protocol == 2 && r6.toe_ring);
     CHECK(r6.lane_csrs());
-    // Nothing slot-related on 6: no slot page / offload / SLOT_BASE (setup_http_slots), no CONN_*
-    // reads, no byte budget, no connection placement, no CONN_DRAINED-keyed credit.
-    CHECK(!r6.slot_mode() && !r6.slot_pipelined() && !r6.conn_placement());
-    CHECK(oasis::HTTPRevision::Classify(3).slot_mode() && oasis::HTTPRevision::Classify(5).conn_placement());
+    for (unsigned raw : {3u, 4u, 5u}) {
+        std::string what;
+        try {
+            (void)oasis::HTTPRevision::Classify(static_cast<uint8_t>(raw));
+        } catch (const std::runtime_error &e) {
+            what = e.what();
+        }
+        CHECK(what.find("HBM-slot handler") != std::string::npos);
+    }
     for (unsigned raw : {7u, 8u, 0x7Fu, 0xFFu}) {
         bool threw = false;
         try {
@@ -621,8 +334,8 @@ void rev6_rules() {
     CHECK(HTTPReadConfig::LaneDepthFor(r6.protocol, 16, 2, 4) == 2);  // and the queue
     CHECK(HTTPReadConfig::LaneDepthFor(r6.protocol, 8, 0, 4) == 4);   // queue unknown
     CHECK(HTTPReadConfig::LaneDepthFor(2, 16, 64) == 16);             // revision 2 unchanged
-    CHECK(HTTPReadConfig::LaneCreditOk(r6.protocol, 3, 1, 4, false)); // no CONN_DRAINED key
-    CHECK(!HTTPReadConfig::LaneCreditOk(r6.protocol, 4, 1, 4, true));
+    CHECK(HTTPReadConfig::LaneCreditOk(3, 1, 4));
+    CHECK(!HTTPReadConfig::LaneCreditOk(4, 1, 4));
 
     // --- STALL: bit 24 is toe_rx's order|len|budget error on 6, the notify overflow below ---
     const uint32_t sw = (1u << 24) | (1u << 25) | (1u << 28) | (3u << 8);
@@ -638,8 +351,8 @@ void rev6_rules() {
 
     // --- per-lane words keep the revision-2 layout; LANE_ERR bit 7 = the lane fifo refused a beat ---
     const uint64_t err = 0x80ULL | (0x48ULL << 8);  // lane 0 fifo, lane 1 resp_err + read_timeout
-    const auto e = HTTPReadConfig::DecodeLaneErrors(err, 4, r6.protocol);
-    CHECK(e.at(0).rx_fifo_stall && !e.at(0).slot_overflow && !e.at(0).lane_dead);
+    const auto e = HTTPReadConfig::DecodeLaneErrors(err, 4);
+    CHECK(e.at(0).rx_fifo_stall && !e.at(0).lane_dead);
     CHECK(e.at(1).resp_err && e.at(1).read_timeout && !e.at(1).rx_fifo_stall);
     const uint64_t ready = nib(false, true, true, false) | (nib(false, true, true, true) << 4) |
                            (nib(true, true, true, false) << 8) | (nib(false, false, true, true) << 12);
@@ -666,10 +379,6 @@ void rev6_rules() {
 
 int main() {
     rev2_decoders();
-    rev3_decoders();
-    rev4_rules();
-    rev5_rules();
-    rev5_three_decoders();
     rev6_rules();
     request_split();
     placement_at_depth();

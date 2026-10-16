@@ -209,9 +209,9 @@ class Scheduler {
     std::thread             dispatcher_;
 
     // ---------------------------------------------------------------------------------------------
-    // No-progress watchdog (see watchdog_loop). On by default on a CSR revision-3 (HBM slot) or
-    // revision-6 (TOE ring) bitstream, and on any other only when OASIS_STALL_DUMP_S is set, so
-    // revision-2 runs are untouched unless asked.
+    // No-progress watchdog (see watchdog_loop). On by default on a CSR revision-6 (TOE ring)
+    // bitstream, and on any other only when OASIS_STALL_DUMP_S is set, so revision-2 runs are
+    // untouched unless asked.
     // ---------------------------------------------------------------------------------------------
     bool                    watchdog_on_ = false;
     double                  stall_dump_s_ = 30.0; // 0 = kick only, never dump
