@@ -491,7 +491,7 @@ BeginGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalStat
 		// Nothing here cleared the list between row groups, so group i re-read groups i-1..0:
 		// sum(1..N) fetches of ~1 MB. Measured at sf1 (49 groups): 1,224 fetches, 1,224 MB off a
 		// 207 MB object, and a projected ~1.07 TB at sf30 -- which is why q1/q10/q12/q19 never
-		// finished there. See oasis-debug/2026-09-20/FINDINGS-2C-reread-mechanism.md.
+		// finished there.
 		//
 		// DuckDB's own ParquetReader::Scan does exactly this on every row-group switch
 		// (parquet_reader.cpp, "see if we have to switch to the next row group"); this scan drives

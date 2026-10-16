@@ -142,9 +142,9 @@ constexpr const auto HTTP_CREDIT_TIMEOUT = std::chrono::seconds(30);
 // The real contract is "readPkg must be issued in the global ARRIVAL order across all sessions",
 // which a handler draining slots in REQUEST order cannot honour with several connections open.
 //
-// The handler now holds ONE persistent connection for every request (see handler.sv). With a single
-// session, arrival order and request order are the same thing, so the contract holds by
-// construction and HTTP/1.1 pipelining over that connection is both legal and safe.
+// Each lane now holds ONE persistent connection, and on one session arrival order and request order
+// are the same thing, so HTTP/1.1 pipelining over it is legal. Across lanes rx_dispatch issues
+// readPkg in arrival order (revision 2), and on revision 6 the TOE keeps a receive ring per session.
 //
 // 0 MEANS "WHATEVER THE BITSTREAM ADVERTISES". It was 4 to match NUM_SLOTS in vfpga_top.svh, which
 // made the two numbers a pair that had to be kept in step by hand -- and silently capped a deeper
@@ -1323,7 +1323,7 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     if (notify_overflow) {
         oss << ". The announcement queue overflowed, so segments the TOE announced were dropped and "
                "that response is permanently short. This should be unreachable (NOTIFY_DEPTH in "
-               "tcp_session_table.sv vs the shared rx fifo); if it fires, the reader is not draining";
+               "rx_dispatch.sv vs the shared rx fifo); if it fires, the reader is not draining";
     }
 
     // The one failure mode worth naming outright, because nothing else in the system points at it.

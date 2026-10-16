@@ -161,10 +161,9 @@ void RefuseCrossStreamBatch(OasisContext &ctx, const HTTPReadConfig::RequestBatc
                 std::to_string(decoders) +
                 " decoders -- its chunks may belong to different streams. Run with "
                 "OASIS_HTTP_BATCH=0 (one request per column chunk), or give the batch a per-chunk "
-                "lane before enabling multi-decoder batching. This is also the required mode on a "
-                "multi-session bitstream (--multi): there each lane owns its own TCP connection and "
-                "its own request-text stream, so a batch spanning lanes has no single destination "
-                "to be DMA'd to.");
+                "lane before enabling multi-decoder batching. Each lane owns its own TCP connection "
+                "and its own request-text stream, so a batch spanning lanes has no single "
+                "destination to be DMA'd to.");
         }
     }
 }
@@ -254,12 +253,11 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     //
     // Which sink is correct depends on the bitstream, so ask it rather than assume:
     //
-    //   - ONE session (handler_stream, lane_count()==1): only axis_host_recv[0] is wired -- the
-    //     handler's s_axis_req connects to it and vfpga_top.svh ties off [1..N_STRM_AXI-1]. All
-    //     text goes to 0 whatever decode lane the chunk is bound for.
-    //   - N sessions (handler_multi, lane_count()>1): each lane owns a session AND its own request
-    //     stream, so lane L's text must go to axis_host_recv[L]. Sending it to 0 would hand every
-    //     lane's GETs to lane 0's connection.
+    //   - ONE lane (lane_count()==1): only axis_host_recv[0] carries request text. All text goes
+    //     to 0 whatever decode lane the chunk is bound for.
+    //   - N lanes (lane_count()>1): each lane owns a session AND its own request stream, so lane
+    //     L's text must go to axis_host_recv[L]. Sending it to 0 would hand every lane's GETs to
+    //     lane 0's connection.
     //
     // Getting this wrong is silent. A tied-off stream holds tready high and discards, so the DMA
     // reports success while the text vanishes; the handler has already been armed by submit_batch,

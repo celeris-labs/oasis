@@ -523,7 +523,7 @@ class HTTPReadConfig : public libstf::Config {
         uint8_t reconnects = 0;
         uint8_t read_slot  = 0;
         /// The announcement queue overflowed and segments were dropped. Sticky, and should never
-        /// fire -- see NOTIFY_DEPTH in hardware/src/hdl/http_read/tcp_session_table.sv.
+        /// fire -- see NOTIFY_DEPTH in hardware/src/hdl/http_read/rx_dispatch.sv.
         bool notify_overflow = false;
         /// The fifo that decouples the TCP stack from the HTTP parser filled up, so back-pressure
         /// reached the TOE anyway. Sticky. Not a correctness problem, but it means RX_FIFO_DEPTH in
