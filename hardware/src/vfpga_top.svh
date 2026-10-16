@@ -14,14 +14,8 @@ localparam NUM_HTTP_LANES = N_STRM_AXI - 1;
 
 // -- Tie-off unused interfaces and signals --------------------------------------------------------
 `ifdef EN_TCP
-// HTTP_SLOTS hands sq_rd/cq_rd to slot_dma_shell: the per-decoder readers drive the read
-// submission queue and its completions are swallowed there (a last=0 read draws none -- see the
-// last=0 contract in slot_dma_shell.sv). Without the define both stay tied off, verbatim as
-// build-119 left them, and nothing else in this file moves.
-`ifndef HTTP_SLOTS
 always_comb sq_rd.tie_off_m();
 always_comb cq_rd.tie_off_s();
-`endif
 always_comb rq_wr.tie_off_s();
 // handler_stream.sv opens/closes TCP itself (legacy Coyote-http style).
 //
@@ -183,60 +177,11 @@ logic [63:0]                   http_lane_ready_word;
 logic [63:0]                   http_lane_state_word;
 logic [63:0]                   http_lane_err_word;
 logic [63:0]                   http_lane_policy_word;
-`ifdef HTTP_SLOTS
-// Per-connection readback (CSR revision 3, read registers 21..32) plus the slot base the host
-// writes at 42/43. Declared only under the define so the revision-2 build is untouched: at
-// CSR_REV = 2 HttpConfig does not instantiate the registers these would feed.
-logic [3:0][63:0]              http_conn_occ_word;
-logic [1:0][63:0]              http_conn_ready_word;
-logic [3:0][63:0]              http_conn_err_word;
-logic [63:0]                   http_conn_drained_word;
-logic [63:0]                   http_slot_policy_word;
-logic [63:0]                   http_slot_base_w;
-logic [5:0][63:0]              http_conn_ext_word;   // revision 5: read ids 33..38
-`endif
 
 // 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
 // 8 to 16 words, which put START on top of RANGE_BEGIN_W1: writing that parameter fired the request
 // mid-configuration, so registers 32..38 -- the rest of the Range begin and all of the Range end --
 // never reached the snapshot and the FPGA sent "Range: bytes=<truncated>-" with no end at all.
-// Revision 3 appends SLOT_BASE_LO/HI at 42/43 and twelve read registers, so NUM_PARAM_REGS grows
-// to 44. HTTP_CONFIG_ADDR_SPACE is already 64, so the AXI-Lite window does not move and neither
-// does any address a revision-2 host knows. See ARCHITECTURE.md, ADR-5, "CSR rev 3".
-`ifdef HTTP_SLOTS
-HttpConfig #(
-    .NUM_PARAM_REGS(44),
-    .START_ADDR    (39),
-    .CSR_REV       (5)
-) inst_http_config (
-    .clk         (clk),
-    .rst_n       (rst_n),
-    .write_config(write_configs[2]),
-    .read_config (read_configs[2]),
-    .cfg          (http_cfg_live),
-    .start_cfg    (http_start),
-    .client_state (http_client_state),
-    .total_word   (http_total_word),
-    .inflight_word(http_inflight_word),
-    .queue_depth_word(http_queue_depth_word),
-    .stall_word   (http_stall_word),
-    .resp_word           (http_resp_word),
-    .content_length_word (http_content_length_word),
-    .body_remaining_word (http_body_remaining_word),
-    .lane_occ_word       (http_lane_occ_word),
-    .lane_ready_word     (http_lane_ready_word),
-    .lane_state_word     (http_lane_state_word),
-    .lane_err_word       (http_lane_err_word),
-    .lane_policy_word    (http_lane_policy_word),
-    .conn_occ_word       (http_conn_occ_word),
-    .conn_ready_word     (http_conn_ready_word),
-    .conn_err_word       (http_conn_err_word),
-    .conn_drained_word   (http_conn_drained_word),
-    .slot_policy_word    (http_slot_policy_word),
-    .conn_ext_word       (http_conn_ext_word),
-    .slot_base           (http_slot_base_w)
-);
-`else
 HttpConfig #(
     .NUM_PARAM_REGS(42),
     .START_ADDR    (39)
@@ -261,7 +206,6 @@ HttpConfig #(
     .lane_err_word       (http_lane_err_word),
     .lane_policy_word    (http_lane_policy_word)
 );
-`endif // HTTP_SLOTS
 `elsif EN_RDMA
 RDMAReadConfig #(
     .NUM_STREAMS(NUM_STREAMS)
@@ -435,195 +379,7 @@ for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_hm_req
     assign hm_req_tlast[L]         = axis_host_recv[L].tlast;
 end
 
-`ifdef HTTP_SLOTS
-// -------------------------------------------------------------------------------------------------
-// N TCP connections, one 4 MiB slot each in card memory, drained by one reader per decoder.
-// ARCHITECTURE.md ADR-5; the handler itself is hdl/http_read/handler_slots.sv.
-//
-// handler_multi below is NOT deleted and NOT edited: it is the sealed build-119 control arm, and
-// the A/B that justifies this work is the same bench running both. Everything either handler needs
-// -- hm_req_*, hm_body_*, the revision-1/2 readback words -- is shared above, so the only thing
-// this branch adds is the card DMA side and the revision-3 words.
-//
-// The card side of handler_slots is FLAT on purpose (no metaIntf, no req_t), which is what lets the
-// whole handler run in xsim against unit-tests/card_dma/card_dma_model.sv. slot_dma_shell is the
-// single place those flat wires become Coyote descriptors; see its header for the req_t field
-// table and for why a last=0 read draws no completion.
-// -------------------------------------------------------------------------------------------------
-localparam int NUM_HTTP_CONNS = `N_HTTP_CONNS;
-// log2 of one connection's slot: the slots fill the one 1 GiB slot page -- 28 (256 MiB) at 4
-// connections, 25 (32 MiB) at 24 or 32. The host does not guess it: SLOT_POLICY[29:24].
-localparam int HTTP_SLOT_LOG2 = 30 - $clog2(NUM_HTTP_CONNS);
-
-logic                       hs_wr_req_valid, hs_wr_req_ready, hs_wr_req_last;
-logic [VADDR_BITS-1:0]      hs_wr_req_vaddr;
-logic [LEN_BITS-1:0]        hs_wr_req_len;
-logic                       hs_wr_tvalid, hs_wr_tready, hs_wr_tlast;
-logic [AXI_DATA_BITS-1:0]   hs_wr_tdata;
-logic [AXI_DATA_BITS/8-1:0] hs_wr_tkeep;
-logic                       hs_wr_ack;
-
-logic                       hs_rd_req_valid [NUM_DECODERS];
-logic                       hs_rd_req_ready [NUM_DECODERS];
-logic [VADDR_BITS-1:0]      hs_rd_req_vaddr [NUM_DECODERS];
-logic [LEN_BITS-1:0]        hs_rd_req_len   [NUM_DECODERS];
-logic                       hs_rd_req_last  [NUM_DECODERS];
-logic                       hs_rd_tvalid [NUM_DECODERS];
-logic                       hs_rd_tready [NUM_DECODERS];
-logic [AXI_DATA_BITS-1:0]   hs_rd_tdata  [NUM_DECODERS];
-logic [AXI_DATA_BITS/8-1:0] hs_rd_tkeep  [NUM_DECODERS];
-logic                       hs_rd_tlast  [NUM_DECODERS];
-
-// sq_wr is shared with OutputWriter and cq_wr is seen by both; the arbiter, the duplicator and the
-// boundary register slices are down at the OutputWriter instantiation, where the other end lives.
-metaIntf #(.STYPE(req_t)) sq_wr_leg [2] (.aclk(clk), .aresetn(rst_n));
-metaIntf #(.STYPE(ack_t)) cq_wr_slot    (.aclk(clk), .aresetn(rst_n));
-
-handler_slots #(
-    .N_CONNS    (NUM_HTTP_CONNS),
-    .N_DECODERS (NUM_DECODERS),
-    .QUEUE_DEPTH(HTTP_QUEUE_DEPTH),
-    .SLOT_LOG2  (HTTP_SLOT_LOG2),
-    .CSR_REV    (5)
-) inst_handler (
-    .ap_clk  (clk),
-    .ap_rst_n(rst_n),
-
-    .m_axis_open_connection_TVALID (tcp_open_req.valid),
-    .m_axis_open_connection_TREADY (tcp_open_req.ready),
-    .m_axis_open_connection_TDATA  (tcp_open_req.data),
-    .s_axis_open_status_TVALID     (tcp_open_rsp.valid),
-    .s_axis_open_status_TREADY     (tcp_open_rsp.ready),
-    .s_axis_open_status_TDATA      (tcp_open_rsp.data),
-    .m_axis_close_connection_TVALID(tcp_close_req.valid),
-    .m_axis_close_connection_TREADY(tcp_close_req.ready),
-    .m_axis_close_connection_TDATA (tcp_close_req.data),
-
-    .s_axis_notifications_TVALID(tcp_notify.valid),
-    .s_axis_notifications_TREADY(tcp_notify.ready),
-    .s_axis_notifications_TDATA (tcp_notify.data),
-    .m_axis_read_package_TVALID (tcp_rd_pkg.valid),
-    .m_axis_read_package_TREADY (tcp_rd_pkg.ready),
-    .m_axis_read_package_TDATA  (tcp_rd_pkg.data),
-    .s_axis_rx_metadata_TVALID  (tcp_rx_meta.valid),
-    .s_axis_rx_metadata_TREADY  (tcp_rx_meta.ready),
-    .s_axis_rx_metadata_TDATA   (tcp_rx_meta.data[TCP_RX_META_BITS-1:0]),
-    .s_axis_rx_data_TVALID      (axis_tcp_recv.tvalid),
-    .s_axis_rx_data_TREADY      (axis_tcp_recv.tready),
-    .s_axis_rx_data_TDATA       (axis_tcp_recv.tdata),
-    .s_axis_rx_data_TKEEP       (axis_tcp_recv.tkeep),
-    .s_axis_rx_data_TLAST       (axis_tcp_recv.tlast),
-
-    .m_axis_tx_meta_TVALID  (tcp_tx_meta.valid),
-    .m_axis_tx_meta_TREADY  (tcp_tx_meta.ready),
-    .m_axis_tx_meta_TDATA   (tcp_tx_meta.data),
-    .m_axis_tx_data_TVALID  (axis_tcp_send.tvalid),
-    .m_axis_tx_data_TREADY  (axis_tcp_send.tready),
-    .m_axis_tx_data_TDATA   (axis_tcp_send.tdata),
-    .m_axis_tx_data_TKEEP   (axis_tcp_send.tkeep),
-    .m_axis_tx_data_TLAST   (axis_tcp_send.tlast),
-    .s_axis_tx_status_TVALID(tcp_tx_stat.valid),
-    .s_axis_tx_status_TREADY(tcp_tx_stat.ready),
-    .s_axis_tx_status_TDATA (tcp_tx_stat.data),
-
-    .req_valid(http_start.valid),
-    .req_ready(http_start.ready),
-    .req_data (http_start.data),
-
-    // SLOT_BASE_LO/HI are a 64-bit host write; the descriptor field is VADDR_BITS (48) wide. The
-    // top bits of a Coyote virtual address are never used, and truncating here rather than in
-    // handler_slots keeps the handler free of shell widths.
-    .slot_base(http_slot_base_w[VADDR_BITS-1:0]),
-
-    .s_axis_req_TVALID(hm_req_tvalid), .s_axis_req_TREADY(hm_req_tready),
-    .s_axis_req_TDATA (hm_req_tdata),  .s_axis_req_TKEEP (hm_req_tkeep),
-    .s_axis_req_TLAST (hm_req_tlast),
-
-    .m_axis_body_tvalid(hm_body_tvalid), .m_axis_body_tready(hm_body_tready),
-    .m_axis_body_tdata (hm_body_tdata),  .m_axis_body_tkeep (hm_body_tkeep),
-    .m_axis_body_tlast (hm_body_tlast),
-
-    .wr_req_valid(hs_wr_req_valid), .wr_req_ready(hs_wr_req_ready),
-    .wr_req_vaddr(hs_wr_req_vaddr), .wr_req_len   (hs_wr_req_len),
-    .wr_req_last (hs_wr_req_last),
-    .m_axis_card_tvalid(hs_wr_tvalid), .m_axis_card_tready(hs_wr_tready),
-    .m_axis_card_tdata (hs_wr_tdata),  .m_axis_card_tkeep (hs_wr_tkeep),
-    .m_axis_card_tlast (hs_wr_tlast),
-    .wr_ack(hs_wr_ack),
-
-    .rd_req_valid(hs_rd_req_valid), .rd_req_ready(hs_rd_req_ready),
-    .rd_req_vaddr(hs_rd_req_vaddr), .rd_req_len  (hs_rd_req_len),
-    .rd_req_last (hs_rd_req_last),
-    .s_axis_card_tvalid(hs_rd_tvalid), .s_axis_card_tready(hs_rd_tready),
-    .s_axis_card_tdata (hs_rd_tdata),  .s_axis_card_tkeep (hs_rd_tkeep),
-    .s_axis_card_tlast (hs_rd_tlast),
-
-    .totalWord        (http_total_word),
-    .inflightWord     (http_inflight_word),
-    .queueDepthWord   (http_queue_depth_word),
-    .stallWord        (http_stall_word),
-    .respWord         (http_resp_word),
-    .contentLengthWord(http_content_length_word),
-    .bodyRemainingWord(http_body_remaining_word),
-    .state_debug      (http_client_state),
-
-    .laneOccWord      (http_lane_occ_word),
-    .laneReadyWord    (http_lane_ready_word),
-    .laneStateWord    (http_lane_state_word),
-    .laneErrWord      (http_lane_err_word),
-    .lanePolicyWord   (http_lane_policy_word),
-
-    .connOccWord    (http_conn_occ_word),
-    .connReadyWord  (http_conn_ready_word),
-    .connErrWord    (http_conn_err_word),
-    .connDrainedWord(http_conn_drained_word),
-    .slotPolicyWord (http_slot_policy_word),
-    .connExtWord    (http_conn_ext_word)
-);
-
-// ONE card channel since 2026-09-22: build-123 was built with N_CARD_AXI = NUM_DECODERS+1, placed
-// at WNS -1.53 ns and failed route_design on congestion (34,111 unroutable signals; SLR0 at 99.55%
-// CLB). See hardware/CMakeLists.txt and slot_dma_shell.sv. The writer owns the channel's write
-// half, the readers share its read half through slot_rd_share, and both dests are 0 because with
-// MULT_CARD_AXI 0 the shell's credit mux indexes a one-entry array with that field.
-slot_dma_shell #(
-    .N_RD        (NUM_DECODERS),
-    .N_CARD      (N_CARD_AXI),
-    .WR_DEST     (0),
-    .RD_DEST     (0),
-    // 16 KiB, matching handler_slots' RD_MAX default: it sizes slot_rd_share's per-decoder receive
-    // fifos (2 x RD_MAX each) and the credit that keeps a slow decoder off the shared stream.
-    .RD_MAX      (16384),
-    // Coyote thread id 0: the pid keys the TLB lookup, and it is the id libstf's StreamWriter has
-    // always used. The slot page must be mapped by that same cThread. See slot_dma_shell.sv.
-    .CARD_PID    (0)
-) inst_slot_dma_shell (
-    .clk  (clk),
-    .rst_n(rst_n),
-
-    .wr_req_valid(hs_wr_req_valid), .wr_req_ready(hs_wr_req_ready),
-    .wr_req_vaddr(hs_wr_req_vaddr), .wr_req_len  (hs_wr_req_len),
-    .wr_req_last (hs_wr_req_last),
-    .wr_tvalid(hs_wr_tvalid), .wr_tready(hs_wr_tready),
-    .wr_tdata (hs_wr_tdata),  .wr_tkeep (hs_wr_tkeep), .wr_tlast(hs_wr_tlast),
-    .wr_ack   (hs_wr_ack),
-
-    .rd_req_valid(hs_rd_req_valid), .rd_req_ready(hs_rd_req_ready),
-    .rd_req_vaddr(hs_rd_req_vaddr), .rd_req_len  (hs_rd_req_len),
-    .rd_req_last (hs_rd_req_last),
-    .rd_tvalid(hs_rd_tvalid), .rd_tready(hs_rd_tready),
-    .rd_tdata (hs_rd_tdata),  .rd_tkeep (hs_rd_tkeep), .rd_tlast(hs_rd_tlast),
-
-    .sq_wr(sq_wr_leg[1]),
-    .cq_wr(cq_wr_slot),
-    .sq_rd(sq_rd),
-    .cq_rd(cq_rd),
-
-    .axis_card_send(axis_card_send),
-    .axis_card_recv(axis_card_recv)
-);
-
-`elsif HTTP_TOE_BUF
+`ifdef HTTP_TOE_BUF
 // -------------------------------------------------------------------------------------------------
 // The TOE keeps the receive buffer itself (ENABLE_HTTP_TOE_BUFFER: TCP_STACK_RX_DDR_BYPASS_EN = 0, a
 // 1 MiB ring per session in card memory, patches 0007/0008). handler_toe is handler_multi with
@@ -783,7 +539,7 @@ handler_multi #(
     .laneErrWord      (http_lane_err_word),
     .lanePolicyWord   (http_lane_policy_word)
 );
-`endif // HTTP_SLOTS
+`endif // HTTP_TOE_BUF
 
 // Each lane is already its own stream -- there is nothing left to select.
 AXI4S axi_http_lane [NUM_DECODERS] (.aclk(clk), .aresetn(rst_n));
@@ -938,71 +694,6 @@ always_comb axi_out[BYPASS_ID].tie_off_m();
 `endif
 
 // -- Output writer --------------------------------------------------------------------------------
-`ifdef HTTP_SLOTS
-// sq_wr now carries two kinds of request: OutputWriter's LOCAL_WRITE/STRM_HOST transfers of decoded
-// output, and slot_writer's LOCAL_WRITE/STRM_CARD transfers of arriving TCP segments. The shell
-// splits them again by `strm` (req_mux_stream_1_2 in the user wrapper), so one round-robin arbiter
-// over the two producers is all that is needed here.
-//
-// cq_wr goes the other way: ONE completion stream that both consumers must see, because neither can
-// tell in advance which of them a beat belongs to. Both filter -- StreamWriter on
-// strm == STRM_HOST && dest == its own stream id (stream_writer.sv:213), slot_dma_shell on
-// STRM_CARD && dest 0 && host == 0 -- and, critically, both hold cq_wr.ready high unconditionally,
-// so a completion for one can never be held behind the other. That is the property that makes a
-// plain duplicator safe here; meta_intf_dup2 keeps the per-output `seen` bit anyway.
-//
-// The register slices are the reason this is not simply wired straight through: the HBM shell sits
-// physically far from the user region, build-119 already closes at WNS -1.474 ns with 2009 failing
-// paths, and these two descriptor paths plus the card channel's two data streams are the new long
-// ones.
-metaIntf #(.STYPE(req_t)) sq_wr_shared (.aclk(clk), .aresetn(rst_n));
-metaIntf #(.STYPE(ack_t)) cq_wr_shared (.aclk(clk), .aresetn(rst_n));
-metaIntf #(.STYPE(ack_t)) cq_wr_ow     (.aclk(clk), .aresetn(rst_n));
-
-MetaIntfArbiter #(
-    .N_INTERFACES(2),
-    .STYPE(req_t)
-) inst_sq_wr_share (
-    .clk(clk),
-    .rst_n(rst_n),
-    .intf_in(sq_wr_leg),
-    .intf_out(sq_wr_shared)
-);
-
-meta_reg_array #(
-    .DATA_BITS($bits(req_t)),
-    .N_STAGES (2)
-) inst_sq_wr_boundary_reg (.aclk(clk), .aresetn(rst_n), .s_meta(sq_wr_shared), .m_meta(sq_wr));
-
-meta_reg_array #(
-    .DATA_BITS($bits(ack_t)),
-    .N_STAGES (2)
-) inst_cq_wr_boundary_reg (.aclk(clk), .aresetn(rst_n), .s_meta(cq_wr), .m_meta(cq_wr_shared));
-
-meta_intf_dup2 #(
-    .STYPE(ack_t)
-) inst_cq_wr_dup (
-    .clk(clk),
-    .rst_n(rst_n),
-    .in(cq_wr_shared),
-    .out_0(cq_wr_ow),
-    .out_1(cq_wr_slot)
-);
-
-OutputWriter inst_output_writer (
-    .clk(clk),
-    .rst_n(rst_n),
-
-    .sq_wr(sq_wr_leg[0]),
-    .cq_wr(cq_wr_ow),
-    .notify(notify),
-
-    .mem_config(mem_conf),
-
-    .data_in(axi_out),
-    .data_out(axis_host_send)
-);
-`else
 OutputWriter inst_output_writer (
     .clk(clk),
     .rst_n(rst_n),
@@ -1016,4 +707,3 @@ OutputWriter inst_output_writer (
     .data_in(axi_out),
     .data_out(axis_host_send)
 );
-`endif // HTTP_SLOTS

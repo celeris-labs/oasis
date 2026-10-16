@@ -8,30 +8,18 @@ decoders=1
 enable_http_multi=0
 enable_http=0
 enable_perf_ila=0
-enable_http_slots=0
 enable_toe_buffer=0
-conns=0
 build_num=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --http) enable_http=1 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
         --multi) enable_http_multi=1 ;;
-        # Per-connection receive slots in HBM (ADR-5): rx_dispatch -> slot_writer -> one card slot
-        # per TCP connection (the 1 GiB slot page split N ways) -> one slot_reader per decoder.
-        # Needs --multi. N is the connection count, --decoders..32: equal to --decoders is stage 1,
-        # more is stage 2 (CSR revision 5, host-placed connections). Giving it turns the mode on, so
-        # `--conns 4` alone is enough -- there is no separate --slots flag to forget.
-        #
-        # This is the flag that sets EN_MEM, which changes the SHELL (N_CARD_AXI+1 more cdma engines
-        # and HBM crossbar ports) and not just the user region. Do not expect build-119's timing.
-        --conns) enable_http_slots=1; conns="$2"; shift ;;
-        --conns=*) enable_http_slots=1; conns="${1#*=}" ;;
         # The TOE keeps the receive buffer itself (TCP_STACK_RX_DDR_BYPASS_EN = 0): a 1 MiB ring per
         # session in the TCP stack's HBM channel, shared with the transmit rings through Coyote's
         # tcp_mem_mux (hardware/patches/0008), instead of one 1 MiB rx FIFO for all sessions. Needs
-        # --multi; refused together with --conns (CMake says so). Changes the SHELL: the TOE's
-        # non-bypass HLS, the mux, and the rx FIFO's 256 BRAM gone. EN_MEM stays 0.
+        # --multi. Changes the SHELL: the TOE's non-bypass HLS, the mux, and the rx FIFO's 256 BRAM
+        # gone. EN_MEM stays 0.
         --toe-buffer) enable_toe_buffer=1 ;;
         # Add the 42-probe TCP/HTTP performance ILA back. OFF by default since it costs ~13.2k
         # LUTs and ~114.5 BRAM in the user region -- affordable at 1-2 lanes, not at 4 (build-110
@@ -73,10 +61,6 @@ cmake_args+=(-DN_DECODERS="$decoders")
 # One TCP session per decoder lane. Needs --http; the build fails loudly otherwise.
 cmake_args+=(-DENABLE_HTTP_MULTI="$([ "$enable_http_multi" = 1 ] && echo ON || echo OFF)")
 cmake_args+=(-DENABLE_PERF_ILA="$([ "$enable_perf_ila" = 1 ] && echo ON || echo OFF)")
-# Per-connection HBM slots. OFF unless --conns was given, so a plain `--http --multi` build is
-# byte-for-byte the build-119 configuration.
-cmake_args+=(-DENABLE_HTTP_SLOTS="$([ "$enable_http_slots" = 1 ] && echo ON || echo OFF)")
-cmake_args+=(-DN_HTTP_CONNS="$conns")
 # TOE receive rings in card memory. OFF unless --toe-buffer, so every other invocation configures
 # exactly as before.
 cmake_args+=(-DENABLE_HTTP_TOE_BUFFER="$([ "$enable_toe_buffer" = 1 ] && echo ON || echo OFF)")
@@ -114,8 +98,8 @@ cmake -S . -B "$build_dir" "${cmake_args[@]}" || { echo "cmake configure failed 
 {
     echo "configured : $(date '+%Y-%m-%d %H:%M %Z') on $(hostname) by $(id -un)"
     echo "command    : scripts/synthesize.sh $orig_args"
-    echo "flags      : http=$enable_http multi=$enable_http_multi decoders=$decoders conns=$conns" \
-         "slots=$enable_http_slots toe_buffer=$enable_toe_buffer perf_ila=$enable_perf_ila"
+    echo "flags      : http=$enable_http multi=$enable_http_multi decoders=$decoders" \
+         "toe_buffer=$enable_toe_buffer perf_ila=$enable_perf_ila"
     echo "cmake args : ${cmake_args[*]}"
     echo "oasis      : $(git -C "$script_dir/.." rev-parse HEAD 2>/dev/null)" \
          "($(git -C "$script_dir/.." rev-parse --abbrev-ref HEAD 2>/dev/null))"

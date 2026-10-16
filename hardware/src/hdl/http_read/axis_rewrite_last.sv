@@ -95,7 +95,7 @@ module axis_rewrite_last #(
 
     // THE CONFIG PUSH. The length the queue takes this cycle: the port's own handshake, or with
     // CFG_REG the handshake of the cycle before, held in a register. Why (build-128/133 timing):
-    // in handler_slots cfg_valid is the entry admission -- the host's config beat, the chunk
+    // in the handler cfg_valid is the entry admission -- the host's config beat, the chunk
     // occupancy compare and this module's cfg_ready -- and it went straight on into the length
     // queue's LUTRAM write enable, its pointer and cnt_q (-1.44 ns on build-128, the handler core
     // placed apart from the decoder lane). With CFG_REG that cone ends at one flop.

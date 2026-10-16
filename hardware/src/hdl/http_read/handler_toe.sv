@@ -49,7 +49,7 @@ import http_types::*;
 //     readPkg outstanding before it opens a new one: the old session's bytes still on their way
 //     must land in the (discarding) lane while it is down, never be spliced into a rebound session
 //     -- even one that got the same session id.
-//   * Timing slices ported from the slot handler: a two-deep slice between the framer and the chunk
+//   * Timing slices: a two-deep slice between the framer and the chunk
 //     counter (61ad533) with the chunk-length push registered (CFG_REG), and the decoder's tready
 //     kept out of the chunk-occupancy counter (741295a). toe_rx registers notifications (1419da6)
 //     and the routed beats (b7ff974) itself.
@@ -83,8 +83,8 @@ module handler_toe #(
     parameter int CLOSE_SETTLE = 4096,
     // INFLIGHT[31:24] / LANE_POLICY[7:0].
     parameter int CSR_REV = 6,
-    // 1: the two-deep slice between the framer and the chunk counter (61ad533, a slot-build timing
-    // fix for a framer an SLR away from its counter). It costs a 2:1 mux and two 577-bit registers
+    // 1: the two-deep slice between the framer and the chunk counter (61ad533, a timing fix for a
+    // framer an SLR away from its counter). It costs a 2:1 mux and two 577-bit registers
     // per lane; 0 wires the framer straight into the counter as handler_multi does.
     parameter bit FRAMER_SLICE = 1'b1,
     localparam int CONN_BITS = (NUM_CONNS > 1) ? $clog2(NUM_CONNS) : 1

@@ -66,8 +66,8 @@ import http_types::*;
 //
 // Register map (read side):
 //   0  HTTP_CONFIG_ID
-//   1  CLIENT_STATE     ([3:0])      -- handler.sv state_debug (aliased; prefer STATUS)
-//   2  STATUS           ([31:0])     -- packed FSM status, see handler.sv totalWord
+//   1  CLIENT_STATE     ([3:0])      -- the handler's state_debug (aliased; prefer STATUS)
+//   2  STATUS           ([31:0])     -- packed FSM status, see the handler's totalWord
 //   3  ECHO_FILE_LEN    ([31:0])
 //   4  ECHO_FILE_W0     ([31:0])     -- path chars 0..3
 //   5  ECHO_FILE_W4     ([31:0])     -- path chars 16..19
@@ -76,7 +76,7 @@ import http_types::*;
 //   7  ECHO_RANGE_END   ([39:32] len, [31:0] first 4 ASCII digits)
 //   8  ECHO_SERVER      ([47:32] port, [31:0] ip)
 //   10 INFLIGHT         ([7:0] slots occupied, [15:8] NUM_SLOTS, [16] announcement pending,
-//                        [17] peer FINed, [18] connection up) -- see handler.sv inflightWord
+//                        [17] peer FINed, [18] connection up) -- see the handler's inflightWord
 //   11 STALL            ([0] connect stalled, [1] send stalled, [2] read stalled, [3] init error,
 //                        [4] send error, [5] response had no Content-Length, [6] fatal dirty abort,
 //                        [7] status not 200/206, [15:8] reconnects, [23:16] read slot,
@@ -170,133 +170,9 @@ import http_types::*;
 // this register and treats (NUM_SLOTS - occupied) as its credit.
 //
 // =================================================================================================
-// CSR REVISION 3 -- per-CONNECTION visibility, and the slot base (ADR-5, handler_slots)
-// =================================================================================================
-//
-// Selected by the CSR_REV parameter, which DEFAULTS TO 2. At 2 this module is byte for byte the
-// revision-2 map above: the registers below do not exist, the read register file still answers
-// anything past 20 with resp_error, and the two new write registers are not instantiated at all --
-// which is what lets handler_multi go on being the sealed build-119 control arm. Everything here
-// is APPENDED; nothing at 0..20 and nothing in the revision-2 write map moved.
-//
-// Read INFLIGHT[31:24] first, exactly as for revision 2. It reads 3 on a bitstream built this way.
-//
-// WHY THE STRIDE IS 8 AGAIN, AND WHY THERE ARE FOUR WORDS OF EACH. Revision 2 fixed the slot width
-// at 8 lanes so a host compiled against one bitstream could not silently reinterpret another's
-// fields. The same argument applies with 24 or 32 connections, so the answer is more WORDS at the
-// same stride rather than a wider stride: word w covers connections 8w..8w+7, always, whatever
-// N_CONNS is. Connections the bitstream does not have read 0, and SLOT_POLICY says how many exist.
-//
-// New WRITE registers (the revision-1/2 write map is untouched; these sit above req_chunk_bytes):
-//   42 SLOT_BASE_LO   ([31:0])  card-memory address of slot 0, low half
-//   43 SLOT_BASE_HI   ([31:0])  high half. The host writes both BEFORE the first arm, and the page
-//                               they name must already have been offloaded to the card -- a
-//                               first-touch page fault on this path stalls the shared TOE fifo for
-//                               milliseconds (ADR-5, risk 7).
-//   An instantiation with CSR_REV = 3 must therefore pass NUM_PARAM_REGS >= 44.
-//
-// New READ registers:
-//   21..24 CONN_OCC0..3    chunk entries QUEUED AND NOT YET RETIRED, one byte per DECODER at
-//                          [8k+7:8k] of word w for decoder 8w+k, saturating at 255. Same quantity
-//                          and same meaning as LANE_OCC (16); this is the 32-wide form.
-//   25..26 CONN_READY0..1  the ADMISSION WINDOW, one nibble per CONNECTION at [4k+3:4k] of word w
-//                          for connection 16w+k:
-//                            +0 ARM_READY    the connection will accept an ARM beat. Note this now
-//                                            includes the DEPTH-1 CREDIT: it is low while the
-//                                            connection's slot still holds an undrained response,
-//                                            which is how the hardware stops a second GET being
-//                                            armed on a connection that cannot hold one.
-//                            +1 ENTRY_READY  its decoder will accept a chunk ENTRY beat
-//                            +2 CONN_UP      it holds an established TCP session
-//                            +3 FATAL        it is out of the game until the host reissues
-//                          All three admission bits stay monotone in the host's favour, so
-//                          poll-then-write is still race free and still one round trip.
-//   27..30 CONN_ERR0..3    STICKY causes, one byte per CONNECTION at [8k+7:8k] of word w for
-//                          connection 8w+k. Bits 0..6 are LANE_ERR's (19) unchanged:
-//                            +0 CONN_DEAD  +1 DIRTY  +2 INIT_ERR  +3 RESP_ERR  +4 STATUS_BAD
-//                            +5 TX_REFUSED +6 READ_TIMEOUT
-//                          Bit 7 IS REDEFINED and this is the one field revision 3 does not simply
-//                          extend:
-//                            +7 SLOT_OVERFLOW  a segment for this connection would have run past
-//                                              the end of its 2^SLOT_LOG2 slot and was dropped
-//                                              whole. In revision 2 bit 7 was RX_FIFO_STALL, the
-//                                              per-lane decoupling fifo -- and there is no
-//                                              per-connection fifo any more, so the bit had no
-//                                              meaning left to keep. The shared writer fifo's
-//                                              equivalent is STALL[25], unchanged.
-//                          RESP_ERR (+3) now covers two causes: a response with no Content-Length,
-//                          and bytes left in the slot at the end of one (the host armed two GETs on
-//                          a depth-1 connection, or a server overran its own length). STALL[31]
-//                          separates them.
-//   31     CONN_DRAINED    [c]      the depth-1 credit for connection c: its slot is empty and it
-//                                   will accept an arm. Raised by the reader when it releases the
-//                                   slot, and by a teardown; lowered by the host's own ARM. This is
-//                                   what replaces "one response per lane outstanding" as the thing
-//                                   the host paces against.
-//                          [32+c]   connection c overflowed its slot (sticky, = CONN_ERR bit 7).
-//   32     SLOT_POLICY     fixed at elaboration, for the host to size itself against:
-//                            [7:0]   CSR revision (3, same value as INFLIGHT[31:24])
-//                            [15:8]  N_CONNS        [23:16] N_DECODERS
-//                            [29:24] SLOT_LOG2 -- one slot is 2^this bytes, and the host's rule is
-//                                    one GET per connection of at most (2^SLOT_LOG2 - 64 KiB)
-//                            [35:30] log2 of the largest single card read
-//                            [51:36] ENTRY_DEPTH, armed GETs queued per decoder
-//                            [57:52] log2 of the shared writer fifo, in 64-byte beats
-//   LANE_POLICY (20) keeps its revision-2 fields and reads revision 3 in [7:0].
-//
-// CSR REVISION 4 -- PIPELINED GETs PER CONNECTION (handler_slots, 2026-09-23)
-// ---------------------------------------------------------------------------
-// The SAME register map as revision 3; CSR_REV >= 3 instantiates it here, and the number is what
-// tells the host which rules apply. What changed is behaviour behind three fields:
-//   * CONN_READY +0 ARM_READY no longer includes the depth-1 credit: it is "the previous request
-//     text has gone out and the decoder's entry queue has room". Several GETs may be armed on one
-//     connection; their responses land back to back in its slot and the reader frames them as one
-//     stream.
-//   * CONN_DRAINED [c] means "slot c is empty and NOTHING is armed on it": raised when the reader
-//     releases the slot with no entry queued behind it, or by a teardown; lowered by an ARM. The
-//     host's rule becomes a BYTE BUDGET: the bytes of every response armed since it last read this
-//     bit set must fit in 2^SLOT_LOG2 (the slot is a bump allocator that resets when drained).
-//   * SLOT_POLICY [29:24] SLOT_LOG2 is 28 in stage 1 (256 MiB x 4 connections = the 1 GiB page).
-//   RESP_ERR's residue cause now reads "bytes left in the slot when the connection ran dry".
-//
-// CSR REVISION 5 -- MORE CONNECTIONS THAN DECODERS (handler_slots stage 2, 2026-09-23)
-// ---------------------------------------------------------------------------------
-// Everything of revision 4 stays where it is. Additions:
-//   WRITE REQ_CHUNK_BYTES (41) [44:40] REQ_CONN: the connection an ARM beat is sent on ([35:32]
-//        is still the decoder). Entry beats ignore it. Below revision 5 the connection is the
-//        decoder and these bits are not decoded.
-//   An ARM for connection c on decoder d is admitted only when d can take one (DEC_STATE +0) and c
-//   is either FREE (CONN_DRAINED[c] and nothing pending on it) or the TAIL of d's entry queue (the
-//   last arm d took named c, and c still has entries). That keeps each connection's GETs
-//   contiguous in one decoder's queue, which is what lets one framer serve several connections.
-//   A fatal connection or a tainted decoder is never admitted: poll them first.
-//   CONN_READY (25..26) nibble +0/+1 now describe the connection's CURRENT decoder (where its
-//   entries are queued; before its first arm, decoder c mod N_DECODERS) -- decoder c in stage 1.
-//   CONN_ERR (27..30) +5/+6 (TX_REFUSED / READ_TIMEOUT) are pinned on the connection that was being
-//   served, not on a decoder index.
-//   33     DEC_STATE      one byte per DECODER d at [8d+7:8d]:
-//                           +0 ARM_READY    request text of the last arm gone out, entry queue room,
-//                                           not tainted (the decoder half of an arm's admission)
-//                           +1 ENTRY_READY  the chunk queue has room
-//                           +2 TAINTED      a connection went fatal with a response still queued on
-//                                           this decoder: its stream has a hole and its output is
-//                                           cut for good. The host's "fatal lane".
-//                           +3 STREAM_BUSY  request text in flight
-//                           [7:4]           slot_reader state
-//   34..37 CONN_MAP       one byte per CONNECTION c at [8(c%8)+7:8(c%8)] of word 34 + c/8:
-//                           [2:0] current decoder, [3] c is its decoder's TAIL (and has entries),
-//                           [7:4] entries pending on c (armed, not retired or dropped; saturates 15)
-//   38     CONN_CAUSE     [c] residue at a release (RESP_ERR's second cause, per connection),
-//                         [32+c] c went fatal with entries pending, i.e. it tainted its decoder.
-//   INFLIGHT[23:20] saturates at 15 connections; SLOT_POLICY [15:8] has the real count.
-// =================================================================================================
 module HttpConfig #(
     parameter integer NUM_PARAM_REGS = 42,
-    parameter integer START_ADDR     = 39,
-    // 2 = the sealed build-119 map (handler_multi). 3/4 = the per-connection map above
-    // (handler_slots); 5 = that plus read ids 33..38 and REQ_CONN (stage 2). Nothing but this
-    // parameter distinguishes them.
-    parameter integer CSR_REV        = 2
+    parameter integer START_ADDR     = 39
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -304,7 +180,7 @@ module HttpConfig #(
     write_config_i.s write_config,
     read_config_i.s  read_config,
 
-    // Live snapshot of the latched configuration. handler.sv can read these
+    // Live snapshot of the latched configuration. The handler can read these
     // directly; they are stable across runs as long as the host does not
     // overwrite the corresponding write registers.
     output http_config_t cfg,
@@ -329,23 +205,7 @@ module HttpConfig #(
     input  logic [63:0] lane_ready_word,
     input  logic [63:0] lane_state_word,
     input  logic [63:0] lane_err_word,
-    input  logic [63:0] lane_policy_word,
-
-    // -- CSR revision 3. Read only when CSR_REV >= 3, so an instantiation that predates them (the
-    //    revision-2 shell, which is what builds handler_multi) may leave every one unconnected:
-    //    nothing reads them and no X reaches the read register file. handler_slots drives them.
-    input  logic [3:0][63:0] conn_occ_word,
-    input  logic [1:0][63:0] conn_ready_word,
-    input  logic [3:0][63:0] conn_err_word,
-    input  logic      [63:0] conn_drained_word,
-    input  logic      [63:0] slot_policy_word,
-
-    // -- CSR revision 5 (stage 2): read ids 33..38, see the map above. Unconnected below it.
-    input  logic [5:0][63:0] conn_ext_word,
-
-    // -- CSR revision 3: base of the connection slot array in card memory, from SLOT_BASE_LO/HI.
-    //    Zero at revision 2, where the registers that would drive it are not instantiated.
-    output logic [63:0] slot_base
+    input  logic [63:0] lane_policy_word
 );
 
 `RESET_RESYNC
@@ -365,14 +225,9 @@ localparam logic [AXIL_DATA_BITS - 1:0] HTTP_CONFIG_ID = 64'h0000_0000_0048_5454
 // hold is that START ALIASES no parameter, and that the address space covers the highest one.
 localparam int LAST_PARAM_ADDR   = 38;   // highest contiguous parameter, below START
 localparam int STREAM_PARAM_ADDR = 41;   // req_total_bytes at 40, req_chunk_bytes at 41
-// Revision 3 appends two more: slot_base low at 42 and high at 43.
-localparam int SLOT_PARAM_ADDR   = 43;
 `ASSERT_ELAB(START_ADDR > LAST_PARAM_ADDR)
 `ASSERT_ELAB(START_ADDR < STREAM_PARAM_ADDR)
 `ASSERT_ELAB(NUM_PARAM_REGS > STREAM_PARAM_ADDR)
-// An instantiation that asks for revision 3 has to give the address space room for the two slot
-// registers. Catching it here rather than watching SLOT_BASE writes land on nothing.
-`ASSERT_ELAB((CSR_REV < 3) || (NUM_PARAM_REGS > SLOT_PARAM_ADDR))
 
 // -------------------------------------------------------------------------------------------------
 // Per-field write registers. Each ConfigWriteRegister latches the AXI-Lite
@@ -466,25 +321,8 @@ ConfigWriteRegister #(36, data64_t) inst_reg_range_end_w1       (clk, write_conf
 ConfigWriteRegister #(37, data64_t) inst_reg_range_end_w2       (clk, write_config, reg_range_end_w2);
 ConfigWriteRegister #(38, data64_t) inst_reg_range_end_w3       (clk, write_config, reg_range_end_w3);
 
-// -- CSR revision 3 only. NOT instantiated at revision 2, so the revision-2 write map is not merely
-//    unchanged in what it means -- those two addresses genuinely do not exist there, and a host that
-//    writes them to a revision-2 bitstream writes nothing rather than something.
-data64_t reg_slot_base_lo, reg_slot_base_hi;
-
-generate
-    if (CSR_REV >= 3) begin : gen_slot_regs
-        ConfigWriteRegister #(42, data64_t) inst_reg_slot_base_lo (clk, write_config, reg_slot_base_lo);
-        ConfigWriteRegister #(43, data64_t) inst_reg_slot_base_hi (clk, write_config, reg_slot_base_hi);
-        assign slot_base = {reg_slot_base_hi[31:0], reg_slot_base_lo[31:0]};
-    end else begin : gen_no_slot_regs
-        assign reg_slot_base_lo = '0;
-        assign reg_slot_base_hi = '0;
-        assign slot_base        = '0;
-    end
-endgenerate
-
 // -------------------------------------------------------------------------------------------------
-// Live snapshot bus. handler.sv samples whichever fields it needs from `cfg`.
+// Live snapshot bus. The handler samples whichever fields it needs from `cfg`.
 // -------------------------------------------------------------------------------------------------
 always_comb begin
     cfg.server_ip       = reg_server_ip      [31:0];
@@ -519,7 +357,6 @@ always_comb begin
     cfg.req_total_bytes = reg_req_total_bytes[31:0];
     cfg.req_chunk_bytes = reg_req_chunk_bytes[31:0];
     cfg.req_chunk_dest  = reg_req_chunk_bytes[35:32];
-    cfg.req_conn        = reg_req_chunk_bytes[44:40];
     cfg.range_begin_len = reg_range_begin_len[7:0];
     cfg.range_begin_w0  = reg_range_begin_w0 [31:0];
     cfg.range_begin_w1  = reg_range_begin_w1 [31:0];
@@ -560,10 +397,10 @@ assign start_raw.ready = start_cfg.ready;
 // discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
 // ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
 // -------------------------------------------------------------------------------------------------
-// 21 at revision 2 (0..20). Revision 3 appends 21..32; the read register file answers anything
-// above NUM_READ_REGS-1 with resp_error, which is the whole compatibility scheme -- a host that
-// reads register 21 off a revision-2 bitstream gets an error, not a plausible zero.
-localparam int NUM_READ_REGS = (CSR_REV >= 5) ? 39 : (CSR_REV >= 3) ? 33 : 21;
+// 21 (0..20). The read register file answers anything above NUM_READ_REGS-1 with resp_error, which
+// is the whole compatibility scheme -- a host that reads a register this bitstream does not have
+// gets an error, not a plausible zero.
+localparam int NUM_READ_REGS = 21;
 
 logic [AXIL_DATA_BITS - 1:0] read_registers[NUM_READ_REGS];
 
@@ -581,7 +418,7 @@ assign read_registers[8] = {16'b0, cfg.server_port[15:0], cfg.server_ip};
 assign read_registers[9] = {32'b0, cfg.file_w8};
 // Request-ring occupancy. The host's credit before it may push another START. See the map above.
 assign read_registers[10] = {32'b0, inflight_word};
-// Which stage stalled, so a full ring can be told apart from a dead connect. See handler.sv.
+// Which stage stalled, so a full ring can be told apart from a dead connect. See the handler.
 assign read_registers[11] = {32'b0, stall_word};
 // HTTP response framing. On a persistent connection the body is delimited by Content-Length rather
 // than by the FIN, so "the response was a 404 whose XML body happened to parse as column data" and
@@ -612,34 +449,6 @@ assign read_registers[17] = lane_ready_word;
 assign read_registers[18] = lane_state_word;
 assign read_registers[19] = lane_err_word;
 assign read_registers[20] = lane_policy_word;
-
-// -------------------------------------------------------------------------------------------------
-// CSR revision 3: the same questions, asked of up to 32 connections. See the map in the header.
-//
-// Generated rather than written out so that the revision-2 array has exactly 21 entries -- an
-// unconditional assignment to read_registers[21] would be an out-of-bounds write there, and an
-// array that is merely sized differently is not the same thing as a map that is not there.
-// -------------------------------------------------------------------------------------------------
-generate
-    if (CSR_REV >= 3) begin : gen_rev3_reads
-        for (genvar w = 0; w < 4; w++) begin : gen_conn_occ
-            assign read_registers[21 + w] = conn_occ_word[w];
-        end
-        for (genvar w = 0; w < 2; w++) begin : gen_conn_ready
-            assign read_registers[25 + w] = conn_ready_word[w];
-        end
-        for (genvar w = 0; w < 4; w++) begin : gen_conn_err
-            assign read_registers[27 + w] = conn_err_word[w];
-        end
-        assign read_registers[31] = conn_drained_word;
-        assign read_registers[32] = slot_policy_word;
-    end
-    if (CSR_REV >= 5) begin : gen_rev5_reads
-        for (genvar w = 0; w < 6; w++) begin : gen_conn_ext
-            assign read_registers[33 + w] = conn_ext_word[w];
-        end
-    end
-endgenerate
 
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
 // The read side shares HTTP_CONFIG_ADDR_SPACE with the write side (vfpga_top.svh), and the read
