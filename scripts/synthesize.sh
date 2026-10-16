@@ -7,7 +7,6 @@ cmake_args=()
 decoders=1
 enable_http_multi=0
 enable_http=0
-enable_perf_ila=0
 enable_toe_buffer=0
 build_num=0
 while [ $# -gt 0 ]; do
@@ -21,11 +20,6 @@ while [ $# -gt 0 ]; do
         # --multi. Changes the SHELL: the TOE's non-bypass HLS, the mux, and the rx FIFO's 256 BRAM
         # gone. EN_MEM stays 0.
         --toe-buffer) enable_toe_buffer=1 ;;
-        # Add the 42-probe TCP/HTTP performance ILA back. OFF by default since it costs ~13.2k
-        # LUTs and ~114.5 BRAM in the user region -- affordable at 1-2 lanes, not at 4 (build-110
-        # missed timing at WNS -7.43 ns carrying it). Use it to debug the receive path, not to
-        # produce a bitstream anyone will measure.
-        --perf-ila) enable_perf_ila=1 ;;
         # Name the build directory build-N instead of the next free number. For a second checkout
         # (git worktree) whose hardware/ has no build history, so its build carries the number the
         # log and the board notes will refer to. Refuses an existing directory like the default.
@@ -33,22 +27,6 @@ while [ $# -gt 0 ]; do
         --build-num=*) build_num="${1#*=}" ;;
         --decoders) decoders="$2"; shift ;;
         --decoders=*) decoders="${1#*=}" ;;
-        # Make the advertised TCP receive window match the buffer that actually exists.
-        #
-        # NO LONGER THE FIX IT WAS. This existed because the stack over-promised: WINDOW_BITS = 18
-        # advertised 262,144 bytes while every session shared one axis_data_fifo_512_d1024
-        # (tcp_stack.sv:681) holding 65,536. rx_engine decides whether to accept a segment from rxSar
-        # pointer arithmetic, not from the FIFO fill level -- the check that would have used the real
-        # level is commented out at rx_engine.cpp:1123 -- so the overflow was dropped and recovered
-        # by go-back-N. Turning scaling OFF made the promise honest by shrinking it to 65,536.
-        #
-        # Since build-95 the fifo is sized to the window instead, which fixes the same problem in the
-        # direction that helps: they now match at 1 MiB (WINDOW_SCALE_BITS = 4, fifo 16384 deep).
-        # Passing this flag today would drop the window to 64 KiB and cap the largest ranged GET at
-        # a sixteenth of what the hardware can hold -- which, since a GET costs ~1.4 ms of
-        # object-store latency whatever its size, is directly a sixteenth of the throughput.
-        # Keep it only for bisecting a receive-path fault.
-        --no-window-scaling) cmake_args+=(-DTCP_STACK_WINDOW_SCALING_EN=0) ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
     shift
@@ -60,7 +38,6 @@ fi
 cmake_args+=(-DN_DECODERS="$decoders")
 # One TCP session per decoder lane. Needs --http; the build fails loudly otherwise.
 cmake_args+=(-DENABLE_HTTP_MULTI="$([ "$enable_http_multi" = 1 ] && echo ON || echo OFF)")
-cmake_args+=(-DENABLE_PERF_ILA="$([ "$enable_perf_ila" = 1 ] && echo ON || echo OFF)")
 # TOE receive rings in card memory. OFF unless --toe-buffer, so every other invocation configures
 # exactly as before.
 cmake_args+=(-DENABLE_HTTP_TOE_BUFFER="$([ "$enable_toe_buffer" = 1 ] && echo ON || echo OFF)")
@@ -99,7 +76,7 @@ cmake -S . -B "$build_dir" "${cmake_args[@]}" || { echo "cmake configure failed 
     echo "configured : $(date '+%Y-%m-%d %H:%M %Z') on $(hostname) by $(id -un)"
     echo "command    : scripts/synthesize.sh $orig_args"
     echo "flags      : http=$enable_http multi=$enable_http_multi decoders=$decoders" \
-         "toe_buffer=$enable_toe_buffer perf_ila=$enable_perf_ila"
+         "toe_buffer=$enable_toe_buffer"
     echo "cmake args : ${cmake_args[*]}"
     echo "oasis      : $(git -C "$script_dir/.." rev-parse HEAD 2>/dev/null)" \
          "($(git -C "$script_dir/.." rev-parse --abbrev-ref HEAD 2>/dev/null))"

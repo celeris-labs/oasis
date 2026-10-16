@@ -29,33 +29,3 @@ set_property -dict [list \
     CONFIG.C_PROBE24_WIDTH {1} \
     CONFIG.C_PROBE25_WIDTH {1} \
 ] [get_ips ila_rdma_read]
-
-# -- TCP / HTTP handler ILA (matches copy_from_working probe map) ---------------------------------
-create_ip -name ila -vendor xilinx.com -library ip -version 6.2 -module_name ila_perf_tcp
-
-set_property -dict [list \
-  CONFIG.C_NUM_OF_PROBES {42} \
-  CONFIG.C_PROBE2_WIDTH  {48}  \
-  CONFIG.C_PROBE5_WIDTH  {72}  \
-  CONFIG.C_PROBE8_WIDTH  {16}  \
-  CONFIG.C_PROBE11_WIDTH {16}  \
-  CONFIG.C_PROBE14_WIDTH {88}  \
-  CONFIG.C_PROBE17_WIDTH {512} \
-  CONFIG.C_PROBE19_WIDTH {4}   \
-  CONFIG.C_PROBE20_WIDTH {4}   \
-  CONFIG.C_PROBE21_WIDTH {512} \
-  CONFIG.C_PROBE22_WIDTH {512} \
-  CONFIG.C_PROBE25_WIDTH {32}  \
-  CONFIG.C_PROBE28_WIDTH {64}  \
-  CONFIG.C_PROBE31_WIDTH {512} \
-  CONFIG.C_PROBE32_WIDTH {64}  \
-  CONFIG.C_PROBE34_WIDTH {512} \
-  CONFIG.C_PROBE35_WIDTH {7}   \
-  CONFIG.C_PROBE37_WIDTH {16}  \
-  CONFIG.C_PROBE38_WIDTH {4}   \
-  CONFIG.C_PROBE39_WIDTH {512} \
-  CONFIG.C_PROBE40_WIDTH {512} \
-  CONFIG.C_PROBE41_WIDTH {8}   \
-  CONFIG.C_EN_STRG_QUAL {1} \
-  CONFIG.ALL_PROBE_SAME_MU_CNT {2} \
-] [get_ips ila_perf_tcp]

@@ -19,11 +19,6 @@ option(ENABLE_HTTP "Enable HTTP stack" OFF)
 # session delivers ~0.46 GB/s however deeply pipelined and sixteen deliver 4.60, with the FPGA at
 # 0.33 -- so the session count is worth more than anything inside the decoder.
 option(ENABLE_HTTP_MULTI "One TCP session per decoder lane" OFF)
-# The 42-probe TCP/HTTP performance ILA in vfpga_top.svh. OFF by default: it costs ~13.2k LUTs and
-# ~114.5 BRAM of debug logic in the user region, which a 1- or 2-lane build can afford and a 4-lane
-# build cannot (build-110 missed timing at WNS -7.43 ns with it in). Enable for a receive-path
-# investigation, not for a build anyone is going to measure.
-option(ENABLE_PERF_ILA "Include the TCP/HTTP performance ILA" OFF)
 # The TOE keeps the receive buffer itself: TCP_STACK_RX_DDR_BYPASS_EN = 0, a 1 MiB ring per session
 # in card memory (the TCP stack's existing HBM channel, shared 2:1 with the transmit rings by
 # Coyote's tcp_mem_mux; hardware/patches/0008), notifications only after the bytes have landed, and
@@ -72,11 +67,6 @@ if(ENABLE_HTTP_MULTI)
     set(OASIS_DEF_EN_TCP_MULTI "`define EN_TCP_MULTI")
 else()
     set(OASIS_DEF_EN_TCP_MULTI "// EN_TCP_MULTI off: one shared TCP session for all decoder lanes")
-endif()
-if(ENABLE_PERF_ILA)
-    set(OASIS_DEF_EN_PERF_ILA "`define EN_PERF_ILA")
-else()
-    set(OASIS_DEF_EN_PERF_ILA "// EN_PERF_ILA off: no performance ILA instantiated (--perf-ila to add it)")
 endif()
 # vfpga_top.svh instantiates handler_toe (toe_rx: readPkg for any session, any order) instead of
 # handler_multi when the TOE keeps the receive rings.

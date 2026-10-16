@@ -321,32 +321,6 @@ localparam BYPASS_ID = NUM_STREAMS - 1;
 always_comb tcp_listen_req.tie_off_m();
 always_comb tcp_listen_rsp.tie_off_s();
 
-logic [3:0]   dbg_rx_ptr;
-logic [AXI_DATA_BITS-1:0] dbg_rx_buf_0, dbg_rx_buf_1, dbg_tx_acc;
-logic [6:0]   dbg_tx_acc_cnt;
-logic         dbg_tx_acc_last;
-logic [15:0]  dbg_http_len;
-logic [3:0]   dbg_builder_state;
-logic [AXI_DATA_BITS-1:0] dbg_req_lo, dbg_req_hi;
-logic [7:0]   dbg_req_cnt;
-
-// The streamed handler has no request BUILDER, so the probes that watched it building a GET have
-// nothing to watch. Tied off rather than deleted: they are ILA probe indices, and renumbering an
-// ILA invalidates every saved waveform layout and every note that refers to a probe by number.
-always_comb begin
-    dbg_rx_ptr        = '0;
-    dbg_rx_buf_0      = '0;
-    dbg_rx_buf_1      = '0;
-    dbg_tx_acc        = '0;
-    dbg_tx_acc_cnt    = '0;
-    dbg_tx_acc_last   = 1'b0;
-    dbg_http_len      = '0;
-    dbg_builder_state = '0;
-    dbg_req_lo        = '0;
-    dbg_req_hi        = '0;
-    dbg_req_cnt       = '0;
-end
-
 // Stripped HTTP body (unaligned keep) → DataNormalizer → OutputWriter bypass.
 // ENABLE_COMPACTOR(0): barrel-shift + beat merge only (lighter than COMPACTOR=1).
 `ifdef EN_TCP_MULTI
@@ -598,68 +572,6 @@ end
 
 // Raw bypass removed — nothing flows to the bypass output slot now.
 always_comb axi_out[BYPASS_ID].tie_off_m();
-
-
-
-// Performance ILA. OFF by default -- see ENABLE_PERF_ILA in hardware/CMakeLists.txt.
-//
-// 42 probes, several of them 512 bits wide, costing ~13.2k LUTs and ~114.5 BRAM of pure debug logic
-// in the user region. That is affordable at one or two decoder lanes and is not at four: build-110
-// (4 lanes, ILA in) missed timing at WNS -7.43 ns, and the congested clusters were HBM shell nets
-// and the decoder -- the HTTP logic never appeared in the failing paths. Freeing this area is the
-// first lever for closing a 4-lane build, so the probes have to be opt-in rather than always paid.
-//
-// Turn it back on with `scripts/synthesize.sh --perf-ila` when a receive-path fault needs the wire
-// view. The probe map is unchanged, so an existing .ltx still matches.
-`ifdef EN_PERF_ILA
-ila_perf_tcp inst_ila_perf_tcp (
-    .clk(aclk),
-    .probe0  (tcp_open_req.valid),
-    .probe1  (tcp_open_req.ready),
-    .probe2  (tcp_open_req.data),
-    .probe3  (tcp_open_rsp.valid),
-    .probe4  (tcp_open_rsp.ready),
-    .probe5  (tcp_open_rsp.data),
-    .probe6  (tcp_close_req.valid),
-    .probe7  (tcp_close_req.ready),
-    .probe8  (tcp_close_req.data),
-    .probe9  (tcp_rx_meta.valid),
-    .probe10 (tcp_rx_meta.ready),
-    .probe11 (tcp_rx_meta.data),
-    .probe12 (tcp_notify.valid),
-    .probe13 (tcp_notify.ready),
-    .probe14 (tcp_notify.data),
-    .probe15 (axis_tcp_recv.tvalid),
-    .probe16 (axis_tcp_recv.tready),
-    .probe17 (axis_tcp_recv.tdata),
-    .probe18 (axis_tcp_recv.tlast),
-    .probe19 (http_client_state),
-    .probe20 (dbg_rx_ptr),
-    .probe21 (dbg_rx_buf_0),
-    .probe22 (dbg_rx_buf_1),
-    .probe23 (tcp_tx_meta.valid),
-    .probe24 (tcp_tx_meta.ready),
-    .probe25 (tcp_tx_meta.data),
-    .probe26 (tcp_tx_stat.valid),
-    .probe27 (tcp_tx_stat.ready),
-    .probe28 (tcp_tx_stat.data),
-    .probe29 (axis_tcp_send.tvalid),
-    .probe30 (axis_tcp_send.tready),
-    .probe31 (axis_tcp_send.tdata),
-    .probe32 (axis_tcp_send.tkeep),
-    .probe33 (axis_tcp_send.tlast),
-    .probe34 (dbg_tx_acc),
-    .probe35 (dbg_tx_acc_cnt),
-    .probe36 (dbg_tx_acc_last),
-    .probe37 (dbg_http_len),
-    .probe38 (dbg_builder_state),
-    .probe39 (dbg_req_lo),
-    .probe40 (dbg_req_hi),
-    .probe41 (dbg_req_cnt)
-);
-`endif // EN_PERF_ILA
-
-//always_comb axi_out[BYPASS_ID].tie_off_m();
 `elsif EN_RDMA
 AXI4S axi_in (.aclk(clk), .aresetn(rst_n));
 ndata_i #(data8_t, DATABEAT_SIZE) bypass_ndata();
