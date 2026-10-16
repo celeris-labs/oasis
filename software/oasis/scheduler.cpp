@@ -169,8 +169,12 @@ Scheduler::Scheduler(OasisContext &ctx)
     // The no-progress watchdog. On by default on the HBM-slot bitstream, where a second process
     // cannot attach to read the handler state (it would be ctid 1, the slot descriptors use pid 0),
     // so an in-process capture is the only one there is. Elsewhere only on request.
+    // Also on by default on the TOE-ring bitstream (CSR revision 6): its GET credit makes the
+    // dispatcher wait on responses (see emit_batch_slots), so a stalled lane shows up as "no
+    // progress" here first, and the dump plus the dispatcher wake below are the in-process view.
     const char *env = std::getenv("OASIS_STALL_DUMP_S");
-    watchdog_on_    = (http_ && http_->slot_mode()) || (env != nullptr && *env != '\0');
+    watchdog_on_    = (http_ && (http_->slot_mode() || http_->toe_ring())) ||
+                   (env != nullptr && *env != '\0');
     if (env != nullptr && *env != '\0') {
         stall_dump_s_ = std::max(0.0, std::atof(env));
     }
@@ -201,7 +205,7 @@ void Scheduler::note_progress() {
 //    card may still DMA into -- is owned by this Scheduler's in-flight list, which the unwind does
 //    not touch; it is released only by the flow's own completion (or abandoned, never freed, by
 //    ~Scheduler after kDrainTimeout).
-// 2. On the slot bitstream, WAKE the dispatcher, so fail_flows_on_fatal_lanes() also runs while the
+// 2. On the slot and TOE-ring bitstreams, WAKE the dispatcher, so fail_flows_on_fatal_lanes() also runs while the
 //    queue is empty. It used to run only when the dispatcher iterated, and an empty queue parks it
 //    indefinitely -- so a lane that went fatal with the last flows of a query on it hung silently.
 // 3. DUMP, once per stall, the full state when flows are outstanding and nothing has retired or
@@ -242,7 +246,7 @@ void Scheduler::watchdog_loop() {
         } catch (...) { // a consumer callback must never take this thread down
         }
         channels.clear();
-        if (http_ && http_->slot_mode()) {
+        if (http_ && (http_->slot_mode() || http_->toe_ring())) {
             dispatch_cv_.notify_one();
         }
 
