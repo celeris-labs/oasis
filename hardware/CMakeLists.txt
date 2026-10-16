@@ -12,13 +12,9 @@ set(N_DECODERS 1 CACHE STRING "Number of ColumnChunkDecoders (default=1)")
 
 # Include Coyote's RDMA stack during synthesis (disable with -DENABLE_RDMA=OFF)
 option(ENABLE_RDMA "Enable RDMA stack" ON)
-# FPGA HTTP ranged-GET client on the bypass stream (mutually exclusive with RDMA)
+# FPGA HTTP ranged-GET client feeding the decoders (mutually exclusive with RDMA): one TCP session
+# per decoder lane (handler_multi, or handler_toe with ENABLE_HTTP_TOE_BUFFER).
 option(ENABLE_HTTP "Enable HTTP stack" OFF)
-# One TCP session PER DECODER LANE instead of one shared session (handler_multi). Requires
-# ENABLE_HTTP. The ceiling being escaped is the single connection: measured against MinIO, one TCP
-# session delivers ~0.46 GB/s however deeply pipelined and sixteen deliver 4.60, with the FPGA at
-# 0.33 -- so the session count is worth more than anything inside the decoder.
-option(ENABLE_HTTP_MULTI "One TCP session per decoder lane" OFF)
 # The TOE keeps the receive buffer itself: TCP_STACK_RX_DDR_BYPASS_EN = 0, a 1 MiB ring per session
 # in card memory (the TCP stack's existing HBM channel, shared 2:1 with the transmit rings by
 # Coyote's tcp_mem_mux; hardware/patches/0008), notifications only after the bytes have landed, and
@@ -32,12 +28,8 @@ if(ENABLE_HTTP AND ENABLE_RDMA)
     message(FATAL_ERROR "ENABLE_HTTP and ENABLE_RDMA are mutually exclusive")
 endif()
 
-if(ENABLE_HTTP_MULTI AND NOT ENABLE_HTTP)
-    message(FATAL_ERROR "ENABLE_HTTP_MULTI needs ENABLE_HTTP -- there is no HTTP client to give sessions to")
-endif()
-
-if(ENABLE_HTTP_TOE_BUFFER AND NOT ENABLE_HTTP_MULTI)
-    message(FATAL_ERROR "ENABLE_HTTP_TOE_BUFFER needs ENABLE_HTTP_MULTI -- the TOE's receive rings are per session, and the session side is handler_multi's")
+if(ENABLE_HTTP_TOE_BUFFER AND NOT ENABLE_HTTP)
+    message(FATAL_ERROR "ENABLE_HTTP_TOE_BUFFER needs ENABLE_HTTP -- the TOE's receive rings are per session, and the session side is the HTTP client's")
 endif()
 
 # The one knob for both halves: Coyote derives the TOE's toe_config.hpp (HLS) AND the shell's
@@ -63,11 +55,6 @@ endif()
 
 # Coyote generates lynx_pkg.sv from its own template, so oasis cannot add a `define there without
 # editing the submodule. This generated header is oasis's own, included by vfpga_top.svh.
-if(ENABLE_HTTP_MULTI)
-    set(OASIS_DEF_EN_TCP_MULTI "`define EN_TCP_MULTI")
-else()
-    set(OASIS_DEF_EN_TCP_MULTI "// EN_TCP_MULTI off: one shared TCP session for all decoder lanes")
-endif()
 # vfpga_top.svh instantiates handler_toe (toe_rx: readPkg for any session, any order) instead of
 # handler_multi when the TOE keeps the receive rings.
 if(ENABLE_HTTP_TOE_BUFFER)

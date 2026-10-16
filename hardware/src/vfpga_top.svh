@@ -8,8 +8,7 @@ import libstf::*;
 
 `include "oasis_defines.svh"
 
-// Decoder lanes on the HTTP path. With EN_TCP_MULTI each lane also owns its own TCP session and its
-// own request stream; without it there is one session feeding all lanes through a shared framer.
+// Decoder lanes on the HTTP path. Each lane owns its own TCP session and its own request stream.
 localparam NUM_HTTP_LANES = N_STRM_AXI - 1;
 
 // -- Tie-off unused interfaces and signals --------------------------------------------------------
@@ -17,27 +16,19 @@ localparam NUM_HTTP_LANES = N_STRM_AXI - 1;
 always_comb sq_rd.tie_off_m();
 always_comb cq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
-// handler_stream.sv opens/closes TCP itself (legacy Coyote-http style).
+// The ColumnChunkDecoders are fed by the HTTP stack rather than by host DMA, so the host-recv
+// streams carry the REQUEST TEXT instead: the host builds every GET of a query itself and DMAs the
+// lot in, instead of writing a descriptor per request for the FPGA to rebuild the text from. That
+// is what removes the queue-depth limit.
 //
-// The ColumnChunkDecoder is fed by the HTTP stack rather than by host DMA, so the host-recv streams
-// used to be unused. Stream 0 now carries the REQUEST TEXT: the host builds every GET of a query
-// itself and DMAs the lot in, instead of writing a descriptor per request for the FPGA to rebuild
-// the text from. That is what removes the queue-depth limit -- see handler_stream.sv.
-//
-// EN_TCP_MULTI takes one request stream PER LANE (handler_multi), so only the streams past the
-// lane count are tied off. Sending a lane's text to a tied-off stream is silent data loss -- the
-// tie-off holds tready high and discards, the DMA reports success, and the armed handler then waits
-// for bytes that no longer exist. That exact mistake cost a 30 s timeout, a dirty_abort and a
-// collapsed receive window; see the comment on req_dest in software/oasis/operator.cpp.
-`ifdef EN_TCP_MULTI
+// One request stream PER LANE, so only the streams past the lane count are tied off. Sending a
+// lane's text to a tied-off stream is silent data loss -- the tie-off holds tready high and
+// discards, the DMA reports success, and the armed handler then waits for bytes that no longer
+// exist. That exact mistake cost a 30 s timeout, a dirty_abort and a collapsed receive window; see
+// the comment on req_dest in software/oasis/operator.cpp.
 for (genvar I = NUM_HTTP_LANES; I < N_STRM_AXI; I++) begin
     always_comb axis_host_recv[I].tie_off_s();
 end
-`else
-for (genvar I = 1; I < N_STRM_AXI; I++) begin
-    always_comb axis_host_recv[I].tie_off_s();
-end
-`endif
 `elsif EN_RDMA
 always_comb rq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
@@ -142,18 +133,12 @@ ColumnChunkDecoderConfig #(
 );
 
 `ifdef EN_TCP
-// Requests in flight in the HTTP client. Each slot is one queued ranged GET, PIPELINED over the
-// single persistent TCP connection the handler holds open -- so the GET and the server's think time
-// for request k+1 overlap the body transfer of request k instead of following it. Slots no longer
-// cost a TCP session: one connection serves all of them, which is what makes pipelining safe on a
-// TOE whose receive path does not demultiplex sessions (see handler.sv). The host must not enqueue
-// more than this many outstanding requests; it reads the ring occupancy back through HttpConfig's
-// INFLIGHT register, and software/oasis mirrors this number.
-// Responses that may be outstanding. One BIT each in handler_stream (body_last), not a 1160-bit
-// descriptor, so this is no longer a resource decision -- 512 entries cost 512 bits.
-// Column chunks queued ahead of the data, NOT requests. Alignment is a byte count per chunk
-// (axis_rewrite_last), so this scales with columns in a row group -- a handful -- rather than with
-// how finely each chunk is split into ranged GETs.
+// Column chunks queued ahead of the data PER LANE, NOT requests. Alignment is a byte count per
+// chunk (axis_rewrite_last), so this scales with columns in a row group -- a handful -- rather than
+// with how finely each chunk is split into ranged GETs. The GETs themselves are pipelined over the
+// lane's persistent TCP connection, so the GET and the server's think time for request k+1 overlap
+// the body transfer of request k. The host reads the depth back through HttpConfig's QUEUE_DEPTH
+// register.
 localparam int HTTP_QUEUE_DEPTH = 64;
 
 // HttpConfig latches params; a START write emits one http_config_t beat, which the handler accepts
@@ -321,21 +306,20 @@ localparam BYPASS_ID = NUM_STREAMS - 1;
 always_comb tcp_listen_req.tie_off_m();
 always_comb tcp_listen_rsp.tie_off_s();
 
-// Stripped HTTP body (unaligned keep) → DataNormalizer → OutputWriter bypass.
+// Stripped HTTP body (unaligned keep) → DataNormalizer → ColumnChunkDecoder, per lane.
 // ENABLE_COMPACTOR(0): barrel-shift + beat merge only (lighter than COMPACTOR=1).
-`ifdef EN_TCP_MULTI
 // -------------------------------------------------------------------------------------------------
 // N TCP sessions, one per decoder lane.
 //
-// The single-session arrangement below demuxes AFTER the framer, on one shared body stream, so a
-// lane busy on a large chunk back-pressures every other lane. handler_multi moves the demux up into
-// the receive path (rx_dispatch): each lane owns a session, a decoupling fifo and a framer, and the
-// dispatcher decides whether to ASK for a packet rather than whether to accept one. See
-// hdl/http_read/handler_multi.sv and unit-tests/{http_multilane,handler_multi}.
+// The demux sits in the receive path (rx_dispatch / toe_rx), not after one shared framer: each
+// lane owns a session, a decoupling fifo and a framer, and the dispatcher decides whether to ASK
+// for a packet rather than whether to accept one, so a lane busy on a large chunk does not
+// back-pressure the others. See hdl/http_read/handler_multi.sv and unit-tests/{http_multilane,
+// handler_multi}.
 //
-// One connection is still the throughput ceiling being escaped here: measured against MinIO, one
-// TCP session delivers ~0.46 GB/s however deeply pipelined and sixteen deliver 4.60, with the FPGA
-// at 0.33.
+// One connection is the throughput ceiling being escaped here: measured against MinIO, one TCP
+// session delivers ~0.46 GB/s however deeply pipelined and sixteen deliver 4.60, with the FPGA at
+// 0.33.
 // -------------------------------------------------------------------------------------------------
 logic [NUM_DECODERS-1:0]       hm_body_tvalid, hm_body_tready, hm_body_tlast;
 logic [AXI_DATA_BITS-1:0]      hm_body_tdata [NUM_DECODERS];
@@ -525,19 +509,6 @@ for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_hm_lane
     assign axi_http_lane[L].tlast  = hm_body_tlast[L];
     assign hm_body_tready[L]       = axi_http_lane[L].tready;
 end
-
-`else
-// The single-session HTTP path (handler_stream + tcp_session_table) is gone. It demuxed AFTER the
-// framer on one shared body stream, so a lane busy on a large chunk back-pressured every other
-// lane; and the measured ceiling of a single TCP connection -- ~0.46 GB/s however deeply pipelined,
-// against 4.60 across sixteen -- made one session the wrong shape no matter how the demux behaved.
-//
-// ENABLE_HTTP_MULTI survives as a CMake option, so this branch is still reachable by configuration.
-// Failing here, at elaboration, is the point: without it the build dies much later with an
-// unresolved handler_stream module, which reads like a missing file rather than a retired mode.
-if (1) $error("ENABLE_HTTP without ENABLE_HTTP_MULTI: the single-session HTTP path was removed -- reconfigure with -DENABLE_HTTP_MULTI=ON");
-
-`endif
 
 for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_http_decoders
     ndata_i       #(data8_t, DATABEAT_SIZE) lane_ndata();
