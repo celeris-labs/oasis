@@ -72,43 +72,17 @@ libstf::stream_t default_num_streams(OasisContext &ctx) {
 }
 
 size_t default_pipeline_depth(OasisContext &ctx) {
-    // On an HTTP bitstream the source is the FPGA's HTTP client, so the depth that matters is how
-    // many ranged GETs that client can hold, not how many configs the decoder will queue.
+    // On an HTTP bitstream the depth is also bounded by what the HTTP handler can queue:
+    // max_inflight() column-chunk entries (the bitstream's queue depth, or OASIS_HTTP_MAX_INFLIGHT).
+    // A pre-pipelining bitstream reports 0 slots; there one request at a time is the only safe depth.
     //
-    // The handler keeps a ring of request slots, but how many the host may USE is max_inflight(),
-    // not num_slots() -- that cap, times the range-split size, is what bounds how many bytes the
-    // server can have in flight against the TOE's shared receive FIFO. See the comment on
-    // HTTP_DEFAULT_MAX_INFLIGHT in configuration.cpp.
-    //
-    // Note one column chunk may already expand into several ranged GETs inside HTTPReadConfig::read
-    // (it splits at chunk_bytes()), so this depth counts DECODER configs, not GETs; the GET-level
-    // pipelining happens below it.
-    //
-    // Depth must never EXCEED that cap. HTTPReadConfig::read blocks until there is credit, so
-    // over-queueing here would not corrupt anything -- it would just park the dispatcher thread
-    // inside read() instead of leaving the flow queued where it belongs. Sizing to the cap keeps
-    // that blocking path a backstop rather than the normal case.
-    //
-    // A pre-pipelining bitstream reports 0 slots. There, one request at a time is the only safe
-    // depth: that handler sampled its start trigger as a one-cycle pulse in ST_IDLE, so a second
-    // request issued mid-transfer is dropped and never retried.
-    // TWO DIFFERENT RESOURCES, and conflating them deadlocks the pipeline.
-    //
-    // max_inflight() is how many chunk LENGTHS the HTTP handler can hold -- 64, and cheap, because
-    // an entry is a byte count. maximum_num_enqueued_configs() is how many column chunks the
-    // DECODER will accept, and every flow the scheduler dispatches also acquires an output buffer.
-    // The depth has to respect both.
-    //
-    // This returned max_inflight() alone. That was harmless while it evaluated to 1 (the old
-    // bytes-in-flight cap) or 4 (the old ring), and became a deadlock the moment it started
-    // reporting the chunk-queue depth: 64 flows in flight, 64 decoder configs enqueued and 64
-    // output buffers claimed, against a decoder that takes far fewer. The decoder then stops
-    // accepting, chunks never reach tlast so they never retire, and back-pressure runs all the way
-    // out to the TOE -- observed as inflight=46/64 with rx_fifo_stall set and the receive window
-    // collapsing to below the drop threshold.
-    //
-    // It failed at a different query each run because what matters is how many column chunks have
-    // accumulated, not which query asked for them.
+    // TWO DIFFERENT RESOURCES, and conflating them deadlocks the pipeline. max_inflight() is how many
+    // chunk LENGTHS the HTTP handler can hold -- 64, and cheap, because an entry is a byte count.
+    // maximum_num_enqueued_configs() is how many column chunks the DECODER will accept, and every
+    // flow the scheduler dispatches also acquires an output buffer. The depth has to respect both:
+    // with max_inflight() alone, 64 flows in flight claim 64 decoder configs and 64 output buffers
+    // against a decoder that takes far fewer. The decoder then stops accepting, chunks never reach
+    // tlast so they never retire, and back-pressure runs all the way out to the TOE.
     const auto decoder_depth =
         ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
     if (ctx.isHTTPEnabled()) {

@@ -145,15 +145,6 @@ static std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdm
 	return std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + cc.offset, cc.total_compressed_size);
 }
 
-// The FPGA fetches this column chunk itself: one ranged GET whose stripped body streams straight
-// into the decoder, no host round trip. handle.path is already the bare resource path the GET line
-// wants ("/bucket/object.parquet").
-static std::unique_ptr<oasis::SourceOperator> MakeHTTPSource(OasisHTTPFileHandle &http,
-                                                             const parcore::metadata::ColumnChunk &cc) {
-	return std::make_unique<oasis::HTTPSourceOperator>(http.path, http.server_ip, http.server_port, cc.offset,
-	                                                   cc.total_compressed_size);
-}
-
 static std::unique_ptr<oasis::SourceOperator>
 MakeHostSource(oasis::OasisContext &ctx, const CoalescedFetcher::RangeView &view) {
 	if ((reinterpret_cast<uintptr_t>(view.data()) % 64) == 0) {
@@ -213,8 +204,8 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 		    bind.filename.c_str());
 	}
 
-	// The mirror image: an httpfpga:// source needs the HTTP client in the bitstream. Without it
-	// HTTPSourceOperator::apply would fail deep in the config lookup with no mention of the cause.
+	// The mirror image: an httpfpga:// source needs the HTTP client in the bitstream. Without it the
+	// HTTP source operator would fail deep in the config lookup with no mention of the cause.
 	if (http && !ctx.isHTTPEnabled()) {
 		throw NotImplementedException(
 		    "read_oasis('%s'): reading over httpfpga:// requires a bitstream built with --http; this "
@@ -293,13 +284,8 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 
 		// OASIS_HTTP_BATCH=0 gives every column chunk its own request, one source per flow, which
 		// is the RDMA path's shape: no cross-flow coupling, no row-group-wide batch riding the last
-		// flow, and exactly one queue entry per request.
-		//
-		// It cannot use HTTPSourceOperator to do it. That operator drives http_req_builder's
-		// registers -- path words, range ASCII, ip hex -- and the builder no longer exists: the
-		// streamed handler takes its request text from host DMA instead, so those writes land in
-		// registers nothing reads and not one byte is transmitted. So this still goes through
-		// HTTPBatchSourceOperator and the DMA text path; the batch is simply one chunk long.
+		// flow, and exactly one queue entry per request. It is an HTTPBatchSourceOperator whose
+		// batch is one chunk long.
 		//
 		// Ordering stays decode-then-source, unlike RDMA's source-then-decode: the GET fires a real
 		// request whose body streams in on the server's schedule, so the decoder config has to be

@@ -6,18 +6,13 @@
 # Why read_oasis and not read_parquet:
 #   read_parquet('httpfpga://...') only uses httpfpga:// as a byte source and parses on the CPU.
 #   Since the bitstream ties off axi_out[BYPASS_ID], those raw byte reads now go over a host socket
-#   and the FPGA is not involved at all. read_oasis is what builds an HTTPSourceOperator, so the
-#   FPGA issues the GET itself and the body streams into the ColumnChunkDecoder.
+#   and the FPGA is not involved at all. read_oasis is what builds an HTTPBatchSourceOperator, so
+#   the FPGA issues the GET itself and the body streams into the ColumnChunkDecoder.
 #
 # Why not count(*):
 #   A bare count(*) projects no columns, so read_oasis takes the emit_cardinality_only path and
 #   answers straight from the Parquet footer. It passes with the FPGA idle. Every query below
 #   projects a real fixed-width column so the decoder actually runs.
-#
-# PATH LENGTH LIMIT: the GET path is carried in 8 CSR words = 32 characters
-#   (HTTP_FILE_WORDS in software/oasis/configuration.cpp, fileWord0..7 in http_config.sv).
-#   A longer path throws at request-build time rather than silently truncating. That is why this
-#   test uses a short prefix and not '/testbench/tpch-30/...' (33+ chars, does not fit).
 
 require oasis
 

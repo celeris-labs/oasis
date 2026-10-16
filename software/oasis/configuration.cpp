@@ -55,25 +55,11 @@ const libstf::stream_t RDMAReadConfig::num_streams() const { return num_streams_
 
 namespace {
 
-// HttpConfig write map (hardware/src/hdl/http_read/http_config.sv)
+// HttpConfig write map (hardware/src/hdl/http_read/http_config.sv). Write ids 2..38 are the old
+// per-request descriptor fields: a non-zero REQ_TOTAL_BYTES selects the streamed request path, which
+// ignores them, so the host never writes them.
 constexpr const uint32_t HTTP_SERVER_IP       = 0;
 constexpr const uint32_t HTTP_SERVER_PORT     = 1;
-constexpr const uint32_t HTTP_PORT_HEX        = 2;
-constexpr const uint32_t HTTP_IP_HEX_LEN      = 3;
-constexpr const uint32_t HTTP_IP_HEX_W0       = 4;
-constexpr const uint32_t HTTP_FILE_LEN        = 8;
-constexpr const uint32_t HTTP_FILE_W0         = 9;  // 9..24 (16 words, 64 path characters)
-// Register 25 was a dead `num_sessions` field; it now carries per-request flags (bit 0 = this
-// response ends the decoder stream). Reusing it keeps the address map byte-for-byte identical --
-// shifting any register lands every later parameter in the wrong place, silently.
-constexpr const uint32_t HTTP_REQ_FLAGS       = 25;
-constexpr const uint32_t HTTP_PKG_WORD_COUNT  = 26;
-constexpr const uint32_t HTTP_USER_FREQUENCY  = 27;
-constexpr const uint32_t HTTP_TIME_IN_SECONDS = 28;
-constexpr const uint32_t HTTP_RANGE_BEGIN_LEN = 29;
-constexpr const uint32_t HTTP_RANGE_BEGIN_W0  = 30; // 30..33
-constexpr const uint32_t HTTP_RANGE_END_LEN   = 34;
-constexpr const uint32_t HTTP_RANGE_END_W0    = 35; // 35..38
 constexpr const uint32_t HTTP_START           = 39;
 // 40, above START. See the map comment in http_config.sv for why it is above rather than below:
 // 0..38 was full, and moving START would shift every parameter after it.
@@ -82,49 +68,9 @@ constexpr const uint32_t HTTP_REQ_TOTAL_BYTES = 40;
 // them down and marks tlast. One per CHUNK, not per request.
 constexpr const uint32_t HTTP_REQ_CHUNK_BYTES = 41;
 
-// Bitstreams up to and including build-88 instantiate HttpConfig with START_ADDR=31: the override in
-// vfpga_top.svh was not moved when the GET path widened from 8 to 16 words. On those, a write to 31
-// -- RANGE_BEGIN_W1 in the map above -- ALSO fires the start trigger, snapshotting the config while
-// registers 32..38 (the rest of the Range begin, all of the Range end) still hold their previous
-// values. The FPGA then sends "Range: bytes=<truncated begin>-" with no end and the server answers
-// 400. Writing this register last, immediately before START, is correct on both: on a fixed bitstream
-// it is an ordinary parameter and START at 39 still comes after it, and on a legacy one the trigger
-// fires only once everything else has landed. ConfigWriteReadyRegister registers its valid, so the
-// snapshot taken on that write includes the register 31 write itself.
-constexpr const uint32_t HTTP_LEGACY_START = 31;
-
-// totalWord bit 22: the handler is outside ST_IDLE. See describe_status() for the full layout.
-constexpr const uint32_t HTTP_STATUS_BUSY_BIT = 22;
-
-// ASCII words transferred per Range endpoint. Range values are absolute file
-// offsets, so they scale with file size, not with read size: 2 words (8 digits)
-// caps out at ~95 MiB, which any real Parquet file blows past immediately. 4
-// words = 16 digits ~ 8.9 PiB.
-constexpr const uint32_t HTTP_RANGE_WORDS = 4;
-constexpr const uint32_t HTTP_RANGE_MAX_DIGITS = HTTP_RANGE_WORDS * 4;
-
-// ASCII words transferred for the GET path (64 chars) and the Host: IP (16 chars).
-constexpr const uint32_t HTTP_FILE_WORDS = 16;
-constexpr const uint32_t HTTP_IP_WORDS   = 4;
-
-// http_req_builder assembles the request into a fixed 256-byte buffer (buffer_q[255:0]) with no
-// overflow detection -- writes past the end alias instead of failing, so this check is the only
-// thing standing between a long path and a silently corrupted request. The fixed parts are
-// "GET " (4) + " HTTP/1.1\r\nHost: " (17) + ":" (1) + port (4) + CRLF (2) +
-// "Range: bytes=" (13) + "-" (1) + CRLF (2) + "Connection: keep-alive\r\n\r\n" (26) = 70 bytes.
-constexpr const uint32_t HTTP_HEADER_BUFFER_BYTES = 256;
-constexpr const uint32_t HTTP_HEADER_FIXED_BYTES  = 70;
-
-// Read-side CSRs (see hardware/src/hdl/http_read/http_config.sv).
-constexpr const uint32_t HTTP_CLIENT_STATE     = 1;
+// Read-side CSRs (see hardware/src/hdl/http_read/http_config.sv). Ids 1 and 3..9 (client state and
+// the echo of the descriptor fields) are only printed raw, by debug_dump().
 constexpr const uint32_t HTTP_TOTAL_WORD       = 2;
-constexpr const uint32_t HTTP_ECHO_FILE_LEN    = 3;
-constexpr const uint32_t HTTP_ECHO_FILE_W0     = 4;
-constexpr const uint32_t HTTP_ECHO_FILE_W4     = 5;
-constexpr const uint32_t HTTP_ECHO_RANGE_BEGIN = 6;
-constexpr const uint32_t HTTP_ECHO_RANGE_END   = 7;
-constexpr const uint32_t HTTP_ECHO_SERVER      = 8;
-constexpr const uint32_t HTTP_ECHO_FILE_W8     = 9;
 constexpr const uint32_t HTTP_INFLIGHT         = 10;
 constexpr const uint32_t HTTP_STALL            = 11;
 constexpr const uint32_t HTTP_RESP             = 12;
@@ -396,40 +342,9 @@ uint8_t HttpMaxInflight(uint8_t slots) {
     return static_cast<uint8_t>(depth);
 }
 
-// Packs `s` little-endian into `words`. Throws rather than truncating: a silently shortened path
-// makes the FPGA request a different (usually nonexistent) file, and the 404 body then flows through
-// the datapath as if it were real data.
-void PackAsciiWords(const std::string &s, uint32_t &len, uint32_t *words, size_t n_words,
-                    const char *what) {
-    if (s.size() > n_words * 4) {
-        std::ostringstream msg;
-        msg << "HTTP " << what << " is " << s.size() << " characters, but only " << (n_words * 4)
-            << " are transferred to the FPGA: '" << s << "'";
-        throw std::runtime_error(msg.str());
-    }
-    len = static_cast<uint32_t>(s.size());
-    std::memset(words, 0, n_words * sizeof(uint32_t));
-    for (size_t i = 0; i < s.size(); i++) {
-        words[i / 4] |= static_cast<uint32_t>(static_cast<uint8_t>(s[i])) << (8 * (i % 4));
-    }
-}
-
 std::string IpToAscii(uint32_t ip_be) {
     return std::to_string((ip_be >> 24) & 0xff) + "." + std::to_string((ip_be >> 16) & 0xff) + "." +
            std::to_string((ip_be >> 8) & 0xff) + "." + std::to_string(ip_be & 0xff);
-}
-
-uint32_t PackPortHex(uint16_t port) {
-    std::ostringstream oss;
-    oss.width(4);
-    oss.fill('0');
-    oss << port;
-    const auto s = oss.str();
-    uint32_t word = 0;
-    for (uint32_t i = 0; i < 4; i++) {
-        word |= static_cast<uint32_t>(static_cast<uint8_t>(s[i])) << (8 * i);
-    }
-    return word;
 }
 
 } // namespace
@@ -438,20 +353,10 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
                                  uint32_t num_regs)
     : Config(cthread, addr_offset, num_regs) {}
 
-// Splits [range_begin, range_end] into GETs of at most chunk_bytes() and fires them in order. Only
-// the last one is marked body_last, so the whole column chunk still arrives as ONE decoder stream
-// with exactly one tlast -- the DataNormalizer resets its running byte offset on tlast, so an extra
-// one mid-chunk would desynchronise everything after it.
 // -------------------------------------------------------------------------------------------------
-// Streamed requests: build every GET of a column chunk as TEXT and hand the lot over at once.
-//
-// The descriptor path below writes ~40 CSRs per request and then waits for a free slot in the
-// hardware ring. Measured on a scale-30 lineitem scan that ring is full for 1462 of 1465 requests,
-// so the host spends essentially the whole query blocked. Here the FPGA stores nothing per request:
-// the text is the request, and the queue holds one bit per expected response.
-//
-// The text must match what http_req_builder used to assemble byte for byte, because strip_http
-// frames responses by Content-Length and the server is the same one either way.
+// Streamed requests: build every GET of a column chunk as TEXT and hand the lot over at once. The
+// FPGA stores nothing per request: the text is the request, and the queue holds one entry per
+// column chunk.
 // -------------------------------------------------------------------------------------------------
 // Requests one batch may carry. The queue holds one entry per expected response and the host pushes
 // every entry BEFORE arming the transfer, so a batch larger than the queue can never drain.
@@ -620,9 +525,7 @@ void PadRequestTextToBeat(std::string &text) {
 //
 // THIS IS NOT OPTIONAL, and leaving it out is what made every multi-batch query fail.
 // ConfigWriteReadyRegister does not back-pressure: a START written while the previous beat is still
-// unconsumed OVERWRITES it, and that beat disappears with no error raised anywhere. The old
-// descriptor path called await_credit() before every START for exactly this reason; the streamed
-// path was written without an equivalent.
+// unconsumed OVERWRITES it, and that beat disappears with no error raised anywhere.
 //
 // The cost was invisible in the obvious places and glaring on the wire. An arm dropped this way
 // means a whole batch's request text is never transmitted: a scale-30 supplier scan submitted three
@@ -1003,29 +906,6 @@ void HTTPReadConfig::await_arm_taken(uint8_t lane) {
     }
 }
 
-void HTTPReadConfig::read(libstf::stream_t /*stream*/, uint32_t server_ip, uint16_t server_port,
-                          const std::string &path, uint64_t range_begin, uint64_t range_end,
-                          uint16_t /*session_id*/) {
-    // The descriptor path drives http_req_builder's registers, which no streamed handler has; on
-    // revision 6 it would additionally bypass the one-GET-per-arm rule and the GET cap that keep the
-    // TOE's receive windows open. Refuse rather than send nothing (or worse).
-    if (toe_ring()) {
-        throw std::runtime_error("HTTPReadConfig::read (descriptor path) on a CSR revision-6 (TOE "
-                                 "receive ring) bitstream: use HTTPBatchSourceOperator");
-    }
-    const uint64_t chunk = chunk_bytes();
-    if (chunk == 0 || (range_end - range_begin + 1) <= chunk) {
-        issue_range(server_ip, server_port, path, range_begin, range_end, /*body_last*/ true);
-        return;
-    }
-
-    for (uint64_t begin = range_begin; begin <= range_end; begin += chunk) {
-        const uint64_t end  = std::min(begin + chunk - 1, range_end);
-        const bool     last = (end == range_end);
-        issue_range(server_ip, server_port, path, begin, end, last);
-    }
-}
-
 uint64_t HTTPReadConfig::chunk_bytes() {
     static const uint64_t configured = [] {
         const char *env = std::getenv("OASIS_HTTP_CHUNK_BYTES");
@@ -1038,198 +918,9 @@ uint64_t HTTPReadConfig::chunk_bytes() {
     return configured;
 }
 
-void HTTPReadConfig::await_credit() {
-    // Make sure the hardware can actually take this request before writing any of it.
-    //
-    // ConfigWriteReadyRegister does not back-pressure: a START write that lands while the previous
-    // one is still unconsumed OVERWRITES it, and that request disappears without a trace. So the
-    // host has to police the depth itself.
-    //
-    // On a pipelined bitstream the ring reports its occupancy and we wait for a free slot. On a
-    // pre-pipelining one there is no such register (it reads back zero), and the only signal
-    // available is the busy bit -- there, a request arriving mid-transfer really is dropped for
-    // good, because the old handler sampled runTx as a one-cycle pulse in ST_IDLE only. That is the
-    // wedge that outlives the process and makes every later run fail; with no reset CSR, the only
-    // way out is reprogramming.
-    if (num_slots() == 0) {
-        if (const uint32_t status = debug_status(); (status & (1u << HTTP_STATUS_BUSY_BIT)) != 0) {
-            std::ostringstream msg;
-            msg << "FPGA HTTP handler is still busy from an earlier request ["
-                << describe_status(status)
-                << "]; this bitstream predates the pipelined handler and only accepts a new request "
-                   "from its IDLE state, so this one would be silently dropped and then hang. There "
-                   "is no reset register -- reprogram the bitstream to clear it.";
-            throw std::runtime_error(msg.str());
-        }
-    } else {
-        // Cap the depth at HttpMaxInflight() rather than at the ring size: depth x chunk size is
-        // what bounds the bytes the server may have in flight. See HTTP_DEFAULT_MAX_INFLIGHT.
-        const uint8_t depth    = max_inflight();
-        const auto    deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
-        HTTPInflight  flight   = inflight();
-        while (flight.occupied >= depth) {
-            if (std::chrono::steady_clock::now() > deadline) {
-                std::ostringstream msg;
-                msg << "FPGA HTTP request ring has been at its depth limit (" << unsigned(depth)
-                    << " of " << unsigned(flight.slots) << " slots) for "
-                    << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
-                    << "s [" << flight.describe() << "; " << describe_status(debug_status())
-                    << "]. The pipeline has stopped draining -- " << stall().describe()
-                    << ". There is no reset register -- reprogram the bitstream to clear it.";
-                msg << " " << response().describe() << ".";
-                throw std::runtime_error(msg.str());
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-            flight = inflight();
-        }
-    }
-}
-
-void HTTPReadConfig::issue_range(uint32_t server_ip, uint16_t server_port, const std::string &path,
-                                 uint64_t range_begin, uint64_t range_end, bool body_last) {
-    await_credit();
-    last_request_bytes_.store(static_cast<uint32_t>(range_end - range_begin + 1),
-                              std::memory_order_relaxed);
-
-    const auto ip_ascii    = IpToAscii(server_ip);
-    const auto begin_ascii = std::to_string(range_begin);
-    const auto end_ascii   = std::to_string(range_end);
-
-    // The length CSRs must never claim more characters than were transferred, or the HW walks past
-    // the words it was given and builds a garbage Range: header. Check before packing so the error
-    // names the offending field.
-    if (begin_ascii.size() > HTTP_RANGE_MAX_DIGITS || end_ascii.size() > HTTP_RANGE_MAX_DIGITS) {
-        std::ostringstream msg;
-        msg << "HTTP range endpoint does not fit in " << HTTP_RANGE_MAX_DIGITS
-            << " ASCII digits: begin=" << range_begin << " end=" << range_end;
-        throw std::runtime_error(msg.str());
-    }
-
-    const size_t header_bytes = HTTP_HEADER_FIXED_BYTES + path.size() + ip_ascii.size() +
-                                begin_ascii.size() + end_ascii.size();
-    if (header_bytes > HTTP_HEADER_BUFFER_BYTES) {
-        std::ostringstream msg;
-        msg << "Assembled HTTP request is " << header_bytes << " bytes but the FPGA request buffer "
-            << "holds only " << HTTP_HEADER_BUFFER_BYTES << " (path=" << path.size()
-            << " ip=" << ip_ascii.size() << " range=" << begin_ascii.size() << "+"
-            << end_ascii.size() << "): '" << path << "'";
-        throw std::runtime_error(msg.str());
-    }
-
-    uint32_t file_len = 0;
-    uint32_t file_words[HTTP_FILE_WORDS] {};
-    PackAsciiWords(path, file_len, file_words, HTTP_FILE_WORDS, "GET path");
-
-    uint32_t ip_len = 0;
-    uint32_t ip_words[HTTP_IP_WORDS] {};
-    PackAsciiWords(ip_ascii, ip_len, ip_words, HTTP_IP_WORDS, "Host: address");
-
-    uint32_t range_begin_len = 0;
-    uint32_t range_begin_words[HTTP_RANGE_WORDS] {};
-    PackAsciiWords(begin_ascii, range_begin_len, range_begin_words, HTTP_RANGE_WORDS,
-                   "Range begin");
-
-    uint32_t range_end_len = 0;
-    uint32_t range_end_words[HTTP_RANGE_WORDS] {};
-    PackAsciiWords(end_ascii, range_end_len, range_end_words, HTTP_RANGE_WORDS, "Range end");
-
-    write_register(libstf::ConfigRegister(HTTP_SERVER_IP, server_ip));
-    write_register(libstf::ConfigRegister(HTTP_SERVER_PORT, server_port));
-    write_register(libstf::ConfigRegister(HTTP_PORT_HEX, PackPortHex(server_port)));
-    write_register(libstf::ConfigRegister(HTTP_IP_HEX_LEN, ip_len));
-    for (uint32_t i = 0; i < HTTP_IP_WORDS; i++) {
-        write_register(libstf::ConfigRegister(HTTP_IP_HEX_W0 + i, ip_words[i]));
-    }
-    write_register(libstf::ConfigRegister(HTTP_FILE_LEN, file_len));
-    for (uint32_t i = 0; i < HTTP_FILE_WORDS; i++) {
-        write_register(libstf::ConfigRegister(HTTP_FILE_W0 + i, file_words[i]));
-    }
-    write_register(libstf::ConfigRegister(HTTP_REQ_FLAGS, body_last ? 1u : 0u));
-    write_register(libstf::ConfigRegister(HTTP_PKG_WORD_COUNT, 16));
-    write_register(libstf::ConfigRegister(HTTP_USER_FREQUENCY, 256ULL * 1024ULL * 1024ULL));
-    write_register(libstf::ConfigRegister(HTTP_TIME_IN_SECONDS, 0));
-    write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_LEN, range_begin_len));
-    for (uint32_t i = 0; i < HTTP_RANGE_WORDS; i++) {
-        // Deferred to just before START -- see HTTP_LEGACY_START.
-        if (HTTP_RANGE_BEGIN_W0 + i == HTTP_LEGACY_START) {
-            continue;
-        }
-        write_register(libstf::ConfigRegister(HTTP_RANGE_BEGIN_W0 + i, range_begin_words[i]));
-    }
-    write_register(libstf::ConfigRegister(HTTP_RANGE_END_LEN, range_end_len));
-    for (uint32_t i = 0; i < HTTP_RANGE_WORDS; i++) {
-        write_register(libstf::ConfigRegister(HTTP_RANGE_END_W0 + i, range_end_words[i]));
-    }
-    static_assert(HTTP_LEGACY_START >= HTTP_RANGE_BEGIN_W0 &&
-                      HTTP_LEGACY_START < HTTP_RANGE_BEGIN_W0 + HTTP_RANGE_WORDS,
-                  "HTTP_LEGACY_START must name a Range-begin word for the deferral above to write it");
-    write_register(libstf::ConfigRegister(HTTP_LEGACY_START,
-                                          range_begin_words[HTTP_LEGACY_START - HTTP_RANGE_BEGIN_W0]));
-
-    // Barrier before START. The parameter writes above are posted MMIO stores; the START
-    // write is just another posted store, so nothing guarantees the parameter registers have
-    // been latched by HttpConfig before the START beat samples the cfg snapshot. If START wins
-    // the race, the handler builds its GET from a *stale* cfg — the "file path is one run behind"
-    // symptom (the bring-up tool papered over this with sleep(1) before START). A CSR read is
-    // non-posted and cannot be reordered ahead of the prior writes to the same AXI-Lite device,
-    // so it drains them and orders START strictly after every parameter write.
-    (void)read_register(HTTP_CLIENT_STATE);
-
-    write_register(libstf::ConfigRegister(HTTP_START, 1));
-
-    // Post-START trace, gated on OASIS_HTTP_DEBUG=1. read_oasis fires this request from a scheduler
-    // thread with no DuckDB logging in reach, so without it a request that never left the FPGA is
-    // indistinguishable from one whose response never came back -- both just hang. The echo
-    // registers are the only proof the parameters were latched at all, since the parameter CSRs
-    // themselves are write-only.
-    if (http_debug_enabled()) {
-        const auto flight = inflight();
-        // Bitstream identity in one line. slots=0 means a pre-pipelining bitstream, so if this says
-        // 0 when a pipelined one was programmed, the board is not running what you think it is.
-        if (flight.legacy()) {
-            std::fprintf(stderr, "[oasis-http] bitstream: pre-pipelining (no INFLIGHT register, depth 1)\n");
-        } else {
-            // cap is how many requests may be outstanding, occupied/slots the ring RIGHT NOW. The
-            // two answer different questions and are easy to confuse: a query touching one column
-            // chunk shows occupied=1 however deep the ring is, because there is only ever one
-            // request to make. cap is what says pipelining is enabled; occupancy is what says it is
-            // being used.
-            //
-            // The byte product printed last is no longer a limit that must be respected -- TCP flow
-            // control bounds what is actually in flight now (see HttpMaxInflight). It is printed
-            // because it is still the useful scale: how much the server has been invited to send
-            // before the window makes it wait.
-            std::fprintf(stderr,
-                         "[oasis-http] bitstream: %s cap=%u chunk=%llu (<=%llu B in flight)\n",
-                         flight.describe().c_str(), unsigned(HttpMaxInflight(flight.slots)),
-                         static_cast<unsigned long long>(chunk_bytes()),
-                         static_cast<unsigned long long>(HttpMaxInflight(flight.slots) *
-                                                         (chunk_bytes() ? chunk_bytes() : 0)));
-        }
-        std::fprintf(stderr, "[oasis-http] START GET %s range=[%llu,%llu] last=%d ip=0x%08x port=%u\n",
-                     path.c_str(), static_cast<unsigned long long>(range_begin),
-                     static_cast<unsigned long long>(range_end), int(body_last), server_ip,
-                     server_port);
-        std::fprintf(stderr, "[oasis-http]   latched: %s\n", request_echo().describe().c_str());
-        std::fprintf(stderr, "[oasis-http]   t=0ms      %s\n", describe_status(debug_status()).c_str());
-
-        // The sticky stall bits, reported the moment they change rather than only when a read times
-        // out. They are the only evidence for conditions that do NOT stop the query -- rx_fifo_stall
-        // above all, which says the decoupling fifo filled and back-pressure reached the TOE anyway.
-        // A run that succeeds is not evidence that it did not happen, so it has to be read on the
-        // success path or it is never read at all. Printed on transition, not per request: the bits
-        // are sticky, so repeating them for every remaining GET would bury the first occurrence.
-        const auto stalls = stall();
-        if (stalls.any() && stall_reported_ != stalls.raw) {
-            stall_reported_ = stalls.raw;
-            std::fprintf(stderr, "[oasis-http]   STALL: %s\n", stalls.describe().c_str());
-        }
-    }
-}
-
-// Mirrors the totalWord layout in hardware/src/hdl/http_read/handler.sv. The 4-bit client_state CSR
-// multiplexes several sub-FSMs onto one value (2, 6, 9 and 10 each alias two states), so only this
-// packed word can say which stage is actually stuck.
+// Mirrors the totalWord layout in hardware/src/hdl/http_read/handler_multi.sv (and handler_toe.sv).
+// The 4-bit client_state CSR multiplexes several sub-FSMs onto one value (2, 6, 9 and 10 each alias
+// two states), so only this packed word can say which stage is actually stuck.
 std::string HTTPReadConfig::describe_status(uint32_t status) {
     static const char *handler_states[] = {"IDLE", "CONNECT", "SEND", "READ", "RECONNECT"};
     const auto top = status & 0xFu;
@@ -1243,14 +934,6 @@ std::string HTTPReadConfig::describe_status(uint32_t status) {
         << ((status >> 21) & 1u) << " busy=" << ((status >> 22) & 1u)
         << " sid=" << ((status >> 24) & 0xFFu);
     return oss.str();
-}
-
-uint8_t HTTPReadConfig::client_state() {
-    return static_cast<uint8_t>(read_register(HTTP_CLIENT_STATE).value() & 0xF);
-}
-
-uint32_t HTTPReadConfig::debug_status() {
-    return static_cast<uint32_t>(read_register(HTTP_TOTAL_WORD).value());
 }
 
 HTTPReadConfig::HTTPInflight HTTPReadConfig::inflight() {
@@ -1807,24 +1490,15 @@ HTTPReadConfig::HTTPResponse HTTPReadConfig::response() {
     r.dirty          = (word & (1u << 26)) != 0;
     r.body_remaining = static_cast<uint32_t>(read_register(HTTP_BODY_REMAINING).value());
     r.content_length = static_cast<uint32_t>(read_register(HTTP_CONTENT_LENGTH).value());
-    // Only meaningful while requests are strictly one at a time -- see HTTPResponse::requested.
-    r.requested      = (max_inflight() > 1) ? 0u
-                                            : last_request_bytes_.load(std::memory_order_relaxed);
     return r;
 }
 
 std::string HTTPReadConfig::HTTPResponse::describe() const {
     std::ostringstream oss;
     oss << "last response: status=" << std::string(status, 3) << (status_ok ? " (ok)" : " (NOT ok)")
-        << " Content-Length=" << content_length << " requested=" << requested
-        << " body_remaining=" << body_remaining;
+        << " Content-Length=" << content_length << " body_remaining=" << body_remaining;
     if (unframeable) oss << " UNFRAMEABLE(no Content-Length)";
     if (dirty)       oss << " partially-delivered";
-    if (length_mismatch()) {
-        oss << ". THE SERVER SENT A DIFFERENT LENGTH THAN WAS REQUESTED -- the response is not the "
-               "one this request asked for (a 200 instead of a 206, a range clamped at end of file, "
-               "or an error document), so whatever reached the decoder is not this column chunk";
-    }
     return oss.str();
 }
 
@@ -1839,54 +1513,6 @@ uint8_t HTTPReadConfig::num_slots() {
 }
 
 uint8_t HTTPReadConfig::max_inflight() { return HttpMaxInflight(num_slots()); }
-
-HTTPRequestEcho HTTPReadConfig::request_echo() {
-    const auto range_begin = read_register(HTTP_ECHO_RANGE_BEGIN).value();
-    const auto range_end   = read_register(HTTP_ECHO_RANGE_END).value();
-    const auto server      = read_register(HTTP_ECHO_SERVER).value();
-
-    HTTPRequestEcho echo {};
-    echo.file_len        = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_LEN).value());
-    echo.file_w0         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W0).value());
-    echo.file_w4         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W4).value());
-    echo.file_w8         = static_cast<uint32_t>(read_register(HTTP_ECHO_FILE_W8).value());
-    echo.range_begin_w0  = static_cast<uint32_t>(range_begin & 0xFFFFFFFFULL);
-    echo.range_begin_len = static_cast<uint8_t>((range_begin >> 32) & 0xFF);
-    echo.range_end_w0    = static_cast<uint32_t>(range_end & 0xFFFFFFFFULL);
-    echo.range_end_len   = static_cast<uint8_t>((range_end >> 32) & 0xFF);
-    echo.server_ip       = static_cast<uint32_t>(server & 0xFFFFFFFFULL);
-    echo.server_port     = static_cast<uint16_t>((server >> 32) & 0xFFFF);
-    return echo;
-}
-
-// Renders the little-endian ASCII word pair the hardware latched, so a mismatch is readable
-// ("h-10" vs "h-1/") instead of two hex blobs.
-std::string HTTPRequestEcho::describe() const {
-    auto word_to_ascii = [](uint32_t w) {
-        std::string s;
-        for (int i = 0; i < 4; i++) {
-            const auto c = static_cast<char>((w >> (8 * i)) & 0xFF);
-            s += (c >= 0x20 && c < 0x7F) ? c : '.';
-        }
-        return s;
-    };
-
-    std::ostringstream oss;
-    oss << "path_len=" << file_len << " path[0:4]='" << word_to_ascii(file_w0) << "'"
-        << " path[16:20]='" << word_to_ascii(file_w4) << "'"
-        << " path[32:36]='" << word_to_ascii(file_w8) << "'"
-        << " range=" << static_cast<unsigned>(range_begin_len) << ":'"
-        << word_to_ascii(range_begin_w0) << "'-" << static_cast<unsigned>(range_end_len) << ":'"
-        << word_to_ascii(range_end_w0) << "'"
-        << " ip=0x" << std::hex << server_ip << std::dec << " port=" << server_port;
-    return oss.str();
-}
-
-uint64_t HTTPReadConfig::read_stream_register(libstf::stream_t /*stream*/, uint32_t reg) {
-    assert(reg < HTTP_READ_CONFIG_REGS);
-    return cthread->getCSR(addr_offset + reg);
-}
-
 
 std::string HTTPReadConfig::debug_dump() {
     std::ostringstream o;

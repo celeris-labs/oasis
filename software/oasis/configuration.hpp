@@ -120,45 +120,20 @@ class RDMAReadConfig : public libstf::Config {
     libstf::stream_t num_streams_;
 };
 
-/**
- * Snapshot of the request parameters the hardware actually latched, read back from HttpConfig read
- * CSRs 3..8. The parameter write registers are write-only, so this is the only way to confirm that
- * the CSR writes landed before START sampled them.
- */
-struct HTTPRequestEcho {
-    uint32_t file_len        = 0;
-    uint32_t file_w0         = 0; // GET path characters 0..3
-    uint32_t file_w4         = 0; // GET path characters 16..19
-    uint32_t file_w8         = 0; // GET path characters 32..35
-    uint32_t range_begin_w0  = 0; // first four ASCII digits of the range start
-    uint8_t  range_begin_len = 0;
-    uint32_t range_end_w0    = 0;
-    uint8_t  range_end_len   = 0;
-    uint32_t server_ip       = 0;
-    uint16_t server_port     = 0;
-
-    /// One-line human-readable rendering, with the ASCII words decoded.
-    std::string describe() const;
-};
-
-/**
- * Dirty bring-up of hardware HttpConfig + handler (HW TCP open).
- * Writes the full CSR map and pulses START. No body return path yet.
- */
 /// Pads request text to a whole 64-byte DMA beat with a header the server ignores, so the transfer
 /// has no tail to round up and nothing can be left in the stream for the next batch to pick up.
 void PadRequestTextToBeat(std::string &text);
 
+/**
+ * Drives the hardware HttpConfig and HTTP handler: column-chunk entries and transfer arms through the
+ * CSRs, request text by host DMA (HTTPBatchSourceOperator), and every readback register decoded.
+ */
 class HTTPReadConfig : public libstf::Config {
   public:
     HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset, uint32_t num_regs);
 
-    /// A query's worth of requests, built as text on the host.
-    ///
-    /// The descriptor path writes ~40 CSRs per request and then waits for a slot in the hardware
-    /// ring; measured on a scale-30 lineitem scan that ring is full for 1462 of 1465 requests, so
-    /// the host is blocked for essentially the whole query. Here the FPGA stores nothing per
-    /// request -- the text IS the request -- and the queue holds one bit per expected response.
+    /// A query's worth of requests, built as text on the host. The FPGA stores nothing per request
+    /// -- the text IS the request -- and its queue holds one entry per column chunk.
     struct RequestBatch {
         /// Every GET, concatenated, in the order the responses will come back.
         std::string text;
@@ -307,21 +282,12 @@ class HTTPReadConfig : public libstf::Config {
     /// "416", ...), or "unparsed". Reads CSR 12. Meaningful mainly when stall().status_bad is set.
     std::string last_http_status();
 
-    /// The exact bytes http_req_builder used to assemble in hardware.
+    /// One ranged GET (keep-alive) as request text.
     static std::string BuildGet(const std::string &host, uint16_t port, const std::string &path,
                                 uint64_t range_begin, uint64_t range_end);
 
-    /// Fire one ranged GET. `stream` / `session_id` ignored (single HttpConfig; HW opens).
-    void read(libstf::stream_t stream, uint32_t server_ip, uint16_t server_port, const std::string &path,
-              uint64_t range_begin, uint64_t range_end, uint16_t session_id);
-
-    uint8_t client_state();
-
-    /// Read CSR 2: packed FSM status word (layout defined by `totalWord` in handler.sv).
-    uint32_t debug_status();
-
     /**
-     * Read CSR 10: the request-ring occupancy (`inflightWord` in handler.sv).
+     * Read CSR 10: the request-queue occupancy (`inflightWord` in handler_multi.sv / handler_toe.sv).
      *
      * The handler pipelines several ranged GETs over concurrent TCP sessions, so "busy" is the
      * normal state during a scan and says nothing about whether another request can be accepted.
@@ -530,7 +496,8 @@ class HTTPReadConfig : public libstf::Config {
     static HTTPLanePolicy  DecodePolicy(uint64_t policy_word);
 
     /**
-     * Read CSR 11: which pipeline stage stopped making progress (`stallWord` in handler.sv).
+     * Read CSR 11: which pipeline stage stopped making progress (`stallWord` in handler_multi.sv /
+     * handler_toe.sv).
      *
      * A full request ring says the pipeline stopped draining but not where. This says where, which
      * matters because the stages fail for very different reasons. In particular a stalled CONNECT
@@ -641,7 +608,8 @@ class HTTPReadConfig : public libstf::Config {
     static HTTPStall DecodeStall(uint32_t word, bool toe_ring);
 
     /**
-     * Read CSRs 12/13: how the last HTTP response was framed (`respWord` in handler.sv).
+     * Read CSRs 12/13: how the last HTTP response was framed (`respWord` in handler_multi.sv /
+     * handler_toe.sv).
      *
      * On a persistent connection the body is delimited by Content-Length rather than by the FIN, so
      * the hardware now knows the status code and whether it could frame the response at all. Before
@@ -654,24 +622,8 @@ class HTTPReadConfig : public libstf::Config {
         bool     unframeable = false;      // no Content-Length
         bool     dirty = false;            // body bytes already emitted for the current response
         uint32_t body_remaining = 0;       // bytes of the current body still to stream
-        /// Content-Length the server sent for the last response, latched in hardware. Compare
-        /// against `requested`: they differ when the server answered a different question than the
-        /// one asked -- a 200 instead of a 206, a range clamped at EOF, an error document. This is
-        /// the check `body_remaining` cannot do, because it counts down to zero.
+        /// Content-Length the server sent for the last response, latched in hardware.
         uint32_t content_length = 0;
-        /// Bytes the host asked for in the most recent ranged GET (host-side, not from hardware).
-        /// ZERO when more than one request can be outstanding: `content_length` is latched by the
-        /// hardware from whichever response is being framed, while this is simply the last range the
-        /// host issued, and once those are different requests comparing them is meaningless. It
-        /// would not be a harmless inaccuracy either -- pipelined GETs of a split column chunk have
-        /// genuinely different lengths, so the check would fire on every healthy run and train the
-        /// reader to ignore it.
-        uint32_t requested = 0;
-
-        /// False whenever `requested` is 0, which includes the pipelined case above.
-        bool length_mismatch() const {
-            return requested != 0 && content_length != 0 && content_length != requested;
-        }
         std::string describe() const;
     };
     HTTPResponse response();
@@ -703,13 +655,8 @@ class HTTPReadConfig : public libstf::Config {
     /// in-process state capture.
     std::string debug_dump();
 
-    /// Read CSRs 3..8: the request parameters currently latched in hardware.
-    HTTPRequestEcho request_echo();
-
-    /// Renders a packed status word from debug_status() into per-sub-FSM fields.
+    /// Renders the packed status word (read id 2) into per-sub-FSM fields.
     static std::string describe_status(uint32_t status);
-
-    uint64_t read_stream_register(libstf::stream_t stream, uint32_t reg);
 
     static constexpr uint64_t ID = HTTP_READ_CONFIG_ID;
 
@@ -735,22 +682,6 @@ class HTTPReadConfig : public libstf::Config {
     /// shipped before them -- the same register, the same spin, the same timeout and the same
     /// message. A `--decoders 1` legacy bitstream must not notice that this work package happened.
     void await_cfg_ready_legacy(const char *what);
-
-    /// Bytes asked for in the most recent ranged GET, so response() can compare what the server
-    /// said against what was requested.
-    std::atomic<uint32_t> last_request_bytes_ {0};
-
-    /// The stallWord already reported on the debug path. The stall bits are sticky, so without this
-    /// every remaining request in the query would reprint the same condition and bury the first.
-    uint32_t stall_reported_ {0};
-
-    /// Block until the request ring has room for one more GET, or throw naming the stalled stage.
-    void await_credit();
-
-    /// Write the CSR map for ONE ranged GET and pulse START. `body_last` is false when this GET is
-    /// part of a larger column chunk and the decoder stream continues past it.
-    void issue_range(uint32_t server_ip, uint16_t server_port, const std::string &path,
-                     uint64_t range_begin, uint64_t range_end, bool body_last);
 
     /// -1 until the first inflight() read; then the bitstream's slot count.
     int num_slots_ = -1;

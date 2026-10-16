@@ -57,49 +57,13 @@ class RDMASourceOperator final : public SourceOperator {
 };
 
 /**
- * Fires a ranged HTTP GET from the FPGA's own HTTP client. The handler opens the TCP connection,
- * issues the request, strips the response headers and streams the body straight into the stream's
- * ColumnChunkDecoder -- the bytes never touch host memory, mirroring RDMASourceOperator.
+ * Fetches column chunks with the FPGA's own HTTP client: the ranged GETs are built as text on the
+ * host and handed over in one go, and the handler streams each response body straight into the
+ * stream's ColumnChunkDecoder -- the bytes never touch host memory, mirroring RDMASourceOperator.
  *
- * `offset`/`size` are the column chunk's byte extent in the remote object; they become an inclusive
- * `Range: bytes=offset-(offset+size-1)` header.
- *
- * Single-session constraint: HttpConfig is one set of parameter CSRs behind one START pulse, so at
- * most one of these may be in flight at a time. Scheduler pins its pipeline depth to 1 on HTTP
- * bitstreams to enforce that (see default_pipeline_depth in scheduler.cpp); do not relax it without
- * giving the hardware per-session request state.
- */
-class HTTPSourceOperator final : public SourceOperator {
-  public:
-    HTTPSourceOperator(std::string path, uint32_t server_ip, uint16_t server_port, uint64_t offset,
-                       size_t size)
-        : path_(std::move(path))
-        , server_ip_(server_ip)
-        , server_port_(server_port)
-        , offset_(offset)
-        , size_(size) {}
-
-    void apply(libstf::stream_t stream, OasisContext &ctx) override;
-    void print(std::ostream &os) const override;
-
-  private:
-    std::string path_;
-    uint32_t    server_ip_;
-    uint16_t    server_port_;
-    uint64_t    offset_;
-    size_t      size_;
-};
-
-/**
- * Every ranged GET of a row group, built as text on the host and handed over in one go.
- *
- * HTTPSourceOperator issues ONE range and blocks until the hardware ring has a free slot. Measured
- * on a scale-30 lineitem scan that ring is full for 1462 of 1465 requests, so the query spends
- * essentially all of its time waiting for a descriptor slot rather than for the server.
- *
- * This builds the text for every chunk it was given, pushes one body_last bit per expected
- * response, arms the transfer and DMAs the text. The FPGA stores nothing per request, so there is
- * no slot to wait for: how many requests may be outstanding becomes a question about host memory.
+ * This builds the text for every chunk it was given, pushes one chunk-length entry per column chunk,
+ * arms the transfer and DMAs the text. The FPGA stores nothing per request, so how many requests may
+ * be outstanding becomes a question about host memory.
  *
  * The buffer must outlive the DMA, which is why it is a member rather than a local.
  */

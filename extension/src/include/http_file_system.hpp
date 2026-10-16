@@ -93,7 +93,7 @@ private:
 };
 
 // `path` is the resource path only ("/bucket/object.parquet"), already normalized — that is exactly
-// what the GET line needs, so read_oasis can hand it to HTTPSourceOperator unchanged.
+// what the GET line needs, so read_oasis can hand it to HTTPBatchSourceOperator unchanged.
 //
 // server_ip / server_port are snapshotted at open time rather than read from the filesystem on
 // demand: read_oasis builds its source operators on DuckDB worker threads, and the settings behind

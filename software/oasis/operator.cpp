@@ -9,14 +9,12 @@
 
 #include <algorithm>
 #include <cassert>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace oasis {
@@ -27,59 +25,6 @@ void RDMASourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
 
 void RDMASourceOperator::print(std::ostream &os) const {
     os << "RDMASource(offset=" << offset_ << ", size=" << size_ << ")";
-}
-
-void HTTPSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
-    // HTTP ranges are inclusive on both ends, the column chunk extent is [offset, offset + size).
-    // A zero-length chunk would underflow that conversion into a range ending at 2^64-1, which the
-    // hardware would happily turn into a request for the rest of the object.
-    if (size_ == 0) {
-        throw std::runtime_error("HTTPSourceOperator: zero-length column chunk at offset " +
-                                 std::to_string(offset_) + " in '" + path_ + "'");
-    }
-    ctx.config<HTTPReadConfig>()->read(stream, server_ip_, server_port_, path_, offset_,
-                                       offset_ + size_ - 1, /*session_id*/ 0);
-
-    // Debug-gated stage tracing. The HTTP handler going back to IDLE only proves the transfer
-    // finished at the network edge; it says nothing about whether the body reached the decoder or
-    // whether the decoder emitted anything. Sampling the decoder's in/out handshake counters
-    // alongside the handler state localises a stall to one stage:
-    //   in=0            -> body never arrived (strip_http / normalizer dropped it)
-    //   in>0, out=0     -> decoder consumed but produced nothing (config or decode failure)
-    //   in>0, out>0     -> decoder produced output, loss is in OutputWriter / OBM delivery
-    // Detached and best-effort: it only reads CSRs, and OasisContext owns both configs for the
-    // whole session so they outlive the samples.
-    if (http_debug_enabled()) {
-        std::thread([&ctx, stream] {
-            auto http = ctx.config<HTTPReadConfig>();
-            auto dec  = ctx.config<parcore::ColumnChunkDecoderConfig>();
-            for (const int ms : {200, 1000, 5000}) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-                const auto prof = dec->read_profile(stream);
-                std::fprintf(stderr,
-                             "[oasis-http]   t=%-5dms %s\n"
-                             "[oasis-http]              decoder in: hs=%llu starved=%llu stalled=%llu | "
-                             "out: hs=%llu starved=%llu stalled=%llu\n",
-                             ms, HTTPReadConfig::describe_status(http->debug_status()).c_str(),
-                             static_cast<unsigned long long>(prof.in.handshakes_cycles),
-                             static_cast<unsigned long long>(prof.in.starved_cycles),
-                             static_cast<unsigned long long>(prof.in.stalled_cycles),
-                             static_cast<unsigned long long>(prof.out.handshakes_cycles),
-                             static_cast<unsigned long long>(prof.out.starved_cycles),
-                             static_cast<unsigned long long>(prof.out.stalled_cycles));
-            }
-            // Coyote's shell counters close the last gap: "Sent local writes" says whether the
-            // OutputWriter ever issued a host DMA, and "Notifications received" whether the
-            // completion interrupt made it back. Decoder counters cannot see either.
-            std::fflush(stderr);
-            ctx.cthread()->printDebug();
-        }).detach();
-    }
-}
-
-void HTTPSourceOperator::print(std::ostream &os) const {
-    os << "HTTPSource(path=" << path_ << ", range=[" << offset_ << "," << (offset_ + size_ - 1)
-       << "])";
 }
 
 void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
@@ -137,8 +82,7 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
 
         // The decoder's handshake counters alongside every batch line. Without them a trace shows
         // the queue filling but not WHY nothing retires, because a chunk only retires when it
-        // reaches tlast, and that needs the decoder to be accepting. The equivalent sampling in
-        // HTTPSourceOperator never runs on this path -- the batch operator replaced it.
+        // reaches tlast, and that needs the decoder to be accepting.
         //
         //   in stalled climbing   -> the decoder refuses input; nothing can retire
         //   in starved climbing   -> the decoder is idle waiting; the stall is upstream
