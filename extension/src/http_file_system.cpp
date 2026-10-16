@@ -44,23 +44,7 @@ uint64_t GetUIntSetting(optional_ptr<FileOpener> opener, const string &key, uint
 	return fallback;
 }
 
-// parseIpBE: 10.253.74.74 -> 0x0AFD4A4A.
-// Used as-is for openConnTcp and HTTP Host CSR (those CSRs do not byte-swap).
-//
-// THE BSWAP LOOKS WRONG AND IS KEPT ANYWAY. On the wire it produces "who-has 74.74.253.10" for
-// 10.253.74.74 -- byte-reversed -- and cThread::doArpLookup (cThread.cpp:1061) stores the word
-// verbatim, so on the face of it ParseIpBE order is what the register wants. Removing the bswap and
-// shortening the settle in one commit on 2026-08-07 produced an intermittent failure: a long stall
-// with no traffic, then normal speed once traffic started, then the 30 s host credit timeout. Two
-// variables, one symptom, so neither is convicted.
-//
-// The reading that fits every observation is that the warm-up never resolved anything and works only
-// as a side effect -- the request is BROADCAST with the FPGA's own IP and MAC in the sender fields,
-// so the segment learns the FPGA's mapping either way. That would make the target irrelevant and the
-// settle time the whole point, which is why the settle is the knob below and this is left alone.
-//
-// Do not "fix" this without changing it ALONE and running tpch_demo --only 1 from a cold board
-// several times. A failure here costs a reprogram, and the symptom is intermittent.
+// 10.253.74.74 -> 0x0AFD4A4A: the order the SERVER_IP CSR takes (it does not byte-swap).
 uint32_t ParseIpBE(const string &host) {
 	unsigned b0 = 0, b1 = 0, b2 = 0, b3 = 0;
 	if (std::sscanf(host.c_str(), "%u.%u.%u.%u", &b0, &b1, &b2, &b3) != 4 || b0 > 255 ||
@@ -68,19 +52,6 @@ uint32_t ParseIpBE(const string &host) {
 		throw IOException("Invalid http_server address '%s'", host);
 	}
 	return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
-}
-
-// Extra microseconds to wait after the ARP request. ZERO by default -- see EnsureInitialized.
-useconds_t ArpSettleMicros() {
-	static const useconds_t configured = [] {
-		const char *env = std::getenv("OASIS_ARP_SETTLE_US");
-		if (!env || !*env) {
-			return useconds_t(0);
-		}
-		const long parsed = std::strtol(env, nullptr, 10);
-		return parsed < 0 ? useconds_t(0) : static_cast<useconds_t>(parsed);
-	}();
-	return configured;
 }
 
 string NormalizeHttpPath(const string &path) {
@@ -186,46 +157,11 @@ void OasisHTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 
 	(void)ctx.config<oasis::HTTPReadConfig>();
 
-	// Optional ARP warm-up; handler opens TCP itself on START.
+	// No ARP warm-up: the handler opens its connection on the first START and the TOE resolves the
+	// server's MAC itself then.
 	if (HttpFpgaDebugEnabled()) {
-		std::fprintf(stderr,
-		             "[httpfpga] init http_server=%s parseIpBE=0x%08x arp=0x%08x port=%u\n",
-		             server_host_.c_str(), server_ip_, server_ip_,
-		             static_cast<unsigned>(server_port_));
-	}
-	// Resolve the server MAC into the TOE ARP table, then let it settle. Without this the handler
-	// reaches START and tries to open the connection before the server MAC is known, then stalls —
-	// START fires but no SYN ever leaves the FPGA (the "fire, then hang, no TCP" symptom). This call
-	// was previously commented out, which is exactly that hang.
-	//
-	// NO settle time. There used to be a flat sleep(1) here and it was never load-bearing -- it was
-	// leftover debugging. It cost 1.0 s of wall clock on EVERY duckdb invocation, about seventy
-	// percent of the fixed per-query cost and more than every GET in an sf1 scan put together.
-	//
-	// A full 22-query TPC-H run at OASIS_ARP_SETTLE_US=5 -- five microseconds -- passes 22/22, which
-	// is as close to removing it as makes no difference. doArpLookup already usleeps 100 us internally
-	// (cThread.cpp:1074) and the handler opens its connection lazily on the first START, so the slack
-	// that made this look necessary is still there without paying for it.
-	//
-	// The knob stays, defaulting to zero, ONLY because the failure it was once believed to guard
-	// against is a wedge that outlives the process. If a connect ever stalls with no init_error, try
-	// OASIS_ARP_SETTLE_US=1000000 and say so -- do not re-add this blindly.
-	//
-	// REMOVED. This asked the TOE to resolve IpForArpLookup(server_ip_), which byte-swaps: for a
-	// server at 10.253.74.74 it broadcast "Who has 74.74.253.10?" -- an address that exists nowhere,
-	// so nothing ever answered and no mapping was ever learned. The warm-up did resolve something,
-	// but only as a side effect: the request goes out as a BROADCAST carrying the FPGA's own IP and
-	// MAC in the sender fields, so the segment learns the FPGA's mapping regardless of what was
-	// asked for. That is what made it look load-bearing.
-	//
-	// It also put a bogus ARP into every capture, next to real traffic, where it reads like a
-	// symptom of whatever is being debugged. The TOE resolves the server itself when it opens the
-	// connection; the correct target does not need asking for twice, and the wrong one never helped.
-	//
-	// If a connect ever stalls with no init_error after this, the honest fix is to resolve the
-	// RIGHT address -- doArpLookup(server_ip_), no swap -- not to restore the swapped one.
-	if (const useconds_t settle = ArpSettleMicros()) {
-		usleep(settle);
+		std::fprintf(stderr, "[httpfpga] init http_server=%s ip=0x%08x port=%u\n", server_host_.c_str(),
+		             server_ip_, static_cast<unsigned>(server_port_));
 	}
 
 	initialized = true;
