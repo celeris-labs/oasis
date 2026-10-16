@@ -76,10 +76,9 @@ void rev2_decoders() {
     CHECK(p.lane_stall_cycles == 65536 && p.lane_stall_log2 == 16);
 
     // Revision-2 host rules: depth = OASIS_HTTP_LANE_DEPTH clamped to the queue, no GET cap.
-    CHECK(HTTPReadConfig::LaneDepthFor(2, 4, 64) == 4);
-    CHECK(HTTPReadConfig::LaneDepthFor(2, 100, 64) == 64);
-    CHECK(HTTPReadConfig::LaneDepthFor(2, 0, 64) == 1);
-    CHECK(HTTPReadConfig::LaneDepthFor(0, 4, 64) == 1);   // pre-lane bitstream
+    CHECK(HTTPReadConfig::LaneDepthFor(4, 64) == 4);
+    CHECK(HTTPReadConfig::LaneDepthFor(100, 64) == 64);
+    CHECK(HTTPReadConfig::LaneDepthFor(0, 64) == 1);
     CHECK(HTTPReadConfig::LaneCreditOk(3, 1, 4));
     CHECK(!HTTPReadConfig::LaneCreditOk(4, 1, 4));
     CHECK(HTTPReadConfig::EffectiveSplit(0, 0) == 0);
@@ -144,7 +143,7 @@ void placement_at_depth() {
     in.active     = 4;
     in.rr         = 0;
 
-    in.lane_depth = HTTPReadConfig::LaneDepthFor(2, 1, 64);
+    in.lane_depth = HTTPReadConfig::LaneDepthFor(1, 64);
     auto out      = oasis::Scheduler::PlaceOnLane(in);
     CHECK(out.stream && *out.stream == 1); // first idle lane from the cursor
 
@@ -153,7 +152,7 @@ void placement_at_depth() {
     CHECK(!out.stream && out.lane_bound_wait); // every lane owes a chunk: park, poll
 
     // Same windows at revision 2 depth 4: a lane owing one chunk still takes more.
-    in.lane_depth = HTTPReadConfig::LaneDepthFor(2, 4, 64);
+    in.lane_depth = HTTPReadConfig::LaneDepthFor(4, 64);
     out           = oasis::Scheduler::PlaceOnLane(in);
     CHECK(out.stream.has_value() && !out.lane_bound_wait);
 }
@@ -224,16 +223,22 @@ size_t check_chunk_split(uint64_t begin, uint64_t size, uint64_t split) {
 }
 
 void rev6_rules() {
-    // --- revision mapping: 6 is driven as 2 (its register map); 0..2 are themselves; 3..5 (the
-    //     HBM-slot handler) and 7+ refused ---
-    for (unsigned raw = 0; raw <= 2; raw++) {
-        const auto r = oasis::HTTPRevision::Classify(static_cast<uint8_t>(raw));
-        CHECK(r.raw == raw && r.protocol == raw && !r.toe_ring);
-    }
+    // --- revision mapping: 6 is driven as 2 (its register map), 2 as itself; below 2 (no per-lane
+    //     registers), 3..5 (the HBM-slot handler) and 7+ refused ---
+    const auto r2 = oasis::HTTPRevision::Classify(2);
+    CHECK(r2.raw == 2 && r2.protocol == 2 && !r2.toe_ring);
     const auto r6 = oasis::HTTPRevision::Classify(6);
     CHECK(oasis::HTTP_CSR_REVISION_TOE == 6);
     CHECK(r6.raw == 6 && r6.protocol == 2 && r6.toe_ring);
-    CHECK(r6.lane_csrs());
+    for (unsigned raw : {0u, 1u}) {
+        std::string what;
+        try {
+            (void)oasis::HTTPRevision::Classify(static_cast<uint8_t>(raw));
+        } catch (const std::runtime_error &e) {
+            what = e.what();
+        }
+        CHECK(what.find("predates the per-lane registers") != std::string::npos);
+    }
     for (unsigned raw : {3u, 4u, 5u}) {
         std::string what;
         try {
@@ -327,13 +332,13 @@ void rev6_rules() {
     }
 
     // --- lane depth: protocol 2 + the GET credit ---
-    CHECK(HTTPReadConfig::LaneDepthFor(r6.protocol, 4, 64, 4) == 4);  // the default
-    CHECK(HTTPReadConfig::LaneDepthFor(r6.protocol, 16, 64, 4) == 4); // OASIS_HTTP_LANE_DEPTH=16 clamped
-    CHECK(HTTPReadConfig::LaneDepthFor(r6.protocol, 2, 64, 4) == 2);
-    CHECK(HTTPReadConfig::LaneDepthFor(r6.protocol, 0, 64, 4) == 1);
-    CHECK(HTTPReadConfig::LaneDepthFor(r6.protocol, 16, 2, 4) == 2);  // and the queue
-    CHECK(HTTPReadConfig::LaneDepthFor(r6.protocol, 8, 0, 4) == 4);   // queue unknown
-    CHECK(HTTPReadConfig::LaneDepthFor(2, 16, 64) == 16);             // revision 2 unchanged
+    CHECK(HTTPReadConfig::LaneDepthFor(4, 64, 4) == 4);   // the default
+    CHECK(HTTPReadConfig::LaneDepthFor(16, 64, 4) == 4);  // OASIS_HTTP_LANE_DEPTH=16 clamped
+    CHECK(HTTPReadConfig::LaneDepthFor(2, 64, 4) == 2);
+    CHECK(HTTPReadConfig::LaneDepthFor(0, 64, 4) == 1);
+    CHECK(HTTPReadConfig::LaneDepthFor(16, 2, 4) == 2);   // and the queue
+    CHECK(HTTPReadConfig::LaneDepthFor(8, 0, 4) == 4);    // queue unknown
+    CHECK(HTTPReadConfig::LaneDepthFor(16, 64) == 16);    // revision 2: no credit clamp
     CHECK(HTTPReadConfig::LaneCreditOk(3, 1, 4));
     CHECK(!HTTPReadConfig::LaneCreditOk(4, 1, 4));
 
@@ -368,7 +373,7 @@ void rev6_rules() {
     in.needed     = 1;
     in.active     = 4;
     in.rr         = 0;
-    in.lane_depth = HTTPReadConfig::LaneDepthFor(r6.protocol, 16, 64, p.get_credit);
+    in.lane_depth = HTTPReadConfig::LaneDepthFor(16, 64, p.get_credit);
     in.lanes      = HTTPReadConfig::DecodeLanes(3ULL | (4ULL << 8) | (4ULL << 16) | (4ULL << 24), all, 4);
     auto out      = oasis::Scheduler::PlaceOnLane(in);
     CHECK(out.stream && *out.stream == 0);

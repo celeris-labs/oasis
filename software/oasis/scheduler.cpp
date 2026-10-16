@@ -74,7 +74,6 @@ libstf::stream_t default_num_streams(OasisContext &ctx) {
 size_t default_pipeline_depth(OasisContext &ctx) {
     // On an HTTP bitstream the depth is also bounded by what the HTTP handler can queue:
     // max_inflight() column-chunk entries (the bitstream's queue depth, or OASIS_HTTP_MAX_INFLIGHT).
-    // A pre-pipelining bitstream reports 0 slots; there one request at a time is the only safe depth.
     //
     // TWO DIFFERENT RESOURCES, and conflating them deadlocks the pipeline. max_inflight() is how many
     // chunk LENGTHS the HTTP handler can hold -- 64, and cheap, because an entry is a byte count.
@@ -87,9 +86,6 @@ size_t default_pipeline_depth(OasisContext &ctx) {
         ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
     if (ctx.isHTTPEnabled()) {
         const auto http_depth = ctx.config<HTTPReadConfig>()->max_inflight();
-        if (http_depth == 0) {
-            return 1;   // pre-pipelining bitstream: one request at a time is the only safe depth
-        }
         return std::min<size_t>(static_cast<size_t>(http_depth), decoder_depth);
     }
     return decoder_depth;
@@ -101,8 +97,8 @@ size_t default_pipeline_depth(OasisContext &ctx) {
 // are monotone in the host's favour (only a config beat the host itself writes can clear either), so
 // a sample stays true until this thread acts on it, and the pick needs no lock and no re-read.
 struct Scheduler::LaneSnapshot {
-    /// False on every bitstream without per-lane registers, and on a sample that could not be taken.
-    /// The pick then falls back to pick_stream(), i.e. to exactly the pre-WP5 behaviour.
+    /// False without HTTP, on a one-lane bitstream, and on a sample that could not be taken. The pick
+    /// then falls back to pick_stream(), i.e. to placement by host load alone.
     bool                      valid = false;
     HTTPReadConfig::HTTPLanes lanes {};
 };
@@ -116,17 +112,15 @@ Scheduler::Scheduler(OasisContext &ctx)
     }
 
     // Resolve the lane geometry ONCE, before the dispatcher exists. Every value here is fixed by the
-    // programmed bitstream (or by the environment), the accessors cache their first read, and doing
-    // it here means the loop below never has to ask whether the per-lane registers may be touched --
-    // which matters because on a bitstream without them that question is answered by a bus error,
-    // not by zeros. default_pipeline_depth() above already read CSRs, so this adds no new ordering
-    // requirement on when the Scheduler may be built.
+    // programmed bitstream (or by the environment) and the accessors cache their first read.
+    // default_pipeline_depth() above already read CSRs, so this adds no new ordering requirement on
+    // when the Scheduler may be built.
     if (ctx.isHTTPEnabled()) {
         http_ = ctx.config<HTTPReadConfig>();
-        // Both conditions, not just the revision. A revision-2 bitstream with ONE lane still routes
-        // by the decoder index rather than by a lane, so there is no per-lane window that a decode
-        // stream can be metered against, and lane-aware picking would be metering the wrong thing.
-        lane_aware_ = http_->lane_csrs_available() && http_->lane_count() > 1;
+        // With ONE lane the beats route by the decoder index rather than by a lane, so there is no
+        // per-lane window that a decode stream can be metered against, and lane-aware picking would
+        // be metering the wrong thing.
+        lane_aware_ = http_->lane_count() > 1;
         if (lane_aware_) {
             lane_count_       = http_->lane_count();
             lane_depth_       = std::max<size_t>(http_->lane_depth_limit(), 1);
@@ -474,7 +468,7 @@ std::optional<libstf::stream_t> Scheduler::pick_stream() const {
 Scheduler::LaneSnapshot Scheduler::sample_lanes() {
     LaneSnapshot view;
     if (!lane_aware_) {
-        return view; // revision 0, one lane, or no HTTP at all: read nothing, decide as before
+        return view; // one lane, or no HTTP at all: read nothing, decide by host load
     }
     try {
         view.lanes = http_->lanes();

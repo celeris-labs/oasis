@@ -77,14 +77,13 @@ constexpr const uint32_t HTTP_RESP             = 12;
 constexpr const uint32_t HTTP_BODY_REMAINING   = 13;
 constexpr const uint32_t HTTP_CONTENT_LENGTH   = 14;
 // The true response-queue depth. inflightWord's slot/occupancy fields are byte-wide and saturate at
-// 255; this is how a host learns it may push thousands. Reads 0 on bitstreams predating it.
+// 255; this is how a host learns it may push thousands.
 constexpr const uint32_t HTTP_QUEUE_DEPTH      = 15;
 
-// PER-LANE READBACK -- CSR REVISION 2 ONLY. Read ids 16..20, all 64 bits, at a fixed stride of 8
+// PER-LANE READBACK -- CSR REVISION 2 AND UP. Read ids 16..20, all 64 bits, at a fixed stride of 8
 // lanes whatever NUM_CONNS is. The read register file answers an out-of-range address with
-// resp_error, NOT with zeros, so none of these may be touched unless inflightWord[31:24] says the
-// bitstream has them: see HTTP_CSR_REVISION_LANES and lane_csrs_available(). The write map is
-// unchanged by all of this. Field tables live in hardware/src/hdl/http_read/http_config.sv.
+// resp_error, NOT with zeros, which is why a bitstream below HTTP_CSR_REVISION_LANES is refused at
+// startup. Field tables live in hardware/src/hdl/http_read/http_config.sv.
 constexpr const uint32_t HTTP_LANE_OCC         = 16; // byte per lane at [8L+7:8L], saturating at 255
 constexpr const uint32_t HTTP_LANE_READY       = 17; // nibble per lane: arm/entry/conn_up/fatal
 constexpr const uint32_t HTTP_LANE_STATE       = 18; // tcp_read nibble low, http_req_stream high
@@ -550,26 +549,8 @@ void PadRequestTextToBeat(std::string &text) {
 // batch takes to send. The timeout is the same 30 s used for the request ring: reaching it means
 // the pipeline stopped, which is a diagnosis rather than a tuning knob.
 //
-// All of the above holds for BOTH forms below. The two differ only in which register answers the
-// question -- the OR-folded req_ready bit for one lane's worth of hardware, or that lane's own
-// nibble -- and never in the write order around the call, which is the part that is protocol.
-void HTTPReadConfig::await_cfg_ready_legacy(const char *what) {
-    const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
-    while (!inflight().req_ready) {
-        if (std::chrono::steady_clock::now() > deadline) {
-            std::ostringstream msg;
-            msg << "FPGA HTTP config port has refused a " << what << " for "
-                << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
-                << "s [" << inflight().describe() << "; " << stall().describe()
-                << "]. The pipeline has stopped draining.";
-            throw std::runtime_error(msg.str());
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(20));
-    }
-}
-
-// The lane-aware form. ONE register read per poll (id 17), because both admission bits and the fatal
-// flag live in the same nibble -- see the atomicity note in handler_multi.sv.
+// ONE register read per poll (id 17), because both admission bits and the fatal flag live in the
+// same nibble -- see the atomicity note in handler_multi.sv.
 //
 // WHY THE FATAL CHECK COMES FIRST, and not after the ready test.
 // ARM_READY is !stream_busy for the lane. A lane that was armed and then went fatal never finishes
@@ -579,15 +560,10 @@ void HTTPReadConfig::await_cfg_ready_legacy(const char *what) {
 // The batch has to be reissued either way; the only question is whether the host finds that out now
 // or in half a minute.
 //
-// The old req_ready register answers about "the lane last addressed", which is only the right
-// question when the beat about to be written names that same lane -- and the whole reason this
-// package exists is that it stopped being true. On a bitstream with no per-lane registers there is
-// nothing better and nothing worse: await_cfg_ready_legacy() is the code that shipped, unchanged.
+// The OR-folded req_ready bit (inflightWord[19]) answers about "the lane last addressed", which is
+// only the right question when the beat about to be written names that same lane; the lane's own
+// nibble always is.
 void HTTPReadConfig::await_cfg_ready(const char *what, uint8_t lane, LaneAdmit admit) {
-    if (!lane_csrs_available()) {
-        await_cfg_ready_legacy(what);
-        return;
-    }
     if (lane >= lane_count()) {
         std::ostringstream msg;
         msg << "FPGA HTTP " << what << " names lane " << unsigned(lane) << ", but the bitstream has "
@@ -633,7 +609,7 @@ void HTTPReadConfig::await_cfg_ready(const char *what, uint8_t lane, LaneAdmit a
 // cannot be replayed by the hardware, and the host holds the only copy of the text.
 void HTTPReadConfig::throw_lane_fatal(uint8_t lane, const char *what) {
     const auto errs       = lane_errors();
-    const auto state_word = lane_csrs_available() ? read_register(HTTP_LANE_STATE).value() : 0ULL;
+    const auto state_word = read_register(HTTP_LANE_STATE).value();
     const auto e          = errs.at(lane);
 
     std::ostringstream msg;
@@ -656,9 +632,9 @@ void HTTPReadConfig::throw_lane_fatal(uint8_t lane, const char *what) {
 
 // Per-lane admission: wait until this lane can owe `needed` more responses.
 //
-// The shared-queue version below cannot answer this once there are several lanes. inflightWord's
-// occupancy is the MAX over lanes, so a busy neighbour blocks a batch for an idle lane, and a lane
-// that has stopped draining is invisible behind one that has not.
+// The shared queue in inflightWord cannot answer this once there are several lanes: its occupancy is
+// the MAX over lanes, so a busy neighbour would block a batch for an idle lane, and a lane that has
+// stopped draining would be invisible behind one that has not.
 //
 // `needed` above the limit is not made into an impossible wait. The limit is a HOST pipelining cap,
 // while the hardware's real bound is the lane's queue (policy().queue_depth, and max_batch_chunks()
@@ -666,12 +642,6 @@ void HTTPReadConfig::throw_lane_fatal(uint8_t lane, const char *what) {
 // lane to itself.
 void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed, const char *what) {
     if (needed == 0) {
-        return;
-    }
-    if (!lane_csrs_available()) {
-        // Verbatim pre-lane behaviour: reserve against the shared queue, which is depth-1-per-batch
-        // as far as any single lane is concerned, because there is only one.
-        await_queue_space(needed, what);
         return;
     }
     if (lane >= lane_count()) {
@@ -700,38 +670,6 @@ void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed, const char *
                 << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
                 << "s [" << l.describe() << "; " << lane_errors().describe() << "; "
                 << stall().describe() << "]. That lane has stopped draining.";
-            throw std::runtime_error(msg.str());
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(20));
-    }
-}
-
-// Wait until the queue has room for a WHOLE batch, before any of it is pushed.
-//
-// await_cfg_ready only answers "can one more beat be accepted", which is not the question a batch
-// needs to ask. Entries are pushed one at a time and the arm that starts the transfer comes after
-// the last of them, so a batch that runs out of room half way through can never finish: the
-// remaining entries wait for space, space is freed only by responses, and responses need the arm.
-//
-// That is reachable whenever the host's own ceiling -- oasis_scan_groups_in_flight x projected
-// columns -- meets the hardware queue. At 16 groups it is 32 for a two-column scan and 48 for
-// three, both with headroom; a FOUR-column scan makes it exactly 64, the queue depth, and the
-// deadlock is then certain rather than unlucky. TPC-H q5 is the first query that scans four
-// hardware columns, which is why q1-q4 pass and q5 hangs at inflight=64/64.
-void HTTPReadConfig::await_queue_space(size_t needed, const char *what) {
-    const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
-    while (true) {
-        const auto f = inflight();
-        // A pre-pipelining bitstream reports slots == 0 and has no queue to reserve in.
-        if (f.legacy() || static_cast<size_t>(f.free_slots()) >= needed) {
-            return;
-        }
-        if (std::chrono::steady_clock::now() > deadline) {
-            std::ostringstream msg;
-            msg << "FPGA HTTP queue never freed " << needed << " slots for " << what << " within "
-                << std::chrono::duration_cast<std::chrono::seconds>(HTTP_CREDIT_TIMEOUT).count()
-                << "s [" << f.describe() << "; " << stall().describe()
-                << "]. The pipeline has stopped draining.";
             throw std::runtime_error(msg.str());
         }
         std::this_thread::sleep_for(std::chrono::microseconds(20));
@@ -788,9 +726,7 @@ void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
                      "%s | %s\n",
                      unsigned(lane), batch.chunk_bytes.size(), batch.text.size(),
                      f.describe().c_str(), st.any() ? st.describe().c_str() : "no stalls");
-        if (lane_csrs_available()) {
-            std::fprintf(stderr, "[oasis-http]   %s\n", lanes().describe().c_str());
-        }
+        std::fprintf(stderr, "[oasis-http]   %s\n", lanes().describe().c_str());
         // Name the status the moment it goes bad. It is a live register, so it must be read while
         // the failure is on the board -- by the time the run ends it may have been overwritten.
         if (st.status_bad) {
@@ -816,9 +752,8 @@ void HTTPReadConfig::push_entries(const RequestBatch &batch, uint8_t lane) {
         throw std::runtime_error(msg.str());
     }
     // Reserve room for the whole batch BEFORE pushing any of it. Without this the loop below can
-    // fill the queue mid-batch and hang with the arm never issued -- see await_queue_space. Per
-    // lane where the hardware reports per-lane occupancy, against the shared queue where it does
-    // not; await_lane_credit() picks.
+    // fill the queue mid-batch and hang with the arm never issued: the remaining entries wait for
+    // space, space is freed only by responses, and responses need the arm.
     await_lane_credit(lane, batch.chunk_bytes.size(), "a batch of chunk-length entries");
 
     // The lane, on EVERY beat of this batch. handler_multi takes cfg_lane from req_chunk_dest --
@@ -970,12 +905,10 @@ uint8_t HTTPReadConfig::lane_count() {
     // Clamped to HTTP_LANE_SLOTS because that is how far the per-lane registers reach: a bitstream
     // with more lanes than the CSR stride addresses is one this library cannot meter, and pretending
     // otherwise would admit batches against lane windows that are not there.
-    if (lane_csrs_available()) {
-        const auto p = policy();
-        if (p.num_conns > 0 && p.num_conns <= HTTP_LANE_SLOTS) {
-            lane_count_cached_ = p.num_conns;
-            return lane_count_cached_;
-        }
+    const auto p = policy();
+    if (p.num_conns > 0 && p.num_conns <= HTTP_LANE_SLOTS) {
+        lane_count_cached_ = p.num_conns;
+        return lane_count_cached_;
     }
     lane_count_cached_ = inflight().lanes;
     return lane_count_cached_;
@@ -990,6 +923,13 @@ HTTPRevision HTTPRevision::Classify(uint8_t raw) {
         r.toe_ring = true;
         return r;
     }
+    if (raw < HTTP_CSR_REVISION_LANES) {
+        std::ostringstream msg;
+        msg << "FPGA HTTP handler reports CSR revision " << unsigned(raw) << " (inflightWord[31:24]): "
+            << "the bitstream predates the per-lane registers (revision 2), which this liboasis "
+               "needs. Program a revision-2 (handler_multi) or revision-6 (handler_toe) bitstream.";
+        throw std::runtime_error(msg.str());
+    }
     if (raw > HTTP_CSR_REVISION_LANES && raw < HTTP_CSR_REVISION_TOE) {
         std::ostringstream msg;
         msg << "FPGA HTTP handler reports CSR revision " << unsigned(raw) << " (inflightWord[31:24]): "
@@ -1000,7 +940,7 @@ HTTPRevision HTTPRevision::Classify(uint8_t raw) {
     if (raw > HTTP_CSR_REVISION_TOE) {
         std::ostringstream msg;
         msg << "FPGA HTTP handler reports CSR revision " << unsigned(raw) << " (inflightWord[31:24]); "
-            << "this liboasis knows revisions 0..2 and " << unsigned(HTTP_CSR_REVISION_TOE)
+            << "this liboasis drives revisions 2 and " << unsigned(HTTP_CSR_REVISION_TOE)
             << ". Its register map and host rules are unknown here, and driving it by a guess would "
                "write registers that may not exist. Build and install the host library that matches "
                "the programmed bitstream.";
@@ -1026,7 +966,6 @@ uint8_t HTTPReadConfig::raw_revision() { return rev().raw; }
 
 bool HTTPReadConfig::toe_ring() { return rev().toe_ring; }
 
-bool HTTPReadConfig::lane_csrs_available() { return revision() >= HTTP_CSR_REVISION_LANES; }
 
 uint8_t HTTPReadConfig::lane_for_stream(libstf::stream_t stream) {
     const uint8_t lanes = lane_count();
@@ -1088,9 +1027,6 @@ HTTPReadConfig::HTTPLanePolicy HTTPReadConfig::DecodePolicy(uint64_t policy_word
 }
 
 HTTPReadConfig::HTTPLanes HTTPReadConfig::lanes() {
-    if (!lane_csrs_available()) {
-        return {};
-    }
     // TWO reads, and the admission bits come out of ONE of them on purpose -- both are monotone in
     // the host's favour, so a nibble read here is still true when the write it admits lands.
     const auto occ   = read_register(HTTP_LANE_OCC).value();
@@ -1099,27 +1035,15 @@ HTTPReadConfig::HTTPLanes HTTPReadConfig::lanes() {
 }
 
 HTTPReadConfig::HTTPLaneErrors HTTPReadConfig::lane_errors() {
-    if (!lane_csrs_available()) {
-        return {};
-    }
     return DecodeLaneErrors(read_register(HTTP_LANE_ERR).value(), lane_count());
 }
 
 HTTPReadConfig::HTTPLanePolicy HTTPReadConfig::policy() {
-    if (!lane_csrs_available()) {
-        return {};
-    }
     return DecodePolicy(read_register(HTTP_LANE_POLICY).value());
 }
 
 size_t HTTPReadConfig::lane_depth_limit() {
     if (lane_depth_ != 0) {
-        return lane_depth_;
-    }
-    if (!lane_csrs_available()) {
-        // No per-lane occupancy to meter against, so there is no per-lane depth either: the shared
-        // queue is what admits a batch, exactly as it did before this existed.
-        lane_depth_ = LaneDepthFor(revision(), 1, 1);
         return lane_depth_;
     }
     const size_t hw      = max_batch_chunks();
@@ -1134,7 +1058,7 @@ size_t HTTPReadConfig::lane_depth_limit() {
         throw std::runtime_error("FPGA reports CSR revision 6 (TOE receive ring) but LANE_POLICY "
                                  "carries GET_CREDIT 0 [" + policy().describe() + "]");
     }
-    lane_depth_          = LaneDepthFor(revision(), want, hw, credit);
+    lane_depth_          = LaneDepthFor(want, hw, credit);
     if (toe_ring()) {
         char line[320];
         std::snprintf(line, sizeof(line),
@@ -1156,12 +1080,9 @@ size_t HTTPReadConfig::lane_depth_limit() {
     return lane_depth_;
 }
 
-size_t HTTPReadConfig::LaneDepthFor(uint8_t revision, size_t want, size_t hw, size_t get_credit) {
-    if (revision < HTTP_CSR_REVISION_LANES) {
-        return 1;
-    }
+size_t HTTPReadConfig::LaneDepthFor(size_t want, size_t hw, size_t get_credit) {
     if (get_credit != 0) {
-        // Revision 6 (protocol 2 + the GET credit). Every column chunk is at least one GET, and the
+        // Revision 6 (the GET credit). Every column chunk is at least one GET, and the
         // hardware holds at most GET_CREDIT unfinished GETs per lane, so a deeper host queue would only
         // admit flows whose first arm then waits on the dispatcher thread.
         hw = (hw == 0) ? get_credit : std::min(hw, get_credit);
@@ -1302,16 +1223,10 @@ std::string HTTPReadConfig::HTTPLanePolicy::describe() const {
 
 std::string HTTPReadConfig::HTTPInflight::describe() const {
     std::ostringstream oss;
-    if (legacy()) {
-        return "inflight=<unsupported: pre-pipelining bitstream>";
-    }
     oss << "inflight=" << static_cast<unsigned>(occupied) << "/" << static_cast<unsigned>(slots)
         << " conn=" << (conn_up ? "up" : "down") << (has_pending ? " pending" : "")
-        << (peer_closed ? " peer-closed" : "");
-    if (revision != 0) {
-        oss << " rev=" << static_cast<unsigned>(revision)
-            << " lanes=" << static_cast<unsigned>(lanes);
-    }
+        << (peer_closed ? " peer-closed" : "") << " rev=" << static_cast<unsigned>(revision)
+        << " lanes=" << static_cast<unsigned>(lanes);
     return oss.str();
 }
 
@@ -1503,9 +1418,7 @@ std::string HTTPReadConfig::HTTPResponse::describe() const {
 }
 
 uint8_t HTTPReadConfig::num_slots() {
-    // Fixed by the bitstream, so read it once. A pre-pipelining bitstream has no INFLIGHT register;
-    // ConfigReadRegisterFile returns zero for an out-of-range address, which lands here as 0 slots
-    // and selects the legacy single-request path.
+    // Fixed by the bitstream, so read it once.
     if (num_slots_ < 0) {
         num_slots_ = static_cast<int>(inflight().slots);
     }
@@ -1521,8 +1434,7 @@ std::string HTTPReadConfig::debug_dump() {
         h << "0x" << std::hex << std::setw(16) << std::setfill('0') << v;
         return h.str();
     };
-    const uint8_t rev   = revision();
-    const int     last  = rev >= HTTP_CSR_REVISION_LANES ? int(HTTP_LANE_POLICY) : int(HTTP_QUEUE_DEPTH);
+    const int last = int(HTTP_LANE_POLICY);
     o << "HTTP CSR dump (revision " << unsigned(raw_revision())
       << (toe_ring() ? ", TOE receive rings, revision-2 register map" : "") << ", read ids 0.."
       << last << "):\n";
@@ -1535,16 +1447,13 @@ std::string HTTPReadConfig::debug_dump() {
     o << "  inflight:    " << inflight().describe() << "\n";
     o << "  stall:       " << stall().describe() << "\n";
     o << "  response:    " << response().describe() << " (decoder 0's framer)\n";
-    if (rev >= HTTP_CSR_REVISION_LANES) {
-        const uint8_t n = lane_count();
-        o << "  " << DecodeLanes(w[HTTP_LANE_OCC], w[HTTP_LANE_READY], n).describe() << "\n";
-        o << "  " << DecodeLaneErrors(w[HTTP_LANE_ERR], n).describe() << "\n";
-        for (uint8_t l = 0; l < n; l++) {
-            o << "  lane " << unsigned(l) << " state: " << DescribeLaneState(w[HTTP_LANE_STATE], l)
-              << "\n";
-        }
-        o << "  " << DecodePolicy(w[HTTP_LANE_POLICY]).describe() << "\n";
+    const uint8_t n = lane_count();
+    o << "  " << DecodeLanes(w[HTTP_LANE_OCC], w[HTTP_LANE_READY], n).describe() << "\n";
+    o << "  " << DecodeLaneErrors(w[HTTP_LANE_ERR], n).describe() << "\n";
+    for (uint8_t l = 0; l < n; l++) {
+        o << "  lane " << unsigned(l) << " state: " << DescribeLaneState(w[HTTP_LANE_STATE], l) << "\n";
     }
+    o << "  " << DecodePolicy(w[HTTP_LANE_POLICY]).describe() << "\n";
     if (toe_ring()) {
         // Revision 6 only: what the revision-2 words mean on handler_toe. No register above 20 is
         // read -- they do not exist on this bitstream.

@@ -32,8 +32,7 @@ class HTTPReadConfig;
  * Two knobs are tunable at runtime: the number of *active* streams (the span the dispatcher load-
  * balances across) and the per-stream pipeline depth.
  *
- * On a bitstream that reports per-lane HTTP registers (CSR revision >= 2) with more than one lane,
- * the dispatcher additionally places work by LANE CREDIT rather than by host load alone: each
+ * On an HTTP bitstream with more than one lane, the dispatcher additionally places work by LANE CREDIT rather than by host load alone: each
  * iteration samples the hardware's per-lane admission windows and picks the least-loaded lane that
  * can still owe another response. Stream index and lane index are the SAME index -- the lane owns
  * the TCP session, the framer, the chunk queue and the decoder its body bytes come out on -- so
@@ -161,17 +160,16 @@ class Scheduler {
 
     // ---------------------------------------------------------------------------------------------
     // Lane-aware dispatch. Every field here is resolved ONCE, in the constructor, from registers the
-    // bitstream cannot change while it is programmed -- so the dispatch loop never re-asks whether
-    // the lane registers exist, and a revision-0 board pays nothing at all for this section.
+    // bitstream cannot change while it is programmed, so the dispatch loop never re-reads them.
     // ---------------------------------------------------------------------------------------------
 
     /// The HTTP read config, or null when this bitstream has none. Held so the dispatcher does not
     /// walk the config map on every iteration.
     std::shared_ptr<HTTPReadConfig> http_;
 
-    /// Whether to place work by lane credit. Requires the per-lane CSRs (revision >= 2) AND more
-    /// than one lane: with a single lane the field the beats carry is the DECODER index, not a lane,
-    /// so there is no per-lane window to meter a decode stream against.
+    /// Whether to place work by lane credit. Requires more than one lane: with a single lane the
+    /// field the beats carry is the DECODER index, not a lane, so there is no per-lane window to
+    /// meter a decode stream against.
     bool lane_aware_ = false;
 
     /// Lanes the bitstream has, and the chunk entries the host will let ONE of them owe
@@ -239,12 +237,12 @@ class Scheduler {
     void dispatch_loop();
 
     // Returns the least-loaded active stream that has a free pipeline slot, or nullopt if all are
-    // full. Must be called holding dispatch_mutex_. The host-load-only pick: used on every bitstream
-    // without per-lane registers, and as the fallback when a lane sample could not be taken.
+    // full. Must be called holding dispatch_mutex_. The host-load-only pick: used without HTTP, on a
+    // one-lane bitstream, and as the fallback when a lane sample could not be taken.
     std::optional<libstf::stream_t> pick_stream() const;
 
-    // Two CSR reads into a LaneSnapshot, or an invalid snapshot when this bitstream has no per-lane
-    // registers (and then it reads nothing at all). MUST be called with no scheduler lock held.
+    // Two CSR reads into a LaneSnapshot, or an invalid snapshot when placement is not lane-aware
+    // (and then it reads nothing at all). MUST be called with no scheduler lock held.
     LaneSnapshot sample_lanes();
 
     // The lane-aware pick: the least-loaded lane that can still owe `needed` more responses, skipping
