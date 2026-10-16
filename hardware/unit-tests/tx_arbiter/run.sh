@@ -14,7 +14,7 @@ rm -rf xsim.dir xsim.jou xsim.log xvlog.pb xelab.pb webtalk* .Xil 2>/dev/null ||
 
 # http_req_stream joins the compile for section 4: the wedge under test lives in the req/grant
 # contract BETWEEN the claimant and the arbiter, so neither module alone can express it.
-xvlog -sv ../http_pipeline/lynxTypes_stub.sv "$HDL/tx_arbiter.sv" "$HDL/http_req_stream.sv" \
+xvlog -sv ../common/lynxTypes_stub.sv "$HDL/tx_arbiter.sv" "$HDL/http_req_stream.sv" \
       tx_arbiter_tb.sv
 xelab -debug typical -timescale 1ns/1ps -top tx_arbiter_tb -snapshot tx_arbiter_tb_snap
 xsim tx_arbiter_tb_snap -R
