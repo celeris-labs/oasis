@@ -1,29 +1,23 @@
 `timescale 1ns / 1ps
 // =================================================================================================
-// lane_drain_tb -- INDEPENDENT black-box liveness bench for handler_multi AND handler_slots.
+// lane_drain_tb -- INDEPENDENT black-box liveness bench for handler_multi AND handler_toe.
 //
 // Written from the external contract only.  Nothing below handler_multi's or rx_dispatch's port
 // list was read, and none of the RTL author's benches were consulted.
 //
 // TWO DUTs, ONE BENCH
 // -------------------
-// DUT_SLOTS selects which handler is instantiated.  Everything outside it -- the TOE, the origin
-// server, the host and the decoder sinks -- is IDENTICAL, which is the point: the scenarios are the
-// contract, and the contract did not change when the datapath moved into HBM.  With DUT_SLOTS=1 the
-// bench also instantiates unit-tests/card_dma/card_dma_model.sv, so the card path is modelled with
-// its real rules (byte-granular vaddr/len, normalised keep, acks in issue order, and a FAIL on any
-// read of a byte that was never written or that overlaps an un-acked write).
+// DUT_TOE selects which handler is instantiated: handler_multi against the bypass TOE model (one
+// shared packet FIFO, below), or handler_toe against the NON-BYPASS TOE MODEL (a receive ring per
+// session).  The origin server, the host and the decoder sinks are IDENTICAL, which is the point:
+// the scenarios are the contract.
 //
 // WHAT THE HOST HAS TO DO DIFFERENTLY, AND WHY
 // --------------------------------------------
-// handler_slots takes ONE GET PER ARM (each arm is one reader entry), so in slots mode a batch of N
-// GETs becomes N arms of one GET each, issued by a per-lane FEEDER process.  Since CSR revision 4
-// the hardware no longer holds a second arm on a connection until its slot is empty (revision 3
-// did, "depth 1"); the feeder therefore keeps the two host rules software keeps: at most +HDEPTH
-// GETs outstanding per connection (4; HDEPTH=1 reproduces revision 3's pacing), and the bytes armed
-// since CONN_DRAINED was last seen set must fit in the slot.  +SRVLAT gives the origin a
-// request->response latency so pipelining has something to hide; +COALESCE lets responses share
-// TCP segments.
+// handler_toe takes ONE GET PER ARM, so with DUT_TOE=1 a batch of N GETs becomes N arms of one GET
+// each, issued by a per-lane FEEDER process that keeps at most +HDEPTH chunks (4) outstanding on
+// its lane.  +SRVLAT gives the origin a request->response latency so pipelining has something to
+// hide; +COALESCE lets responses share TCP segments.
 //
 // The feeder is asynchronous on purpose.  submit_batch returns as soon as the work is queued rather
 // than when the last GET has been armed, so a scenario that says "queue six responses on this lane
@@ -31,7 +25,7 @@
 // accepted, the whole batch would have drained before the scenario got to stop anything, and d, e,
 // s_d and s_e would all quietly stop testing what they were written to test.
 //
-// handler_multi's runs are unaffected: with DUT_SLOTS=0 the host model is exactly what it was.
+// handler_multi's runs are unaffected: with DUT_TOE=0 the host model is exactly what it was.
 //
 // The bench is the whole outside world:
 //   * TOE  : connection opens, a shared notification interface, and ONE shared packet FIFO
@@ -64,45 +58,24 @@ module lane_drain_tb #(
     // xsim, so that one scenario gets its own snapshot with a small value.
     parameter int STALL_CYCLES  = 268435456,
 
-    // 0 = handler_multi (build-119, the control arm).  1 = handler_slots + the card DMA model.
-    parameter int DUT_SLOTS = 0,
-    // log2 of one connection's slot, slots DUT only.  19 = 512 KiB, so the host's biggest legal GET
-    // is 512 - 64 = 448 KiB.  That is small enough to keep the model's card memory and the bench's
-    // byte-by-byte checking cheap, and big enough that s_d's 400000-byte response -- the one that
-    // is deliberately larger than build-119's whole lane fifo -- still fits in a slot.  The `ovf`
-    // scenario gets its own snapshot with a small value so the overflow happens quickly.
-    parameter int SLOT_LOG2 = 19,
-    // handler_slots' CSR revision. 5 = stage 2 (the arm names its connection in req_conn); 4 = the
-    // revision-4 decoding, conn == decoder. With NUM_DEC == NUM_CONNS both run the same scenarios.
-    parameter int CSR_REV = 5,
-    // Decoders ("lanes" everywhere below). 0 = NUM_CONNS, the stage-1 shape every scenario was
-    // written for: lane L = connection L = decoder L. A smaller value is STAGE 2 (slots DUT,
-    // revision 5 only): the host model then places every GET on a connection of its own choosing
-    // -- see "STAGE-2 HOST MODEL" -- and the s2* scenarios apply.
-    parameter int NUM_DEC = 0,
     // 1 = handler_toe (the TOE with a receive ring per session, RX_DDR_BYPASS = 0), against the
-    // NON-BYPASS TOE MODEL below instead of the shared-fifo one. Needs DUT_SLOTS = 0.
+    // NON-BYPASS TOE MODEL below instead of the shared-fifo one.
     parameter int DUT_TOE = 0,
     // handler_toe's FIN settle, exposed so a mutant can be run (fin_overtake must fail at ~200).
     parameter int TOE_CLOSE_SETTLE = 4096,
     // handler_toe's FRAMER_SLICE, exposed so the variant without the 61ad533 slice can be run.
     parameter bit TOE_FRAMER_SLICE = 1'b1
 );
-    localparam int  NL     = (NUM_DEC > 0) ? NUM_DEC : NUM_CONNS;
-    localparam bit  STAGE2 = (NL != NUM_CONNS);
-    initial if (STAGE2 && (DUT_SLOTS == 0 || CSR_REV < 5))
-        $fatal(1, "lane_drain_tb: NUM_DEC < NUM_CONNS needs DUT_SLOTS=1 and CSR_REV >= 5");
-    initial if (DUT_TOE != 0 && (DUT_SLOTS != 0 || STAGE2))
-        $fatal(1, "lane_drain_tb: DUT_TOE=1 needs DUT_SLOTS=0 and NUM_DEC=0");
-    // The host model for handler_slots AND handler_toe: one GET per arm, through the feeder.
-    localparam bit FEEDER = (DUT_SLOTS != 0) || (DUT_TOE != 0);
+    localparam int  NL     = NUM_CONNS;   // lanes: lane L = connection L = decoder L
+    // The host model for handler_toe: one GET per arm, through the feeder.
+    localparam bit FEEDER = (DUT_TOE != 0);
 
     localparam int BPB            = AXI_DATA_BITS/8;
     localparam longint TOE_RING   = longint'(1) << 20;   // the non-bypass TOE's ring per session
     localparam int LIVENESS_BOUND = 100000;   // cycles without a readPkg while work is queued
-    // Variables rather than localparams since the `feed` scenario (unit-tests/decoder_feed): at the
-    // real time scale a host can legitimately wait longer than 200k cycles for a connection (MinIO
-    // holds one for ~2.5 ms = 600k cycles), and a run is longer than 4M cycles. +CFGBOUND= +MAXCYC=.
+    // Variables rather than localparams: at the real time scale a host can legitimately wait longer
+    // than 200k cycles for a connection (MinIO holds one for ~2.5 ms = 600k cycles), and a run is
+    // longer than 4M cycles. +CFGBOUND= +MAXCYC=.
     int CFG_BOUND  = 200000;                  // cycles waiting for req_ready
     int MAX_CYCLES = 4000000;
     initial begin
@@ -174,95 +147,8 @@ module lane_drain_tb #(
     function automatic bit lane_conn_up(input int L);  return laneReadyWord[4*L + 2]; endfunction
     function automatic bit lane_is_fatal(input int L); return laneReadyWord[4*L + 3]; endfunction
 
-    // -- slots DUT only: the card DMA side, and the revision-3 readback ----------------------------
-    localparam longint unsigned SLOT_BYTES = longint'(1) << SLOT_LOG2;
-    // A deliberately non-zero base, so a slot_base that was dropped somewhere reads as a model
-    // "outside the modelled card memory" FAIL rather than working by accident at address 0.
-    localparam longint unsigned SLOT_BASE  = 64'h0000_0000_4000_0000;
-
-    logic [VADDR_BITS-1:0]      slot_base_w;
-    assign slot_base_w = VADDR_BITS'(SLOT_BASE);
-
-    logic                       cw_req_valid, cw_req_ready, cw_req_last, cw_ack;
-    logic [VADDR_BITS-1:0]      cw_req_vaddr;
-    logic [LEN_BITS-1:0]        cw_req_len;
-    logic                       cw_tvalid, cw_tready, cw_tlast;
-    logic [AXI_DATA_BITS-1:0]   cw_tdata;
-    logic [AXI_DATA_BITS/8-1:0] cw_tkeep;
-
-    // The most one card read may ask for. 16 KiB since 2026-09-22, when the per-decoder card read
-    // channels became one shared one; it also sizes slot_rd_share's receive fifos at 2 x this.
-    localparam int RD_MAX_BYTES = 16384;
-
-    // Reader side: one port per decoder, into slot_rd_share.
-    logic                       cr_req_valid [NL];
-    logic                       cr_req_ready [NL];
-    logic [VADDR_BITS-1:0]      cr_req_vaddr [NL];
-    logic [LEN_BITS-1:0]        cr_req_len   [NL];
-    logic                       cr_req_last  [NL];
-    logic                       cr_tvalid [NL];
-    logic                       cr_tready [NL];
-    logic [AXI_DATA_BITS-1:0]   cr_tdata  [NL];
-    logic [AXI_DATA_BITS/8-1:0] cr_tkeep  [NL];
-    logic                       cr_tlast  [NL];
-
-    // Channel side: the one read half of the one card channel.
-    logic                       sh_req_valid, sh_req_ready, sh_req_last;
-    logic [VADDR_BITS-1:0]      sh_req_vaddr;
-    logic [LEN_BITS-1:0]        sh_req_len;
-    logic                       sh_tvalid, sh_tready, sh_tlast;
-    logic [AXI_DATA_BITS-1:0]   sh_tdata;
-    logic [AXI_DATA_BITS/8-1:0] sh_tkeep;
-    logic                       share_order_err, share_fifo_err, share_len_err;
-
-    // ...as the model's one-element port arrays want it.
-    logic                       m_rd_req_valid [1];
-    logic                       m_rd_req_ready [1];
-    logic [VADDR_BITS-1:0]      m_rd_req_vaddr [1];
-    logic [LEN_BITS-1:0]        m_rd_req_len   [1];
-    logic                       m_rd_req_last  [1];
-    logic                       m_rd_tvalid [1];
-    logic                       m_rd_tready [1];
-    logic [AXI_DATA_BITS-1:0]   m_rd_tdata  [1];
-    logic [AXI_DATA_BITS/8-1:0] m_rd_tkeep  [1];
-    logic                       m_rd_tlast  [1];
-    logic                       m_rd_ack    [1];
-
-    logic       dma_fail;
-    int         dma_errors;
-    logic [3:0][63:0] connOccWord;
-    logic [1:0][63:0] connReadyWord;
-    logic [3:0][63:0] connErrWord;
-    logic      [63:0] connDrainedWord, slotPolicyWord;
-    logic [5:0][63:0] connExtWord;   // revision 5, read ids 33..38
-
-    // CONN_DRAINED, register 31: [c] the slot is empty and nothing is armed on it (revision 4: the
-    // host's byte-budget reset; revision 3: the depth-1 credit). The feeder budgets on it.
-    function automatic bit conn_drained(input int c); return connDrainedWord[c]; endfunction
-    function automatic bit conn_overflowed(input int c); return connDrainedWord[32 + c]; endfunction
-
-    // Revision 5 (stage 2). DEC_STATE (33) per decoder, CONN_MAP (34..37) per connection, CONN_CAUSE
-    // (38). See the map in http_config.sv.
-    function automatic bit dec_arm_ok(input int d);    return connExtWord[0][8*d + 0]; endfunction
-    function automatic bit dec_entry_ok(input int d);  return connExtWord[0][8*d + 1]; endfunction
-    function automatic bit dec_tainted(input int d);   return connExtWord[0][8*d + 2]; endfunction
-    function automatic int conn_pend(input int c);     return int'(connExtWord[1 + c/8][8*(c%8) + 4 +: 4]); endfunction
-    function automatic int conn_curdec(input int c);   return int'(connExtWord[1 + c/8][8*(c%8) +: 3]); endfunction
-    function automatic bit conn_is_tail(input int c);  return connExtWord[1 + c/8][8*(c%8) + 3]; endfunction
-    function automatic bit conn_tainter(input int c);  return connExtWord[5][32 + c]; endfunction
-    function automatic bit conn_fatal(input int c);    return connReadyWord[c/16][4*(c%16) + 3]; endfunction
-    function automatic bit conn_is_up(input int c);    return connReadyWord[c/16][4*(c%16) + 2]; endfunction
-
     generate
     if (DUT_TOE != 0) begin : g_toe
-
-    assign dma_fail        = 1'b0;
-    assign dma_errors      = 0;
-    assign share_order_err = 1'b0;
-    assign share_fifo_err  = 1'b0;
-    assign share_len_err   = 1'b0;
-    assign connOccWord = '0; assign connReadyWord = '0; assign connErrWord = '0;
-    assign connDrainedWord = '0; assign slotPolicyWord = '0; assign connExtWord = '0;
 
     handler_toe #(
         .NUM_CONNS    (NL),
@@ -315,15 +201,7 @@ module lane_drain_tb #(
         .laneErrWord(laneErrWord), .lanePolicyWord(lanePolicyWord)
     );
 
-    end else if (DUT_SLOTS == 0) begin : g_multi
-
-    assign dma_fail        = 1'b0;
-    assign dma_errors      = 0;
-    assign share_order_err = 1'b0;
-    assign share_fifo_err  = 1'b0;
-    assign share_len_err   = 1'b0;
-    assign connOccWord = '0; assign connReadyWord = '0; assign connErrWord = '0;
-    assign connDrainedWord = '0; assign slotPolicyWord = '0; assign connExtWord = '0;
+    end else begin : g_multi
 
     handler_multi #(
         .NUM_CONNS    (NL),
@@ -372,136 +250,6 @@ module lane_drain_tb #(
         .bodyRemainingWord(bodyRemainingWord), .state_debug(state_debug),
         .laneOccWord(laneOccWord), .laneReadyWord(laneReadyWord), .laneStateWord(laneStateWord),
         .laneErrWord(laneErrWord), .lanePolicyWord(lanePolicyWord)
-    );
-
-    end else begin : g_slots   // ------------------------------------------------------------------
-
-    handler_slots #(
-        .N_CONNS        (NUM_CONNS),
-        .N_DECODERS     (NL),
-        .QUEUE_DEPTH    (QUEUE_DEPTH),
-        .ENTRY_DEPTH    (QUEUE_DEPTH),
-        .SLOT_LOG2      (SLOT_LOG2),
-        .SLOT_FIFO_DEPTH(1024),
-        .RD_MAX         (RD_MAX_BYTES),
-        .STALL_CYCLES   (STALL_CYCLES),
-        .CSR_REV        (CSR_REV)
-    ) dut (
-        .ap_clk(clk), .ap_rst_n(rst_n),
-        .m_axis_open_connection_TVALID(oc_tvalid),
-        .m_axis_open_connection_TREADY(oc_tready),
-        .m_axis_open_connection_TDATA (oc_tdata),
-        .s_axis_open_status_TVALID(os_tvalid),
-        .s_axis_open_status_TREADY(os_tready),
-        .s_axis_open_status_TDATA (os_tdata),
-        .m_axis_close_connection_TVALID(cc_tvalid),
-        .m_axis_close_connection_TREADY(cc_tready),
-        .m_axis_close_connection_TDATA (cc_tdata),
-        .s_axis_notifications_TVALID(n_tvalid),
-        .s_axis_notifications_TREADY(n_tready),
-        .s_axis_notifications_TDATA (n_tdata),
-        .m_axis_read_package_TVALID(rp_tvalid),
-        .m_axis_read_package_TREADY(rp_tready),
-        .m_axis_read_package_TDATA (rp_tdata),
-        .s_axis_rx_metadata_TVALID(rm_tvalid),
-        .s_axis_rx_metadata_TREADY(rm_tready),
-        .s_axis_rx_metadata_TDATA (rm_tdata),
-        .s_axis_rx_data_TVALID(rd_tvalid), .s_axis_rx_data_TREADY(rd_tready),
-        .s_axis_rx_data_TDATA (rd_tdata),  .s_axis_rx_data_TKEEP (rd_tkeep),
-        .s_axis_rx_data_TLAST (rd_tlast),
-        .m_axis_tx_meta_TVALID(tm_tvalid), .m_axis_tx_meta_TREADY(tm_tready),
-        .m_axis_tx_meta_TDATA (tm_tdata),
-        .m_axis_tx_data_TVALID(td_tvalid), .m_axis_tx_data_TREADY(td_tready),
-        .m_axis_tx_data_TDATA (td_tdata),  .m_axis_tx_data_TKEEP (td_tkeep),
-        .m_axis_tx_data_TLAST (td_tlast),
-        .s_axis_tx_status_TVALID(ts_tvalid), .s_axis_tx_status_TREADY(ts_tready),
-        .s_axis_tx_status_TDATA (ts_tdata),
-        .req_valid(req_valid), .req_ready(req_ready), .req_data(req_data),
-        // What the host writes to SLOT_BASE_LO/HI, and what it must have offloaded to the card.
-        .slot_base(slot_base_w),
-        .s_axis_req_TVALID(rq_tvalid), .s_axis_req_TREADY(rq_tready),
-        .s_axis_req_TDATA (rq_tdata),  .s_axis_req_TKEEP (rq_tkeep),
-        .s_axis_req_TLAST (rq_tlast),
-        .m_axis_body_tvalid(bd_tvalid), .m_axis_body_tready(bd_tready),
-        .m_axis_body_tdata (bd_tdata),  .m_axis_body_tkeep (bd_tkeep),
-        .m_axis_body_tlast (bd_tlast),
-
-        .wr_req_valid(cw_req_valid), .wr_req_ready(cw_req_ready),
-        .wr_req_vaddr(cw_req_vaddr), .wr_req_len(cw_req_len), .wr_req_last(cw_req_last),
-        .m_axis_card_tvalid(cw_tvalid), .m_axis_card_tready(cw_tready),
-        .m_axis_card_tdata (cw_tdata),  .m_axis_card_tkeep (cw_tkeep),
-        .m_axis_card_tlast (cw_tlast),
-        .wr_ack(cw_ack),
-
-        .rd_req_valid(cr_req_valid), .rd_req_ready(cr_req_ready),
-        .rd_req_vaddr(cr_req_vaddr), .rd_req_len(cr_req_len), .rd_req_last(cr_req_last),
-        .s_axis_card_tvalid(cr_tvalid), .s_axis_card_tready(cr_tready),
-        .s_axis_card_tdata (cr_tdata),  .s_axis_card_tkeep (cr_tkeep),
-        .s_axis_card_tlast (cr_tlast),
-
-        .totalWord(totalWord), .inflightWord(inflightWord), .queueDepthWord(queueDepthWord),
-        .stallWord(stallWord), .respWord(respWord), .contentLengthWord(contentLengthWord),
-        .bodyRemainingWord(bodyRemainingWord), .state_debug(state_debug),
-        .laneOccWord(laneOccWord), .laneReadyWord(laneReadyWord), .laneStateWord(laneStateWord),
-        .laneErrWord(laneErrWord), .lanePolicyWord(lanePolicyWord),
-        .connOccWord(connOccWord), .connReadyWord(connReadyWord), .connErrWord(connErrWord),
-        .connDrainedWord(connDrainedWord), .slotPolicyWord(slotPolicyWord),
-        .connExtWord(connExtWord)
-    );
-
-    // The REAL topology since 2026-09-22: every decoder's reader reaches ONE card read channel
-    // through slot_rd_share, which holds their receive fifos and the credit. build-123 failed
-    // route_design with five card AXI streams, so this -- and not a channel per decoder -- is what
-    // the black-box scenarios have to be true of. `thr` and `dmabp` are the ones that would notice:
-    // a shared stream back-pressured by a slow decoder is exactly the coupling they test for.
-    slot_rd_share #(
-        .N_RD  (NL),
-        .RD_MAX(RD_MAX_BYTES)
-    ) rdshare (
-        .clk(clk), .rst_n(rst_n),
-        .rd_req_valid(cr_req_valid), .rd_req_ready(cr_req_ready),
-        .rd_req_vaddr(cr_req_vaddr), .rd_req_len(cr_req_len), .rd_req_last(cr_req_last),
-        .rd_tvalid(cr_tvalid), .rd_tready(cr_tready),
-        .rd_tdata (cr_tdata),  .rd_tkeep (cr_tkeep), .rd_tlast(cr_tlast),
-        .ch_req_valid(sh_req_valid), .ch_req_ready(sh_req_ready),
-        .ch_req_vaddr(sh_req_vaddr), .ch_req_len(sh_req_len), .ch_req_last(sh_req_last),
-        .ch_tvalid(sh_tvalid), .ch_tready(sh_tready),
-        .ch_tdata (sh_tdata),  .ch_tkeep (sh_tkeep), .ch_tlast(sh_tlast),
-        .order_err(share_order_err), .fifo_err(share_fifo_err), .len_err(share_len_err),
-        .credit_ok(), .oq_occ()
-    );
-
-    assign m_rd_req_valid[0] = sh_req_valid;
-    assign sh_req_ready      = m_rd_req_ready[0];
-    assign m_rd_req_vaddr[0] = sh_req_vaddr;
-    assign m_rd_req_len[0]   = sh_req_len;
-    assign m_rd_req_last[0]  = sh_req_last;
-    assign sh_tvalid         = m_rd_tvalid[0];
-    assign m_rd_tready[0]    = sh_tready;
-    assign sh_tdata          = m_rd_tdata[0];
-    assign sh_tkeep          = m_rd_tkeep[0];
-    assign sh_tlast          = m_rd_tlast[0];
-
-    // Coyote's card path, with its real rules. MEM_BASE/MEM_BYTES bound the window exactly to the
-    // slots this configuration owns, so a vaddr that is wrong by a slot is an error rather than a
-    // silent write into a neighbour.
-    card_dma_model #(
-        .N_RD     (1),
-        .MEM_BASE (SLOT_BASE),
-        .MEM_BYTES(longint'(NUM_CONNS) * SLOT_BYTES)
-    ) cdma (
-        .clk(clk), .rst_n(rst_n),
-        .wr_req_valid(cw_req_valid), .wr_req_ready(cw_req_ready),
-        .wr_req_vaddr(cw_req_vaddr), .wr_req_len(cw_req_len), .wr_req_last(cw_req_last),
-        .wr_tvalid(cw_tvalid), .wr_tready(cw_tready),
-        .wr_tdata (cw_tdata),  .wr_tkeep (cw_tkeep), .wr_tlast(cw_tlast),
-        .wr_ack(cw_ack),
-        .rd_req_valid(m_rd_req_valid), .rd_req_ready(m_rd_req_ready),
-        .rd_req_vaddr(m_rd_req_vaddr), .rd_req_len(m_rd_req_len), .rd_req_last(m_rd_req_last),
-        .rd_tvalid(m_rd_tvalid), .rd_tready(m_rd_tready),
-        .rd_tdata (m_rd_tdata),  .rd_tkeep (m_rd_tkeep), .rd_tlast(m_rd_tlast),
-        .rd_ack(m_rd_ack),
-        .model_fail(dma_fail), .model_errors(dma_errors)
     );
 
     end
@@ -586,7 +334,7 @@ module lane_drain_tb #(
         int   bytes_in, resp_done;
         int   next_seq;
         int   planned_total;
-        // Sequence number the slots-mode feeder has reached. Separate from next_seq because the
+        // Sequence number the feeder has reached. Separate from next_seq because the
         // scenario allocates sequence numbers when it QUEUES work and the feeder consumes them
         // later, one arm at a time.
         int   feed_seq;
@@ -826,8 +574,8 @@ module lane_drain_tb #(
                 // Nothing is owed a readPkg, so there is nothing for the DUT to be late with. The
                 // property is "a readPkg within LIVENESS_BOUND cycles WHILE a notification is
                 // outstanding"; counting through an idle origin as well tripped it on the first
-                // segment after a real-scale MinIO time to first byte (0.8 ms = 200k cycles,
-                // decoder_feed). A wedge keeps a notification outstanding, so it still counts.
+                // segment after a real-scale MinIO time to first byte (0.8 ms = 200k cycles).
+                // A wedge keeps a notification outstanding, so it still counts.
                 idle_since_rp = 0;
             end else idle_since_rp = idle_since_rp + 1;
             i = 0;
@@ -1002,7 +750,7 @@ module lane_drain_tb #(
     initial void'($value$plusargs("SRVLAT=%d", srv_lat));
     initial void'($value$plusargs("SRVJIT=%d", srv_jit));
 
-    // ORIGIN PACING (decoder_feed). Three knobs, all off by default so every older scenario is
+    // ORIGIN PACING. Three knobs, all off by default so every older scenario is
     // byte for byte what it was:
     //   +SRVSER      the origin answers the requests of ONE connection ONE AT A TIME, the way Go's
     //                net/http (MinIO) serves pipelined GETs: request k+1's time to first byte
@@ -1051,24 +799,10 @@ module lane_drain_tb #(
             err($sformatf("lane %0d transmitted request seq %0d that the host never planned", lane, seq));
             return;
         end
-        if (!STAGE2) begin
-            r = ln[lane].plan.pop_front();
-        end else begin
-            // Stage 2: a lane's GETs travel on several connections, so they reach the origin in no
-            // particular order. Find this one by its sequence number; its place on the body stream
-            // was fixed when it was ARMED (s2_arm), not here.
-            int k; k = -1;
-            foreach (ln[lane].plan[j]) if (k < 0 && ln[lane].plan[j].seq == seq) k = j;
-            if (k < 0) begin
-                err($sformatf("lane %0d: request seq %0d is not in the plan (duplicate GET?)", lane, seq));
-                return;
-            end
-            r = ln[lane].plan[k];
-            ln[lane].plan.delete(k);
-        end
+        r = ln[lane].plan.pop_front();
         len = r.len;
         hdr = resp_header(len);
-        if (!STAGE2) ln[lane].expq.push_back(r);
+        ln[lane].expq.push_back(r);
         if (srv_ser) begin
             // +SRVSER: queue it; srv_ser_engine answers it when this connection is free.
             SReq q;
@@ -1124,11 +858,7 @@ module lane_drain_tb #(
                     if (lane < 0 || lane >= NL) begin
                         err($sformatf("session %0d: request names lane %0d, out of range", sid, lane));
                     end else begin
-                        if (STAGE2) begin
-                            // A connection carries whichever lane it was armed for; no binding.
-                            s.lane = lane;
-                            ln[lane].sid = sid;
-                        end else if (s.lane < 0) begin
+                        if (s.lane < 0) begin
                             s.lane = lane;
                             ln[lane].sid = sid;
                             $display("  [cyc=%0d] server: session %0d carries lane %0d (first GET seq %0d)",
@@ -1202,9 +932,6 @@ module lane_drain_tb #(
     // Emission is paced at one 512-bit beat per cycle, i.e. line rate for this link.
     // =============================================================================================
     int  net_rr = 0;
-    // A peer that has stopped sending. Scenarios that kill a connection use it to stop the origin
-    // queueing MORE bytes for a session that is about to go away -- see the note in `ovf`.
-    int  mute_sid = -1;
     // Sessions whose remaining bytes the origin holds back for now -- still "in flight" -- so a
     // scenario can choose exactly when they reach the wire (cu, cuovf).
     int  hold_sid  = -1;
@@ -1222,7 +949,7 @@ module lane_drain_tb #(
                 sid = -1;
                 for (tries = 0; tries < live_sids.size(); tries++) begin
                     k = live_sids[(net_rr + tries) % live_sids.size()];
-                    if (k != mute_sid && k != hold_sid && k != hold2_sid && sess[k].pending.size() > 0 && rate_ok(k) &&
+                    if (k != hold_sid && k != hold2_sid && sess[k].pending.size() > 0 && rate_ok(k) &&
                         (DUT_TOE == 0 || toe_win(k) > 0)) begin
                         sid = k; net_rr = (net_rr + tries + 1); break;
                     end
@@ -1391,7 +1118,7 @@ module lane_drain_tb #(
     // left. So a lane fed without a gap takes exactly DECRATE (1280 MB/s = 5.12 B/cycle = one full
     // beat per 12.5 cycles), BYTE-weighted -- the DataNormalizer in front of the real decoder packs
     // partial beats, so a short beat must not cost a whole one. Unlike `thr` it applies to every
-    // decoder at once, which is the question decoder_feed asks.
+    // decoder at once.
     int            dec_cost = 0;
     int            dec_debt [NL];
     logic [NL-1:0] dec_rdy_q = '1;
@@ -1408,67 +1135,7 @@ module lane_drain_tb #(
         if (dec_cost > 0) bd_tready = bd_tready & dec_rdy_q;
     end
 
-    // =============================================================================================
-    // DECODER-FEED MEASUREMENT (scenario `feed`; unit-tests/decoder_feed/run.sh)
-    //
-    // Over a steady-state window (fmeas), per decoder:
-    //   * the model's WORK: busy% = work / window, exact (in 1/1024-cycle units, so a decoder that
-    //     finishes a beat half way through a cycle and then has nothing is 50% busy that cycle);
-    //   * the hardware StreamProfiler's four counters, same semantics as
-    //     parcore/libstf/hardware/src/hdl/util/stream_profiler.sv: handshake (valid & ready),
-    //     stalled (valid & !ready), starved (!valid INSIDE a chunk: after the first beat, before the
-    //     tlast), idle (!valid between chunks). With a 1.28 GB/s decoder a handshake is at most 1 cycle
-    //     in 12.5, so a decoder-bound lane shows ~8% handshake and ~92% STALLED, and starved+idle is
-    //     what the decoder lost;
-    //   * every lost 1/1024-cycle CLASSIFIED by what the receive path was doing at that moment (dcls,
-    //     set by g_feedstat from the DUT's own state -- slots DUT only):
-    //       EMPTY    the reader has no entry at all: the host has not queued work for this decoder
-    //                (lane depth, dispatcher, connection placement)
-    //       SWITCH   the per-response TURNAROUND: the reader is retiring / releasing / taking the
-    //                next entry, or the next response's bytes are in HBM or in the read path but not
-    //                one body byte of it has reached the decoder yet -- the first card read of a new
-    //                connection (after the empty-slot release) and strip_http's byte-serial parse of
-    //                the next header (on a switch AND on a same-connection continue)
-    //       CONNECT  the head's connection is not up
-    //       RDPATH   mid-response, the head's bytes are in HBM / the shared card read channel /
-    //                slot_rd_share / the framer but not at the decoder
-    //       WRPATH   the head's next bytes are between the TOE and HBM (rx_dispatch, the writer
-    //                fifo, an un-acked card write)
-    //       HOL      the head waits for the network while a LATER entry of this decoder already has
-    //                bytes in its slot: head-of-line on a slow response
-    //       SERVER   the head waits for the network and nothing behind it has arrived either
-    //       SHORT    a beat too small to cover a cycle (a response's last bytes); not a stall
-    // =============================================================================================
-    localparam int FC_N = 9;
-    localparam int FC_EMPTY = 1, FC_SWITCH = 2, FC_CONNECT = 3, FC_RDPATH = 4, FC_WRPATH = 5,
-                   FC_HOL = 6, FC_SERVER = 7, FC_SHORT = 8;
-    bit     fmeas = 1'b0;
-    longint f_cyc = 0;
-    longint f_work [NL], f_lost [NL], f_bytes [NL];
-    longint f_hs [NL], f_stall [NL], f_starv [NL], f_idle [NL];
-    longint f_cls  [NL][FC_N];
-    longint f_pops [NL], f_rels [NL];
-    bit     f_inchunk [NL];
-    int     dcls [NL];
-    // connection time over the ACTIVE connections: free (the host may place a GET on it), waiting
-    // (a GET is armed and its bytes have not all landed), held (every byte armed on it has landed
-    // and the slot waits for its reader to consume and release it)
-    longint f_cfree = 0, f_cwait = 0, f_cheld = 0;
-    // the card channels: beats moved, and the most writes ever outstanding
-    longint f_wr_beats = 0, f_rd_beats = 0;
-    int     f_wr_out_max = 0;
-    task automatic feed_stats_clear();
-        f_cyc = 0; f_cfree = 0; f_cwait = 0; f_cheld = 0; f_wr_beats = 0; f_rd_beats = 0;
-        f_wr_out_max = 0;
-        for (int L = 0; L < NL; L++) begin
-            f_work[L] = 0; f_lost[L] = 0; f_bytes[L] = 0; f_hs[L] = 0; f_stall[L] = 0;
-            f_starv[L] = 0; f_idle[L] = 0; f_pops[L] = 0; f_rels[L] = 0;
-            for (int k = 0; k < FC_N; k++) f_cls[L][k] = 0;
-        end
-    endtask
-
     always @(posedge clk) begin
-        if (fmeas) f_cyc = f_cyc + 1;
         for (int L = 0; L < NL; L++) begin
             int add, tot, w, nb; bit hs;
             hs  = bd_tvalid[L] && bd_tready[L];
@@ -1483,24 +1150,6 @@ module lane_drain_tb #(
                 dec_debt[L] = tot - w;
                 dec_rdy_q[L] <= (dec_debt[L] < 1024);
             end
-            if (fmeas && dec_cost > 0) begin
-                f_work[L] = f_work[L] + w;
-                f_lost[L] = f_lost[L] + (1024 - w);
-                if (w < 1024) begin
-                    if (bd_tvalid[L]) f_cls[L][FC_SHORT] = f_cls[L][FC_SHORT] + (1024 - w);
-                    else              f_cls[L][dcls[L]]  = f_cls[L][dcls[L]]  + (1024 - w);
-                end
-                if (hs) begin
-                    f_hs[L] = f_hs[L] + 1;
-                    f_bytes[L] = f_bytes[L] + longint'(nb);
-                end
-                else if (bd_tvalid[L]) f_stall[L] = f_stall[L] + 1;
-                else if (f_inchunk[L]) f_starv[L] = f_starv[L] + 1;
-                else                   f_idle[L]  = f_idle[L] + 1;
-            end
-            if (!rst_n)                  f_inchunk[L] = 1'b0;
-            else if (hs && bd_tlast[L])  f_inchunk[L] = 1'b0;
-            else if (bd_tvalid[L])       f_inchunk[L] = 1'b1;
         end
     end
 
@@ -1545,8 +1194,6 @@ module lane_drain_tb #(
         c.server_port     = SRV_PORT;
         c.req_chunk_bytes = 32'(chunk_bytes);
         c.req_chunk_dest  = 4'(dest);
-        // Stage-1 shape: lane L's connection is L (revision 5 reads it; revision 4 ignores it).
-        c.req_conn        = 5'(dest);
         c.req_total_bytes = 32'(total_bytes);
         return c;
     endfunction
@@ -1621,11 +1268,11 @@ module lane_drain_tb #(
     endtask
 
     // =============================================================================================
-    // DEPTH-1 HOST MODEL (slots DUT)
+    // ONE-GET-PER-ARM HOST MODEL (handler_toe)
     //
-    // handler_slots allows one outstanding GET per connection and says so at the config port:
-    // ARM_READY is low until the slot has been released. So a batch of N GETs becomes N arms of one
-    // GET each, and the pacing is the hardware's credit rather than a delay the bench chose.
+    // handler_toe takes one GET per arm and says at the config port when it will take the next one
+    // (ARM_READY includes its GET credit). So a batch of N GETs becomes N arms of one GET each, and
+    // the pacing is the hardware's credit rather than a delay the bench chose.
     //
     // The feeder runs as its own process per lane, so submit_batch RETURNS AS SOON AS THE WORK IS
     // QUEUED. That is what keeps the scenarios meaning what they say: `d` queues six responses and
@@ -1643,22 +1290,16 @@ module lane_drain_tb #(
     endclass
 
     Work feed_q [NL][$];
-    // Host-side pipelining state for the slots DUT (CSR revision 4). +HDEPTH=1 reproduces what the
-    // revision-3 hardware enforced by itself.
-    localparam int HDR_ALLOW = 256;
-    bit  allow_overflow = 0;   // `ovf`: a slot is overrun on purpose
+    // Host-side pipelining state: the LANE's chunk depth, +HDEPTH (4; +LDEPTH overrides).
     int  hdepth = 4;
     int  armed_n     [NL];
     int  ent_n_lane  [NL];   // chunk entries pushed
-    int  armed_bytes [NL];
-    // The LANE's chunk depth: hdepth in stage 1 (lane = connection), and in stage 2 enough to
-    // keep every connection of the lane's share busy (+LDEPTH overrides).
     int  ldepth;
     initial begin
         void'($value$plusargs("HDEPTH=%d", hdepth));
-        ldepth = STAGE2 ? hdepth * ((NUM_CONNS + NL - 1) / NL) : hdepth;
+        ldepth = hdepth;
         void'($value$plusargs("LDEPTH=%d", ldepth));
-        for (int c = 0; c < NL; c++) begin armed_n[c] = 0; armed_bytes[c] = 0; ent_n_lane[c] = 0; end
+        for (int c = 0; c < NL; c++) begin armed_n[c] = 0; ent_n_lane[c] = 0; end
     end
     int  feed_busy [NL];   // work items queued or in progress, for all_drained()
 
@@ -1676,232 +1317,12 @@ module lane_drain_tb #(
     // faithful than it was rather than less.
     semaphore cfg_lock = new(1);
 
-    // In stage 2 a lane is a decoder, and its admission half is DEC_STATE's (the per-connection
-    // nibble describes a connection's current decoder, which is not the lane's).
     function automatic bit lane_arm_ready(input int L);
-        return STAGE2 ? dec_arm_ok(L) : laneReadyWord[4*L + 0];
+        return laneReadyWord[4*L + 0];
     endfunction
     function automatic bit lane_entry_ready(input int L);
-        return STAGE2 ? dec_entry_ok(L) : laneReadyWord[4*L + 1];
+        return laneReadyWord[4*L + 1];
     endfunction
-
-    // =============================================================================================
-    // STAGE-2 HOST MODEL (NUM_DEC < NUM_CONNS)
-    //
-    // What software/oasis does on a revision-5 bitstream, reduced to the rule the hardware checks:
-    // every GET goes on a connection the host picks, and an arm for connection c on decoder L is
-    // only admitted if c is FREE (CONN_DRAINED and nothing pending) or c is L's TAIL (the last
-    // connection L took an arm for, still with entries). The model prefers a free connection --
-    // spreading GETs over connections is the whole point of stage 2 -- round robin over the first
-    // +S2CONNS (default all), and falls back to pipelining on the tail up to +HDEPTH GETs, each
-    // connection's armed bytes kept under the slot as in revision 4.
-    //
-    // The choice and the beat are made under cfg_lock, so two lanes' feeders can never pick the same
-    // free connection. The hardware words it reads are REGISTERED (a cycle or two stale), so a
-    // connection this model armed less than S2_SETTLE cycles ago is not trusted to be free yet.
-    // =============================================================================================
-    localparam int S2_SETTLE = 8;
-    int  s2_conns      = NUM_CONNS;
-    int  s2_rr         = 0;
-    int  s2_tail  [NL];
-    int  s2_armcyc[NUM_CONNS];
-    int  s2_hpend [NUM_CONNS];       // host view: armed on c since it was last seen free
-    longint s2_bytes[NUM_CONNS];
-    int  s2_used  [NUM_CONNS];       // GETs ever armed on c
-    int  s2_lane_of_last[NUM_CONNS]; // the lane c's last GET was armed on
-    bit  s2_ever_lane[NUM_CONNS][NL];
-    int  s2_max_busy   = 0;          // most connections with entries pending at once (CONN_MAP)
-    int  s2_n_tail     = 0, s2_n_free = 0;
-    // decoder_feed: the exact response bytes (header + body) armed on c since it was last free, so
-    // the measurement can tell "every byte of it has landed" from "still arriving"; and how long the
-    // host sleeps between two failed picks (pick_conn polls every 20 us; 1 = every cycle, the old
-    // behaviour).
-    longint s2_exp [NUM_CONNS];
-    int  s2_poll       = 1;
-    longint h_noconn_cyc = 0;        // cycles (in the window) the host spent polling for a connection
-    longint h_noadm_cyc  = 0;        // ...of them, with the DECODER half refusing (DEC_STATE arm_ok low)
-    function automatic int resp_hdr_len(input int len);
-        string h;
-        h = resp_header(len);
-        return h.len();
-    endfunction
-    initial begin
-        void'($value$plusargs("S2CONNS=%d", s2_conns));
-        for (int L = 0; L < NL; L++) s2_tail[L] = -1;
-        for (int c = 0; c < NUM_CONNS; c++) begin
-            s2_armcyc[c] = -1000; s2_hpend[c] = 0; s2_bytes[c] = 0; s2_used[c] = 0; s2_exp[c] = 0;
-            s2_lane_of_last[c] = -1;
-            for (int L = 0; L < NL; L++) s2_ever_lane[c][L] = 0;
-        end
-    end
-    always @(posedge clk) if (rst_n && STAGE2) begin
-        int n; n = 0;
-        for (int c = 0; c < NUM_CONNS; c++) if (conn_pend(c) != 0) n = n + 1;
-        if (n > s2_max_busy) s2_max_busy = n;
-    end
-
-    function automatic bit s2_hw_settled(input int c); return (cyc - s2_armcyc[c]) > S2_SETTLE; endfunction
-    function automatic bit s2_free(input int c);
-        return s2_hw_settled(c) && conn_drained(c) && (conn_pend(c) == 0) && !conn_fatal(c);
-    endfunction
-
-    // Pick a connection for one GET of `need` bytes on lane L; -1 if none can take it right now.
-    function automatic int s2_pick(input int L, input longint need);
-        int t;
-        for (int k = 0; k < s2_conns; k++) begin
-            automatic int c = (s2_rr + k) % s2_conns;
-            if (s2_free(c)) begin s2_rr = (c + 1) % s2_conns; return c; end
-        end
-        t = s2_tail[L];
-        if (t >= 0 && !conn_fatal(t) && s2_hw_settled(t) && conn_pend(t) != 0 && conn_curdec(t) == L &&
-            conn_is_tail(t) && conn_pend(t) < hdepth &&
-            (allow_overflow || (s2_bytes[t] + need) <= longint'(SLOT_BYTES)))
-            return t;
-        return -1;
-    endfunction
-
-    // One arm of stage 2: pick, then the beat, both under the port lock. `r` is this GET's response.
-    task automatic s2_arm(input int L, input http_config_t cfg0, input int need, input Resp r,
-                          output bit ok);
-        int t0, guard, c;
-        http_config_t cfg;
-        t0 = cyc; ok = 1'b0;
-        while ((cyc - t0) < CFG_BOUND && !ok) begin
-            cfg_lock.get(1);
-            c = lane_arm_ready(L) ? s2_pick(L, need) : -1;
-            if (c >= 0) begin
-                if (s2_free(c)) begin s2_bytes[c] = 0; s2_hpend[c] = 0; s2_exp[c] = 0; s2_n_free++; end
-                else s2_n_tail++;
-                cfg = cfg0; cfg.req_conn = 5'(c);
-                @(posedge clk);
-                req_data <= cfg; req_valid <= 1'b1;
-                guard = 0;
-                while (guard < 16 && !ok) begin
-                    @(posedge clk);
-                    if (req_ready) ok = 1'b1;
-                    guard = guard + 1;
-                end
-                req_valid <= 1'b0;
-                if (ok) begin
-                    // The response is expected on L's body stream in ARM order (the decoder's queue
-                    // order), whatever order the connections deliver in.
-                    ln[L].expq.push_back(r);
-                    s2_armcyc[c] = cyc; s2_hpend[c]++; s2_bytes[c] += need; s2_used[c]++;
-                    s2_exp[c] += longint'(resp_hdr_len(r.len) + r.len);
-                    s2_tail[L] = c; s2_lane_of_last[c] = L; s2_ever_lane[c][L] = 1;
-                    if ($test$plusargs("FDBG"))
-                        $display("  [cyc=%0d] FDBG s2 lane %0d arms seq %0d on conn %0d", cyc, L, r.seq, c);
-                end
-            end
-            cfg_lock.put(1);
-            if (!ok) begin
-                if (fmeas && c < 0) h_noconn_cyc = h_noconn_cyc + s2_poll;
-                if (fmeas && c < 0 && !lane_arm_ready(L)) h_noadm_cyc = h_noadm_cyc + s2_poll;
-                repeat (s2_poll) @(posedge clk);
-            end
-        end
-        arm_n = arm_n + 1; arm_wait_sum = arm_wait_sum + (cyc - t0);
-        if ((cyc - t0) > arm_wait_max) arm_wait_max = cyc - t0;
-        if (!ok && !cfg_stalled) begin
-            cfg_stalled = 1'b1; cfg_stall_cycle = cyc;
-            $display("  [cyc=%0d] *** CONFIG STALL: stage-2 lane %0d found no connection / was never admitted in %0d cycles (DEC_STATE=0x%016h drained=0x%08h)",
-                     cyc, L, CFG_BOUND, connExtWord[0], connDrainedWord[31:0]);
-        end
-    endtask
-
-    // =============================================================================================
-    // decoder_feed: what the receive path is doing while a decoder has nothing to do (dcls, see
-    // "DECODER-FEED MEASUREMENT"), and how the active connections spend their time. Sampled at the
-    // NEGEDGE, where every DUT register holds the value the posedge accounting sees. Slots DUT only:
-    // it reads handler_slots' internals by name.
-    // =============================================================================================
-    generate if (DUT_SLOTS != 0) begin : g_feedstat
-        for (genvar gd = 0; gd < NL; gd++) begin : g_fd
-            always @(negedge clk) if (fmeas) begin
-                automatic logic [3:0] st = g_slots.dut.gen_dec[gd].inst_slot_reader.st_q;
-                automatic bit         hv = g_slots.dut.gen_dec[gd].inst_slot_reader.head_valid_q;
-                automatic int         n  = int'(g_slots.dut.gen_dec[gd].inst_slot_reader.eq_cnt_q);
-                automatic int         hd = int'(g_slots.dut.gen_dec[gd].inst_slot_reader.eq_head_q);
-                automatic int         h  = int'(g_slots.dut.gen_dec[gd].inst_slot_reader.head_conn_q);
-                automatic bit         behind = 1'b0;
-                if (g_slots.dut.gen_dec[gd].inst_slot_reader.pop) f_pops[gd] = f_pops[gd] + 1;
-                if (|g_slots.dut.gen_dec[gd].inst_slot_reader.conn_release) f_rels[gd] = f_rels[gd] + 1;
-                if (!hv && n == 0)
-                    dcls[gd] = FC_EMPTY;
-                else if (!hv || st == 4'd5 || st == 4'd6 || st == 4'd7 || st == 4'd9)
-                    dcls[gd] = FC_SWITCH;                         // S_DONE0/1/2, S_ACKW, or taking
-                else if (!g_slots.dut.conn_up_q[h])
-                    dcls[gd] = FC_CONNECT;
-                else if ((g_slots.dut.landed[h] > g_slots.dut.gen_dec[gd].inst_slot_reader.rd_cursor_q) ||
-                         (g_slots.dut.gen_dec[gd].inst_slot_reader.n_out_q != 0) ||
-                         (g_slots.rdshare.committed_q[gd] != 0))
-                    // bytes of the head are in HBM or on their way to the decoder; between two
-                    // responses at the decoder that is the turnaround, inside one it is the read path
-                    dcls[gd] = ln[gd].active ? FC_RDPATH : FC_SWITCH;
-                else if (!g_slots.dut.conn_quiet_w[h] || g_slots.dut.rxd_has_pending[h])
-                    dcls[gd] = FC_WRPATH;
-                else begin
-                    for (int k = 1; k < n; k++) begin
-                        automatic int c2 = int'(g_slots.dut.gen_dec[gd].inst_slot_reader.eq_conn[(hd + k) % QUEUE_DEPTH]);
-                        if (c2 != h && g_slots.dut.landed[c2] != 0) behind = 1'b1;
-                    end
-                    dcls[gd] = behind ? FC_HOL : FC_SERVER;
-                end
-            end
-        end
-        // +FEEDTRACE=n: the first n response turnarounds of decoder 0 inside the window, as a
-        // timeline relative to the decoder taking the previous response's LAST beat: framer done,
-        // reader pop, next head taken, first card read issued, first byte back from the card, first
-        // body byte of the new response at the decoder. The decomposition of the SWITCH class.
-        int tr_n = 0, tr_max = 0;
-        int ev_last = -1, ev_done = -1, ev_pop = -1, ev_take = -1, ev_req = -1, ev_data = -1;
-        int ev_conn = -1; longint ev_landed = 0; bit ev_same = 0, prev_act = 0, prev_done = 0, prev_hv = 0;
-        initial void'($value$plusargs("FEEDTRACE=%d", tr_max));
-        always @(negedge clk) if (fmeas && tr_n < tr_max) begin
-            automatic bit hv = g_slots.dut.gen_dec[0].inst_slot_reader.head_valid_q;
-            automatic bit pp = g_slots.dut.gen_dec[0].inst_slot_reader.pop;
-            if (g_slots.dut.sh_resp_done[0] && !prev_done) ev_done = cyc;
-            if (pp) begin
-                ev_pop  = cyc;
-                ev_same = g_slots.dut.gen_dec[0].inst_slot_reader.nxt_same_q;
-            end
-            // the next head: taken after a release, or carried on in place (CONTINUE)
-            if ((hv && !prev_hv) || (pp && ev_same)) begin
-                ev_take   = cyc; ev_req = -1; ev_data = -1;
-                ev_conn   = int'(g_slots.dut.gen_dec[0].inst_slot_reader.head_conn_q);
-                if (pp && ev_same) ev_conn = int'(g_slots.dut.gen_dec[0].inst_slot_reader.head_conn_q);
-                else ev_conn = int'(g_slots.dut.gen_dec[0].inst_slot_reader.eq_conn[g_slots.dut.gen_dec[0].inst_slot_reader.eq_head_q]);
-                ev_landed = longint'(g_slots.dut.landed[ev_conn]);
-            end
-            if (ev_take >= 0 && ev_req < 0 && cr_req_valid[0] && cr_req_ready[0]) ev_req = cyc;
-            if (ev_req >= 0 && ev_data < 0 && cr_tvalid[0] && cr_tready[0]) ev_data = cyc;
-            if (bd_tvalid[0] && bd_tready[0] && bd_tlast[0]) ev_last = cyc;
-            if (ln[0].active && !prev_act && ev_last >= 0 && ev_take >= 0) begin
-                $display("  FEEDTRACE dec0 %s conn %0d (%0d B landed at take), cycles vs the decoder taking the previous response's last beat: framer done %0d, pop %0d, next head %0d, card read %0d, card data %0d, first body byte %0d",
-                         ev_same ? "CONTINUE" : "SWITCH  ", ev_conn, ev_landed,
-                         ev_done - ev_last, ev_pop - ev_last, ev_take - ev_last,
-                         (ev_req  < 0) ? 99999 : ev_req  - ev_last,
-                         (ev_data < 0) ? 99999 : ev_data - ev_last, cyc - ev_last);
-                tr_n = tr_n + 1;
-            end
-            prev_act  = ln[0].active;
-            prev_done = g_slots.dut.sh_resp_done[0];
-            prev_hv   = hv;
-        end
-        always @(negedge clk) if (fmeas) begin
-            for (int c = 0; c < NUM_CONNS && c < s2_conns; c++) begin
-                if (g_slots.dut.pend_q[c] == 0 && g_slots.dut.conn_drained_q[c])
-                    f_cfree = f_cfree + 1;
-                else if (g_slots.dut.pend_q[c] != 0 && longint'(g_slots.dut.landed[c]) < s2_exp[c])
-                    f_cwait = f_cwait + 1;
-                else
-                    f_cheld = f_cheld + 1;
-            end
-            if (g_slots.cdma.w_outst_q > f_wr_out_max) f_wr_out_max = g_slots.cdma.w_outst_q;
-            if (cw_tvalid && cw_tready) f_wr_beats = f_wr_beats + 1;
-            if (sh_tvalid) f_rd_beats = f_rd_beats + 1;
-        end
-    end endgenerate
 
     task automatic push_cfg_mt(input http_config_t c, input int lane, input bit is_arm,
                                output bit ok);
@@ -1992,54 +1413,17 @@ module lane_drain_tb #(
                             ent_n_lane[gl] = ent_n_lane[gl] + 1;
                         end
                         // Then one arm per GET. The arm waits on ARM_READY (request text gone out,
-                        // entry-queue room). Since CSR revision 4 the hardware no longer holds a
-                        // second arm on a connection, so the two host rules software keeps are
-                        // kept HERE, exactly as configuration.cpp keeps them:
-                        //   * at most `hdepth` CHUNKS outstanding on the lane (+HDEPTH, 4; checked
-                        //     before the entries, above), and at HDEPTH=1 one GET per slot;
-                        //   * the bytes armed since the slot was last seen empty (CONN_DRAINED)
-                        //     plus this GET's must fit in the slot. HDR_ALLOW covers the origin's
-                        //     response header. `ovf` overruns a slot on purpose and skips it.
-                        for (int i = 0; i < w.nreq && o !== 1'b0 && STAGE2; i++) begin
-                            Resp r;
-                            r = new(); r.lane = gl; r.seq = seq0 + i; r.len = w.body_len;
-                            build_text(gl, 1, seq0 + i, txt);
-                            s2_arm(gl, mk_cfg(w.chunk_len, gl, txt.size()), w.body_len + HDR_ALLOW, r, o);
-                            if (!o) break;
-                            armed_n[gl] = armed_n[gl] + 1;
-                            bl = new(); bl.d = txt;
-                            ln[gl].txq.push_back(bl);
-                        end
-                        for (int i = 0; i < w.nreq && o !== 1'b0 && !STAGE2; i++) begin
-                            int need, tw;
-                            need = w.body_len + HDR_ALLOW;
-                            tw   = 0;
-                            // handler_toe: no slot to budget; the GET credit is the hardware's
-                            // ARM_READY (push_cfg_mt waits on it), and the bench's GETs keep the
-                            // window rule by size (win_bad breaks it on purpose).
-                            forever begin
-                                bit too_deep, too_big;
-                                if (DUT_TOE != 0) break;
-                                // HDEPTH=1 is revision 3's pacing exactly: the next GET waits for
-                                // the slot to be empty (a chunk split into several GETs retires
-                                // only one tlast, so counting chunks cannot pace it).
-                                too_deep = (hdepth == 1) && !conn_drained(gl);
-                                too_big  = !allow_overflow && !conn_drained(gl) &&
-                                           ((longint'(armed_bytes[gl]) + longint'(need)) > longint'(SLOT_BYTES));
-                                if (!(too_deep || too_big) || tw >= CFG_BOUND) break;
-                                @(posedge clk);
-                                tw = tw + 1;
-                            end
-                            if ($test$plusargs("FDBG")) $display("  [cyc=%0d] FDBG lane %0d host wait %0d cyc before arm", cyc, gl, tw);
-                            if (conn_drained(gl)) armed_bytes[gl] = 0;
+                        // entry-queue room, the GET credit); the lane depth was kept above, in
+                        // chunks, as configuration.cpp keeps it. The bench's GETs keep the window
+                        // rule by size (win_bad breaks it on purpose).
+                        for (int i = 0; i < w.nreq && o !== 1'b0; i++) begin
                             build_text(gl, 1, seq0 + i, txt);
                             push_cfg_mt(mk_cfg(w.chunk_len, gl, txt.size()), gl, 1'b1, o);
                             if (!o) break;
                             armed_n[gl]     = armed_n[gl] + 1;
                             if ($test$plusargs("FDBG"))
-                                $display("  [cyc=%0d] FDBG lane %0d arm #%0d accepted, %0d outstanding, %0d bytes budgeted",
-                                         cyc, gl, armed_n[gl], armed_n[gl] - ln[gl].resp_done, armed_bytes[gl] + need);
-                            armed_bytes[gl] = armed_bytes[gl] + need;
+                                $display("  [cyc=%0d] FDBG lane %0d arm #%0d accepted, %0d outstanding",
+                                         cyc, gl, armed_n[gl], armed_n[gl] - ln[gl].resp_done);
                             bl = new(); bl.d = txt;
                             ln[gl].txq.push_back(bl);
                         end
@@ -2050,28 +1434,6 @@ module lane_drain_tb #(
             end
         end
     endgenerate
-
-    // decoder_feed: ONE GET for decoder `lane`, the way emit_batch_slots does it on revision 5 -- the
-    // chunk-length entry, then pick_conn + the arm (s2_arm), then the request text. Synchronous: the
-    // software's dispatcher is one thread and does not move on until the arm has been taken.
-    task automatic feed_get(input int lane, input int len, output bit ok);
-        Resp r, re; Blob bl; byte unsigned txt[$];
-        r = new(); r.lane = lane; r.seq = ln[lane].next_seq; r.len = len;
-        ln[lane].plan.push_back(r);
-        ln[lane].next_seq      = ln[lane].next_seq + 1;
-        ln[lane].planned_total = ln[lane].planned_total + 1;
-        push_cfg_mt(mk_cfg(len, lane, 0), lane, 1'b0, ok);
-        if (!ok) return;
-        ent_n_lane[lane] = ent_n_lane[lane] + 1;
-        re = new(); re.lane = lane; re.seq = r.seq; re.len = len;
-        build_text(lane, 1, r.seq, txt);
-        s2_arm(lane, mk_cfg(len, lane, txt.size()), len + HDR_ALLOW, re, ok);
-        if (!ok) return;
-        armed_n[lane] = armed_n[lane] + 1;
-        ln[lane].feed_seq = r.seq + 1;
-        bl = new(); bl.d = txt;
-        ln[lane].txq.push_back(bl);
-    endtask
 
     // The one entry point the scenarios use. It is the same call for both DUTs; only what happens
     // behind it differs.
@@ -2237,13 +1599,10 @@ module lane_drain_tb #(
             if (ln[i].expq.size() != 0) ok = 0;
             if (ln[i].txq.size()  != 0) ok = 0;
             if (ln[i].resp_done != ln[i].planned_total) ok = 0;
-            // Work the depth-1 feeder has not finished arming is work that has not drained.
+            // Work the feeder has not finished arming is work that has not drained.
             if (feed_busy[i] != 0) ok = 0;
         end
         foreach (live_sids[k]) if (sess[live_sids[k]].pending.size() != 0) ok = 0;
-        // Stage 2: the last body byte reaches the sink a few cycles before its reader entry
-        // retires, and a connection is only reusable once it has. Drained means both.
-        if (STAGE2) for (int c = 0; c < NUM_CONNS; c++) if (conn_pend(c) != 0 && !conn_fatal(c)) ok = 0;
         return ok;
     endfunction
 
@@ -2329,16 +1688,6 @@ module lane_drain_tb #(
     // expected consequence of the transient, not a defect, and this must not turn a containment
     // measurement into a failure.
     // =============================================================================================
-    // The slots DUT adds three bits at 29..31, which were a literal zero in build-119:
-    //   [29] space_stall   the shared writer fifo throttled rx_dispatch's readPkg issue. NOT a
-    //                      failure -- it is the elastic fifo doing its job, and it fires routinely
-    //                      in `dmabp`, where the modelled DMA is slower than this bench's TOE (the
-    //                      bench delivers at 64 B/cycle; the board delivers ~0.2-0.8 GB/s per
-    //                      connection). Reported, never fatal.
-    //   [30] slot_overflow expected, and asserted on, only in `ovf`.
-    //   [31] residue_err   bytes in a slot belonging to no response. Always a failure.
-    // (allow_overflow is declared with the feeder, which reads it.)
-
     task automatic check_sticky();
         string why;
         why = "";
@@ -2347,21 +1696,6 @@ module lane_drain_tb #(
         if (stallWord[25]) why = {why, " rx_fifo_stall(25)"};
         if (stallWord[24]) why = {why, " rxd_overflow(24)"};
         if (stallWord[7])  why = {why, " status_bad(7)"};
-        if (DUT_SLOTS != 0) begin
-            if (stallWord[29]) $display("  NOTE slots: space_stall(29) set -- the writer throttled the readPkg issue");
-            if (stallWord[31]) why = {why, " residue_err(31)"};
-            if (stallWord[30] && !allow_overflow) why = {why, " slot_overflow(30)"};
-            if (dma_fail) begin
-                $display("  CARD DMA MODEL reported %0d contract violation(s)", dma_errors);
-                why = {why, $sformatf(" card_dma_model(%0d)", dma_errors)};
-            end
-            // The shared read channel's own invariants. None can be true of a correct
-            // configuration: a beat that belonged to no outstanding request, a receive fifo that
-            // refused one (the credit is then wrong), a read longer than RD_MAX.
-            if (share_order_err) why = {why, " share_order_err"};
-            if (share_fifo_err)  why = {why, " share_fifo_err"};
-            if (share_len_err)   why = {why, " share_len_err"};
-        end
         if (why != "") begin
             $display("  STICKY stall bits set:%s   (stallWord=0x%08h)", why, stallWord);
             if (verdict.len() >= 4 && verdict.substr(0, 3) == "PASS") begin
@@ -2370,37 +1704,6 @@ module lane_drain_tb #(
             end
         end
     endtask
-
-    // Stage-2 bookkeeping, printed at the end of an s2 scenario. Returns connections used.
-    function automatic int s2_report(string tag);
-        int used, pend_now;
-        used = 0; pend_now = 0;
-        for (int c = 0; c < NUM_CONNS; c++) begin
-            if (s2_used[c] > 0) used++;
-            if (conn_pend(c) != 0) pend_now++;
-        end
-        $display("");
-        $display("  == %s: %0d connections, %0d decoders ==", tag, NUM_CONNS, NL);
-        for (int L = 0; L < NL; L++)
-            $display("     lane %0d: %0d/%0d responses, %0d body bytes%s", L, ln[L].resp_done,
-                     ln[L].planned_total, ln[L].bytes_in, dec_tainted(L) ? "  TAINTED" : "");
-        $display("     connections used %0d, busy at once (max) %0d, pending now %0d; arms on a free conn %0d, pipelined on the tail %0d",
-                 used, s2_max_busy, pend_now, s2_n_free, s2_n_tail);
-        for (int c = 0; c < NUM_CONNS; c++)
-            if (conn_pend(c) != 0)
-                $display("     conn %0d: %0d entries pending on decoder %0d%s drained=%0b", c, conn_pend(c),
-                         conn_curdec(c), conn_is_tail(c) ? " (tail)" : "", conn_drained(c));
-        $display("     opens=%0d closes=%0d readPkgs=%0d  DEC_STATE=0x%016h  CONN_CAUSE=0x%016h",
-                 n_open_rsp, n_close_req, rp_issued, connExtWord[0], connExtWord[5]);
-        return used;
-    endfunction
-
-    function automatic string s2_any_fatal();
-        string r; r = "";
-        for (int c = 0; c < NUM_CONNS; c++) if (conn_fatal(c)) r = {r, $sformatf(" conn %0d fatal", c)};
-        for (int L = 0; L < NL; L++) if (dec_tainted(L)) r = {r, $sformatf(" decoder %0d tainted", L)};
-        return r;
-    endfunction
 
     // =============================================================================================
     // Scenarios
@@ -2422,7 +1725,6 @@ module lane_drain_tb #(
             meas_bytes[i]  = 0;
             lane_ignore[i] = 0;
         end
-        mute_sid = -1;
         repeat (30) @(posedge clk);
         rst_n = 1'b1;
         repeat (10) @(posedge clk);
@@ -2962,7 +2264,7 @@ module lane_drain_tb #(
                                  sess[ln[0].sid].requested);
                     if (!sess.exists(ln[0].sid) || sess[ln[0].sid].ring.size() == 0)
                         verdict = "FAIL (the stalled lane's bytes are not waiting in its ring)";
-                end else if (DUT_SLOTS == 0) begin
+                end else begin
                     if (!lane_dead_sticky(0)) begin
                         $display("  lane 0 was killed by the HOL watchdog but its lane-dead sticky bit reads CLEAR");
                         verdict = "FAIL (lane-dead sticky bit not set on the killed lane)";
@@ -2972,28 +2274,6 @@ module lane_drain_tb #(
                             $display("  lane %0d reads lane-dead, but only lane 0's consumer was stopped", L);
                             verdict = $sformatf("FAIL (lane-dead set on surviving lane %0d)", L);
                         end
-                    end
-                end else begin
-                    // THE ASSERTION INVERTS, and that inversion IS the result.
-                    //
-                    // In build-119 a decoder that stops for good blocks the head of rx_dispatch's
-                    // arrival-ordered queue, the HOL watchdog eventually kills that lane, and
-                    // "contained" means "the watchdog did its job". Here the stopped decoder's
-                    // bytes go into its slot in HBM and the shared receive path never notices, so
-                    // NO connection may be declared dead at all -- if one is, the coupling ADR-5
-                    // exists to remove is still there.
-                    for (int L = 0; L < NL; L++) begin
-                        if (lane_dead_sticky(L)) begin
-                            $display("  conn %0d was declared dead by the HOL watchdog: the shared receive path is still coupled to a decoder",
-                                     L);
-                            verdict = $sformatf("FAIL (conn %0d declared dead; slots must not couple)", L);
-                        end
-                    end
-                    $display("  [cyc=%0d] slots: connDrained=0x%016h (conn 0 must read 0: its slot is still held)",
-                             cyc, connDrainedWord);
-                    if (conn_drained(0)) begin
-                        $display("  conn 0's slot reads DRAINED while its decoder has taken nothing");
-                        verdict = "FAIL (depth-1 credit returned on an undrained slot)";
                     end
                 end
             end
@@ -3160,14 +2440,12 @@ module lane_drain_tb #(
 
         // (fsfin) the peer FINs right behind a COMPLETE response while its decoder is stalled -----
         //
-        // (2026-09-24, the reader->framer register slice of 9811956.) Lane 0's decoder stops, then
-        // one small response lands and the origin closes the session straight after it (what a
-        // `Connection: close` or a max-requests origin does). Every byte of the response is in the
-        // handler, so nothing is owed by the network and the response must complete the moment
-        // the decoder comes back. FSBLEN sizes the body so the response's LAST beats wait in the
-        // slice in front of the framer rather than in slot_rd_share's receive fifo: there the old
-        // datapath counted them through rd_pending and held the FIN drain; if the drain does not
-        // count the slice, it expires (CLOSE_SETTLE) and aborts a finished response.
+        // Lane 0's decoder stops, then one small response lands and the origin closes the session
+        // straight after it (what a `Connection: close` or a max-requests origin does). Every byte
+        // of the response is in the handler, so nothing is owed by the network and the response
+        // must complete the moment the decoder comes back. +FSBLEN sizes the body, i.e. where its
+        // LAST beats wait when the FIN arrives; if the FIN drain does not count them, it expires
+        // (CLOSE_SETTLE) and aborts a finished response.
         "fsfin": begin
             int fsblen;
             if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
@@ -3185,12 +2463,11 @@ module lane_drain_tb #(
             wait_cycles(6000);                           // > CLOSE_SETTLE, decoder still stopped
             body_ready_ctl[0] = 1'b1;                    // and it comes back
             wait_drain(200000, ok);
-            $display("  [cyc=%0d] after: lane0 done=%0d/%0d conn0 fatal=%0b lane0 fatal=%0b",
-                     cyc, ln[0].resp_done, ln[0].planned_total,
-                     (DUT_SLOTS != 0) ? conn_fatal(0) : 1'b0, lane_is_fatal(0));
+            $display("  [cyc=%0d] after: lane0 done=%0d/%0d lane0 fatal=%0b",
+                     cyc, ln[0].resp_done, ln[0].planned_total, lane_is_fatal(0));
             if (!ok) begin verdict = "HANG (the finished response never reached the decoder)"; dump("fsfin"); end
             else if (n_err) begin verdict = "FAIL (routing/framing violated)"; dump("fsfin"); end
-            else if (lane_is_fatal(0) || ((DUT_SLOTS != 0) && conn_fatal(0)))
+            else if (lane_is_fatal(0))
                 verdict = "FAIL (a complete response was aborted by the FIN drain)";
             else verdict = "PASS";
         end
@@ -3458,33 +2735,20 @@ module lane_drain_tb #(
         end
 
         // =========================================================================================
-        // SLOTS-ONLY SCENARIOS. Each of them asks a question that only exists because the buffer
-        // moved into HBM, and each is meaningless against handler_multi -- big is larger than its
-        // whole lane fifo, ovf and dmabp name hardware it does not have, and thr's expected answer
-        // is the opposite of what build-119 does.
+        // big / thr: questions for a handler whose lanes do not share a receive buffer
+        // (handler_toe). Against handler_multi big is larger than its whole lane fifo, and thr's
+        // expected answer is the opposite of what the arrival-ordered receive path does.
         // =========================================================================================
 
-        // (big) the host's largest legal GET, on every connection at once ---------------------------
+        // (big) the host's whole window budget, on every lane at once -------------------------------
         //
-        // SLOT_BYTES - 64 KiB is the contract in ADR-5: one GET per connection, sized so the header
-        // and the alignment slack cannot push the body past the end of the slot. Doing it on every
-        // connection simultaneously is what makes it a test of the SHARED writer rather than of one
-        // slot -- one descriptor per segment, N connections' worth, through one channel.
-        "big": begin
+        // GET_CREDIT (4) GETs of the 236 KiB cap each, on every lane simultaneously.
+        "big": if (DUT_TOE == 0) verdict = "SKIP (handler_toe scenario)"; else begin
             int blen;
             if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-            if (DUT_TOE != 0) begin
-                // handler_toe: the stage-1 host's whole window budget on every lane at once --
-                // GET_CREDIT (4) GETs of the 236 KiB cap each.
-                blen = 236 * 1024;
-                $display("  toe: 4 GETs of %0d bytes on each of %0d lane(s)", blen, NL);
-                for (int L = 0; L < NL; L++) submit_batch(L, 4, blen, o);
-            end else begin
-                blen = int'(SLOT_BYTES) - 65536;
-                $display("  slot = %0d bytes, GET = %0d bytes on each of %0d connection(s)",
-                         SLOT_BYTES, blen, NL);
-                for (int L = 0; L < NL; L++) submit_batch(L, 1, blen, o);
-            end
+            blen = 236 * 1024;
+            $display("  toe: 4 GETs of %0d bytes on each of %0d lane(s)", blen, NL);
+            for (int L = 0; L < NL; L++) submit_batch(L, 4, blen, o);
             wait_drain(3000000, ok);
             for (int L = 0; L < NL; L++)
                 $display("     conn %0d: %0d/%0d responses, %0d body bytes",
@@ -3500,8 +2764,8 @@ module lane_drain_tb #(
         // 4 B/cycle at 16 -- while every other connection runs flat out. In build-119 this is what
         // starves the neighbours: the slow lane's fifo fills, conn_space_ok drops, the head of the
         // arrival-ordered queue blocks and everyone waits (measured on the rx_perf model: the other
-        // lane lost 20%, 33.90 -> 27.26 B/cycle). Here the slow decoder's bytes are in its slot and
-        // the shared path never sees it.
+        // lane lost 20%, 33.90 -> 27.26 B/cycle). With a receive ring per session the slow
+        // decoder's bytes wait in its own ring and the shared path never sees it.
         //
         // Measured in two phases against the SAME bench so nothing but the throttle differs:
         //   A  the fast connections alone, conn 0 idle           -> the solo rate
@@ -3556,8 +2820,8 @@ module lane_drain_tb #(
                              (solo_rate > 0.0) ? 100.0*both_rate/solo_rate : 0.0);
                     if (solo_rate > 0.0 && (both_rate/solo_rate) < worst) worst = both_rate/solo_rate;
                 end
-                $display("     stall bits: route_stall(28)=%0b rx_fifo_stall(25)=%0b space_stall(29)=%0b",
-                         stallWord[28], stallWord[25], stallWord[29]);
+                $display("     stall bits: route_stall(28)=%0b rx_fifo_stall(25)=%0b",
+                         stallWord[28], stallWord[25]);
                 $display("     worst neighbour retained %0.1f%% of its solo rate", 100.0*worst);
 
                 if (stallWord[28] || stallWord[25])
@@ -3570,667 +2834,6 @@ module lane_drain_tb #(
                 else
                     verdict = $sformatf("PASS (neighbours kept %0.1f%% of their solo rate)", 100.0*worst);
                 throttle_lane = -1; throttle_div = 0;
-            end
-        end
-
-        // (dmabp) the card path is slow and lumpy ---------------------------------------------------
-        //
-        // +DMA_WR_BP=50 +DMA_RD_GAP=40 go to card_dma_model, so the write data channel refuses half
-        // the cycles and four beats in ten come back with a gap behind them. Nothing about the
-        // handler may change: every byte still arrives, in order, and the rx side is still never
-        // refused. space_stall(29) IS expected here -- the modelled DMA is slower than this bench's
-        // TOE, which is the whole point of an elastic fifo -- and it is reported, not failed.
-        "dmabp": begin
-            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-            for (int L = 0; L < NL; L++) submit_batch(L, 6, 16384, o);
-            wait_drain(3000000, ok);
-            for (int L = 0; L < NL; L++)
-                $display("     conn %0d: %0d/%0d responses, %0d body bytes",
-                         L, ln[L].resp_done, ln[L].planned_total, ln[L].bytes_in);
-            $display("     stall bits: route_stall(28)=%0b rx_fifo_stall(25)=%0b space_stall(29)=%0b",
-                     stallWord[28], stallWord[25], stallWord[29]);
-            if (!ok) begin verdict = "HANG"; dump("dmabp"); end
-            else if (n_err) begin verdict = "FAIL"; dump("dmabp"); end
-            else verdict = "PASS";
-        end
-
-        // (ovf) one connection overruns its slot; the others must not notice ------------------------
-        //
-        // Runs on a snapshot with a small SLOT_LOG2 so the overrun happens in a few thousand cycles
-        // rather than after half a megabyte. The host contract (GET <= SLOT - 64 KiB) says this can
-        // never happen; the point is what the hardware does when it does. Connection 0 must go
-        // FATAL with SLOT_OVERFLOW set and nothing else may be disturbed.
-        "ovf": begin
-            int blen;
-            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-            allow_overflow = 1;
-            lane_ignore[0] = 1;
-            blen = int'(SLOT_BYTES) + 8192;          // deliberately past the end of the slot
-            $display("  slot = %0d bytes; conn 0 asks for %0d", SLOT_BYTES, blen);
-            for (int L = 1; L < NL; L++) submit_batch(L, 2, 3000, o);
-            wait_drain(400000, ok);
-            $display("  [cyc=%0d] warm-up drained=%0b", cyc, ok);
-            if (!ok) begin verdict = "HANG (warm-up)"; dump("ovf"); end
-            else begin
-                submit_batch(0, 1, blen, o);
-                // Wait for the writer to report the overrun, then take conn 0's PEER off the wire.
-                //
-                // The rest of a response that cannot be stored is not interesting here, and
-                // leaving it queued at the origin tests something else: segments that arrive
-                // AFTER the session has been released. rx_dispatch reads those as orphans and
-                // throws them away -- `cuovf` is that scenario. This one is about CONTAINMENT of
-                // a slot overrun.
-                t0 = cyc;
-                while ((cyc - t0) < 400000 && !conn_overflowed(0)) @(posedge clk);
-                mute_sid = ln[0].sid;
-                if (sess.exists(ln[0].sid)) begin
-                    sess[ln[0].sid].pending = {};
-                    sess[ln[0].sid].wr      = {};
-                end
-                while ((cyc - t0) < 400000 && !lane_is_fatal(0)) @(posedge clk);
-                $display("  [cyc=%0d] conn 0: fatal=%0b slot_overflow=%0b connErr=0x%016h",
-                         cyc, lane_is_fatal(0), conn_overflowed(0), connErrWord[0]);
-                if (!conn_overflowed(0))
-                    verdict = "FAIL (the overrun was not reported on conn 0)";
-                else if (!lane_is_fatal(0))
-                    verdict = "FAIL (conn 0 overran its slot and was not declared fatal)";
-                else begin
-                    // and now the whole point: everyone else still works
-                    for (int L = 1; L < NL; L++) begin
-                        if (conn_overflowed(L))
-                            verdict = $sformatf("FAIL (conn %0d reports an overflow it never had)", L);
-                        if (lane_is_fatal(L))
-                            verdict = $sformatf("FAIL (conn %0d went fatal over conn 0's overflow)", L);
-                    end
-                    if (verdict == "") begin
-                        b1 = 0;
-                        for (int L = 1; L < NL; L++) b1 = b1 + ln[L].resp_done;
-                        for (int L = 1; L < NL; L++) submit_batch(L, 2, 3000, o);
-                        // conn 0 will never drain, so wait on the survivors rather than on everything
-                        t0 = cyc;
-                        forever begin
-                            int done_now;
-                            @(posedge clk);
-                            done_now = 0;
-                            for (int L = 1; L < NL; L++) done_now = done_now + ln[L].resp_done;
-                            if (done_now >= b1 + 2*(NL-1)) break;
-                            if ((cyc - t0) > 600000) break;
-                        end
-                        for (int L = 1; L < NL; L++)
-                            $display("     conn %0d: %0d responses, %0d body bytes",
-                                     L, ln[L].resp_done, ln[L].bytes_in);
-                        b0 = 0;
-                        for (int L = 1; L < NL; L++) b0 = b0 + ln[L].resp_done;
-                        dump("ovf");
-                        if (b0 < b1 + 2*(NL-1))
-                            verdict = "FAIL (the survivors stopped after conn 0 overran its slot)";
-                        else if (n_err)
-                            verdict = "FAIL (byte/framing errors on a surviving connection)";
-                        else
-                            verdict = "PASS (contained: conn 0 fatal, the others byte-exact)";
-                    end
-                end
-            end
-        end
-
-        // (refatal) a connection is torn down with bytes still in its slot -----------------------
-        //
-        // The teardown order this checks is the reason BR_DRAIN exists: the session is released
-        // first so nothing new can enter the slot, then BOTH halves of the datapath are waited out
-        // (slot_writer's conn_quiet, slot_reader's flush_busy), and only then are the cursors
-        // zeroed. Get it wrong and the next response on that connection is read out of the slot at
-        // the wrong offset -- which shows up as a byte mismatch on a response that is otherwise
-        // completely ordinary, or as the stale bytes being parsed as its header.
-        //
-        // TWO PHASES, because the architecture has two answers and both matter:
-        //
-        //   B/C  a CLEAN reconnect with a dirty slot. The connection is idle -- its response has
-        //        drained -- but the origin has put bytes in its slot that belong to no response,
-        //        and then its peer FINs. That is the ordinary MinIO idle-close, and the connection
-        //        must come back and be BYTE-EXACT. Without the release it would read the stale
-        //        bytes as the next response's status line.
-        //
-        //   D    a FATAL mid-response teardown, which is what a FIN with work outstanding is in
-        //        this design and in build-119 alike: the request text has been consumed and cannot
-        //        be replayed, so the connection stays down and the host reissues elsewhere. What is
-        //        asserted here is that the teardown is CLEAN -- the session closed, the slot handed
-        //        back (CONN_DRAINED returns), slot_writer's "release with segments in flight"
-        //        assertion silent, and the other connections untouched.
-        "refatal": begin
-            int sid0, stale, rfn, rfb, rfp;
-            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-            for (int L = 0; L < NL; L++) submit_batch(L, 1, 3000, o);
-            wait_drain(400000, ok);
-            $display("  [cyc=%0d] warm-up drained=%0b, conn 0 session=%0d", cyc, ok, ln[0].sid);
-            if (!ok) begin verdict = "HANG (warm-up)"; dump("refatal"); end
-            else begin
-                // -- B: leave bytes in conn 0's slot that belong to no response, then FIN it -------
-                sid0  = ln[0].sid;
-                stale = 5000;
-                for (int i = 0; i < stale; i++) sess[sid0].pending.push_back(byte'(8'hA5));
-                sess[sid0].wr.push_back(stale);
-                t0 = cyc;
-                while ((cyc - t0) < 200000 && sess[sid0].pending.size() > 0) @(posedge clk);
-                wait_cycles(2000);
-                $display("  [cyc=%0d] %0d stale bytes are in conn 0's slot; FINning its idle peer (drained=%0b)",
-                         cyc, stale, conn_drained(0));
-                peer_close(sid0);
-                // -- C: it must reconnect by itself and the next response must be byte-exact ------
-                t0 = cyc;
-                while ((cyc - t0) < 300000 && n_open_rsp < 1 + NUM_CONNS) @(posedge clk);
-                $display("  [cyc=%0d] after the idle FIN: opens=%0d closes=%0d conn0 up=%0b fatal=%0b drained=%0b",
-                         cyc, n_open_rsp, n_close_req, lane_conn_up(0), lane_is_fatal(0),
-                         conn_drained(0));
-                if (lane_is_fatal(0))
-                    verdict = "FAIL (an idle FIN with a dirty slot made conn 0 fatal)";
-                else begin
-                    b1 = ln[0].bytes_in;
-                    for (int L = 0; L < NL; L++) submit_batch(L, 2, 5000, o);
-                    wait_drain(800000, ok);
-                    $display("  [cyc=%0d] after the reconnect: drained=%0b conn0 +%0d bytes, %0d/%0d responses",
-                             cyc, ok, ln[0].bytes_in - b1, ln[0].resp_done, ln[0].planned_total);
-                    if (!ok) begin
-                        verdict = "HANG (the connection never came back after the idle FIN)";
-                        dump("refatal");
-                    end else if (n_err) begin
-                        verdict = "FAIL (the response after the reconnect was not byte-exact: the slot was not released)";
-                        dump("refatal");
-                    end
-                end
-
-                // -- D: now kill it mid-response and check the teardown itself --------------------
-                if (verdict == "") begin
-                    sid0 = ln[0].sid;
-                    b0   = pkt_taken;
-                    lane_ignore[0] = 1;              // its response is being cut on purpose
-                    net_allow = b0 + 3;
-                    // +RFP puts exactly that many packets on the wire before the cut (net_allow is
-                    // a budget, so the default above lets b0 + 3 through, not 3).
-                    if ($value$plusargs("RFP=%d", rfp)) net_allow = rfp;
-                    // +RFN GETs are armed before the cut (revision 4: several outstanding on one
-                    // connection when it dies -- the stale entries behind the head must neither
-                    // wedge the teardown nor leak into anybody else).
-                    if (!$value$plusargs("RFN=%d", rfn)) rfn = 1;
-                    // +RFB sets their body size and +RFP the packets let through; RFB=20000 RFP=7
-                    // (MSS 4096) completes the first response and cuts the SECOND one: the reader has
-                    // CONTINUEd onto the next entry with its cursor mid-slot, and the flush then
-                    // abandons a head that never started from offset 0.
-                    if (!$value$plusargs("RFB=%d", rfb)) rfb = (rfn > 1) ? 100000 : 120000;
-                    submit_batch(0, rfn, rfb, o);
-                    t0 = cyc;
-                    while ((cyc - t0) < 200000 && pkt_taken < b0 + 3) @(posedge clk);
-                    wait_cycles(2000);
-                    $display("  [cyc=%0d] conn 0's slot is half written (%0d packets, %0d body bytes); FINning its peer mid-response",
-                             cyc, pkt_taken - b0, ln[0].bytes_in - b1);
-                    // The peer that FINs has stopped sending. Leaving the rest queued would strand
-                    // it in the TOE's shared fifo (see the note in `ovf`), which is a different
-                    // question from whether this teardown is clean.
-                    mute_sid = sid0;
-                    if (sess.exists(sid0)) begin sess[sid0].pending = {}; sess[sid0].wr = {}; end
-                    peer_close(sid0);
-                    net_allow = 1000000000;
-                    t0 = cyc;
-                    while ((cyc - t0) < 400000 && !(lane_is_fatal(0) && !lane_conn_up(0)))
-                        @(posedge clk);
-                    // The session going away is BR_CLOSE; the slot coming back is BR_DRAIN, which
-                    // is deliberately later -- it waits for the writer and the reader to let go
-                    // first. Sampling the credit on the same cycle as conn_up would be reading the
-                    // answer before the question had been asked.
-                    t0 = cyc;
-                    while ((cyc - t0) < 200000 && !conn_drained(0)) @(posedge clk);
-                    $display("  [cyc=%0d] mid-response FIN: conn 0 fatal=%0b up=%0b drained=%0b closes=%0d connErr=0x%016h",
-                             cyc, lane_is_fatal(0), lane_conn_up(0), conn_drained(0), n_close_req,
-                             connErrWord[0]);
-                    // The connection stays down -- the request text is gone and only the host can
-                    // reissue -- but its SLOT must have come back, and nobody else may be hurt.
-                    if (!lane_is_fatal(0))
-                        verdict = "FAIL (a mid-response FIN with work outstanding left conn 0 alive)";
-                    else if (lane_conn_up(0))
-                        verdict = "FAIL (conn 0 is fatal but still holds its session)";
-                    else if (!conn_drained(0))
-                        verdict = "FAIL (conn 0's slot was never released: BR_DRAIN did not complete)";
-                    else begin
-                        for (int L = 1; L < NL; L++)
-                            if (lane_is_fatal(L))
-                                verdict = $sformatf("FAIL (conn %0d went fatal over conn 0's teardown)", L);
-                    end
-                    if (verdict == "") begin
-                        // and the survivors are still byte-exact and still complete work
-                        ln[0].planned_total = ln[0].resp_done;
-                        ln[0].plan = {}; ln[0].expq = {};
-                        ln[0].active = 0; ln[0].must_end = 0;
-                        n_err = 0;                   // the cut stream is the scenario, not a defect
-                        b1 = 0;
-                        for (int L = 1; L < NL; L++) b1 = b1 + ln[L].resp_done;
-                        for (int L = 1; L < NL; L++) submit_batch(L, 2, 4000, o);
-                        wait_drain(800000, ok);
-                        for (int L = 1; L < NL; L++)
-                            $display("     conn %0d: %0d/%0d responses, %0d body bytes",
-                                     L, ln[L].resp_done, ln[L].planned_total, ln[L].bytes_in);
-                        dump("refatal");
-                        if (!ok)
-                            verdict = "HANG (the survivors stopped after conn 0's mid-response teardown)";
-                        else if (n_err)
-                            verdict = "FAIL (byte/framing errors on a surviving connection)";
-                        else
-                            verdict = "PASS (slot released on both paths; reconnect byte-exact, fatal contained)";
-                    end
-                end
-            end
-        end
-
-        // =========================================================================================
-        // STAGE-2 SCENARIOS (NUM_DEC < NUM_CONNS, revision 5). Lanes are decoders; the host model
-        // places every GET on a connection (see "STAGE-2 HOST MODEL").
-        // =========================================================================================
-
-        // (s2mix) every lane, many GETs of mixed sizes, spread over all the connections, answered
-        // out of queue order (+SRVJIT) and coalesced (+COALESCE) -- byte-exact per decoder stream.
-        "s2mix": begin
-            int nreq, bmax, minused, used;
-            nreq = 3 * ((NUM_CONNS + NL - 1) / NL); bmax = 20000; minused = NUM_CONNS;
-            void'($value$plusargs("NREQ=%d", nreq));
-            void'($value$plusargs("BMAX=%d", bmax));
-            void'($value$plusargs("S2MINUSED=%d", minused));
-            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-            if (!STAGE2) verdict = "SKIP (stage-2 scenario)";
-            else begin
-                for (int i = 0; i < nreq; i++)
-                    for (int L = 0; L < NL; L++)
-                        submit_batch(L, 1, 64 + ((L*7919 + i*3571 + 13) % bmax), o);
-                wait_drain(3000000, ok);
-                used = s2_report("s2mix");
-                if (!ok) begin verdict = "HANG"; dump("s2mix"); end
-                else if (n_err) verdict = "FAIL (byte/framing errors)";
-                else if (s2_any_fatal() != "") verdict = {"FAIL (", s2_any_fatal(), ")"};
-                else if (used < minused)
-                    verdict = $sformatf("FAIL (only %0d connections carried GETs, wanted %0d)", used, minused);
-                else verdict = $sformatf("PASS (%0d GETs over %0d connections, %0d busy at once)",
-                                         nreq*NL, used, s2_max_busy);
-            end
-        end
-
-        // (s2arm) EVERY connection armed at once: one GET per connection, held at the origin by
-        // +SRVLAT, so all NUM_CONNS have an entry pending simultaneously; then all of it drains.
-        "s2arm": begin
-            int per;
-            per = (NUM_CONNS + NL - 1) / NL;
-            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-            if (!STAGE2) verdict = "SKIP (stage-2 scenario)";
-            else begin
-                for (int L = 0; L < NL; L++)
-                    for (int i = 0; i < per && (L*per + i) < NUM_CONNS; i++) submit_batch(L, 1, 6000 + 101*i, o);
-                wait_drain(2000000, ok);
-                void'(s2_report("s2arm"));
-                if (!ok) begin verdict = "HANG"; dump("s2arm"); end
-                else if (n_err) verdict = "FAIL (byte/framing errors)";
-                else if (s2_any_fatal() != "") verdict = {"FAIL (", s2_any_fatal(), ")"};
-                else if (s2_max_busy < NUM_CONNS)
-                    verdict = $sformatf("FAIL (at most %0d of %0d connections were armed at once)",
-                                        s2_max_busy, NUM_CONNS);
-                else verdict = $sformatf("PASS (all %0d connections armed at once)", NUM_CONNS);
-            end
-        end
-
-        // (s2fatal) one connection dies with GETs of decoder 0 pending on it. Asserted:
-        //   * exactly that connection goes FATAL and it alone is recorded as having tainted a
-        //     decoder, and exactly decoder 0 is TAINTED;
-        //   * every OTHER connection -- including those whose entries were queued on decoder 0
-        //     behind the dead one's (the stale-entry fix) -- drains to nothing pending;
-        //   * the other decoders finish byte-exact, and then take new work spread over the
-        //     surviving connections, some of which were decoder 0's.
-        "s2fatal": begin
-            int per, victim_sid, victim, nfatal, b_used[NUM_CONNS], reused;
-            bit bad;
-            per = (NUM_CONNS + NL - 1) / NL;
-            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-            if (!STAGE2) verdict = "SKIP (stage-2 scenario)";
-            else begin
-                // -- A: warm-up on every lane
-                for (int L = 0; L < NL; L++) for (int i = 0; i < per; i++) submit_batch(L, 1, 3000, o);
-                wait_drain(1500000, ok);
-                $display("  [cyc=%0d] warm-up drained=%0b", cyc, ok);
-                // -- B: long responses queued everywhere, then kill a connection holding lane 0's
-                if (ok) begin
-                    for (int L = 0; L < NL; L++) for (int i = 0; i < per; i++) submit_batch(L, 1, 40000, o);
-                    t0 = cyc;
-                    while ((cyc - t0) < 400000 && feed_busy[0] != 0) @(posedge clk);
-                    wait_cycles(200);
-                    victim_sid = -1;
-                    foreach (live_sids[k])
-                        if (victim_sid < 0 && sess[live_sids[k]].alive && sess[live_sids[k]].lane == 0 &&
-                            (sess[live_sids[k]].pending.size() > 0 || sess[live_sids[k]].last_rel > cyc))
-                            victim_sid = live_sids[k];
-                    if (victim_sid < 0) begin verdict = "FAIL (no session with lane-0 work in flight to kill)"; ok = 0; end
-                end
-                if (ok) begin
-                    $display("  [cyc=%0d] killing session %0d mid-response (it carries lane 0)", cyc, victim_sid);
-                    lane_ignore[0] = 1;
-                    mute_sid = victim_sid;
-                    sess[victim_sid].pending = {}; sess[victim_sid].wr = {};
-                    peer_close(victim_sid);
-                    t0 = cyc;
-                    while ((cyc - t0) < 600000 && !dec_tainted(0)) @(posedge clk);
-                    // Everyone else drains: other lanes complete, and every surviving connection
-                    // ends with nothing pending -- including the ones queued on decoder 0.
-                    t0 = cyc;
-                    forever begin
-                        bit done; done = 1;
-                        @(posedge clk);
-                        for (int L = 1; L < NL; L++) if (ln[L].resp_done != ln[L].planned_total) done = 0;
-                        for (int c = 0; c < NUM_CONNS; c++) if (!conn_fatal(c) && conn_pend(c) != 0) done = 0;
-                        if (done || (cyc - t0) > 1500000) break;
-                    end
-                    victim = -1; nfatal = 0; bad = 0;
-                    for (int c = 0; c < NUM_CONNS; c++) if (conn_fatal(c)) begin nfatal++; victim = c; end
-                    $display("  [cyc=%0d] after the kill: DEC_STATE=0x%016h fatal conns=%0d (conn %0d) CONN_CAUSE=0x%016h",
-                             cyc, connExtWord[0], nfatal, victim, connExtWord[5]);
-                    for (int c = 0; c < NUM_CONNS; c++)
-                        if (!conn_fatal(c) && conn_pend(c) != 0) begin
-                            $display("     conn %0d still has %0d entries pending (curdec %0d)", c, conn_pend(c), conn_curdec(c));
-                            bad = 1;
-                        end
-                    if (!dec_tainted(0)) verdict = "FAIL (decoder 0 lost a response and was not tainted)";
-                    else if (nfatal != 1) verdict = $sformatf("FAIL (%0d connections fatal, expected exactly 1)", nfatal);
-                    else if (!conn_tainter(victim) || s2_lane_of_last[victim] != 0)
-                        verdict = $sformatf("FAIL (the fatal connection %0d is not recorded as decoder 0's tainter)", victim);
-                    else if (bad) verdict = "FAIL (a surviving connection's entries were never retired: stale entries block the decoder)";
-                    else begin
-                        for (int L = 1; L < NL; L++) if (dec_tainted(L)) verdict = $sformatf("FAIL (decoder %0d tainted too)", L);
-                        for (int c = 0; c < NUM_CONNS; c++) if (c != victim && conn_tainter(c))
-                            verdict = $sformatf("FAIL (conn %0d recorded as a tainter)", c);
-                    end
-                    // -- C: the survivors take new work, spread over every live connection
-                    if (verdict == "") begin
-                        for (int c = 0; c < NUM_CONNS; c++) b_used[c] = s2_used[c];
-                        for (int i = 0; i < 2*per; i++) for (int L = 1; L < NL; L++) submit_batch(L, 1, 2500 + 97*i, o);
-                        t0 = cyc;
-                        forever begin
-                            bit done; done = 1;
-                            @(posedge clk);
-                            for (int L = 1; L < NL; L++) if (ln[L].resp_done != ln[L].planned_total || feed_busy[L] != 0) done = 0;
-                            for (int c = 0; c < NUM_CONNS; c++) if (!conn_fatal(c) && conn_pend(c) != 0) done = 0;
-                            if (done || (cyc - t0) > 1500000 || cfg_stalled) break;
-                        end
-                        reused = 0;
-                        for (int c = 0; c < NUM_CONNS; c++)
-                            if (c != victim && s2_ever_lane[c][0] && s2_used[c] > b_used[c]) reused++;
-                        void'(s2_report("s2fatal"));
-                        for (int L = 1; L < NL; L++)
-                            if (ln[L].resp_done != ln[L].planned_total)
-                                verdict = $sformatf("HANG (lane %0d: %0d of %0d after the kill)", L, ln[L].resp_done, ln[L].planned_total);
-                        if (verdict == "") begin
-                            if (n_err) verdict = "FAIL (byte/framing errors on a surviving decoder)";
-                            else if (reused == 0) verdict = "FAIL (no connection of the tainted decoder was reused elsewhere)";
-                            else verdict = $sformatf("PASS (conn %0d fatal, decoder 0 tainted, %0d of its other connections reused)",
-                                                     victim, reused);
-                        end
-                    end
-                    if (verdict != "" && verdict.substr(0, 3) != "PASS") dump("s2fatal");
-                end
-            end
-        end
-
-        // (s2idle) the origin idle-closes most connections (MinIO does after ~minutes). Each must
-        // reconnect by itself (clean: nothing pending), none may go fatal, and the next work over
-        // all of them is byte-exact.
-        "s2idle": begin
-            int per, nfin, o0, k;
-            per = (NUM_CONNS + NL - 1) / NL;
-            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-            if (!STAGE2) verdict = "SKIP (stage-2 scenario)";
-            else begin
-                for (int L = 0; L < NL; L++) for (int i = 0; i < per; i++) submit_batch(L, 1, 3000, o);
-                wait_drain(1500000, ok);
-                wait_cycles(2000);
-                nfin = (NUM_CONNS > 22) ? 20 : NUM_CONNS - 2;
-                o0 = n_open_rsp; k = 0;
-                foreach (live_sids[j]) if (k < nfin && sess[live_sids[j]].alive) begin
-                    peer_close(live_sids[j]); k++;
-                end
-                t0 = cyc;
-                while ((cyc - t0) < 400000 && n_open_rsp < o0 + nfin) @(posedge clk);
-                wait_cycles(3000);
-                $display("  [cyc=%0d] %0d idle sessions FINned: opens %0d -> %0d, fatal=%s", cyc, nfin, o0, n_open_rsp, s2_any_fatal());
-                if (!ok) verdict = "HANG (warm-up)";
-                else if (s2_any_fatal() != "") verdict = {"FAIL (idle close made a connection fatal: ", s2_any_fatal(), ")"};
-                else if (n_open_rsp < o0 + nfin) verdict = $sformatf("FAIL (%0d of %0d idle-closed connections reopened)", n_open_rsp - o0, nfin);
-                else begin
-                    for (int i = 0; i < 2*per; i++) for (int L = 0; L < NL; L++) submit_batch(L, 1, 1000 + 77*i + 5*L, o);
-                    wait_drain(2000000, ok);
-                    void'(s2_report("s2idle"));
-                    if (!ok) begin verdict = "HANG (after the idle closes)"; dump("s2idle"); end
-                    else if (n_err) verdict = "FAIL (byte/framing errors after the reconnects)";
-                    else if (s2_any_fatal() != "") verdict = {"FAIL (", s2_any_fatal(), ")"};
-                    else verdict = $sformatf("PASS (%0d idle closes, all reopened, byte-exact after)", nfin);
-                end
-            end
-        end
-
-
-        // =========================================================================================
-        // (feed) DOES THE RECEIVE PATH KEEP EVERY DECODER BUSY? unit-tests/decoder_feed/run.sh
-        // sweeps it; its header has the time scale and the two origin profiles.
-        //
-        // THE HOST is the software's ONE dispatcher thread, per GET:
-        //   Scheduler::PlaceOnLane      the least-occupied decoder whose CONN_OCC + 1 <= lane depth
-        //                               (conn depth x ceil(active conns / decoders), configuration.cpp
-        //                               lane_depth_limit), round robin on ties; none -> sleep
-        //                               kLaneRetry (100 us) and look again
-        //   emit_batch_slots            one chunk = one GET: the chunk-length entry, then
-        //   HTTPReadConfig::pick_conn   a FREE connection round robin over the active ones, else this
-        //                               decoder's tail if it has < conn depth pending; none -> sleep
-        //                               20 us and poll again, with the dispatcher held (no other decoder
-        //                               gets work meanwhile -- that is the software's shape)
-        //   arm_transfer + the text DMA
-        // plus a fixed host cost per GET (CSR writes, the arm handshake, the DMA invoke). An endless
-        // supply of column chunks, sizes uniform in [GETMIN, GETMAX].
-        //
-        // The window starts WARMCYC cycles in and lasts MEASCYC; after it the host stops and everything
-        // must drain byte-exact (the checker never stops). Verdict: PASS/FAIL is correctness; the
-        // decoder-feed judgement is its own line, FEEDVERDICT.
-        // =========================================================================================
-        "feed": begin
-            string  origin;
-            int     scale, ttfb_ns, jit_ns, rate_mbs, decrate, gmin, gmax;
-            int     hostget_ns, poll_ns, retry_ns, hostget, retry, ldep;
-            int     warm, meas, drainb, t0m, t1m, rr, pick, occ, best, len, avg, tlife, hdr;
-            int     nget, nget0, npops, nrels, hdrb;
-            real    q0, q3;
-            longint qwork [4];
-            longint tot_bytes, tot_work, hn0, hr0;
-            real    ceil_bpc, dem_bpc, conn_bpc, gbps, minb, meanb, b, cyc_r;
-            real    lost_pct [FC_N];
-            longint h_nolane_cyc;
-            if (!STAGE2 || DUT_SLOTS == 0) verdict = "SKIP (feed needs the stage-2 slots DUT)";
-            else begin
-                origin = "minio";
-                void'($value$plusargs("ORIGIN=%s", origin));
-                scale = 10;          void'($value$plusargs("SCALE=%d", scale));
-                if (origin == "fast") begin ttfb_ns = 120000; jit_ns = 20000;  rate_mbs = 750; hdrb = 200; end
-                else                  begin ttfb_ns = 800000; jit_ns = 200000; rate_mbs = 230; hdrb = 600; end
-                if (!$value$plusargs("HDRBYTES=%d", srv_hdr_bytes)) srv_hdr_bytes = hdrb;
-                void'($value$plusargs("TTFB_NS=%d",  ttfb_ns));
-                void'($value$plusargs("JIT_NS=%d",   jit_ns));
-                void'($value$plusargs("RATE_MBS=%d", rate_mbs));
-                decrate = 1280;      void'($value$plusargs("DECRATE=%d", decrate));
-                gmin = 279 * 1024;   void'($value$plusargs("GETMIN=%d", gmin));
-                gmax = 424 * 1024;   void'($value$plusargs("GETMAX=%d", gmax));
-                hostget_ns = 10000;  void'($value$plusargs("HOSTGET_NS=%d", hostget_ns));
-                poll_ns    = 20000;  void'($value$plusargs("POLL_NS=%d",    poll_ns));
-                retry_ns   = 100000; void'($value$plusargs("RETRY_NS=%d",   retry_ns));
-                if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
-                if (!$value$plusargs("LINKBPC=%d", link_bpc)) link_bpc = 50;   // 100 Gb/s
-
-                // Everything that is a TIME on the host or the origin is divided by SCALE, and so is
-                // every GET: latency : transfer : decode stay in proportion. Rates (bytes/cycle) and
-                // everything inside the FPGA (segment size, RD_MAX, card latency) do NOT scale, so
-                // the per-response fixed costs of the RTL weigh SCALE times more here than on the
-                // board -- conservative.
-                // +SRVOVERLAP: the origin processes pipelined requests CONCURRENTLY (TTFB counted
-                // from each request's arrival, bytes still in order at the per-connection rate) --
-                // the optimistic bound, for comparison with the serial (Go/MinIO) default.
-                srv_ser     = !$test$plusargs("SRVOVERLAP");
-                srv_lat     = ttfb_ns / 4 / scale;
-                srv_jit     = jit_ns  / 4 / scale;
-                srv_rate_mb = rate_mbs * 4;                    // MB/s -> milli-bytes per cycle
-                dec_cost    = (1024 * 250) / decrate;          // 1/1024-cycles per byte
-                gmin        = gmin / scale;
-                gmax        = gmax / scale;
-                hostget     = hostget_ns / 4 / scale; if (hostget < 1) hostget = 1;
-                s2_poll     = poll_ns / 4 / scale;    if (s2_poll < 1) s2_poll = 1;
-                retry       = retry_ns / 4 / scale;   if (retry < 1) retry = 1;
-                ldep        = hdepth * ((s2_conns + NL - 1) / NL);
-                void'($value$plusargs("LDEPTH=%d", ldep));
-                avg         = (gmin + gmax) / 2;
-                hdr         = resp_hdr_len(avg);
-                tlife       = srv_lat + srv_jit/2 + int'(real'(avg + hdr) * 1000.0 / real'(srv_rate_mb));
-                // A slow origin builds a backlog in the slots at start-up (every connection streams at
-                // once) that the decoders then eat into only at the small surplus, so a server-bound
-                // run takes many connection lifetimes to settle; the quarters printed below show it.
-                warm        = 12 * tlife + 20000;
-                meas        = 40 * int'(real'(avg) * real'(dec_cost) / 1024.0);
-                if (meas < 8 * tlife) meas = 8 * tlife;
-                void'($value$plusargs("WARMCYC=%d", warm));
-                void'($value$plusargs("MEASCYC=%d", meas));
-                drainb      = 30 * tlife + 200000;
-                // A host may wait a whole connection lifetime for a free one; the global watchdog
-                // has to cover the run. Both only if not given explicitly.
-                if (!$test$plusargs("CFGBOUND")) CFG_BOUND  = 20 * tlife + 200000;
-                if (!$test$plusargs("MAXCYC"))   MAX_CYCLES = cyc + warm + meas + drainb + CFG_BOUND + 100000;
-
-                // What the ORIGIN could deliver if every active connection were always busy and
-                // re-armed the instant it finished: conns x size / (TTFB + size / rate), capped by
-                // the wire. Anything a decoder loses beyond this is lost inside the FPGA or the host.
-                conn_bpc = real'(avg + hdr) / (real'(srv_lat) + real'(srv_jit)/2.0 +
-                                               real'(avg + hdr) * 1000.0 / real'(srv_rate_mb));
-                ceil_bpc = real'(s2_conns) * conn_bpc;
-                if (ceil_bpc > real'(link_bpc)) ceil_bpc = real'(link_bpc);
-                dem_bpc  = real'(NL) * 1024.0 / real'(dec_cost);
-
-                $display("  feed: origin=%s scale=1/%0d conns=%0d/%0d decoders=%0d conn_depth=%0d lane_depth=%0d",
-                         origin, scale, s2_conns, NUM_CONNS, NL, hdepth, ldep);
-                $display("  feed: TTFB %0d+0..%0d cyc, %0d mB/cyc per conn, link %0d B/cyc, decoder %0d MB/s (%0d/1024 cyc/B)",
-                         srv_lat, srv_jit, srv_rate_mb, link_bpc, decrate, dec_cost);
-                $display("  feed: GET %0d..%0d B + %0d B header, host %0d cyc/GET, pick poll %0d cyc, lane retry %0d cyc; warm %0d, window %0d cyc",
-                         gmin, gmax, resp_hdr_len(avg), hostget, s2_poll, retry, warm, meas);
-                $display("  feed: origin ceiling %0.2f B/cyc vs decoder demand %0.2f B/cyc = %0.1f%%",
-                         ceil_bpc, dem_bpc, 100.0 * ceil_bpc / dem_bpc);
-
-                t0m = cyc + warm; t1m = t0m + meas;
-                // progress, so a long run can be watched
-                fork begin
-                    while (cyc < t1m) begin
-                        repeat (100000) @(posedge clk);
-                        $display("  [cyc=%0d] feed progress: %0d responses framed (%s), window %0d..%0d",
-                                 cyc, ln[0].resp_done + ln[NL-1].resp_done, "dec 0 + last", t0m, t1m);
-                    end
-                end join_none
-                // the window, with four quarter snapshots of the work to show it is steady
-                fork begin
-                    while (cyc < t0m) @(posedge clk);
-                    feed_stats_clear(); h_noconn_cyc = 0; h_noadm_cyc = 0;
-                    fmeas = 1'b1;
-                    for (int q = 0; q < 4; q++) begin
-                        while (cyc < t0m + ((q + 1) * meas) / 4) @(posedge clk);
-                        qwork[q] = 0;
-                        for (int L = 0; L < NL; L++) qwork[q] = qwork[q] + f_work[L];
-                    end
-                    fmeas = 1'b0;
-                end join_none
-
-                // THE DISPATCHER
-                rr = 0; nget = 0; nget0 = -1; h_nolane_cyc = 0;
-                while (cyc < t1m && !cfg_stalled && !liveness_failed) begin
-                    pick = -1; best = 1 << 30;
-                    for (int i = 0; i < NL; i++) begin
-                        automatic int sl = (rr + i) % NL;
-                        occ = int'(connOccWord[sl / 8][8 * (sl % 8) +: 8]);
-                        if (!dec_tainted(sl) && (occ + 1) <= ldep && occ < best) begin
-                            pick = sl; best = occ;
-                        end
-                    end
-                    if (pick < 0) begin
-                        if (fmeas) h_nolane_cyc = h_nolane_cyc + retry;
-                        repeat (retry) @(posedge clk);
-                        continue;
-                    end
-                    rr  = (pick + 1) % NL;
-                    len = gmin + $urandom_range(0, gmax - gmin);
-                    repeat (hostget) @(posedge clk);
-                    if (fmeas && nget0 < 0) nget0 = nget;
-                    feed_get(pick, len, o);
-                    if (!o) break;
-                    nget++;
-                end
-                $display("  [cyc=%0d] feed: host stopped after %0d GETs (%0d in the window)", cyc, nget,
-                         (nget0 < 0) ? 0 : nget - nget0);
-                wait (fmeas == 1'b0);
-                wait_drain(drainb, ok);
-
-                // ---- report -------------------------------------------------------------------------
-                cyc_r = real'(f_cyc);
-                if (f_cyc == 0) begin
-                    $display("  feed: the measurement window never opened (the run stopped at cycle %0d)", cyc);
-                    cyc_r = 1.0;
-                end
-                tot_bytes = 0; tot_work = 0; minb = 1000.0; meanb = 0.0;
-                for (int k = 0; k < FC_N; k++) lost_pct[k] = 0.0;
-                $display("");
-                $display("  == feed: %s, %0d of %0d connections, conn depth %0d, 1/%0d scale, window %0d cycles ==",
-                         origin, s2_conns, NUM_CONNS, hdepth, scale, f_cyc);
-                $display("     dec  busy%%   hs%%  stall%%  starv%%  idle%%   MB/s  resp  rel | lost%%: empty switch conn rdpath wrpath   hol server short");
-                for (int L = 0; L < NL; L++) begin
-                    b = 100.0 * real'(f_work[L]) / (1024.0 * cyc_r);
-                    if (b < minb) minb = b;
-                    meanb = meanb + b / real'(NL);
-                    tot_bytes = tot_bytes + f_bytes[L];
-                    $display("     %3d %6.2f %5.2f %6.2f %6.2f %6.2f %6.0f %5d %4d |        %5.2f  %5.2f %4.2f  %5.2f  %5.2f %5.2f  %5.2f %5.2f",
-                             L, b, 100.0*real'(f_hs[L])/cyc_r, 100.0*real'(f_stall[L])/cyc_r,
-                             100.0*real'(f_starv[L])/cyc_r, 100.0*real'(f_idle[L])/cyc_r,
-                             real'(f_bytes[L]) * 250.0 / cyc_r, f_pops[L], f_rels[L],
-                             100.0*real'(f_cls[L][FC_EMPTY])/(1024.0*cyc_r),  100.0*real'(f_cls[L][FC_SWITCH])/(1024.0*cyc_r),
-                             100.0*real'(f_cls[L][FC_CONNECT])/(1024.0*cyc_r), 100.0*real'(f_cls[L][FC_RDPATH])/(1024.0*cyc_r),
-                             100.0*real'(f_cls[L][FC_WRPATH])/(1024.0*cyc_r), 100.0*real'(f_cls[L][FC_HOL])/(1024.0*cyc_r),
-                             100.0*real'(f_cls[L][FC_SERVER])/(1024.0*cyc_r), 100.0*real'(f_cls[L][FC_SHORT])/(1024.0*cyc_r));
-                    for (int k = 0; k < FC_N; k++)
-                        lost_pct[k] = lost_pct[k] + 100.0*real'(f_cls[L][k])/(1024.0*cyc_r)/real'(NL);
-                end
-                gbps = real'(tot_bytes) / cyc_r * 0.25;
-                npops = 0; nrels = 0;
-                for (int L = 0; L < NL; L++) begin npops = npops + f_pops[L]; nrels = nrels + f_rels[L]; end
-                $display("     aggregate %0.3f GB/s (decoders could take %0.3f); busy min %0.2f%% mean %0.2f%%; quarters %0.1f/%0.1f/%0.1f/%0.1f%%",
-                         gbps, dem_bpc * 0.25, minb, meanb,
-                         100.0*real'(qwork[0])/(1024.0*real'(NL)*real'(meas/4)),
-                         100.0*real'(qwork[1]-qwork[0])/(1024.0*real'(NL)*real'(meas/4)),
-                         100.0*real'(qwork[2]-qwork[1])/(1024.0*real'(NL)*real'(meas/4)),
-                         100.0*real'(qwork[3]-qwork[2])/(1024.0*real'(NL)*real'(meas/4)));
-                $display("     connections (%0d active): free %0.1f%%  waiting on the origin %0.1f%%  held for the reader %0.1f%%",
-                         s2_conns, 100.0*real'(f_cfree)/(cyc_r*real'(s2_conns)),
-                         100.0*real'(f_cwait)/(cyc_r*real'(s2_conns)), 100.0*real'(f_cheld)/(cyc_r*real'(s2_conns)));
-                $display("     host: waiting for lane credit %0.1f%%, polling for a connection %0.1f%% of the window (decoder admission refusing %0.1f%%); arms free/tail %0d/%0d",
-                         100.0*real'(h_nolane_cyc)/cyc_r, 100.0*real'(h_noconn_cyc)/cyc_r,
-                         100.0*real'(h_noadm_cyc)/cyc_r, s2_n_free, s2_n_tail);
-                $display("     card: write channel %0.1f%% busy (max %0d writes outstanding), shared read channel %0.1f%% busy; space_stall(29)=%0b",
-                         100.0*real'(f_wr_beats)/cyc_r, f_wr_out_max, 100.0*real'(f_rd_beats)/cyc_r, stallWord[29]);
-                $display("FEEDRESULT origin=%s conns=%0d depth=%0d scale=%0d ldepth=%0d busy_min=%0.2f busy_mean=%0.2f gbps=%0.3f ceil=%0.1f empty=%0.2f switch=%0.2f connect=%0.2f rdpath=%0.2f wrpath=%0.2f hol=%0.2f server=%0.2f short=%0.2f cfree=%0.1f cwait=%0.1f cheld=%0.1f hnolane=%0.1f hnoconn=%0.1f hnoadm=%0.1f rdch=%0.1f wrch=%0.1f wrout=%0d pops=%0d rels=%0d",
-                         origin, s2_conns, hdepth, scale, ldep, minb, meanb, gbps, 100.0*ceil_bpc/dem_bpc,
-                         lost_pct[FC_EMPTY], lost_pct[FC_SWITCH], lost_pct[FC_CONNECT], lost_pct[FC_RDPATH],
-                         lost_pct[FC_WRPATH], lost_pct[FC_HOL], lost_pct[FC_SERVER], lost_pct[FC_SHORT],
-                         100.0*real'(f_cfree)/(cyc_r*real'(s2_conns)), 100.0*real'(f_cwait)/(cyc_r*real'(s2_conns)),
-                         100.0*real'(f_cheld)/(cyc_r*real'(s2_conns)),
-                         100.0*real'(h_nolane_cyc)/cyc_r, 100.0*real'(h_noconn_cyc)/cyc_r, 100.0*real'(h_noadm_cyc)/cyc_r,
-                         100.0*real'(f_rd_beats)/cyc_r, 100.0*real'(f_wr_beats)/cyc_r, f_wr_out_max,
-                         npops, nrels);
-                q0 = 100.0*real'(qwork[0])/(1024.0*real'(NL)*real'(meas/4));
-                q3 = 100.0*real'(qwork[3]-qwork[2])/(1024.0*real'(NL)*real'(meas/4));
-                $display("FEEDVERDICT %s (every decoder busy >= 95%%: min %0.2f%%)%s",
-                         (minb >= 95.0) ? "DECODER-BOUND" : "STARVED", minb,
-                         ((q0 - q3) > 2.0 || (q3 - q0) > 2.0) ? " NOT-STEADY (first and last quarter differ by > 2 points)" : "");
-                if (!ok) begin verdict = "HANG (did not drain after the window)"; dump("feed"); end
-                else if (n_err) verdict = "FAIL (byte/framing errors)";
-                else if (s2_any_fatal() != "") verdict = {"FAIL (", s2_any_fatal(), ")"};
-                else verdict = $sformatf("PASS (byte-exact, drained; decoders %0.1f%% busy, %0.3f GB/s)", meanb, gbps);
             end
         end
 
@@ -4295,52 +2898,8 @@ module lane_drain_tb #(
             else            verdict = "PASS";
         end
 
-        // (cuovf) the same on handler_slots: conn 0 overruns its slot -> fatal -> BR_CLOSE releases
-        // the session, while the origin still has +LATE segments in flight for it; they land between
-        // two of conn 1's segments. Runs on the SLOT_LOG2=16 snapshot, like `ovf`.
-        "cuovf": if (DUT_TOE != 0) toe_cu(1'b1); else begin
-            int sid0, sid1, c0, late, blen, p0;
-            if (!$value$plusargs("LATE=%d", late)) late = 1;
-            allow_overflow = 1;
-            lane_ignore[0] = 1;
-            blen = int'(SLOT_BYTES) + 8192;
-            for (int L = 1; L < NL; L++) submit_batch(L, 2, 3000, o);
-            wait_drain(400000, ok);
-            $display("  [cyc=%0d] warm-up drained=%0b", cyc, ok);
-            submit_batch(0, 1, blen, o);
-            t0 = cyc;
-            while ((cyc - t0) < 400000 && !conn_overflowed(0)) @(posedge clk);
-            sid0 = ln[0].sid; sid1 = ln[1].sid;
-            hold_sid = sid0;                           // the rest of conn 0's response is "in flight"
-            $display("  [cyc=%0d] conn 0 (sid %0d) overflowed; origin holds its remaining %0d bytes",
-                     cyc, sid0, sess[sid0].pending.size());
-            c0 = n_close_req; t0 = cyc;
-            while ((cyc - t0) < 400000 && n_close_req == c0) @(posedge clk);
-            $display("  [cyc=%0d] handler closed sid %0d (closes=%0d) conn0 fatal=%0b", cyc, sid0, n_close_req, lane_is_fatal(0));
-            ln[0].planned_total = ln[0].resp_done; ln[0].plan = {}; ln[0].expq = {};
-            ln[0].active = 0; ln[0].must_end = 0;
-            hold_pend_trim(sid0, late * mss);
-            b1 = ln[1].resp_done;
-            hold2_sid = sid1;
-            submit_batch(1, 1, 20000, o);
-            t0 = cyc;
-            while ((cyc - t0) < 400000 && sess[sid1].pending.size() < 20000) @(posedge clk);
-            p0 = sess[sid1].pending.size();
-            hold2_sid = -1;                            // two of conn 1's segments...
-            while ((cyc - t0) < 400000 && sess[sid1].pending.size() > p0 - 8192) @(posedge clk);
-            hold2_sid = sid1;
-            hold_sid  = -1;                            // ...the closed session's late bytes...
-            while ((cyc - t0) < 400000 && sess[sid0].pending.size() > 0) @(posedge clk);
-            $display("  [cyc=%0d] origin: 2 conn-1 segments, then sid %0d's late segment, then the rest of conn 1", cyc, sid0);
-            hold2_sid = -1;                            // ...the rest of conn 1
-            wait_drain(400000, ok);
-            dump("cuovf");
-            $display("  conn 1: %0d -> %0d responses (planned %0d), errors=%0d, readPkgs that popped another session's packet: %0d, conn1 fatal=%0b",
-                     b1, ln[1].resp_done, ln[1].planned_total, n_err, n_meta_mismatch, lane_is_fatal(1));
-            if (n_err)      verdict = $sformatf("CORRUPT (%0d checker errors on the surviving connection)", n_err);
-            else if (!ok)   verdict = "HANG (the surviving connection never completed)";
-            else            verdict = "PASS";
-        end
+        // (cuovf) handler_toe only, see toe_cu.
+        "cuovf": if (DUT_TOE != 0) toe_cu(1'b1); else verdict = "SKIP (handler_toe scenario)";
 
         "fin_overtake": if (DUT_TOE != 0) toe_fin_overtake(); else verdict = "SKIP (handler_toe scenario)";
         "win_ok":       if (DUT_TOE != 0) toe_scen_win(1'b0);      else verdict = "SKIP (handler_toe scenario)";
@@ -4371,7 +2930,7 @@ module lane_drain_tb #(
         int c0;
         wait (rst_n === 1'b1);
         c0 = cyc;
-        // Re-read every cycle rather than `repeat (MAX_CYCLES)`, so a scenario may raise it (feed).
+        // Re-read every cycle rather than `repeat (MAX_CYCLES)`, so a scenario may raise it.
         while ((cyc - c0) < MAX_CYCLES) @(posedge clk);
         $display("!!! global watchdog fired at %0d cycles", cyc);
         dump("watchdog");
