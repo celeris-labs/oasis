@@ -178,6 +178,24 @@ void OasisContext::shutdown() {
 // this runs and nothing is allocated.
 void OasisContext::setup_http_slots() {
     auto http = config<HTTPReadConfig>();
+    // CSR revision 6 (handler_toe): the TOE keeps the receive rings itself, in card memory it owns.
+    // There is no slot array, so no page is mapped, nothing is offloaded and SLOT_BASE (write ids
+    // 42/43, which this bitstream does not have) is never written. slot_mode() is false here as well
+    // (revision() reports 2); this branch says so explicitly, validates the GET cap before the first
+    // query (toe_get_cap() throws on an unusable LANE_POLICY), and names the datapath in the log.
+    if (http->toe_ring()) {
+        const auto p = http->policy();
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "OasisContext: TOE receive ring bitstream (CSR rev %u, revision-2 register map): "
+                      "%u lane(s), GET credit %u per lane, ring 2^%u B per session, GETs capped at %llu B; "
+                      "no slot page, no card memory of ours",
+                      unsigned(http->raw_revision()), unsigned(p.num_conns), unsigned(p.get_credit),
+                      unsigned(p.ring_log2), static_cast<unsigned long long>(http->toe_get_cap()));
+        std::fprintf(stderr, "[oasis] %s\n", line);
+        libstf::log(libstf::LogLevel::INFO, "%s", line);
+        return;
+    }
     if (!http->slot_mode()) {
         return;
     }
