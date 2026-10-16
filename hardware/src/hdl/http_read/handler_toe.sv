@@ -492,22 +492,16 @@ module handler_toe #(
         // -- receive and framing ------------------------------------------------------------------
         tcp_read #(
             .RX_FIFO_DEPTH    (RX_FIFO_DEPTH),
-            .EXTERNAL_DISPATCH(1),
             .RSV_EXACT        (1)
         ) inst_tcp_read (
             .clk(ap_clk), .rst_n(ap_rst_n),
             // One activation per response. See read_run_q: the reader needs `start` to FALL between
             // responses, and "up and still owing bytes" is a level that does not.
             .start        (read_run_q[L]),
-            .session_id   (conn_sid_q[L]),
             .body_last    (1'b0),   // tlast comes from axis_rewrite_last, by byte count
             .clear_framing(!conn_up_q[L]),
 
-            .rx_req_len('0), .rx_closed(conn_closed[L]), .rx_take_en(),
-            .m_axis_read_package_TVALID(), .m_axis_read_package_TREADY(1'b0),
-            .m_axis_read_package_TDATA (),
-            .s_axis_rx_metadata_TVALID (1'b0), .s_axis_rx_metadata_TREADY(),
-            .s_axis_rx_metadata_TDATA  ('0),
+            .rx_closed(conn_closed[L]),
 
             .s_axis_rx_data_TVALID(conn_tvalid[L]),
             .s_axis_rx_data_TREADY(conn_tready[L]),

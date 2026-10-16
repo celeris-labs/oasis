@@ -1,14 +1,15 @@
 `timescale 1ns / 1ps
 
-// Standalone testbench for tcp_read (+ strip_http) on a persistent connection.
+// Standalone testbench for tcp_read (+ strip_http) on a persistent connection, as the handlers
+// instantiate it: the bytes of one session arrive pre-routed by the handler's receive dispatcher.
 //
-// http_pipeline covers the happy path end to end. This bench exists for the three things that are
-// awkward to force through the whole handler and that are exactly where keep-alive can go wrong:
+// lane_drain and http_multilane cover the handlers end to end. This bench exists for the things that
+// are awkward to force through the whole handler and that are exactly where keep-alive can go wrong:
 //
-//   1. RESUME MID-PACKET. A TCP segment may carry the tail of body k and the head of response k+1.
-//      When that happens the read for response k must stop with the packet half-consumed and the
-//      read for k+1 must pick it up where it left off -- not issue a new readPkg, because the TOE
-//      has already advanced its app read pointer for that packet and there is nothing to re-read.
+//   1. A RESPONSE BOUNDARY MID-PACKET. A TCP segment may carry the tail of body k and the head of
+//      response k+1. The read for response k must end at the boundary, and the bytes behind it must
+//      stay buffered for the read of k+1 -- the dispatcher has already delivered them and will not
+//      deliver them again.
 //
 //   2. CLEAN ABORT. The peer FINs with nothing left to read and no body byte of the current
 //      response emitted. Nothing has reached the decoder, so the handler may reopen the connection
@@ -18,10 +19,14 @@
 //      stream and cannot be unsent, so replaying would duplicate them: error=1, error_dirty=1. This
 //      is the guard that keeps a lost connection from silently corrupting a column.
 //
-// The TOE model is deliberately small: a byte stream, a queue of announced segment lengths, and a
-// readPkg responder that hands back exactly ONE announced segment per request -- the real contract
-// under TCP_STACK_RX_DDR_BYPASS_EN=1, where a readPkg is a bare token and rxAppMemDataRead pops one
-// packet from the shared FIFO regardless of the length asked for.
+//   4. THE READPKG RESERVATION, in both forms: one MSS per readPkg (RSV_EXACT=0, handler_multi,
+//      dut_m) and the exact one (RSV_EXACT=1, handler_toe, dut_x). Every beat the lane has promised
+//      room for must be accepted.
+//
+// The dispatcher model for the default DUT (handler_multi's configuration) is deliberately small: a
+// byte stream and a queue of announced segment lengths; a segment is delivered whole, in order,
+// once the lane offers rx_space_ok, with rx_pkg_issued pulsed for it -- the contract rx_dispatch
+// keeps under TCP_STACK_RX_DDR_BYPASS_EN=1, where one readPkg pops one packet from the shared FIFO.
 
 import lynxTypes::*;
 
@@ -35,18 +40,13 @@ module tcp_read_tb;
     always #(CLK_NS/2) clk = ~clk;
 
     logic        start;
-    logic [15:0] session_id = 16'h0100;
     logic        body_last;
     logic        clear_framing;
 
-    logic [TCP_LEN_BITS-1:0] rx_req_len;
     logic                    rx_closed;
-    logic                    rx_take_en;
+    logic                    pkg_issued;
+    logic                    space_ok;
 
-    logic                           rdpkg_valid, rdpkg_ready;
-    logic [TCP_RD_PKG_REQ_BITS-1:0] rdpkg_data;
-    logic                           rxmeta_valid, rxmeta_ready;
-    logic [TCP_RX_META_BITS-1:0]    rxmeta_data;
     logic                           rxdata_valid, rxdata_ready;
     logic [AXI_DATA_BITS-1:0]       rxdata_data;
     logic [LANES-1:0]               rxdata_keep;
@@ -61,9 +61,9 @@ module tcp_read_tb;
     logic [23:0] status_ascii;
     logic [31:0] body_remaining;
     logic [3:0]  state_debug;
-    // $clog2(RX_FIFO_DEPTH+1). Was 11 when the fifo was 1024 deep; 4096 needs 13, and a too-narrow
-    // net here silently truncates the level the assertions read.
-    logic [12:0] rx_fifo_level;
+    // $clog2(RX_FIFO_DEPTH+1) for the default depth of 8192. A too-narrow net here silently
+    // truncates the level the assertions read.
+    logic [13:0] rx_fifo_level;
     logic        rx_fifo_stall;
     logic        read_timeout;
 
@@ -78,20 +78,13 @@ module tcp_read_tb;
         .clk(clk),
         .rst_n(rst_n),
         .start(start),
-        .session_id(session_id),
         .body_last(body_last),
         .clear_framing(clear_framing),
 
-        .rx_req_len(rx_req_len),
-        .rx_closed (rx_closed),
-        .rx_take_en(rx_take_en),
+        .rx_pkg_issued(pkg_issued),
+        .rx_pkg_beats ('0),
+        .rx_closed    (rx_closed),
 
-        .m_axis_read_package_TVALID(rdpkg_valid),
-        .m_axis_read_package_TREADY(rdpkg_ready),
-        .m_axis_read_package_TDATA (rdpkg_data),
-        .s_axis_rx_metadata_TVALID (rxmeta_valid),
-        .s_axis_rx_metadata_TREADY (rxmeta_ready),
-        .s_axis_rx_metadata_TDATA  (rxmeta_data),
         .s_axis_rx_data_TVALID     (rxdata_valid),
         .s_axis_rx_data_TREADY     (rxdata_ready),
         .s_axis_rx_data_TDATA      (rxdata_data),
@@ -111,9 +104,12 @@ module tcp_read_tb;
         .status_ascii(status_ascii),
         .status_ok(status_ok),
         .body_remaining(body_remaining),
+        .content_length(),
         .rx_fifo_level(rx_fifo_level),
         .rx_fifo_stall(rx_fifo_stall),
         .read_timeout(read_timeout),
+        .rx_space_ok(space_ok),
+        .rx_free_beats(),
         .debug_rx_write_ptr(),
         .debug_rx_buffer_w0(),
         .debug_rx_buffer_w1(),
@@ -121,7 +117,7 @@ module tcp_read_tb;
     );
 
     // ---------------------------------------------------------------------------------------------
-    // SECOND DUT: EXTERNAL_DISPATCH=1, RSV_EXACT=1 (toe_rx's lane, TOE in non-bypass mode).
+    // SECOND DUT: RSV_EXACT=1 (toe_rx's lane, TOE in non-bypass mode).
     //
     // The caller reserves exactly the beats of each readPkg (rx_pkg_issued + rx_pkg_beats) and
     // may only do so while rx_free_beats covers them; the data then arrives unconditionally. A
@@ -140,13 +136,11 @@ module tcp_read_tb;
     logic [LANES-1:0]         x_bkeep;
     logic                     x_done, x_error, x_fifo_stall;
 
-    tcp_read #(.RX_FIFO_DEPTH(XDEPTH), .WATCHDOG_BITS(16), .EXTERNAL_DISPATCH(1), .RSV_EXACT(1)) dut_x (
+    tcp_read #(.RX_FIFO_DEPTH(XDEPTH), .WATCHDOG_BITS(16), .RSV_EXACT(1)) dut_x (
         .clk(clk), .rst_n(rst_n),
-        .start(x_start), .session_id(16'h0200), .body_last(1'b1), .clear_framing(x_clear),
+        .start(x_start), .body_last(1'b1), .clear_framing(x_clear),
         .rx_pkg_issued(x_pkg), .rx_pkg_beats(x_pkg_beats),
-        .rx_req_len('0), .rx_closed(x_closed), .rx_take_en(),
-        .m_axis_read_package_TVALID(), .m_axis_read_package_TREADY(1'b0), .m_axis_read_package_TDATA(),
-        .s_axis_rx_metadata_TVALID(1'b0), .s_axis_rx_metadata_TREADY(), .s_axis_rx_metadata_TDATA('0),
+        .rx_closed(x_closed),
         .s_axis_rx_data_TVALID(x_dvalid), .s_axis_rx_data_TREADY(x_dready),
         .s_axis_rx_data_TDATA (x_ddata),  .s_axis_rx_data_TKEEP (x_dkeep),
         .s_axis_rx_data_TLAST (x_dlast),
@@ -156,6 +150,40 @@ module tcp_read_tb;
         .status_ascii(), .status_ok(), .content_length(), .body_remaining(), .read_timeout(),
         .rx_fifo_level(x_level), .rx_fifo_stall(x_fifo_stall),
         .rx_space_ok(), .rx_free_beats(x_free),
+        .debug_rx_write_ptr(), .debug_rx_buffer_w0(), .debug_rx_buffer_w1(), .state_debug()
+    );
+
+    // ---------------------------------------------------------------------------------------------
+    // THIRD DUT: RSV_EXACT=0 (handler_multi's lane, rx_dispatch, TOE in bypass mode) with a small
+    // fifo (MDEPTH), so the one-MSS-per-readPkg reservation can be driven to its limit with the
+    // decoder held off. See case_rsv_mss.
+    // ---------------------------------------------------------------------------------------------
+    localparam int MDEPTH = 256;
+    localparam int MLB    = $clog2(MDEPTH + 1);
+    logic                     m_start, m_clear, m_pkg, m_space;
+    logic [MLB-1:0]           m_level;
+    logic                     m_dvalid, m_dready, m_dlast;
+    logic [AXI_DATA_BITS-1:0] m_ddata;
+    logic [LANES-1:0]         m_dkeep;
+    logic                     m_bvalid, m_bready, m_blast;
+    logic [AXI_DATA_BITS-1:0] m_bdata;
+    logic [LANES-1:0]         m_bkeep;
+    logic                     m_done, m_error, m_fifo_stall;
+
+    tcp_read #(.RX_FIFO_DEPTH(MDEPTH), .WATCHDOG_BITS(16)) dut_m (
+        .clk(clk), .rst_n(rst_n),
+        .start(m_start), .body_last(1'b1), .clear_framing(m_clear),
+        .rx_pkg_issued(m_pkg), .rx_pkg_beats('0),
+        .rx_closed(1'b0),
+        .s_axis_rx_data_TVALID(m_dvalid), .s_axis_rx_data_TREADY(m_dready),
+        .s_axis_rx_data_TDATA (m_ddata),  .s_axis_rx_data_TKEEP (m_dkeep),
+        .s_axis_rx_data_TLAST (m_dlast),
+        .m_axis_body_tvalid(m_bvalid), .m_axis_body_tready(m_bready),
+        .m_axis_body_tdata (m_bdata),  .m_axis_body_tkeep (m_bkeep), .m_axis_body_tlast(m_blast),
+        .done(m_done), .error(m_error), .error_dirty(), .resp_error(),
+        .status_ascii(), .status_ok(), .content_length(), .body_remaining(), .read_timeout(),
+        .rx_fifo_level(m_level), .rx_fifo_stall(m_fifo_stall),
+        .rx_space_ok(m_space), .rx_free_beats(),
         .debug_rx_write_ptr(), .debug_rx_buffer_w0(), .debug_rx_buffer_w1(), .state_debug()
     );
 
@@ -170,26 +198,22 @@ module tcp_read_tb;
     // With the decoupling fifo in between, TREADY may only ever drop because the fifo is genuinely
     // full -- never because the parser is busy. At these test sizes the fifo never fills, so the
     // correct count is exactly zero, and any non-zero value means the parser is back in the path.
+    // The dispatcher does not hold a beat for TREADY, so every one of these is also a lost beat.
     // ---------------------------------------------------------------------------------------------
     int unsigned stall_cycles = 0;
     always @(posedge clk) begin
-        if (rst_n && rxdata_valid && !rxdata_ready && (state_debug == 4'd9)) begin
+        if (rst_n && rxdata_valid && !rxdata_ready) begin
             stall_cycles <= stall_cycles + 1;
         end
     end
 
     // ---------------------------------------------------------------------------------------------
-    // TOE model
+    // Dispatcher model
     // ---------------------------------------------------------------------------------------------
     logic [7:0] wire_q[$];   // the connection's byte stream
-    int         seg_q[$];    // announced-but-unread segment lengths
+    int         seg_q[$];    // announced-but-undelivered segment lengths
     int         delivered = 0;
-    int         readpkgs  = 0;
-
-    // rx_req_len is the oldest announcement, recomputed mid-cycle so it is settled by the posedge
-    // where the DUT samples it. The queue is popped by the readPkg responder below, which is also
-    // where the one-readPkg-per-announcement contract is enforced.
-    always @(negedge clk) rx_req_len = (seg_q.size() > 0) ? TCP_LEN_BITS'(seg_q[0]) : '0;
+    int         pkts      = 0;
 
     task automatic push_str(input string s);
         for (int i = 0; i < s.len(); i++) wire_q.push_back(8'(s.getc(i)));
@@ -214,11 +238,11 @@ module tcp_read_tb;
         announced += n;
     endtask
 
-    // readPkg -> rx meta + rx data. Hands back exactly the oldest announced segment.
+    // One announced segment at a time, once the lane offers room for an MSS: rx_pkg_issued for one
+    // cycle, then the segment's beats back to back after the readPkg's round trip, tlast on the
+    // last. A beat is never held for TREADY (see the monitor above).
     initial begin
-        rdpkg_ready  = 1'b0;
-        rxmeta_valid = 1'b0;
-        rxmeta_data  = '0;
+        pkg_issued   = 1'b0;
         rxdata_valid = 1'b0;
         rxdata_data  = '0;
         rxdata_keep  = '0;
@@ -230,26 +254,13 @@ module tcp_read_tb;
             automatic logic [LANES-1:0]         keep;
 
             @(posedge clk);
-            rdpkg_ready <= 1'b1;
-            @(posedge clk);
-            while (!(rdpkg_valid && rdpkg_ready)) @(posedge clk);
-            len = int'(rdpkg_data[TCP_LEN_BITS+TCP_SESSION_BITS-1:TCP_SESSION_BITS]);
-            rdpkg_ready <= 1'b0;
-            readpkgs++;
-
-            if (seg_q.size() == 0) $fatal(1, "readPkg with no announcement outstanding");
-            if (len != seg_q[0]) begin
-                $fatal(1, "readPkg asked for %0d bytes but the oldest announcement is %0d -- one readPkg must name exactly one announced segment",
-                       len, seg_q[0]);
-            end
+            if (seg_q.size() == 0 || !space_ok || clear_framing) continue;
             len = seg_q.pop_front();
-
-            repeat (2) @(posedge clk);
-            rxmeta_data  <= session_id;
-            rxmeta_valid <= 1'b1;
+            pkg_issued <= 1'b1;
             @(posedge clk);
-            while (!rxmeta_ready) @(posedge clk);
-            rxmeta_valid <= 1'b0;
+            pkg_issued <= 1'b0;
+            pkts++;
+            repeat (2) @(posedge clk);
 
             off = delivered;
             n   = (len + LANES - 1) / LANES;
@@ -266,11 +277,10 @@ module tcp_read_tb;
                 rxdata_last  <= (i == n - 1);
                 rxdata_valid <= 1'b1;
                 @(posedge clk);
-                while (!rxdata_ready) @(posedge clk);
-                rxdata_valid <= 1'b0;
-                rxdata_last  <= 1'b0;
-                delivered    = off + (i + 1) * LANES > off + len ? off + len : off + (i + 1) * LANES;
+                delivered = off + i * LANES + in_beat;
             end
+            rxdata_valid <= 1'b0;
+            rxdata_last  <= 1'b0;
             delivered = off + len;
         end
     end
@@ -304,7 +314,7 @@ module tcp_read_tb;
         got.delete();
         delivered = 0;
         announced = 0;
-        readpkgs  = 0;
+        pkts      = 0;
         tlasts    = 0;
         repeat (3) @(posedge clk);
         #1;
@@ -359,11 +369,10 @@ module tcp_read_tb;
     // Cases
     // ---------------------------------------------------------------------------------------------
 
-    // Two responses announced as ONE segment, so the boundary falls inside a readPkg. The first read
-    // must stop mid-packet; the second must resume it without asking the TOE for anything new.
+    // Two responses announced as ONE segment, so the boundary falls inside a packet. The first read
+    // must end at the boundary; the second must frame the rest out of what is already buffered --
+    // nothing more is delivered.
     task automatic case_resume_mid_packet();
-        int pkgs_after_first;
-
         $display("--- case_resume_mid_packet ---");
         reset_all();
         append_response(120, 8'h10);
@@ -371,7 +380,6 @@ module tcp_read_tb;
         announce(wire_q.size());          // a single segment covering both responses
 
         read_one();
-        pkgs_after_first = readpkgs;
         if (error) begin
             $error("[resume] first read reported error (dirty=%0b)", error_dirty);
             fails++;
@@ -391,13 +399,9 @@ module tcp_read_tb;
         end
         finish_read();
 
-        if (readpkgs != pkgs_after_first) begin
-            $error("[resume] second read issued %0d extra readPkg(s); the packet was already half consumed",
-                   readpkgs - pkgs_after_first);
+        if (pkts != 1) begin
+            $error("[resume] %0d packets delivered, expected the one", pkts);
             fails++;
-        end else begin
-            $display("[PASS] resume/no_extra_readpkg (%0d readPkg total)", readpkgs);
-            passes++;
         end
         if (tlasts != 2) begin
             $error("[resume] %0d tlast, expected 2", tlasts);
@@ -425,9 +429,9 @@ module tcp_read_tb;
         finish_read();
     endtask
 
-    // Nothing ever arrives. Before the watchdog, ST_WAIT_NOTIFY had no exit for this at all: it left
-    // only on the framer finishing, an announcement arriving, or the connection closing. After a
-    // reconnect none of those can happen if the pending announcement belonged to the dead session,
+    // Nothing ever arrives. Before the watchdog, waiting for data had no exit for this at all: it
+    // ended only on the framer finishing, an announcement arriving, or the connection closing. After
+    // a reconnect none of those can happen if the pending announcement belonged to the dead session,
     // so the reader waited forever and the board needed a reprogram. A scale-30 run hit exactly this
     // and burned 900 seconds.
     task automatic case_read_watchdog();
@@ -435,7 +439,6 @@ module tcp_read_tb;
         $display("--- case_read_watchdog ---");
         reset_all();
         // No announcement, no data, no close. The one situation with no way out.
-        rx_req_len = '0;
         rx_closed  = 1'b0;
 
         start = 1'b1;
@@ -446,7 +449,7 @@ module tcp_read_tb;
         end
 
         if (!done) begin
-            $error("[watchdog] still waiting after %0d cycles -- ST_WAIT_NOTIFY has no timeout and this hangs the board", waited);
+            $error("[watchdog] still waiting after %0d cycles -- no timeout, and this hangs the board", waited);
             fails++;
         end else if (!error) begin
             $error("[watchdog] finished without reporting an error -- the handler would treat a dead read as a success");
@@ -537,6 +540,155 @@ module tcp_read_tb;
             fails++;
         end else begin
             $display("[PASS] split_chunk/single_tlast");
+            passes++;
+        end
+    endtask
+
+    // ---------------------------------------------------------------------------------------------
+    // RSV_EXACT=0 (dut_m): one MSS per readPkg.
+    //
+    // A readPkg may be issued only while rx_space_ok, which counts every issued-and-undelivered
+    // readPkg as a whole MSS segment (64 beats + 2). With the decoder held off the issuer keeps
+    // going until rx_space_ok falls; every beat of every issued segment must still be ACCEPTED.
+    // Then the decoder runs, the body must be byte-exact with one tlast, and clear_framing must drop
+    // every promise.
+    // ---------------------------------------------------------------------------------------------
+    logic [7:0] m_wire[$];
+    int         m_pend[$];
+    int         m_sent, m_deliv, m_refused, m_held_pkts;
+    logic [7:0] m_got[$];
+    int         m_tlasts;
+
+    always @(posedge clk) begin
+        if (rst_n && m_dvalid && !m_dready) m_refused++;
+        if (rst_n && m_bvalid && m_bready) begin
+            for (int lane = 0; lane < LANES; lane++) if (m_bkeep[lane]) m_got.push_back(m_bdata[lane*8 +: 8]);
+            if (m_blast) m_tlasts++;
+        end
+    end
+
+    task automatic case_rsv_mss();
+        int body, total, guard, stuck;
+        $display("--- case_rsv_mss (RSV_EXACT=0, DEPTH %0d) ---", MDEPTH);
+        body = 30000;
+        m_wire.delete(); m_pend.delete(); m_got.delete();
+        m_sent = 0; m_deliv = 0; m_refused = 0; m_tlasts = 0; m_held_pkts = 0;
+        begin
+            string h;
+            h = $sformatf("HTTP/1.1 206 Partial Content\015\012Content-Length: %0d\015\012\015\012", body);
+            for (int i = 0; i < h.len(); i++) m_wire.push_back(8'(h.getc(i)));
+            for (int i = 0; i < body; i++) m_wire.push_back(8'h60 + i[7:0]);
+        end
+        total = m_wire.size();
+        m_bready = 1'b0;           // the decoder is held off for the first phase
+        m_start  = 1'b1;
+        fork
+            begin : issuer
+                while (m_sent < total) begin
+                    automatic int len;
+                    @(posedge clk);
+                    if (!m_space || ($urandom_range(0, 3) == 0)) continue;
+                    len = (total - m_sent > 4096) ? 4096 : (total - m_sent);
+                    m_pkg <= 1'b1;
+                    m_pend.push_back(len);
+                    m_sent += len;
+                    if (!m_bready) m_held_pkts++;
+                    @(posedge clk);
+                    m_pkg <= 1'b0;
+                    repeat (2) @(posedge clk);   // until the charge shows up in rx_space_ok
+                end
+            end
+            begin : deliverer
+                while (m_deliv < total) begin
+                    @(posedge clk);
+                    if (m_pend.size() > 0) begin
+                        automatic int len = m_pend.pop_front();
+                        automatic int n   = (len + LANES - 1) / LANES;
+                        repeat ($urandom_range(2, 12)) @(posedge clk);
+                        for (int i = 0; i < n; i++) begin
+                            automatic int nb = ((len - i*LANES) > LANES) ? LANES : (len - i*LANES);
+                            automatic logic [AXI_DATA_BITS-1:0] d = '0;
+                            automatic logic [LANES-1:0]         k = '0;
+                            for (int b = 0; b < nb; b++) begin
+                                d[b*8 +: 8] = m_wire[m_deliv + i*LANES + b];
+                                k[b] = 1'b1;
+                            end
+                            m_ddata <= d; m_dkeep <= k; m_dlast <= (i == n - 1); m_dvalid <= 1'b1;
+                            @(posedge clk);
+                        end
+                        m_dvalid <= 1'b0; m_dlast <= 1'b0;
+                        m_deliv += len;
+                    end
+                end
+            end
+            begin : stall_watch
+                stuck = 0;
+                guard = 0;
+                while (stuck < 400 && guard < 200000) begin
+                    automatic int s0 = m_sent;
+                    @(posedge clk);
+                    guard++;
+                    if (m_sent == s0 && m_pend.size() == 0 && !m_dvalid) stuck++; else stuck = 0;
+                end
+                if (m_space !== 1'b0 || m_sent >= total) begin
+                    $error("[rsv_mss] held decoder: rx_space_ok=%0b with %0d of %0d bytes issued -- the reservation never stopped the issuer",
+                           m_space, m_sent, total);
+                    fails++;
+                end else begin
+                    $display("[PASS] rsv_mss/bounded (%0d MSS readPkgs while held, level %0d of %0d, rx_space_ok low)",
+                             m_held_pkts, m_level, MDEPTH);
+                    passes++;
+                end
+                m_bready = 1'b1;
+            end
+        join
+        guard = 0;
+        while (!m_done && guard < 100000) begin @(posedge clk); guard++; end
+        repeat (10) @(posedge clk);
+        if (m_refused != 0) begin
+            $error("[rsv_mss] %0d promised beat(s) were REFUSED by the fifo", m_refused);
+            fails++;
+        end else if (m_fifo_stall !== 1'b0) begin
+            $error("[rsv_mss] sticky overflow_stall set");
+            fails++;
+        end else begin
+            $display("[PASS] rsv_mss/never_refused");
+            passes++;
+        end
+        if (!m_done || m_error || m_tlasts != 1 || m_got.size() != body) begin
+            $error("[rsv_mss] done=%0b error=%0b tlasts=%0d body bytes %0d of %0d",
+                   m_done, m_error, m_tlasts, m_got.size(), body);
+            fails++;
+        end else begin
+            automatic int bad = -1;
+            for (int i = 0; i < body; i++) if (bad < 0 && m_got[i] !== 8'h60 + i[7:0]) bad = i;
+            if (bad >= 0) begin
+                $error("[rsv_mss] body byte %0d = 0x%02x", bad, m_got[bad]);
+                fails++;
+            end else begin
+                $display("[PASS] rsv_mss/body (%0d bytes byte-exact, one tlast)", body);
+                passes++;
+            end
+        end
+        // one MSS charged on an empty fifo, then clear_framing drops it
+        m_start = 1'b0;
+        m_pkg <= 1'b1;
+        @(posedge clk);
+        m_pkg <= 1'b0;
+        repeat (3) @(posedge clk);
+        if (dut_m.rsv_beats_q != 66) begin
+            $error("[rsv_mss] after one charge on an empty fifo: rsv=%0d, want 66", dut_m.rsv_beats_q);
+            fails++;
+        end
+        m_clear = 1'b1;
+        repeat (3) @(posedge clk);
+        m_clear = 1'b0;
+        repeat (3) @(posedge clk);
+        if (dut_m.rsv_beats_q != 0 || m_space !== 1'b1) begin
+            $error("[rsv_mss] after clear_framing: rsv=%0d space_ok=%0b (want 0/1)", dut_m.rsv_beats_q, m_space);
+            fails++;
+        end else begin
+            $display("[PASS] rsv_mss/charge_and_clear (one MSS charged, clear drops it)");
             passes++;
         end
     endtask
@@ -718,12 +870,19 @@ module tcp_read_tb;
     end
 
     initial begin
+        m_start = 1'b0; m_clear = 1'b1; m_pkg = 1'b0;
+        m_dvalid = 1'b0; m_dlast = 1'b0; m_ddata = '0; m_dkeep = '0; m_bready = 1'b1;
+        @(posedge rst_n);
+        repeat (3) @(posedge clk);
+        m_clear = 1'b0;
+    end
+
+    initial begin
         start         = 1'b0;
         clear_framing = 1'b1;
         body_last     = 1'b1;
         rx_closed     = 1'b0;
         body_tready   = 1'b1;
-        rx_req_len    = '0;
         repeat (5) @(posedge clk);
         rst_n = 1'b1;
         @(posedge clk);
@@ -733,6 +892,8 @@ module tcp_read_tb;
         case_dirty_abort();
         case_split_chunk();
         case_read_watchdog();
+        repeat (5) @(posedge clk);
+        case_rsv_mss();
         repeat (5) @(posedge clk);
         case_rsv_exact();
 
@@ -744,7 +905,7 @@ module tcp_read_tb;
             $error("[decoupling] parser back-pressured the TCP stack for %0d cycles -- strip_http is in the drain path again", stall_cycles);
             fails++;
         end else begin
-            $display("[PASS] no_toe_backpressure (0 cycles of TVALID && !TREADY in ST_RECV_DATA)");
+            $display("[PASS] no_toe_backpressure (0 cycles of TVALID && !TREADY)");
             passes++;
         end
         if (rx_fifo_stall !== 1'b0) begin

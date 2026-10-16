@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rx_dispatch + N x tcp_read(EXTERNAL_DISPATCH=1): the multi-session receive path, end to end.
+# rx_dispatch + N x tcp_read: the multi-session receive path, end to end.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 HDL="$ROOT/../../src/hdl/http_read"

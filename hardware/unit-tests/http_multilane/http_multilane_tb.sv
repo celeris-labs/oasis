@@ -3,7 +3,7 @@
 import lynxTypes::*;
 
 // =================================================================================================
-// rx_dispatch + N x tcp_read(EXTERNAL_DISPATCH=1) -- the multi-session receive path, end to end.
+// rx_dispatch + N x tcp_read -- the multi-session receive path, end to end.
 //
 // rx_dispatch has its own unit tests and so does tcp_read; neither can catch what this bench is
 // for. The claim under test is the one the whole arrangement exists to make:
@@ -12,11 +12,9 @@ import lynxTypes::*;
 //     stream come out correctly framed, on their own lanes, and a lane whose consumer stalls
 //     does not stall the others.
 //
-// That last clause is the point. The single-connection design demuxes AFTER strip_http
-// (vfpga_top.svh gen_http_lane_sel), where a busy lane back-pressures the shared body stream and
-// stalls every lane -- its own comment concedes "the same head-of-line behaviour the single-lane
-// design had". Moving the demux upstream is only worth doing if that goes away, so test 2 fails
-// the build if it has not.
+// That last clause is the point. The retired single-connection design demuxed AFTER strip_http,
+// where a busy lane back-pressured the shared body stream and stalled every lane. Moving the demux
+// upstream is only worth doing if that goes away, so test 2 fails the build if it has not.
 // =================================================================================================
 module http_multilane_tb;
 
@@ -96,21 +94,14 @@ module http_multilane_tb;
     for (genvar L = 0; L < NUM_CONNS; L++) begin : gen_lane
         tcp_read #(
             .RX_FIFO_DEPTH    (RX_DEPTH),
-            .WATCHDOG_BITS    (16),
-            .EXTERNAL_DISPATCH(1)
+            .WATCHDOG_BITS    (16)
         ) dut_read (
             .clk(clk), .rst_n(rst_n),
             .start        (lane_start[L]),
-            .session_id   (16'(100 + L)),
             .body_last    (1'b1),
             .clear_framing(lane_clear[L]),
 
-            // Owned by rx_dispatch now.
-            .rx_req_len('0), .rx_closed(conn_closed[L]), .rx_take_en(),
-            .m_axis_read_package_TVALID(), .m_axis_read_package_TREADY(1'b0),
-            .m_axis_read_package_TDATA (),
-            .s_axis_rx_metadata_TVALID (1'b0), .s_axis_rx_metadata_TREADY(),
-            .s_axis_rx_metadata_TDATA  ('0),
+            .rx_closed(conn_closed[L]),
 
             .s_axis_rx_data_TVALID(conn_tvalid[L]),
             .s_axis_rx_data_TREADY(conn_tready[L]),
