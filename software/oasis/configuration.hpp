@@ -29,10 +29,9 @@ bool http_debug_enabled();
 constexpr const uint64_t RDMA_READ_CONFIG_REGS = 2;
 constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
 
-// Matches hardware HttpConfig (39 params [0..38] + START at 39). ID string "HTT".
-// Kept in sync with hardware/src/hdl/http_read/http_config.sv (NUM_PARAM_REGS=39, START_ADDR=39).
-// Must match HTTP_CONFIG_ADDR_SPACE in hardware/src/vfpga_top.svh. Went 32 -> 64 when the GET path
-// grew from 8 to 16 CSR words (32 -> 64 characters), which pushed START from 31 to 39.
+// Matches hardware HttpConfig (params 0..38, START at 39, REQ_TOTAL_BYTES/REQ_CHUNK_BYTES at 40/41).
+// ID string "HTT". Kept in sync with hardware/src/hdl/http_read/http_config.sv (NUM_PARAM_REGS=42,
+// START_ADDR=39). Must match HTTP_CONFIG_ADDR_SPACE in hardware/src/vfpga_top.svh.
 constexpr const uint64_t HTTP_READ_CONFIG_REGS = 64;
 constexpr const uint64_t HTTP_READ_CONFIG_ID   = 0x0000000000485454;
 
@@ -184,7 +183,7 @@ class HTTPReadConfig : public libstf::Config {
     /// one deadlocks -- the arm that would drain the queue is the beat being withheld.
     enum class LaneAdmit : uint8_t { Arm, Entry };
 
-    /// Push the batch's body_last bits, then arm the transfer, ALL ON `lane`. The caller DMAs
+    /// Push the batch's chunk-length entries, then arm the transfer, ALL ON `lane`. The caller DMAs
     /// `batch.text` into that lane's request stream afterwards -- this only tells the hardware what
     /// is coming.
     ///
@@ -235,7 +234,7 @@ class HTTPReadConfig : public libstf::Config {
     static uint64_t ToeGetCap(uint8_t ring_log2, uint32_t get_credit);
 
     /// Largest byte range one GET may ask for, from the bitstream: toe_get_cap() on revision 6, 0
-    /// ("no limit") on revision 2 and below.
+    /// ("no limit") on revision 2.
     uint64_t max_get_bytes();
 
     /// Pure form of await_lane_credit()'s admission rule, so it can be checked without a board: the
@@ -283,9 +282,8 @@ class HTTPReadConfig : public libstf::Config {
         bool    has_pending   = false; // an announced segment is waiting to be read
         bool    peer_closed   = false; // the peer has FINed
         bool    conn_up       = false; // the persistent connection is established
-        /// The config port can accept another beat. MUST be polled before every START: the write
-        /// register does not back-pressure, so a START landing on an unconsumed beat overwrites it
-        /// and the request is lost silently.
+        /// Admission for the lane last addressed (OR-folded). The host polls the lane's own nibble
+        /// in read id 17 instead -- see await_cfg_ready().
         bool    req_ready     = false;
         /// TCP sessions this bitstream has, one per decoder lane. A field reading 0 (a 16-lane
         /// bitstream truncated into four bits) is normalised to 1 here.
@@ -320,7 +318,7 @@ class HTTPReadConfig : public libstf::Config {
     ///     decoder index. `stream % lanes`, matching what operator.cpp already does when it picks
     ///     the axis_host_recv sink for the request text -- the two MUST agree or a lane's entries
     ///     and its request text land on different lanes.
-    ///   - the single-session handler (lane_count() == 1): there is one connection and the field is
+    ///   - a one-lane bitstream (lane_count() == 1): there is one connection and the field is
     ///     purely the DECODER index, so it stays `stream & 0xF`. Folding it to 0 would send every
     ///     column's bytes to decoder 0.
     ///
@@ -597,8 +595,8 @@ class HTTPReadConfig : public libstf::Config {
     };
     HTTPResponse response();
 
-    /// Requests the hardware can hold at once (0 on a pre-pipelining bitstream). Cached after the
-    /// first read; the value is fixed by the bitstream.
+    /// Column-chunk entries one lane can hold (inflightWord[15:8], saturating at 255). Cached after
+    /// the first read; the value is fixed by the bitstream.
     uint8_t num_slots();
 
     /**
@@ -606,11 +604,7 @@ class HTTPReadConfig : public libstf::Config {
      *
      * `num_slots()` is what the bitstream advertises; this is what is safe to use, and anything
      * sizing a queue against the hardware wants this one. Overridable with `OASIS_HTTP_MAX_INFLIGHT`.
-     *
-     * It is safe to pipeline now only because the handler holds ONE persistent connection: the TOE
-     * (`TCP_STACK_RX_DDR_BYPASS_EN=1`) has a single shared receive FIFO and hands its head to
-     * whichever session asks next, so concurrent SESSIONS read each other's bytes -- but with one
-     * session, arrival order and request order are the same thing. See HTTP_DEFAULT_MAX_INFLIGHT.
+     * See HTTP_DEFAULT_MAX_INFLIGHT.
      */
     uint8_t max_inflight();
 

@@ -212,10 +212,6 @@ libstf::stream_t OasisContext::rdmaBypassStream() {
     return config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
 }
 
-libstf::stream_t OasisContext::httpBypassStream() {
-    return config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
-}
-
 bool OasisContext::isHTTPEnabled() {
     return global_config_.has_config(HTTP_READ_CONFIG_ID);
 }

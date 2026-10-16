@@ -49,7 +49,6 @@ public:
     bool isHTTPEnabled();
 
     libstf::stream_t rdmaBypassStream();
-    libstf::stream_t httpBypassStream();
 
     int device_id() const { return device_id_; }
     int vfpga_id() const { return vfpga_id_; }
