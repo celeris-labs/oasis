@@ -377,8 +377,8 @@ module lane_drain_tb #(
 
     // =============================================================================================
     // NON-BYPASS TOE MODEL (DUT_TOE=1): the TOE with a 1 MiB receive ring per session
-    // (RX_DDR_BYPASS = 0, patches 0007/0008). From the contract in oasis-debug/2026-10-11/
-    // toe-buffer/WP1.md, not from the RTL:
+    // (RX_DDR_BYPASS = 0, patches 0007/0008). Modelled on the TOE's interface contract (the same
+    // one toe_rx.sv's header states), not on its RTL:
     //   * a segment the peer sends goes into its session's ring; its DATA NOTIFICATION follows after
     //     a random latency through ONE in-order delay fifo (+NLAT: due = now + NLAT/2..NLAT, never
     //     before the previous one); a FIN notification (peer_close) BYPASSES it, so it can overtake;

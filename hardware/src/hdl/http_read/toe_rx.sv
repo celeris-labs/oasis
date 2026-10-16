@@ -15,7 +15,7 @@ import lynxTypes::*;
 // they have landed, and serves readPkg(sid, len) for ANY session in ANY order, returning exactly len
 // bytes from that session's ring. The order constraint is gone; what is left is bookkeeping.
 //
-// THE CONTRACT THIS MODULE RELIES ON (patch 0007; see oasis-debug/2026-10-11/toe-buffer/WP1.md)
+// THE CONTRACT THIS MODULE RELIES ON (the non-bypass TOE as fixed by hardware/patches/0007)
 //   * Notification {sid, len, ip, port, closed, opened}: len bytes of sid are in its ring. A FIN
 //     (len 0, closed) can OVERTAKE earlier data notifications (it bypasses the write-status
 //     delay). Back-pressure on this interface stalls the TOE's rx engine for EVERY session.
