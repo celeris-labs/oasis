@@ -78,6 +78,51 @@ constexpr const uint8_t HTTP_CSR_REVISION_PIPE = 4;
 /// connection d took an arm for) -- see pick_conn(). Revisions 2..4 are driven exactly as before.
 constexpr const uint8_t HTTP_CSR_REVISION_CONNS = 5;
 
+/// CSR revision of the TOE-RING handler (handler_toe, stage 1 of the TOE-buffer redesign,
+/// 2026-10-11): the TOE is built with TCP_STACK_RX_DDR_BYPASS_EN = 0 and keeps a 1 MiB receive ring
+/// per session in card memory itself, so there is no slot, no slot page and no card-memory buffer of
+/// ours (EN_MEM = 0). The REGISTER MAP IS REVISION 2's -- HttpConfig is instantiated with its default
+/// CSR_REV = 2, so read ids 21..38 are a resp_error and write ids 42/43 do not exist -- which is why
+/// the host drives it as PROTOCOL revision 2 (HTTPRevision::Classify). What differs from revision 2:
+///   * ONE GET PER ARM. The handler counts GETs by arms (gets_out +1 per arm, -1 per framed
+///     response); an arm announcing two GETs would be counted once and retired twice.
+///   * THE GET CREDIT. ARM_READY = !stream_busy && gets_out < GET_CREDIT (LANE_POLICY[55:32]).
+///   * THE WINDOW RULE. The TOE never re-opens a window that closed, so per lane the requested but
+///     unread response bytes must stay <= 2^RING_LOG2 (LANE_POLICY[61:56]) - 64 KiB. The host keeps it
+///     by capping every GET at toe_get_cap() -- ((2^RING_LOG2 - 64 KiB) / GET_CREDIT) - 4 KiB of body,
+///     236 KiB at a 1 MiB ring and credit 4 -- and splitting every larger column chunk, whatever
+///     OASIS_HTTP_CHUNK_BYTES says. toe_rx flags a lane past the budget (STALL[24], budget_err).
+/// Anything numerically above this is NOT treated as "at least revision 6": the host refuses a
+/// revision it does not know (HTTPRevision::Classify) instead of guessing its register map.
+constexpr const uint8_t HTTP_CSR_REVISION_TOE = 6;
+
+/// Revision 6: what the window budget keeps free of the ring (2^RING_LOG2) per lane -- the hardware's
+/// budget_err threshold is 2^RING_LOG2 minus this -- and what each GET is charged on top of its body
+/// for the response header (MinIO sends ~630 bytes).
+constexpr const uint64_t HTTP_TOE_RING_SLACK   = 64ULL * 1024ULL;
+constexpr const uint64_t HTTP_TOE_GET_OVERHEAD = 4ULL * 1024ULL;
+
+/**
+ * What a raw CSR revision (inflightWord[31:24]) means to this library. Pure; HTTPReadConfig::
+ * revision() returns `protocol`, so every `revision() >= HTTP_CSR_REVISION_X` gate in the code -- the
+ * register map and the rules -- sees a revision-6 bitstream as the revision 2 its register map is,
+ * and nothing slot-related (revisions 3..5) can run on it.
+ */
+struct HTTPRevision {
+    uint8_t raw      = 0;     // as read from inflightWord[31:24]
+    uint8_t protocol = 0;     // the register map and rules the host drives: 6 -> 2, else raw
+    bool    toe_ring = false; // revision 6: handler_toe (see HTTP_CSR_REVISION_TOE)
+
+    bool lane_csrs() const { return protocol >= HTTP_CSR_REVISION_LANES; }
+    bool slot_mode() const { return protocol >= HTTP_CSR_REVISION_SLOTS; }
+    bool slot_pipelined() const { return protocol >= HTTP_CSR_REVISION_PIPE; }
+    bool conn_placement() const { return protocol >= HTTP_CSR_REVISION_CONNS; }
+
+    /// Throws std::runtime_error on a revision above HTTP_CSR_REVISION_TOE: its register map is not
+    /// known here, and reading or writing by a guess is how a host corrupts a bitstream's state.
+    static HTTPRevision Classify(uint8_t raw);
+};
+
 /// Lane depth on a revision-4 bitstream when OASIS_HTTP_LANE_DEPTH is not set, and the most it may
 /// be set to. Two already hides the per-request round trip behind the previous transfer (the
 /// build-119 depth sweep: per-GET time 1020 -> 848 -> 822 us at depth 1 -> 2 -> 4).
@@ -185,9 +230,17 @@ class HTTPReadConfig : public libstf::Config {
     };
 
     /// Append one column chunk's GETs to `batch`, splitting at split_bytes() -- chunk_bytes(), and on
-    /// a revision-3 bitstream never more than max_get_bytes().
+    /// a revision-3 or revision-6 bitstream never more than max_get_bytes().
     void read_streamed(uint32_t server_ip, uint16_t server_port, const std::string &path,
                        uint64_t range_begin, uint64_t range_end, RequestBatch &batch);
+
+    /// read_streamed()'s body, pure: append the GETs of the column chunk [range_begin, range_end]
+    /// (inclusive) to `batch`, each asking for at most `split` bytes (0 = one GET), and ONE
+    /// chunk_bytes entry for the whole chunk -- the hardware marks the decoder's tlast by counting
+    /// those bytes down, so the chunk ends exactly once however many GETs it was split into.
+    static void AppendChunkGets(const std::string &host, uint16_t server_port,
+                                const std::string &path, uint64_t range_begin, uint64_t range_end,
+                                uint64_t split, RequestBatch &batch);
 
     /// The GETs of `batch` as separate strings, in order, using request_bytes (the whole text if it
     /// is empty). Pure; exposed so the split can be checked without a board.
@@ -224,7 +277,8 @@ class HTTPReadConfig : public libstf::Config {
     /// On a revision-3 bitstream this is legal only for a batch of ONE request: every GET needs its
     /// own arm there (see arm_transfer()), and one arm announcing several GETs would put several
     /// responses into a slot the hardware drains as one. It throws rather than corrupt; the operator
-    /// drives revision 3 through push_entries() + arm_transfer() per request instead.
+    /// drives revision 3 through push_entries() + arm_transfer() per request instead. The same holds
+    /// on revision 6 (one_arm_per_get()), where the GET credit counts arms.
     void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch,
                       uint8_t lane);
 
@@ -247,8 +301,28 @@ class HTTPReadConfig : public libstf::Config {
     /// Revision 3 only: block until the arm just written has been CONSUMED, i.e. CONN_DRAINED for
     /// the lane's connection has fallen. START does not back-pressure and the handler samples the
     /// LIVE registers, so writing the next beat's registers before the arm is consumed would change
-    /// what it arms. A no-op below revision 3.
+    /// what it arms. Revisions 4 and 6: until ARM_READY has fallen (the arm made the lane's request
+    /// stream busy, and the caller sends that text only after this returns). A no-op on revision 2.
     void await_arm_consumed(uint8_t lane);
+
+    // ---- CSR revision 6 (TOE receive rings, handler_toe) ----------------------------------------
+
+    /// True on a revision-6 bitstream (see HTTP_CSR_REVISION_TOE). revision() reports 2 there.
+    bool toe_ring();
+    /// The revision byte exactly as the bitstream reports it (6 on handler_toe), for messages.
+    uint8_t raw_revision();
+    /// True where every GET needs an arm of its own: the slot handler (revision >= 3) and the TOE-ring
+    /// handler (revision 6). The operator then arms, pads and DMAs each GET separately.
+    bool one_arm_per_get() { return slot_mode() || toe_ring(); }
+
+    /// Revision 6: the largest GET body that keeps a lane inside the window rule, from LANE_POLICY
+    /// (GET_CREDIT, RING_LOG2). Throws if the policy word is unusable. 0 on every other revision.
+    uint64_t toe_get_cap();
+    /// Pure form: ((2^ring_log2 - HTTP_TOE_RING_SLACK) / get_credit) - HTTP_TOE_GET_OVERHEAD, i.e.
+    /// GET_CREDIT GETs of that body plus a 4 KiB header each fill the ring up to its budget exactly.
+    /// 0 when the inputs cannot describe a usable ring (credit 0, ring_log2 outside 17..30, or no
+    /// room left for a body).
+    static uint64_t ToeGetCap(uint8_t ring_log2, uint32_t get_credit);
 
     // ---- CSR revision 3 (HBM slots) ----------------------------------------------------------
 
@@ -284,7 +358,7 @@ class HTTPReadConfig : public libstf::Config {
     static HTTPSlotPolicy DecodeSlotPolicy(uint64_t word);
 
     /// Largest byte range one GET may ask for, from the bitstream: slot_policy().max_get_bytes() on
-    /// revision 3, 0 ("no limit") below it.
+    /// revision 3..5, toe_get_cap() on revision 6, 0 ("no limit") on revision 2 and below.
     uint64_t max_get_bytes();
 
     // ---- CSR revision 4 (pipelined GETs on the slot handler) ------------------------------------
@@ -417,8 +491,10 @@ class HTTPReadConfig : public libstf::Config {
     /// Pure form of lane_depth_limit(): `want` (OASIS_HTTP_LANE_DEPTH) clamped to [1, hw]; 1 below
     /// revision 2 (no per-lane occupancy) and at revision 3 (depth 1 per connection); clamped to
     /// [1, min(hw, HTTP_PIPE_MAX_DEPTH)] at revision 4, where the caller passes
-    /// HTTP_PIPE_DEFAULT_DEPTH as `want` when the variable is unset.
-    static size_t LaneDepthFor(uint8_t revision, size_t want, size_t hw);
+    /// HTTP_PIPE_DEFAULT_DEPTH as `want` when the variable is unset. `get_credit` (revision 6, where
+    /// `revision` is the protocol revision 2): when non-zero the depth is also clamped to it, since
+    /// every column chunk is at least one GET and the hardware holds at most GET_CREDIT per lane.
+    static size_t LaneDepthFor(uint8_t revision, size_t want, size_t hw, size_t get_credit = 0);
 
     /// Block until `lane` will accept a beat of this kind, or throw naming the lane and why it will
     /// not. See the definition for why skipping this loses whole batches without raising anything,
@@ -507,8 +583,10 @@ class HTTPReadConfig : public libstf::Config {
     /// which discards it while reporting success. See the note on req_dest in operator.cpp.
     uint8_t lane_count();
 
-    /// CSR revision the programmed bitstream reports (inflightWord[31:24]), cached after the first
-    /// read. 0 on everything built before the per-lane registers.
+    /// The PROTOCOL revision the host drives the programmed bitstream with, cached after the first
+    /// read: inflightWord[31:24] mapped by HTTPRevision::Classify -- the raw value, except that the
+    /// TOE-ring handler's 6 reads as 2 (its register map; see toe_ring() / raw_revision()). 0 on
+    /// everything built before the per-lane registers. Throws on a revision this library does not know.
     uint8_t revision();
 
     /// Whether read ids 16..20 may be READ AT ALL. Reading them on a bitstream below
@@ -648,9 +726,15 @@ class HTTPReadConfig : public libstf::Config {
         uint16_t queue_depth       = 0; // [31:16], chunk entries PER LANE, saturating at 65535
         uint32_t lane_stall_cycles = 0; // [55:32], the HOL watchdog threshold, saturating at 2^24-1
         uint8_t  lane_stall_log2   = 0; // [61:56], exact even where the field above saturates
+        // REVISION 6 REDEFINES [55:32] and [61:56] (there is no head-of-line watchdog in
+        // handler_toe). DecodePolicy() fills exactly one of the two pairs, by revision.
+        uint32_t get_credit        = 0; // [55:32] on revision 6: GETs (arms) per lane unfinished
+        uint8_t  ring_log2         = 0; // [61:56] on revision 6: the TOE's ring per session, log2 B
 
         /// False on a bitstream below HTTP_CSR_REVISION_LANES, where the register was not read.
         bool valid() const { return revision >= HTTP_CSR_REVISION_LANES; }
+        /// Revision 6 (the raw value lives in [7:0], so this needs no other register).
+        bool toe() const { return revision == HTTP_CSR_REVISION_TOE; }
         std::string describe() const;
     };
     HTTPLanePolicy policy();
@@ -767,6 +851,17 @@ class HTTPReadConfig : public libstf::Config {
         /// [31] some decoder found bytes in a slot that belong to no response it was told about:
         /// two GETs armed on one connection, or a server overrunning its Content-Length.
         bool residue_err = false;
+        /// REVISION 6 (handler_toe) REDEFINES [24]: toe_rx's sticky order_err | len_err | budget_err,
+        /// ORed in hardware (software cannot tell the three apart). order_err: an rx_meta/data beat
+        /// with no readPkg outstanding, or naming another session; len_err: a packet's tlast not on
+        /// the beat its readPkg length implies; budget_err: a lane's notified-but-unread ring bytes
+        /// passed 2^RING_LOG2 - 64 KiB (the window rule broken: a GET above toe_get_cap(), more than
+        /// GET_CREDIT outstanding, or an origin ignoring Range). Exactly one of notify_overflow /
+        /// toe_rx_err is decoded from bit 24, by the revision stall() reads it on.
+        bool toe_rx_err = false;
+        /// Set by stall() on a revision-6 bitstream; selects the revision-6 meaning of bits 24/28 in
+        /// describe(). Not a condition.
+        bool toe = false;
         /// The stallWord exactly as read, so a caller can tell a condition it has already reported
         /// from a new one. The named bools above are for reading; this is for comparing.
         uint32_t raw = 0;
@@ -775,11 +870,13 @@ class HTTPReadConfig : public libstf::Config {
             return connect_stalled || send_stalled || read_stalled || init_error || send_error
                    || resp_unframeable || dirty_abort || status_bad || notify_overflow
                    || rx_fifo_stall || read_timeout || align_starved || route_stall
-                   || slot_overflow || residue_err;
+                   || slot_overflow || residue_err || toe_rx_err;
         }
         std::string describe() const;
     };
     HTTPStall stall();
+    /// Pure decoder of the stallWord. `toe_ring` selects the revision-6 meaning of bit 24.
+    static HTTPStall DecodeStall(uint32_t word, bool toe_ring);
 
     /**
      * Read CSRs 12/13: how the last HTTP response was framed (`respWord` in handler.sv).
@@ -839,8 +936,9 @@ class HTTPReadConfig : public libstf::Config {
     static uint64_t chunk_bytes();
 
     /// Every readback register this bitstream has, raw and decoded, as one multi-line string: the
-    /// status/stall/response words (1..15), the per-lane words (16..20, revision >= 2) and the
-    /// per-connection words (21..32, revision 3). Reads only; safe from any thread. This is the
+    /// status/stall/response words (1..15), the per-lane words (16..20, revision >= 2; on revision 6
+    /// with the GET credit, ring size and GET cap), and the per-connection words (21..32, revision 3,
+    /// never on revision 6). Reads only; safe from any thread. This is the
     /// in-process state capture -- a second process cannot attach on a revision-3 board (it would be
     /// ctid 1, and the slot descriptors carry pid 0).
     std::string debug_dump();
@@ -860,8 +958,18 @@ class HTTPReadConfig : public libstf::Config {
     /// normalises a single-session bitstream's 0 to 1.
     uint8_t lane_count_cached_ {0};
 
-    /// CSR revision, cached. -1 until the first read; the value is fixed by the bitstream.
-    int revision_ {-1};
+    /// CSR revision, classified and cached (raw / protocol / toe_ring). `rev_read_` false until the
+    /// first read; the value is fixed by the bitstream.
+    HTTPRevision rev_ {};
+    bool         rev_read_ {false};
+    /// The classification, read once. revision(), raw_revision() and toe_ring() are views of it.
+    const HTTPRevision &rev();
+
+    /// toe_get_cap(), cached. 0 means "not computed yet" (a usable cap is never 0).
+    uint64_t toe_cap_ {0};
+
+    /// Revision 6 half of await_arm_consumed(): block until ARM_READY of `lane` has fallen.
+    void await_arm_taken_toe(uint8_t lane);
 
     /// lane_depth_limit(), cached. 0 means "not computed yet"; the limit itself is never 0.
     size_t lane_depth_ {0};
