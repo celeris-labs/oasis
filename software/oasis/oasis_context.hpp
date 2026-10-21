@@ -32,6 +32,14 @@ public:
     std::shared_ptr<coyote::cThread> cthread();
     std::shared_ptr<libstf::TLBManager> tlb_manager();
 
+    /**
+     * Routes decoded output buffers (allocate_output_buffer / enqueue_output_buffer) to a
+     * separate pool -- e.g. GPU device memory the FPGA writes into via DMABuf -- while inputs
+     * stay in memory_pool(). Call before the first query; nullptr restores the default.
+     */
+    void set_output_memory_pool(std::shared_ptr<libstf::MemoryPool> pool);
+    std::shared_ptr<libstf::TLBManager> output_tlb_manager();
+
     Scheduler &scheduler();
 
     /**
@@ -114,6 +122,8 @@ private:
     libstf::GlobalConfig global_config_;
     std::shared_ptr<libstf::TLBManager> tlb_manager_;
     std::shared_ptr<libstf::MemConfig> mem_config_;
+    std::shared_ptr<libstf::MemoryPool> output_memory_pool_;
+    std::shared_ptr<libstf::TLBManager> output_tlb_manager_;
 
     bool rdma_enabled_;
     std::vector<std::shared_ptr<coyote::cThread>> rdma_cthreads_;
