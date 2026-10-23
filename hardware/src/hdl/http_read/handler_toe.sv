@@ -695,18 +695,19 @@ module handler_toe #(
             BR_IDLE: begin
                 // The first arm is what says a server address exists. Open every lane then, not
                 // lazily per lane: a lane whose connection is opened only when it is first used
-                // pays a handshake in the middle of a query instead of before it.
+                // pays a handshake in the middle of a query instead of before it. The walk starts
+                // at lane 0 (reset); after a refused open it resumes at the lane that was refused,
+                // because the lanes before it are up.
                 if (any_armed_q && (retry_wait_q == '0)) begin
-                    bring_lane_d = '0;
-                    br_d         = BR_OPEN;
+                    br_d = BR_OPEN;
                 end
             end
             BR_OPEN: begin
                 if (init_done) begin
                     if (init_error) begin
-                        // Back off and retry this same lane. A failed open leaves nothing bound,
-                        // so there is no state to unwind -- but DO come back to where we were:
-                        // during bring-up that is the start, after a reconnect it is BR_DONE.
+                        // A refused open leaves nothing bound, so there is nothing to unwind.
+                        // During bring-up, back off in BR_IDLE and retry this same lane; after a
+                        // reconnect, come back to BR_DONE.
                         br_d = bringing_up_q ? BR_IDLE : BR_DONE;
                     end else begin
                         bind_en_w = 1'b1;

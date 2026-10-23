@@ -461,6 +461,14 @@ module lane_drain_tb #(
     // openStatus at all, success or failure. The request stays queued, so clearing the bit lets the
     // TOE answer late -- which is also what the real one does.
     bit open_hang = 1'b0;
+    // Open requests (1-based, in the order the DUT sent them) the TOE answers with success = 0:
+    // a connect the peer refused. No session is created for them.
+    int open_refuse[$];
+    int n_open_ans = 0, n_open_refused = 0;
+    function automatic bit open_refused_here(input int k);
+        foreach (open_refuse[i]) if (open_refuse[i] == k) return 1'b1;
+        return 1'b0;
+    endfunction
     initial begin : open_svc
         Sess s; int lat, sid;
         os_tvalid = 1'b0; os_tdata = '0;
@@ -468,26 +476,36 @@ module lane_drain_tb #(
             @(posedge clk);
             if (rst_n && !open_hang && openq.size() > 0) begin
                 void'(openq.pop_front());
+                n_open_ans = n_open_ans + 1;
                 lat = 40 + ($urandom_range(0, 240));      // tens..hundreds of cycles
                 repeat (lat) @(posedge clk);
-                sid = toe_reuse_sid();
-                if (sid < 0) begin sid = next_sid; next_sid = next_sid + 1; end
-                else begin
-                    n_sid_reused = n_sid_reused + 1;
-                    $display("  [cyc=%0d] TOE: session id %0d REUSED", cyc, sid);
+                if (open_refused_here(n_open_ans)) begin
+                    os_tdata  <= pack_open_rsp(0, 1'b0);
+                    os_tvalid <= 1'b1;
+                    do @(posedge clk); while (!os_tready);
+                    os_tvalid <= 1'b0;
+                    n_open_refused = n_open_refused + 1;
+                    $display("  [cyc=%0d] TOE: REFUSED open request #%0d (openStatus success = 0)", cyc, n_open_ans);
+                end else begin
+                    sid = toe_reuse_sid();
+                    if (sid < 0) begin sid = next_sid; next_sid = next_sid + 1; end
+                    else begin
+                        n_sid_reused = n_sid_reused + 1;
+                        $display("  [cyc=%0d] TOE: session id %0d REUSED", cyc, sid);
+                    end
+                    s = new(); s.sid = sid; s.alive = 1'b1; s.lane = -1; s.scanp = 0;
+                    s.occ = 0; s.occ_max = 0; s.notified = 0; s.requested = 0; s.snd_off = 0;
+                    s.snd_limit = TOE_RING - 16; s.zero_win = 0; s.closed_at = -1; s.rq_out = 0;
+                    s.n_after_close = 0;
+                    if (!sess.exists(sid)) live_sids.push_back(sid);
+                    sess[sid] = s;
+                    os_tdata  <= pack_open_rsp(sid, 1'b1);
+                    os_tvalid <= 1'b1;
+                    do @(posedge clk); while (!os_tready);
+                    os_tvalid <= 1'b0;
+                    n_open_rsp = n_open_rsp + 1;
+                    $display("  [cyc=%0d] TOE: opened session %0d (open request #%0d)", cyc, sid, n_open_ans);
                 end
-                s = new(); s.sid = sid; s.alive = 1'b1; s.lane = -1; s.scanp = 0;
-                s.occ = 0; s.occ_max = 0; s.notified = 0; s.requested = 0; s.snd_off = 0;
-                s.snd_limit = TOE_RING - 16; s.zero_win = 0; s.closed_at = -1; s.rq_out = 0;
-                s.n_after_close = 0;
-                if (!sess.exists(sid)) live_sids.push_back(sid);
-                sess[sid] = s;
-                os_tdata  <= pack_open_rsp(sid, 1'b1);
-                os_tvalid <= 1'b1;
-                do @(posedge clk); while (!os_tready);
-                os_tvalid <= 1'b0;
-                n_open_rsp = n_open_rsp + 1;
-                $display("  [cyc=%0d] TOE: opened session %0d (open request #%0d)", cyc, sid, n_open_rsp);
             end
         end
     end
@@ -2588,6 +2606,31 @@ module lane_drain_tb #(
                 else if (n_err) verdict = "FAIL";
                 else verdict = "PASS";
             end
+        end
+
+        // ---- REFUSED OPENS ---------------------------------------------------------------------------
+        //
+        // (of1) The TOE refuses lane 1's first open (openStatus success = 0) during the initial
+        // bring-up. The handler backs off and retries THAT lane; every lane already up keeps the
+        // session it has. Expected: NL + 1 open requests (lane 1 twice, every other lane once), no
+        // close, lane 1 not fatal, and every batch byte-exact. A bring-up that restarts at lane 0
+        // opens lanes that are already up a second time: their sessions leak, and a lane is rebound
+        // under the GETs it has already sent.
+        "of1": if (NL < 2) verdict = "SKIP (needs at least 2 lanes)"; else begin
+            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
+            open_refuse.push_back(2);
+            for (int L = 0; L < NL; L++) submit_batch(L, 2, 3000, o);
+            wait_drain(600000, ok);
+            $display("  [cyc=%0d] drained=%0b  open requests=%0d (refused %0d, sessions %0d)  closes=%0d  laneErr=0x%016h",
+                     cyc, ok, n_open_req, n_open_refused, n_open_rsp, n_close_req, laneErrWord);
+            if (!ok) begin verdict = "HANG"; dump("of1"); end
+            else if (n_err) begin verdict = "FAIL (routing/framing errors)"; dump("of1"); end
+            else if (n_open_refused != 1) verdict = "FAIL (the TOE never refused an open: the case tested nothing)";
+            else if (n_open_req != NL + 1 || n_close_req != 0)
+                verdict = $sformatf("FAIL (%0d open requests and %0d closes for %0d lanes and one refusal: a lane that was up was opened again)",
+                                    n_open_req, n_close_req, NL);
+            else if (lane_is_fatal(1)) verdict = "FAIL (a refused first open made lane 1 fatal)";
+            else verdict = "PASS (only the refused lane was opened again; every other lane kept its session)";
         end
 
         // ---- LAZY OPEN -----------------------------------------------------------------------------
