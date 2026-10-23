@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "oasis/configuration.hpp"
@@ -11,7 +12,6 @@
 #include <coyote/cDefs.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -61,46 +61,12 @@ string NormalizeHttpPath(const string &path) {
 	return "/" + path;
 }
 
-// Case-insensitive prefix check for HTTP header lines.
-bool StartsWithIgnoreCase(const string &line, const char *prefix) {
-	const auto prefix_len = std::strlen(prefix);
-	if (line.size() < prefix_len) {
-		return false;
-	}
-	for (size_t i = 0; i < prefix_len; i++) {
-		if (std::tolower(static_cast<unsigned char>(line[i])) !=
-		    std::tolower(static_cast<unsigned char>(prefix[i]))) {
-			return false;
-		}
-	}
-	return true;
-}
-
-uint64_t ParseContentLengthHeader(const string &headers) {
-	size_t pos = 0;
-	while (pos < headers.size()) {
-		auto line_end = headers.find("\r\n", pos);
-		if (line_end == string::npos) {
-			break;
-		}
-		auto line = headers.substr(pos, line_end - pos);
-		pos = line_end + 2;
-
-		if (StartsWithIgnoreCase(line, "content-length:")) {
-			auto value = line.substr(std::strlen("content-length:"));
-			value.erase(0, value.find_first_not_of(" \t"));
-			return std::stoull(value);
-		}
-		if (StartsWithIgnoreCase(line, "content-range:")) {
-			// bytes START-END/TOTAL or bytes */TOTAL
-			auto slash = line.rfind('/');
-			if (slash != string::npos && slash + 1 < line.size()) {
-				auto total = line.substr(slash + 1);
-				total.erase(0, total.find_first_not_of(" \t"));
-				if (total != "*") {
-					return std::stoull(total);
-				}
-			}
+// The Content-Length of a reply's header block, or 0.
+uint64_t ParseContentLength(const string &headers) {
+	const string key = "content-length:";
+	for (const auto &line : StringUtil::Split(headers, "\r\n")) {
+		if (StringUtil::CIEquals(line.substr(0, key.size()), key)) {
+			return std::stoull(line.substr(key.size()));
 		}
 	}
 	return 0;
@@ -222,7 +188,12 @@ uint64_t OasisHTTPFileSystem::CachedContentLength(const string &resource_path) {
 
 	// Probe outside the lock, so the workers' first opens do not serialise on one round trip. A
 	// concurrent probe of the same path computes the same value; the second insert is a no-op.
-	const auto size = ProbeContentLength(resource_path);
+	const auto request = "HEAD " + resource_path + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
+	                     std::to_string(server_port_) + "\r\nConnection: close\r\n\r\n";
+	const auto size = ParseContentLength(HttpExchange(request, "HTTP HEAD", resource_path).headers);
+	if (size == 0) {
+		throw IOException("HTTP server did not return Content-Length for '%s'", resource_path);
+	}
 
 	std::lock_guard<std::mutex> lock(size_cache_mtx_);
 	size_cache_.emplace(resource_path, size);
@@ -314,7 +285,7 @@ void OasisHTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, siz
 		throw IOException("HTTP read size %llu exceeds 32-bit limit", (unsigned long long)size);
 	}
 	const uint64_t range_end = offset + size - 1;
-	const auto request = "GET " + NormalizeHttpPath(path) + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
+	const auto request = "GET " + path + " HTTP/1.1\r\nHost: " + server_host_ + ":" +
 	                     std::to_string(server_port_) + "\r\nRange: bytes=" + std::to_string(offset) + "-" +
 	                     std::to_string(range_end) + "\r\nConnection: close\r\n\r\n";
 	const auto reply = HttpExchange(request, "host GET", path);
@@ -334,22 +305,6 @@ void OasisHTTPFileSystem::HTTPReadRange(const string &path, uint64_t offset, siz
 		std::fprintf(stderr, "[httpfpga] host read path=%s range=[%llu,%llu] size=%llu\n", path.c_str(),
 		             (unsigned long long)offset, (unsigned long long)range_end, (unsigned long long)size);
 	}
-}
-
-uint64_t OasisHTTPFileSystem::ProbeContentLength(const string &resource_path) {
-	if (!initialized) {
-		throw IOException("httpfpga:// filesystem is not initialized");
-	}
-
-	const auto request = "HEAD " + NormalizeHttpPath(resource_path) + " HTTP/1.1\r\nHost: " + server_host_ +
-	                     ":" + std::to_string(server_port_) + "\r\nConnection: close\r\n\r\n";
-	const auto reply = HttpExchange(request, "HTTP HEAD", resource_path);
-
-	const auto content_length = ParseContentLengthHeader(reply.headers);
-	if (content_length == 0) {
-		throw IOException("HTTP server did not return Content-Length for '%s'", resource_path);
-	}
-	return content_length;
 }
 
 timestamp_t OasisHTTPFileSystem::GetLastModifiedTime(FileHandle &handle) {

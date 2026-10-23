@@ -62,11 +62,10 @@ public:
 private:
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
 	void ReadBuffered(OasisHTTPFileHandle &h, void *dst, size_t size, uint64_t location);
-	// One ranged GET over a host socket into `dst`.
+	// One ranged GET of the resource path `path` over a host socket into `dst`.
 	void HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst);
 	// The object's Content-Length, from at most one HEAD per path for the session.
 	uint64_t CachedContentLength(const string &resource_path);
-	uint64_t ProbeContentLength(const string &resource_path);
 	// Sends `request` on a new connection and reads the reply until the server closes it. Throws on a
 	// socket error, a malformed reply or a status other than 200/206; `what` names the request.
 	HttpReply HttpExchange(const string &request, const char *what, const string &resource);
