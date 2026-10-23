@@ -5,13 +5,12 @@ import lynxTypes::*;
 // =================================================================================================
 // Testbench for http_req_stream: host request bytes -> TCP transmit.
 //
-// The module replaces the per-request descriptor ring, so the properties that matter are the ones
-// the ring used to guarantee structurally and now have to be checked:
+// The module passes request text the host built through to the TOE, so the properties that matter
+// are the ones a byte stream can break:
 //
-//   1. EVERY byte the host hands over reaches the wire, exactly once, in order. The ring could not
-//      corrupt request text because it rebuilt it from latched fields; a byte stream can, by
-//      dropping or duplicating a beat, and the result would be a malformed GET that MinIO answers
-//      with a 400 whose body then flows into a column.
+//   1. EVERY byte the host hands over reaches the wire, exactly once, in order. Dropping or
+//      duplicating a beat gives a malformed GET that MinIO answers with a 400 whose body then flows
+//      into a column.
 //   2. The announced tx_meta length matches the bytes actually pushed for that chunk. If they
 //      disagree the TOE's idea of the stream and ours diverge permanently.
 //   3. A REFUSED reservation pushes NOTHING and is retried with the same bytes. This is the case

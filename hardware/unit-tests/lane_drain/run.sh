@@ -23,10 +23,11 @@
 #
 # Exit status is 1 if any case failed. Cases whose passing verdict is not the word PASS are declared
 # below rather than guessed: `e` and `s_e` measure CONTAINMENT and say so, `win_bad` breaks the
-# window rule on purpose, and `lz1`/`lz2` are EXPECTED TO FAIL on both DUTs for the same reason --
-# handler_multi predates the lazy-open fix (commit a08b100, which shipped in the broken build-120),
-# and handler_toe keeps its session side. They are reported as XFAIL with that reason instead of
-# being hidden or counted.
+# window rule on purpose, and `lz1`/`lz2` are EXPECTED TO FAIL on both DUTs: they ask for behaviour
+# neither handler has. lz1 wants a lazy open (an idle lane whose peer FINs stays down until its next
+# batch; both handlers reconnect at once), lz2 wants an open that is never answered to time out and
+# free the bring-up FSM (both handlers wait in BR_OPEN; the connect watchdog only raises a sticky
+# bit). They are reported as XFAIL with that reason instead of being hidden or counted.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 HDL="$ROOT/../../src/hdl/http_read"
@@ -57,7 +58,7 @@ if [ -n "$ONE" ] && [ "$DUT" = both ]; then DUT=multi; fi
 
 rm -rf xsim.dir xsim.jou xsim.log xvlog.pb xelab.pb webtalk* .Xil 2>/dev/null || true
 
-xvlog -sv lynxTypes_stub.sv \
+xvlog -sv ../common/lynxTypes_stub.sv \
       "$HDL/http_types.sv" "$HDL/axis_fifo.sv" "$HDL/axis_skid.sv" \
       "$HDL/strip_http.sv" "$HDL/tcp_read.sv" \
       "$HDL/rx_dispatch.sv" "$HDL/tcp_init.sv" "$HDL/http_req_stream.sv" \
@@ -86,6 +87,12 @@ expected() {
   esac
 }
 is_xfail() { case "$1" in lz1|lz2) return 0 ;; *) return 1 ;; esac; }
+xfail_why() {
+  case "$1" in
+    lz1) echo "known limitation: no lazy open, an idle FIN reconnects at once" ;;
+    lz2) echo "known limitation: an open that is never answered holds BR_OPEN" ;;
+  esac
+}
 
 run_rxd() {
   local out
@@ -128,7 +135,7 @@ run_hm() { # <dut> <scen> <lanes> [plusargs...]
   if echo "$verdict" | grep -q ": $exp"; then
     echo "PASS  ${dut}[$lanes]  $scen  ${*:-}"
   elif is_xfail "$scen"; then
-    echo "XFAIL ${dut}[$lanes]  $scen  -- no lazy open (a08b100); identical on both DUTs"
+    echo "XFAIL ${dut}[$lanes]  $scen  -- $(xfail_why "$scen")"
   else
     echo "FAIL  ${dut}[$lanes]  $scen  ${*:-}  -- ${verdict:-no verdict line}"
     FAILS=$((FAILS + 1))
@@ -213,7 +220,7 @@ if [ "$DUT" = toe ] || [ "$DUT" = both ]; then
   run_hm toe win_ok 2
   run_hm toe win_bad 2
   run_hm toe sidreuse 2 SIDREUSE
-  run_hm toe thr_hbm 4
+  run_hm toe thr_ring 4
   # the model's own knobs under older scenarios: slow notifications and reads, session-id reuse
   run_hm toe h 2 NLAT=2000 RDLAT=400
   run_hm toe d 4 NLAT=1000 RDLAT=200

@@ -14,7 +14,7 @@ fi
 cd "$ROOT"
 rm -rf xsim.dir xsim.jou xsim.log xvlog.pb xelab.pb webtalk* .Xil 2>/dev/null || true
 
-xvlog -sv lynxTypes_stub.sv "$HDL/toe_rx.sv" toe_rx_tb.sv > xvlog.log 2>&1 || { tail -30 xvlog.log; exit 1; }
+xvlog -sv ../common/lynxTypes_stub.sv "$HDL/toe_rx.sv" toe_rx_tb.sv > xvlog.log 2>&1 || { tail -30 xvlog.log; exit 1; }
 xelab -debug typical -timescale 1ns/1ps -top toe_rx_tb -snapshot toe_rx_tb_snap > xelab.log 2>&1 \
   || { tail -30 xelab.log; exit 1; }
 A=()

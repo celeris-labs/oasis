@@ -1,9 +1,9 @@
 `timescale 1ns / 1ps
 // =================================================================================================
-// lane_drain_tb -- INDEPENDENT black-box liveness bench for handler_multi AND handler_toe.
+// lane_drain_tb -- black-box liveness bench for handler_multi AND handler_toe.
 //
-// Written from the external contract only.  Nothing below handler_multi's or rx_dispatch's port
-// list was read, and none of the RTL author's benches were consulted.
+// Written against the external contract: the handlers' ports, the TOE's interfaces and the CSR
+// map. Nothing below the port list is modelled or assumed.
 //
 // TWO DUTs, ONE BENCH
 // -------------------
@@ -52,10 +52,10 @@ module lane_drain_tb #(
     parameter int NUM_CONNS     = 2,
     parameter int QUEUE_DEPTH   = 64,
     parameter int RX_FIFO_DEPTH = 2048,
-    // handler_multi's connect watchdog, in cycles: it raises the sticky conn_stall bit and, with it,
-    // gives BR_OPEN its only escape. Left at the DUT's own default for every scenario but 'lz2',
-    // which has to WAIT for it -- 2^28 cycles is a second of wall clock on the board and a week in
-    // xsim, so that one scenario gets its own snapshot with a small value.
+    // The handler's connect watchdog, in cycles: it raises the sticky conn_stall bit. Left at the
+    // DUT's own default for every scenario but 'lz2', which has to WAIT for it -- 2^28 cycles is a
+    // second of wall clock on the board and a week in xsim, so that one scenario gets its own
+    // snapshot with a small value.
     parameter int STALL_CYCLES  = 268435456,
 
     // 1 = handler_toe (the TOE with a receive ring per session, RX_DDR_BYPASS = 0), against the
@@ -63,7 +63,7 @@ module lane_drain_tb #(
     parameter int DUT_TOE = 0,
     // handler_toe's FIN settle, exposed so a mutant can be run (fin_overtake must fail at ~200).
     parameter int TOE_CLOSE_SETTLE = 4096,
-    // handler_toe's FRAMER_SLICE, exposed so the variant without the 61ad533 slice can be run.
+    // handler_toe's FRAMER_SLICE, exposed so the variant without the framer slice can be run.
     parameter bit TOE_FRAMER_SLICE = 1'b1
 );
     localparam int  NL     = NUM_CONNS;   // lanes: lane L = connection L = decoder L
@@ -1118,9 +1118,8 @@ module lane_drain_tb #(
     // Decoder back-pressure, and the throughput window
     //
     // body_ready_ctl is the per-lane sink. `thr` additionally THROTTLES one lane to one beat every
-    // THROTTLE_DIV cycles, which is the exact shape of the experiment that exposed the coupling in
-    // build-117's model (unit-tests/rx_perf, SLOW=1 SLOWDIV=4): 16 bytes per cycle is a quarter of
-    // line rate, and 4 bytes per cycle at SLOWDIV=16.
+    // THROTTLE_DIV cycles: 16 bytes per cycle at 4 is a quarter of line rate, and 4 bytes per cycle
+    // at 16.
     // =============================================================================================
     logic [NL-1:0] body_ready_ctl;
     int throttle_lane = -1;
@@ -1657,12 +1656,12 @@ module lane_drain_tb #(
                      live_sids[k], sess[live_sids[k]].alive, sess[live_sids[k]].lane,
                      sess[live_sids[k]].pending.size(), sess[live_sids[k]].rx.size());
         // CSR readback, decoded per the map documented in http_config.sv
-        $display("     CSR inflight=0x%08h (slots=%0d of %0d, announce_pending=%0b peerFIN=%0b up=%0b)",
+        $display("     CSR inflight=0x%08h (occupancy=%0d depth=%0d, announce_pending=%0b peerFIN=%0b up=%0b)",
                  inflightWord, inflightWord[7:0], inflightWord[15:8],
                  inflightWord[16], inflightWord[17], inflightWord[18]);
-        $display("     CSR stall=0x%08h (connect=%0b send=%0b read=%0b init_err=%0b send_err=%0b noCL=%0b dirty=%0b bad_status=%0b reconnects=%0d slot=%0d annq_overflow=%0b)",
-                 stallWord, stallWord[0], stallWord[1], stallWord[2], stallWord[3], stallWord[4],
-                 stallWord[5], stallWord[6], stallWord[7], stallWord[15:8], stallWord[23:16], stallWord[24]);
+        $display("     CSR stall=0x%08h (connect=%0b init_err=%0b tx_refused=%0b resp_err=%0b fatal=%0b bad_status=%0b reconnects=%0d bit24=%0b)",
+                 stallWord, stallWord[0], stallWord[3], stallWord[4], stallWord[5], stallWord[6],
+                 stallWord[7], stallWord[15:8], stallWord[24]);
         $display("     CSR stall upper (route_stall=%0b rwl_starved=%0b read_timeout=%0b rx_fifo_stall=%0b)",
                  stallWord[28], stallWord[27], stallWord[26], stallWord[25]);
         $display("     CSR resp=0x%08h  content_length=%0d  body_remaining=%0d  queue_depth=%0d  state=%0d",
@@ -1690,13 +1689,12 @@ module lane_drain_tb #(
     //                         bus, so that beat was DROPPED. Silent corruption, or a hang.
     //   [27] rwl_starved      body bytes arrived with no chunk length configured -- two columns
     //                         about to be merged into one decoder stream.
-    //   [25] rx_fifo_stall    the per-lane decoupling fifo refused the producer, i.e. back-pressure
-    //                         reached the TCP stack again, which is the thing the fifo exists to
-    //                         prevent.
-    //   [24] rxd_overflow     an announcement was dropped.  The bytes it named stay in the TOE's
-    //                         shared fifo with nobody left to ask for them, so every packet behind
-    //                         them waits forever -- data loss that presents as a hang much later,
-    //                         and the reason (s_d) ended 3864 bytes short of 400000.
+    //   [25] rx_fifo_stall    the per-lane decoupling fifo refused a beat routed to it, and that beat
+    //                         was lost: the reservation promised room it did not have.
+    //   [24] handler_multi: rx_dispatch dropped an announcement, so the bytes it named stay in
+    //                         the TOE's shared fifo with nobody left to ask for them and every
+    //                         packet behind them waits forever. handler_toe: the TOE broke its
+    //                         contract (order or length) or a ring passed the window budget.
     //   [7]  status_bad       a response was retired with a status the handler read as not 200/206.
     //
     // Bit positions are handler_multi.sv's stallWord concatenation, not a guess: {3'd0,
@@ -1714,7 +1712,7 @@ module lane_drain_tb #(
         if (stallWord[28]) why = {why, " route_stall(28)"};
         if (stallWord[27]) why = {why, " rwl_starved(27)"};
         if (stallWord[25]) why = {why, " rx_fifo_stall(25)"};
-        if (stallWord[24]) why = {why, " rxd_overflow(24)"};
+        if (stallWord[24]) why = {why, " overflow/contract(24)"};
         if (stallWord[7])  why = {why, " status_bad(7)"};
         if (why != "") begin
             $display("  STICKY stall bits set:%s   (stallWord=0x%08h)", why, stallWord);
@@ -1991,12 +1989,12 @@ module lane_drain_tb #(
         else verdict = $sformatf("PASS (%0d of 3 reconnects got the same session id; byte-exact)", same);
     endtask
 
-    // (thr_hbm) one decoder throttled to one beat in 16 cycles, holding a 4 MiB column chunk fetched
+    // (thr_ring) one decoder throttled to one beat in 16 cycles, holding a 4 MiB column chunk fetched
     // as 18 GETs of ~228 KiB (the stage-1 host's split, GET_CREDIT outstanding). Its bytes wait in
     // its ring, so the others must keep >= 90 % of their solo rate. Phase A: lanes 1.. alone.
     // Phase B: lane 0's chunk armed and throttled first, its first GETs landed (the ring is full to
     // the credit), then the same work on lanes 1.. -- both windows 60k cycles.
-    task automatic toe_thr_hbm();
+    task automatic toe_thr_ring();
         int solo_beats [8], both_beats [8], solo_cyc, both_cyc;
         real worst, sr, br;
         bit ok, o;
@@ -2021,7 +2019,7 @@ module lane_drain_tb #(
         both_cyc = cyc; meas_on = 1; wait_cycles(60000); meas_on = 0; both_cyc = cyc - both_cyc;
         for (int L = 0; L < NL; L++) both_beats[L] = meas_beats[L];
         $display("");
-        $display("  == thr_hbm: lane 0 at 1 beat per 16 cycles with a 4 MiB chunk in flight, %0d fast lane(s) ==", NL - 1);
+        $display("  == thr_ring: lane 0 at 1 beat per 16 cycles with a 4 MiB chunk in flight, %0d fast lane(s) ==", NL - 1);
         $display("     lane 0 (throttled): %0.3f beats/cyc", real'(both_beats[0]) / real'(both_cyc));
         worst = 1.0;
         for (int L = 1; L < NL; L++) begin
@@ -2033,7 +2031,7 @@ module lane_drain_tb #(
         end
         throttle_lane = -1; throttle_div = 0;
         wait_drain(1500000, ok);
-        if (!ok) begin verdict = "HANG (did not drain after the throttle)"; dump("thr_hbm"); end
+        if (!ok) begin verdict = "HANG (did not drain after the throttle)"; dump("thr_ring"); end
         else if (n_err) verdict = "FAIL (byte/framing errors)";
         else if (stallWord[28] || stallWord[25]) verdict = "FAIL (route_stall / rx_fifo_stall)";
         else if (worst < 0.90) verdict = $sformatf("FAIL (a neighbour lost %0.1f%%)", 100.0 * (1.0 - worst));
@@ -2182,13 +2180,9 @@ module lane_drain_tb #(
         end
 
         // ---- SERIALISED variants -------------------------------------------------------------------
-        // These keep exactly ONE response outstanding per lane, deliberately.  They were written
-        // that way because handler_multi could only ever frame one response per transfer arm, so
-        // the drain and containment questions could not otherwise be asked of it at all; that
-        // limitation is fixed (the read stage in handler_multi re-arms per response, and a2/a9/a10
-        // and the p* scenarios now pass pipelined).  They are kept because a serialised control is
-        // still the cleanest way to separate a receive-path fault from a pipelining one: if s_d or
-        // s_e fails while its pipelined twin passes, the pipelining is not what broke.
+        // These keep exactly ONE response outstanding per lane, deliberately: a serialised control
+        // is the cleanest way to separate a receive-path fault from a pipelining one. If s_d or s_e
+        // fails while its pipelined twin passes, the pipelining is not what broke.
 
         "s_base": begin                     // serialised baseline, both lanes
             if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
@@ -2267,7 +2261,7 @@ module lane_drain_tb #(
                 //
                 // The neighbours' bits matter as much as lane 0's: a sticky vector that set every
                 // lane would be as useless as no vector at all, and is exactly what an OR-folded
-                // signal or a mis-indexed slot produces.
+                // signal or a mis-indexed field produces.
                 $display("  [cyc=%0d] CSR laneErr=0x%016h  laneReady=0x%016h",
                          cyc, laneErrWord, laneReadyWord);
                 if (DUT_TOE != 0) begin
@@ -2691,9 +2685,8 @@ module lane_drain_tb #(
         // MinIO closes a connection idle for ~30 s, and with N lanes a lane sits idle that long
         // routinely.  Reconnecting the instant the FIN arrives puts a brand-new session where one
         // whose announcements were still in flight used to be, and the reader then waits out its
-        // ~2 s watchdog for a notification that can never come -- measured on the board as a flat
-        // ~4.7 s on four of the 22 TPC-H queries, and the origin of every lane wedge seen.  The
-        // contract asked for here is the one that removes the race entirely:
+        // ~2 s watchdog for a notification that can never come.  The contract asked for here is the
+        // one that removes the race entirely:
         //   (a) the FIN takes the session away and NOTHING reopens it while the lane has no work;
         //   (b) a later batch on that lane opens a session by itself and completes byte-exact.
         // Both halves matter: (a) alone would be satisfied by a lane that is simply dead.
@@ -2854,11 +2847,11 @@ module lane_drain_tb #(
         // (thr) THE EXPERIMENT ----------------------------------------------------------------------
         //
         // One decoder is throttled to one beat every THRDIV cycles -- 16 B/cycle at the default 4,
-        // 4 B/cycle at 16 -- while every other connection runs flat out. In build-119 this is what
-        // starves the neighbours: the slow lane's fifo fills, conn_space_ok drops, the head of the
-        // arrival-ordered queue blocks and everyone waits (measured on the rx_perf model: the other
-        // lane lost 20%, 33.90 -> 27.26 B/cycle). With a receive ring per session the slow
-        // decoder's bytes wait in its own ring and the shared path never sees it.
+        // 4 B/cycle at 16 -- while every other connection runs flat out. Behind handler_multi's
+        // shared receive fifo this starves the neighbours: the slow lane's fifo fills,
+        // conn_space_ok drops, the head of the arrival-ordered queue blocks and everyone waits.
+        // With a receive ring per session (handler_toe) the slow decoder's bytes wait in its own
+        // ring and the shared path never sees it.
         //
         // Measured in two phases against the SAME bench so nothing but the throttle differs:
         //   A  the fast connections alone, conn 0 idle           -> the solo rate
@@ -2998,7 +2991,7 @@ module lane_drain_tb #(
         "win_ok":       if (DUT_TOE != 0) toe_scen_win(1'b0);      else verdict = "SKIP (handler_toe scenario)";
         "win_bad":      if (DUT_TOE != 0) toe_scen_win(1'b1);      else verdict = "SKIP (handler_toe scenario)";
         "sidreuse":     if (DUT_TOE != 0) toe_scen_sidreuse();     else verdict = "SKIP (handler_toe scenario)";
-        "thr_hbm":      if (DUT_TOE != 0) toe_thr_hbm();      else verdict = "SKIP (handler_toe scenario)";
+        "thr_ring":      if (DUT_TOE != 0) toe_thr_ring();      else verdict = "SKIP (handler_toe scenario)";
 
         default: begin $display("unknown scenario '%s'", scen); $finish; end
         endcase

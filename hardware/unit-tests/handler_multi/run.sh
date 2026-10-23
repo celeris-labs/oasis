@@ -12,10 +12,12 @@ fi
 cd "$ROOT"
 rm -rf xsim.dir xsim.jou xsim.log xvlog.pb xelab.pb webtalk* .Xil 2>/dev/null || true
 
-xvlog -sv lynxTypes_stub.sv \
+xvlog -sv ../common/lynxTypes_stub.sv \
   "$HDL/http_types.sv" "$HDL/axis_fifo.sv" "$HDL/axis_skid.sv" "$HDL/strip_http.sv" "$HDL/tcp_read.sv" \
   "$HDL/rx_dispatch.sv" "$HDL/tcp_init.sv" "$HDL/http_req_stream.sv" \
   "$HDL/axis_rewrite_last.sv" "$HDL/tx_arbiter.sv" "$HDL/handler_multi.sv" \
   handler_multi_tb.sv
 xelab -debug typical -timescale 1ns/1ps -top handler_multi_tb -snapshot handler_multi_tb_snap
 xsim handler_multi_tb_snap -R
+# xsim exits 0 after a $fatal, so the verdict line decides
+grep -qE '^handler_multi_tb: [0-9]+ passed, 0 failed' xsim.log

@@ -3,8 +3,8 @@
 // Standalone testbench for tcp_read (+ strip_http) on a persistent connection, as the handlers
 // instantiate it: the bytes of one session arrive pre-routed by the handler's receive dispatcher.
 //
-// lane_drain and http_multilane cover the handlers end to end. This bench exists for the things that
-// are awkward to force through the whole handler and that are exactly where keep-alive can go wrong:
+// lane_drain covers the handlers end to end. This bench exists for the things that are awkward to
+// force through the whole handler and that are exactly where keep-alive can go wrong:
 //
 //   1. A RESPONSE BOUNDARY MID-PACKET. A TCP segment may carry the tail of body k and the head of
 //      response k+1. The read for response k must end at the boundary, and the bytes behind it must
@@ -157,7 +157,7 @@ module tcp_read_tb;
     // ---------------------------------------------------------------------------------------------
     // THIRD DUT: RSV_EXACT=0 (handler_multi's lane, rx_dispatch, TOE in bypass mode) with a small
     // fifo (MDEPTH), so the one-MSS-per-readPkg reservation can be driven to its limit with the
-    // decoder held off. See case_rsv_mss.
+    // decoder held off. See case_rsv_mss and case_rsv_mss_edge.
     // ---------------------------------------------------------------------------------------------
     localparam int MDEPTH = 256;
     localparam int MLB    = $clog2(MDEPTH + 1);
@@ -191,13 +191,9 @@ module tcp_read_tb;
     // ---------------------------------------------------------------------------------------------
     // Back-pressure monitor: the point of the whole decoupling.
     //
-    // strip_http walks a header one byte per cycle. It used to drive s_axis_rx_data_TREADY directly,
-    // so for the ~550 cycles of a MinIO 206 header the TCP stack was told to stop while data kept
-    // arriving into its single shared 64 KB rx fifo. That backlog is what made a 32 KiB response fine
-    // and a 64 KiB one fall off a cliff.
-    //
-    // With the decoupling fifo in between, TREADY may only ever drop because the fifo is genuinely
-    // full -- never because the parser is busy. At these test sizes the fifo never fills, so the
+    // strip_http walks a header one byte per cycle, ~550 cycles for a MinIO 206 header, while data
+    // keeps arriving. With the decoupling fifo in between, TREADY may only ever drop because the
+    // fifo is genuinely full -- never because the parser is busy. At these test sizes the fifo never fills, so the
     // correct count is exactly zero, and any non-zero value means the parser is back in the path.
     // The dispatcher does not hold a beat for TREADY, so every one of these is also a lost beat.
     // ---------------------------------------------------------------------------------------------
@@ -430,11 +426,10 @@ module tcp_read_tb;
         finish_read();
     endtask
 
-    // Nothing ever arrives. Before the watchdog, waiting for data had no exit for this at all: it
-    // ended only on the framer finishing, an announcement arriving, or the connection closing. After
-    // a reconnect none of those can happen if the pending announcement belonged to the dead session,
-    // so the reader waited forever and the board needed a reprogram. A scale-30 run hit exactly this
-    // and burned 900 seconds.
+    // Nothing ever arrives. Without the watchdog, waiting for data ends only on the framer finishing,
+    // an announcement arriving or the connection closing, and after a reconnect none of those can
+    // happen if the pending announcement belonged to the dead session: the reader would wait for
+    // ever and the board would need a reprogram.
     task automatic case_read_watchdog();
         int unsigned waited;
         $display("--- case_read_watchdog ---");

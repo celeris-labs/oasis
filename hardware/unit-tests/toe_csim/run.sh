@@ -3,7 +3,7 @@
 # card memory (RX_DDR_BYPASS = 0), at the build's configuration: 512-bit data path, MSS 4096,
 # 512 sessions, TCP_NODELAY, fast retransmit, window scaling with WINDOW_SCALE_BITS 4, so
 # WINDOW_BITS 20 = a 1 MiB ring per session. toe_config.hpp is generated here from the submodule's
-# toe_config.hpp.in exactly as CMake would (the build itself still configures RX_DDR_BYPASS 1).
+# toe_config.hpp.in exactly as CMake would for a --toe-buffer build.
 #
 # The testbench (toe_csim_tb.cpp, tb_model.hpp) plays the remote server, the application and the
 # card memory; see the header of toe_csim_tb.cpp for what each case checks. Every case runs in its
@@ -54,7 +54,7 @@ rx_sar_table/rx_sar_table.cpp session_lookup_controller/session_lookup_controlle
 state_table/state_table.cpp tx_app_if/tx_app_if.cpp tx_app_stream_if/tx_app_stream_if.cpp
 tx_engine/tx_engine.cpp tx_sar_table/tx_sar_table.cpp tx_app_interface/tx_app_interface.cpp toe.cpp"
 
-# toe_config.hpp the way CMake's configure_file writes it (build-125 values, RX_DDR_BYPASS varied)
+# toe_config.hpp the way CMake's configure_file writes it (the builds' values, RX_DDR_BYPASS varied)
 CFG_DIR="$BUILD_DIR/cfg-bypass$BYPASS"
 mkdir -p "$CFG_DIR"
 sed -e 's/\${TCP_STACK_MSS}/4096/' \

@@ -3,9 +3,9 @@
 // Standalone testbench for strip_http -- the HTTP/1.1 response framer.
 // Run: ./run.sh
 //
-// The DUT no longer ends a body on the TCP tlast; it parses Content-Length and counts the body down.
+// The DUT does not end a body on the TCP tlast; it parses Content-Length and counts the body down.
 // That is what makes one persistent connection possible, so the cases below are built around the
-// situations a persistent connection creates and the old FIN-delimited design never saw:
+// situations a persistent connection creates:
 //
 //   * two responses back to back in ONE byte stream, with the boundary deliberately landing in the
 //     middle of a 64-byte beat -- the case that would have run body k into header k+1;

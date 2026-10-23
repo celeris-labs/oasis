@@ -6,9 +6,9 @@ import http_types::*;
 // =================================================================================================
 // handler_multi -- N TCP sessions, one per decoder lane, end to end.
 //
-// The receive half is already covered by http_multilane_tb (rx_dispatch + N framers) and the grant
-// logic by tx_arbiter_tb. What only this bench can check is the two halves together inside the real
-// module, against a TOE model that fails the run if the shared transmit path is ever misused:
+// lane_drain drives the receive side of the real module through every stall and reconnect it has.
+// What this bench checks is the receive and transmit halves together, against a TOE model that fails
+// the run if the shared transmit path is ever misused:
 //
 //   * four connections opened and bound, each to its own lane
 //   * four lanes' request text transmitted with NO interleaving -- the failure the arbiter exists
@@ -162,10 +162,9 @@ module handler_multi_tb;
     int pass_cnt = 0, fail_cnt = 0, xfail_cnt = 0;
     task automatic ok (input string n); $display("[PASS] %s", n); pass_cnt++; endtask
     task automatic bad(input string n); $display("[FAIL] %s", n); fail_cnt++; endtask
-    // An expected failure: reported, not counted. handler_multi predates the lazy-open fix
-    // (a08b100), so an idle FIN still draws an immediate reconnect -- lane_drain's lz1/lz2 XFAIL
-    // for the same reason.
-    task automatic xfail(input string n); $display("[XFAIL] %s -- no lazy open (a08b100)", n); xfail_cnt++; endtask
+    // An expected failure: reported, not counted. Known limitation: handler_multi has no lazy open,
+    // so an idle FIN draws an immediate reconnect (lane_drain's lz1 XFAILs for the same reason).
+    task automatic xfail(input string n); $display("[XFAIL] %s -- known limitation: no lazy open", n); xfail_cnt++; endtask
 
     // =============================================================================================
     // TOE model: connect
@@ -565,8 +564,8 @@ module handler_multi_tb;
         // =========================================================================================
         // TWO responses per lane, on every lane, with NO drain in between.
         //
-        // Everything above arms exactly one chunk and one response per lane, which is why it never
-        // saw the bug this case exists for. tcp_read serves ONE response per activation and leaves
+        // Everything above arms exactly one chunk and one response per lane, which cannot catch the
+        // failure this case exists for. tcp_read serves ONE response per activation and leaves
         // ST_DONE only when `start` FALLS; a handler that drives `start` from a level which stays
         // high while any chunk is queued frames the first response on each lane and then parks
         // forever, with the wire still delivering. One response per lane cannot distinguish that
@@ -890,10 +889,8 @@ module handler_multi_tb;
 
             // -- the compatibility stamp ----------------------------------------------------------
             //
-            // The whole scheme for keeping deployed bitstreams and installed libraries apart rests
-            // on this byte: it was a literal zero through revision 1, so a host reading 0 knows not
-            // to touch registers 16..20 (which answer resp_error on those bitstreams), and a
-            // library that predates the byte ignores it.
+            // The host reads this byte before anything else and refuses a bitstream whose revision
+            // it does not know; handler_multi is revision 2.
             if (inflightWord[31:24] == 8'd2)
                 ok("readback/csr_revision (inflightWord[31:24] == 2)");
             else
@@ -937,17 +934,15 @@ module handler_multi_tb;
         // LAZY OPEN. MinIO drops an idle connection. With N lanes this is the NORMAL case, not a
         // fault -- a lane can sit idle past the ~30 s server timeout while its neighbours work.
         //
-        // This block used to require the lane to come straight back on a fresh session, and that is
-        // the behaviour being removed: a session opened on the heels of the dead one raced the dead
-        // one's own announcements, the reader waited out its ~2 s watchdog for a notification that
-        // could never arrive, and an abort with body bytes already delivered is dirty, which kills
-        // the lane. Measured on the board as a flat ~4.7 s on four of the 22 TPC-H queries.
+        // A session opened on the heels of the dead one can race the dead one's own announcements:
+        // the reader waits out its ~2 s watchdog for a notification that can never arrive, and an
+        // abort with body bytes already delivered is dirty, which kills the lane.
         //
-        // The contract now: the FIN RELEASES the session (which is what makes the lane honestly
-        // down, framer reset and session unbound, so a late notification for it is dropped), the
-        // lane then STAYS down for as long as it has no work, and the next batch on it opens one
-        // session -- a fresh one -- by itself. Neighbours unaffected throughout, and none of it is
-        // a fault.
+        // The contract checked here: the FIN RELEASES the session (which is what makes the lane
+        // honestly down, framer reset and session unbound, so a late notification for it is
+        // dropped), the lane then STAYS down for as long as it has no work, and the next batch on it
+        // opens one session -- a fresh one -- by itself. Neighbours unaffected throughout, and none
+        // of it is a fault.
         // =========================================================================================
         $display("--- lazy_open_on_idle_fin ---");
         begin
@@ -964,8 +959,7 @@ module handler_multi_tb;
             if (!dut.conn_up_q[2]) ok("lazy_open/released (the idle FIN gave the session up)");
             else bad("lazy_open/released (lane 2 still holds the session its peer closed)");
 
-            // And now the point of the whole change: NOTHING reopens it. 20000 cycles is ~100x the
-            // reconnect this used to do, which completed in ~200.
+            // And NOTHING reopens it. 20000 cycles is ~100x what an immediate reconnect takes (~200).
             repeat (20000) @(posedge clk);
             if (opens == opens_before)
                 ok("lazy_open/no_idle_reconnect (an idle FIN draws no new connection)");
