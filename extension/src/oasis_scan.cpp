@@ -18,7 +18,7 @@
 #include "rdma_file_system.hpp"
 #include "reader/struct_column_reader.hpp"
 #include "filter_pushdown.hpp"
-#include "thrift_tools.hpp" // ThriftFileTransport, for the per-group ClearPrefetch in BeginGroup
+#include "thrift_tools.hpp" // ThriftFileTransport, for ClearPrefetch in BeginGroup
 
 #include <algorithm>
 #include <cstdlib>
@@ -207,12 +207,8 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 	// DMA them in.
 	const bool fetch_on_host = !rdma && !http;
 
-	// An ENABLE_HTTP bitstream ties off axis_host_recv and compiles out gen_decoders (both in
-	// hardware/src/vfpga_top.svh), so no host-DMA path into any decoder exists: the FPGA issuing its
-	// own GET is the only way to feed it. A host source would DMA into a stream nothing consumes,
-	// the sink would never complete, and the scan would park forever on a readiness callback that
-	// can never fire -- an unkillable-looking hang with no diagnostic. Fail while we can still say
-	// why.
+	// On an ENABLE_HTTP bitstream axis_host_recv carries request text and gen_decoders is compiled
+	// out, so no host-DMA path into a decoder exists: a host source would never complete.
 	if (fetch_on_host && ctx.isHTTPEnabled()) {
 		throw NotImplementedException(
 		    "read_oasis('%s'): this bitstream was built with ENABLE_HTTP, which does not synthesize a "
@@ -221,8 +217,7 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 		    bind.filename.c_str());
 	}
 
-	// The mirror image: an httpfpga:// source needs the HTTP client in the bitstream. Without it the
-	// HTTP source operator would fail deep in the config lookup with no mention of the cause.
+	// And an httpfpga:// source needs the HTTP client in the bitstream.
 	if (http && !ctx.isHTTPEnabled()) {
 		throw NotImplementedException(
 		    "read_oasis('%s'): reading over httpfpga:// requires a bitstream built with --http; this "
@@ -305,14 +300,8 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 		oasis::OperatorFlow flow;
 		auto decode = std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type);
 
-		// OASIS_HTTP_BATCH=0 gives every column chunk its own request, one source per flow, which
-		// is the RDMA path's shape: no cross-flow coupling, no row-group-wide batch riding the last
-		// flow, and exactly one queue entry per request. It is an HTTPBatchSourceOperator whose
-		// batch is one chunk long.
-		//
-		// Ordering stays decode-then-source, unlike RDMA's source-then-decode: the GET fires a real
-		// request whose body streams in on the server's schedule, so the decoder config has to be
-		// enqueued before the trigger rather than after it.
+		// One source per column chunk, the RDMA path's shape. Unlike RDMA the decoder config comes
+		// first: the GET's response streams in on the server's schedule.
 		if (http && !http_batch) {
 			flow.push_back(std::move(decode));
 			std::vector<oasis::HTTPBatchSourceOperator::Chunk> one_chunk;
@@ -320,26 +309,13 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 			flow.push_back(std::make_unique<oasis::HTTPBatchSourceOperator>(
 			    http->path, http->server_ip, http->server_port, std::move(one_chunk)));
 		} else if (http) {
-			// Config strictly before trigger. The HTTP source fires a real GET and the response body
-			// streams into the decoder on its own schedule, so unlike the RDMA/local sources — which
-			// the host or the RDMA stack meters — there is no point at which we can be sure the
-			// decoder config would still win a race with arriving bytes. Enqueue it first.
-			// Scheduler::dispatch_to applies non-sink operators in flow order, so this ordering holds.
+			// Decoder config first, as above (dispatch_to applies non-sink operators in flow order).
 			flow.push_back(std::move(decode));
 
-			// ONE batch for the whole row group, carried by the LAST flow.
-			//
-			// Every GET of the group is built as text on the host and handed over in a single
-			// transfer, so there is no per-request slot to wait for. That means the batch may only
-			// fire once EVERY column's decoder config is enqueued, because the responses come back
-			// in request order and the decoder consumes its configs in the order they were queued.
-			// The dispatcher runs flows in submission order on one thread, so putting the batch in
-			// the last flow puts it strictly after every earlier decode; and within this flow,
-			// dispatch_to applies sinks first and then non-sink operators in order, so this
-			// flow's own decode is enqueued before the batch fires too.
-			//
-			// It cannot be a flow of its own: dispatch_to asserts every flow has a sink, and a
-			// sinkless flow would never retire its pipeline slot.
+			// One batch for the whole row group (revision 2: one transfer; revision 6: one per GET),
+			// carried by the last flow: it may only fire once every column's decoder config is
+			// enqueued, and the dispatcher places flows in submission order on one thread. It cannot
+			// be a flow of its own: every flow needs a sink to retire.
 			if (k + 1 == hw_slot.size()) {
 				std::vector<oasis::HTTPBatchSourceOperator::Chunk> batch_chunks;
 				batch_chunks.reserve(hw_chunks.size());
@@ -481,22 +457,10 @@ BeginGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalStat
 	// InitializeRead(...) does the page-header parsing / I/O positioning for the CPU/string columns,
 	// then DecodeCpuColumns drains them in full. Both run while the FPGA splinters are in flight.
 	if (gstate.has_cpu_columns) {
-		// DROP THE PREVIOUS GROUP'S PREFETCH FIRST -- otherwise the host re-read is QUADRATIC.
-		//
-		// ThriftFileTransport keeps a list of read heads. A page-header read that lands outside
-		// them falls back to registering a new 1,000,000 byte head (PREFETCH_FALLBACK_BUFFERSIZE)
-		// and then calls ReadAheadBuffer::Prefetch(), which re-reads EVERY head in the list, not
-		// just the new one. Heads are pushed with emplace_front, so that re-read walks backwards
-		// from the current row group to the start of the file.
-		//
-		// Nothing here cleared the list between row groups, so group i re-read groups i-1..0:
-		// sum(1..N) fetches of ~1 MB. Measured at sf1 (49 groups): 1,224 fetches, 1,224 MB off a
-		// 207 MB object, and a projected ~1.07 TB at sf30 -- which is why q1/q10/q12/q19 never
-		// finished there.
-		//
-		// DuckDB's own ParquetReader::Scan does exactly this on every row-group switch
-		// (parquet_reader.cpp, "see if we have to switch to the next row group"); this scan drives
-		// InitializeRead directly and so bypassed it.
+		// Drop the previous group's read heads first. A page-header read outside them registers a new
+		// head and ReadAheadBuffer::Prefetch() re-reads every registered head, so each group would
+		// re-read all earlier ones. DuckDB's ParquetReader::Scan clears them on every row-group
+		// switch; this scan drives InitializeRead directly.
 		auto &trans =
 		    reinterpret_cast<ThriftFileTransport &>(*lstate.scan_state->thrift_file_proto->getTransport());
 		trans.ClearPrefetch();

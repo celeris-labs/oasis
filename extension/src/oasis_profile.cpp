@@ -22,8 +22,7 @@ struct ProfileRow {
 
 	parcore::DecoderProfile profile;
 
-	// GIGABYTES per second, not gigabits. ThroughputGBps returns bytes/s / 1e9, and the old name
-	// `_gbps` reads as gigabits to everyone -- an eight-fold understatement in any report.
+	// GB/s = 10^9 bytes per second (ThroughputGBps), not gigabits.
 	double in_throughput_gbytes_s;           // over the whole profiled window (includes idle cycles)
 	double in_throughput_excl_idle_gbps;  // excluding inter-stream idle cycles
 	double out_throughput_gbytes_s;

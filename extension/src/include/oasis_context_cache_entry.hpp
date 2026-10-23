@@ -22,17 +22,8 @@ struct OasisContextCacheEntry : public ObjectCacheEntry {
 
 	// Auto-enqueued (managed-stream) OBM buffer capacity. The scan relies on a column chunk's
 	// decoded output fitting in a single buffer for now, so this value is a hard cap on row group
-	// size: one row group of the widest fixed-width type must fit.
-	//
-	//   DuckDB's default row_group_size (122,880 rows) x 8 bytes (INT64/DOUBLE) = 960 KiB
-	//
-	// which is 94% of the 1 MiB this used to be -- so the default was also, in practice, the
-	// maximum. That matters for throughput and not just for compatibility: over httpfpga:// the
-	// FPGA issues one ranged GET per column chunk, and each one costs a TCP connect, the server's
-	// time-to-first-byte and a teardown. Small row groups mean many chunks mean many round trips,
-	// and the decoder idles through all of them. 8 MiB allows row groups up to ~1M rows of INT64,
-	// which cuts the request count (and therefore the dead time) by roughly 8x on files written
-	// with ROW_GROUP_SIZE 1000000. The cost is host memory: the OBM allocates 2 buffers per stream.
+	// size: 8 MiB is about 1M rows of an 8-byte type. The OBM keeps up to OASIS_OBM_BUFFERS (64) such
+	// buffers per stream.
 	static constexpr size_t OBM_BUFFER_CAPACITY = 8ULL * 1024 * 1024;
 
 	explicit OasisContextCacheEntry(DatabaseInstance &db) : log_sink(db) {

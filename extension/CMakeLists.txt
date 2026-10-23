@@ -46,11 +46,10 @@ find_package(libstf REQUIRED)
 find_package(parcore REQUIRED)
 find_package(oasis REQUIRED)
 
-# liboasis's headers FIRST, and as a plain -I. Coyote/libstf/parcore export $HOME/opt/include as a
-# SYSTEM include, and when liboasis is installed anywhere else (a side-by-side build for a new
-# bitstream) that directory still holds an OLDER oasis/*.hpp, which then shadows the real ones:
-# header templates such as GlobalConfig::get_config<HTTPReadConfig>() get instantiated with the old
-# class layout and corrupt the heap at extension load. -I is searched before every -isystem.
+# liboasis's headers first, as a plain -I (searched before every -isystem): Coyote, libstf and
+# parcore export $HOME/opt/include, which may hold an older oasis/*.hpp when liboasis is installed
+# elsewhere, and header templates such as GlobalConfig::get_config<HTTPReadConfig>() would then be
+# instantiated with the old class layout.
 get_target_property(OASIS_HEADER_DIRS oasis INTERFACE_INCLUDE_DIRECTORIES)
 if(OASIS_HEADER_DIRS)
     include_directories(BEFORE ${OASIS_HEADER_DIRS})
