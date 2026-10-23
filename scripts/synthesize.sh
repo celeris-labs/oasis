@@ -25,6 +25,10 @@ while [ $# -gt 0 ]; do
         --build-num=*) build_num="${1#*=}" ;;
         --decoders) decoders="$2"; shift ;;
         --decoders=*) decoders="${1#*=}" ;;
+        # Parallel Vivado jobs (COMP_CORES, default 64). 64 take ~170 GB; use 16 when two builds
+        # share a host.
+        --cores) cmake_args+=(-DCOMP_CORES="$2"); shift ;;
+        --cores=*) cmake_args+=(-DCOMP_CORES="${1#*=}") ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
     shift

@@ -4,6 +4,11 @@ project(oasis)
 set(CYT_DIR ${CMAKE_SOURCE_DIR}/../parcore/libstf/coyote)
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CYT_DIR}/cmake)
 
+# Parallel Vivado jobs. Synthesis runs the decoders' IP out of context, one job each, and 64 jobs
+# take ~170 GB; two builds on one host want -DCOMP_CORES=16 (synthesize.sh --cores 16). Set before
+# find_package, so Coyote's own default of 8 does not apply.
+set(COMP_CORES 64 CACHE STRING "Number of compilation cores")
+
 find_package(CoyoteHW REQUIRED)
 
 # Number of ColumnChunkDecoders. The number of streams is equal to this in local mode. If RDMA is 
@@ -76,7 +81,6 @@ else()
 endif()
 
 # Build with optimization, since timing closure can be difficult
-set(COMP_CORES 64)
 set(BUILD_OPT 1)
 
 set(FDEV_NAME u55c)
