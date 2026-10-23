@@ -167,7 +167,7 @@ void OasisContext::setup_http() {
                   "OasisContext: TOE receive ring bitstream (CSR rev %u, revision-2 register map): "
                   "%u lane(s), GET credit %u per lane, ring 2^%u B per session, GETs capped at %llu B; "
                   "no slot page, no card memory of ours",
-                  unsigned(http->raw_revision()), unsigned(p.num_conns), unsigned(p.get_credit),
+                  unsigned(http->revision()), unsigned(p.num_conns), unsigned(p.get_credit),
                   unsigned(p.ring_log2), static_cast<unsigned long long>(http->toe_get_cap()));
     std::fprintf(stderr, "[oasis] %s\n", line);
     libstf::log(libstf::LogLevel::INFO, "%s", line);

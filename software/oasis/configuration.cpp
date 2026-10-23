@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -82,7 +81,7 @@ constexpr const uint32_t HTTP_QUEUE_DEPTH      = 15;
 
 // PER-LANE READBACK -- CSR REVISION 2 AND UP. Read ids 16..20, all 64 bits, at a fixed stride of 8
 // lanes whatever NUM_CONNS is. The read register file answers an out-of-range address with
-// resp_error, NOT with zeros, which is why a bitstream below HTTP_CSR_REVISION_LANES is refused at
+// resp_error, NOT with zeros, which is why a bitstream below HTTP_CSR_REVISION_MULTI is refused at
 // startup. Field tables live in hardware/src/hdl/http_read/http_config.sv.
 constexpr const uint32_t HTTP_LANE_OCC         = 16; // byte per lane at [8L+7:8L], saturating at 255
 constexpr const uint32_t HTTP_LANE_READY       = 17; // nibble per lane: arm/entry/conn_up/fatal
@@ -216,15 +215,17 @@ constexpr const uint64_t HTTP_DEFAULT_CHUNK_BYTES = 0;
 // requests outstanding, and those DO overlap, because they are separate connections.
 constexpr const uint64_t HTTP_DEFAULT_LANE_DEPTH = 4;
 
-uint64_t HttpLaneDepth() {
-    static const uint64_t configured = [] {
-        const char *env = std::getenv("OASIS_HTTP_LANE_DEPTH");
-        if (env == nullptr || *env == '\0') {
-            return HTTP_DEFAULT_LANE_DEPTH;
-        }
-        const long long parsed = std::atoll(env);
-        return parsed <= 0 ? HTTP_DEFAULT_LANE_DEPTH : static_cast<uint64_t>(parsed);
-    }();
+// Environment variable `name` as a positive integer, or `fallback` when it is unset, empty, zero
+// or negative.
+uint64_t EnvOr(const char *name, uint64_t fallback) {
+    const char     *env   = std::getenv(name);
+    const long long value = (env == nullptr) ? 0 : std::atoll(env);
+    return value <= 0 ? fallback : static_cast<uint64_t>(value);
+}
+
+// OASIS_HTTP_CHUNK_BYTES, read once: it is consulted for every column chunk.
+uint64_t ConfiguredChunkBytes() {
+    static const uint64_t configured = EnvOr("OASIS_HTTP_CHUNK_BYTES", HTTP_DEFAULT_CHUNK_BYTES);
     return configured;
 }
 
@@ -238,52 +239,6 @@ std::string DescribeLaneState(uint64_t state_word, uint8_t lane) {
     std::ostringstream oss;
     oss << "read_state=" << rd << " tx_state=" << (tx < 5 ? tx_states[tx] : "?") << "(" << tx << ")";
     return oss.str();
-}
-
-// Effective request-queue depth: min(bitstream slots, HTTP_DEFAULT_MAX_INFLIGHT or the override),
-// and both 0 and any value >= the queue size mean "use the whole queue". No longer clamped by a
-// bytes-in-flight product -- see below for why that cap was removed.
-uint8_t HttpMaxInflight(uint8_t slots) {
-    static const int configured = [] {
-        const char *env = std::getenv("OASIS_HTTP_MAX_INFLIGHT");
-        if (env == nullptr) {
-            return static_cast<int>(HTTP_DEFAULT_MAX_INFLIGHT);
-        }
-        const int parsed = std::atoi(env);
-        return parsed < 0 ? static_cast<int>(HTTP_DEFAULT_MAX_INFLIGHT) : parsed;
-    }();
-
-    int depth = (configured == 0 || configured >= static_cast<int>(slots))
-                    ? static_cast<int>(slots)
-                    : configured;
-
-    // THE BYTES-IN-FLIGHT CAP IS GONE. It used to clamp depth to the receive window / chunk_bytes(),
-    // which at the 768 KiB chunk evaluates to 262144/786432 = 0 -> 1: the hardware's whole request
-    // ring reduced to one outstanding GET, so every request paid the server's full service latency
-    // serially.
-    //
-    // The cap was right when it was written and is wrong now, and the reason is a hardware change,
-    // not a change of mind. It existed because the TOE advertised a window FOUR TIMES larger than
-    // the fifo behind it: rx_engine accepted on pointer arithmetic, the overflow was dropped, and
-    // with out-of-order buffering disabled every drop cost a go-back-N -- the duplicate-ACK storms
-    // seconds apart that this cap was added to stop. The host capping what it ASKED for was the only
-    // lever available, because the stack's own promise could not be trusted.
-    //
-    // Since the fifo was sized to 1 << WINDOW_BITS (coyote f248089d, then b21b4ec6 at 1 MiB) the
-    // promise is honest. The advertised window is (appd - recvd) - 1, computed in rx_sar_table from
-    // how much the application has actually read -- not a constant. With exactly one session the
-    // TOE's logical buffer IS the physical fifo, and appd only advances as tcp_read issues readPkg.
-    // So if the reader falls behind, the window shrinks and the sender is throttled by TCP, which is
-    // what TCP is for. Over-committing is no longer a way to lose data; it is just flow control.
-    //
-    // What has NOT gone away: the TOE never sends an unsolicited window update -- rx_app_stream_if
-    // has no event-engine output at all -- so a window that reaches ZERO reopens only when the
-    // peer's persist timer probes, which on Linux starts near 200 ms and backs off. That is the one
-    // expensive failure here, and what keeps it away is drain margin rather than arithmetic: the
-    // decoder consumes at ~16 GB/s against ~1 GB/s arriving, so occupancy stays far from full. If a
-    // profile ever shows multi-hundred-millisecond gaps with no retransmissions on the wire, this
-    // is the mechanism to suspect, and OASIS_HTTP_MAX_INFLIGHT is the way to walk it back.
-    return static_cast<uint8_t>(depth);
 }
 
 std::string IpToAscii(uint32_t ip_be) {
@@ -305,18 +260,14 @@ HTTPReadConfig::HTTPReadConfig(std::shared_ptr<coyote::cThread> cthread, uint32_
 // Requests one batch may carry. The queue holds one entry per expected response and the host pushes
 // every entry BEFORE arming the transfer, so a batch larger than the queue can never drain.
 size_t HTTPReadConfig::max_batch_chunks() {
-    static const size_t cached = [this] {
-        // Prefer the dedicated register: inflightWord's fields saturate at 255, and splitting a row
-        // group at 255 when the hardware holds 8192 reintroduces exactly the batching this design
-        // exists to remove.
-        const auto reported = static_cast<uint32_t>(read_register(HTTP_QUEUE_DEPTH).value());
-        if (reported > 0) {
-            return static_cast<size_t>(reported);
+    // The dedicated register, not inflightWord[15:8], which saturates at 255.
+    if (max_batch_chunks_ == 0) {
+        max_batch_chunks_ = static_cast<uint32_t>(read_register(HTTP_QUEUE_DEPTH).value());
+        if (max_batch_chunks_ == 0) {
+            throw std::runtime_error("FPGA HTTP handler reports a chunk queue depth of 0 (read id 15)");
         }
-        const auto slots = num_slots();
-        return (slots == 0) ? size_t(1) : static_cast<size_t>(slots);
-    }();
-    return cached;
+    }
+    return max_batch_chunks_;
 }
 
 std::string HTTPReadConfig::BuildGet(const std::string &host, uint16_t port, const std::string &path,
@@ -365,55 +316,35 @@ void HTTPReadConfig::AppendChunkGets(const std::string &host, uint16_t server_po
     // counting these bytes, so the split is invisible to it.
     batch.chunk_bytes.push_back(static_cast<uint32_t>(total));
 
-    // Record every GET's length so the revision-6 path can arm them one at a time. A batch that was
-    // built before this existed (text but no lengths) is normalised to "all of it is one request"
-    // first, so the lengths always add up to the text.
-    const auto append = [&](uint64_t b, uint64_t e) {
-        if (batch.request_bytes.empty() && !batch.text.empty()) {
-            batch.request_bytes.push_back(static_cast<uint32_t>(batch.text.size()));
-        }
-        const auto get = BuildGet(host, server_port, path, b, e);
+    // Every GET's length is recorded so the revision-6 path can arm them one at a time. Written so
+    // that a range ending at the top of the 64-bit space cannot wrap the cursor.
+    for (uint64_t begin = range_begin;; ) {
+        const uint64_t end = (split == 0 || range_end - begin < split) ? range_end : begin + split - 1;
+        const auto     get = BuildGet(host, server_port, path, begin, end);
         batch.text += get;
         batch.request_bytes.push_back(static_cast<uint32_t>(get.size()));
-    };
-
-    if (split == 0 || total <= split) {
-        append(range_begin, range_end);
-        return;
-    }
-    // Written so that a range ending at the top of the 64-bit space cannot wrap the cursor.
-    for (uint64_t begin = range_begin;; begin += split) {
-        const uint64_t left = range_end - begin; // bytes after `begin`, inclusive range
-        const uint64_t end  = (left < split) ? range_end : begin + split - 1;
-        append(begin, end);
         if (end == range_end) {
             break;
         }
+        begin = end + 1;
     }
 }
 
 std::vector<std::string> HTTPReadConfig::SplitRequests(const RequestBatch &batch) {
-    std::vector<std::string> out;
-    if (batch.request_bytes.empty()) {
-        if (!batch.text.empty()) {
-            out.push_back(batch.text);
-        }
-        return out;
+    size_t total = 0;
+    for (const uint32_t n : batch.request_bytes) {
+        total += n;
     }
+    if (total != batch.text.size()) {
+        throw std::runtime_error("HTTP request batch: request lengths add up to " +
+                                 std::to_string(total) + " bytes but the text is " +
+                                 std::to_string(batch.text.size()));
+    }
+    std::vector<std::string> out;
     size_t off = 0;
     for (const uint32_t n : batch.request_bytes) {
-        if (off + n > batch.text.size()) {
-            throw std::runtime_error("HTTP request batch: request lengths (" +
-                                     std::to_string(off + n) + " bytes so far) overrun the text (" +
-                                     std::to_string(batch.text.size()) + " bytes)");
-        }
         out.push_back(batch.text.substr(off, n));
         off += n;
-    }
-    if (off != batch.text.size()) {
-        throw std::runtime_error("HTTP request batch: request lengths add up to " +
-                                 std::to_string(off) + " bytes but the text is " +
-                                 std::to_string(batch.text.size()));
     }
     return out;
 }
@@ -428,7 +359,9 @@ uint64_t HTTPReadConfig::EffectiveSplit(uint64_t split_cfg, uint64_t max_get) {
     return std::min(split_cfg, max_get);
 }
 
-uint64_t HTTPReadConfig::split_bytes() { return EffectiveSplit(chunk_bytes(), max_get_bytes()); }
+uint64_t HTTPReadConfig::split_bytes() {
+    return EffectiveSplit(ConfiguredChunkBytes(), toe_get_cap());
+}
 
 // Pad the batch's request text to a whole 64-byte beat, using a header the server ignores.
 //
@@ -509,14 +442,6 @@ void PadRequestTextToBeat(std::string &text) {
 // only the right question when the beat about to be written names that same lane; the lane's own
 // nibble always is.
 void HTTPReadConfig::await_cfg_ready(const char *what, uint8_t lane, LaneAdmit admit) {
-    if (lane >= lane_count()) {
-        std::ostringstream msg;
-        msg << "FPGA HTTP " << what << " names lane " << unsigned(lane) << ", but the bitstream has "
-            << unsigned(lane_count()) << " lane(s). A beat for a lane that does not exist is routed "
-            << "by the truncated index and lands on the wrong connection.";
-        throw std::runtime_error(msg.str());
-    }
-
     const auto deadline = std::chrono::steady_clock::now() + HTTP_CREDIT_TIMEOUT;
     while (true) {
         const auto l = DecodeLanes(0, read_register(HTTP_LANE_READY).value(), lane_count()).at(lane);
@@ -585,15 +510,10 @@ void HTTPReadConfig::throw_lane_fatal(uint8_t lane, const char *what) {
 // while the hardware's real bound is the lane's queue (policy().queue_depth, and max_batch_chunks()
 // is what submit_batch checks against); a batch larger than the cap is legal and simply gets the
 // lane to itself.
-void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed, const char *what) {
+void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed) {
+    const char *what = "a batch of chunk-length entries";
     if (needed == 0) {
         return;
-    }
-    if (lane >= lane_count()) {
-        std::ostringstream msg;
-        msg << "FPGA HTTP credit requested for lane " << unsigned(lane) << ", but the bitstream has "
-            << unsigned(lane_count()) << " lane(s)";
-        throw std::runtime_error(msg.str());
     }
 
     const size_t limit    = std::max<size_t>(lane_depth_limit(), needed);
@@ -699,7 +619,7 @@ void HTTPReadConfig::push_entries(const RequestBatch &batch, uint8_t lane) {
     // Reserve room for the whole batch BEFORE pushing any of it. Without this the loop below can
     // fill the queue mid-batch and hang with the arm never issued: the remaining entries wait for
     // space, space is freed only by responses, and responses need the arm.
-    await_lane_credit(lane, batch.chunk_bytes.size(), "a batch of chunk-length entries");
+    await_lane_credit(lane, batch.chunk_bytes.size());
 
     // The lane, on EVERY beat of this batch. handler_multi takes cfg_lane from req_chunk_dest --
     // bits [35:32] of the chunk-length register -- for entries AND for the arm, so it is not
@@ -786,18 +706,6 @@ void HTTPReadConfig::await_arm_taken(uint8_t lane) {
     }
 }
 
-uint64_t HTTPReadConfig::chunk_bytes() {
-    static const uint64_t configured = [] {
-        const char *env = std::getenv("OASIS_HTTP_CHUNK_BYTES");
-        if (env == nullptr) {
-            return HTTP_DEFAULT_CHUNK_BYTES;
-        }
-        const long long parsed = std::atoll(env);
-        return parsed < 0 ? HTTP_DEFAULT_CHUNK_BYTES : static_cast<uint64_t>(parsed);
-    }();
-    return configured;
-}
-
 // Mirrors the totalWord layout in hardware/src/hdl/http_read/handler_multi.sv (and handler_toe.sv).
 // The 4-bit client_state CSR multiplexes several sub-FSMs onto one value (2, 6, 9 and 10 each alias
 // two states), so only this packed word can say which stage is actually stuck.
@@ -824,11 +732,6 @@ HTTPReadConfig::HTTPInflight HTTPReadConfig::inflight() {
     f.has_pending = (word & (1u << 16)) != 0;
     f.peer_closed = (word & (1u << 17)) != 0;
     f.conn_up     = (word & (1u << 18)) != 0;
-    f.req_ready   = (word & (1u << 19)) != 0;
-    // [23:20] is the lane count on handler_multi. A single-session bitstream leaves it zero, and
-    // zero lanes is not a thing -- it means one shared connection.
-    const uint8_t lanes = static_cast<uint8_t>((word >> 20) & 0xFu);
-    f.lanes       = (lanes == 0) ? uint8_t(1) : lanes;
     // [31:24] is the CSR revision, and it is the ENTIRE compatibility scheme between this library
     // and a programmed bitstream. It is deliberately NOT normalised: 0 means "the per-lane registers
     // are not there and reading them is a bus error", which is a fact to act on rather than a
@@ -838,79 +741,41 @@ HTTPReadConfig::HTTPInflight HTTPReadConfig::inflight() {
 }
 
 uint8_t HTTPReadConfig::lane_count() {
-    // Cached: it cannot change without reprogramming, and this is read on the per-chunk path.
-    if (lane_count_cached_ != 0) {
-        return lane_count_cached_;
+    // LANE_POLICY carries NUM_CONNS untruncated (inflightWord[23:20] is four bits). The per-lane
+    // registers reach HTTP_LANE_SLOTS lanes, so a bitstream with more cannot be metered.
+    if (lane_count_ == 0) {
+        const auto conns = policy().num_conns;
+        if (conns == 0 || conns > HTTP_LANE_SLOTS) {
+            throw std::runtime_error("FPGA HTTP handler reports " + std::to_string(conns) +
+                                     " lanes (LANE_POLICY); this library drives 1 to " +
+                                     std::to_string(HTTP_LANE_SLOTS));
+        }
+        lane_count_ = conns;
     }
-    // inflightWord[23:20] is FOUR BITS WIDE, so it reports a 16-lane bitstream as 0 -- the exact
-    // truncation the RTL comment warns about ("a concat that does not add up is not a compile error,
-    // it is a host that decodes the wrong bits"). Read id 20 carries NUM_CONNS untruncated, so
-    // prefer it wherever it exists, and only then fall back.
-    //
-    // Clamped to HTTP_LANE_SLOTS because that is how far the per-lane registers reach: a bitstream
-    // with more lanes than the CSR stride addresses is one this library cannot meter, and pretending
-    // otherwise would admit batches against lane windows that are not there.
-    const auto p = policy();
-    if (p.num_conns > 0 && p.num_conns <= HTTP_LANE_SLOTS) {
-        lane_count_cached_ = p.num_conns;
-        return lane_count_cached_;
-    }
-    lane_count_cached_ = inflight().lanes;
-    return lane_count_cached_;
+    return lane_count_;
 }
 
-HTTPRevision HTTPRevision::Classify(uint8_t raw) {
-    HTTPRevision r;
-    r.raw = raw;
-    if (raw == HTTP_CSR_REVISION_TOE) {
-        // handler_toe: the revision-2 register map with the revision-6 rules on top.
-        r.protocol = HTTP_CSR_REVISION_LANES;
-        r.toe_ring = true;
-        return r;
+void HTTPReadConfig::CheckRevision(uint8_t revision) {
+    if (revision == HTTP_CSR_REVISION_MULTI || revision == HTTP_CSR_REVISION_TOE) {
+        return;
     }
-    if (raw < HTTP_CSR_REVISION_LANES) {
-        std::ostringstream msg;
-        msg << "FPGA HTTP handler reports CSR revision " << unsigned(raw) << " (inflightWord[31:24]): "
-            << "the bitstream predates the per-lane registers (revision 2), which this liboasis "
-               "needs. Program a revision-2 (handler_multi) or revision-6 (handler_toe) bitstream.";
-        throw std::runtime_error(msg.str());
-    }
-    if (raw > HTTP_CSR_REVISION_LANES && raw < HTTP_CSR_REVISION_TOE) {
-        std::ostringstream msg;
-        msg << "FPGA HTTP handler reports CSR revision " << unsigned(raw) << " (inflightWord[31:24]): "
-            << "revisions 3..5 are the HBM-slot handler, which this liboasis no longer drives. "
-               "Program a revision-2 (handler_multi) or revision-6 (handler_toe) bitstream.";
-        throw std::runtime_error(msg.str());
-    }
-    if (raw > HTTP_CSR_REVISION_TOE) {
-        std::ostringstream msg;
-        msg << "FPGA HTTP handler reports CSR revision " << unsigned(raw) << " (inflightWord[31:24]); "
-            << "this liboasis drives revisions 2 and " << unsigned(HTTP_CSR_REVISION_TOE)
-            << ". Its register map and host rules are unknown here, and driving it by a guess would "
-               "write registers that may not exist. Build and install the host library that matches "
-               "the programmed bitstream.";
-        throw std::runtime_error(msg.str());
-    }
-    r.protocol = raw;
-    return r;
+    std::ostringstream msg;
+    msg << "FPGA HTTP handler reports CSR revision " << unsigned(revision) << " (inflightWord[31:24]); "
+        << "this liboasis drives revisions 2 (handler_multi) and 6 (handler_toe). Program a matching "
+           "bitstream, or install the host library built for this one.";
+    throw std::runtime_error(msg.str());
 }
 
-const HTTPRevision &HTTPReadConfig::rev() {
-    // Fixed by the bitstream, so read it once -- and read it BEFORE anything touches ids 16..20,
-    // because on a bitstream without them that read is a resp_error rather than a zero.
-    if (!rev_read_) {
-        rev_      = HTTPRevision::Classify(inflight().revision);
-        rev_read_ = true;
+uint8_t HTTPReadConfig::revision() {
+    // Read once, and before anything touches read ids 16..20: below revision 2 those reads are a
+    // resp_error rather than a zero.
+    if (revision_ == 0) {
+        const uint8_t raw = inflight().revision;
+        CheckRevision(raw);
+        revision_ = raw;
     }
-    return rev_;
+    return revision_;
 }
-
-uint8_t HTTPReadConfig::revision() { return rev().protocol; }
-
-uint8_t HTTPReadConfig::raw_revision() { return rev().raw; }
-
-bool HTTPReadConfig::toe_ring() { return rev().toe_ring; }
-
 
 uint8_t HTTPReadConfig::lane_for_stream(libstf::stream_t stream) {
     const uint8_t lanes = lane_count();
@@ -994,7 +859,7 @@ size_t HTTPReadConfig::lane_depth_limit() {
     const size_t hw      = max_batch_chunks();
     const bool   env_set = std::getenv("OASIS_HTTP_LANE_DEPTH") != nullptr &&
                            *std::getenv("OASIS_HTTP_LANE_DEPTH") != '\0';
-    const size_t want    = static_cast<size_t>(HttpLaneDepth());
+    const size_t want    = static_cast<size_t>(EnvOr("OASIS_HTTP_LANE_DEPTH", HTTP_DEFAULT_LANE_DEPTH));
     // Revision 6: never more chunks queued per lane than the hardware holds GETs (every chunk is at
     // least one GET). Chunks split into several GETs can still exceed the credit; their later arms
     // then wait for earlier responses (emit_one_get_per_arm in operator.cpp).
@@ -1030,16 +895,14 @@ size_t HTTPReadConfig::LaneDepthFor(size_t want, size_t hw, size_t get_credit) {
         // Revision 6 (the GET credit). Every column chunk is at least one GET, and the
         // hardware holds at most GET_CREDIT unfinished GETs per lane, so a deeper host queue would only
         // admit flows whose first arm then waits on the dispatcher thread.
-        hw = (hw == 0) ? get_credit : std::min(hw, get_credit);
+        hw = std::min(hw, get_credit);
     }
-    return std::max<size_t>(1, std::min<size_t>(want, hw == 0 ? 1 : hw));
+    return std::max<size_t>(1, std::min(want, hw));
 }
 
 bool HTTPReadConfig::LaneCreditOk(size_t occ, size_t needed, size_t limit) {
     return occ + needed <= limit;
 }
-
-uint64_t HTTPReadConfig::max_get_bytes() { return toe_get_cap(); }
 
 
 // ---- CSR revision 6 -------------------------------------------------------------------------------
@@ -1101,9 +964,6 @@ std::string HTTPReadConfig::HTTPLane::describe() const {
 }
 
 std::string HTTPReadConfig::HTTPLanes::describe() const {
-    if (empty()) {
-        return "lanes=<unsupported: bitstream predates the per-lane registers>";
-    }
     std::ostringstream oss;
     oss << "lanes=" << unsigned(count);
     for (uint8_t i = 0; i < count; i++) {
@@ -1130,9 +990,6 @@ std::string HTTPReadConfig::HTTPLaneError::describe() const {
 }
 
 std::string HTTPReadConfig::HTTPLaneErrors::describe() const {
-    if (empty()) {
-        return "lane errors=<unsupported: bitstream predates the per-lane registers>";
-    }
     std::ostringstream oss;
     oss << "lane errors:";
     bool any_set = false;
@@ -1149,9 +1006,6 @@ std::string HTTPReadConfig::HTTPLaneErrors::describe() const {
 }
 
 std::string HTTPReadConfig::HTTPLanePolicy::describe() const {
-    if (!valid()) {
-        return "policy=<unsupported: bitstream predates the per-lane registers>";
-    }
     std::ostringstream oss;
     if (toe()) {
         oss << "policy: rev=" << unsigned(revision) << " (TOE receive rings) lanes="
@@ -1170,8 +1024,7 @@ std::string HTTPReadConfig::HTTPInflight::describe() const {
     std::ostringstream oss;
     oss << "inflight=" << static_cast<unsigned>(occupied) << "/" << static_cast<unsigned>(slots)
         << " conn=" << (conn_up ? "up" : "down") << (has_pending ? " pending" : "")
-        << (peer_closed ? " peer-closed" : "") << " rev=" << static_cast<unsigned>(revision)
-        << " lanes=" << static_cast<unsigned>(lanes);
+        << (peer_closed ? " peer-closed" : "") << " rev=" << static_cast<unsigned>(revision);
     return oss.str();
 }
 
@@ -1183,15 +1036,12 @@ HTTPReadConfig::HTTPStall HTTPReadConfig::DecodeStall(uint32_t word, bool toe_ri
     HTTPStall s {};
     s.raw              = word;
     s.connect_stalled  = (word & (1u << 0)) != 0;
-    s.send_stalled     = (word & (1u << 1)) != 0;
-    s.read_stalled     = (word & (1u << 2)) != 0;
     s.init_error       = (word & (1u << 3)) != 0;
     s.send_error       = (word & (1u << 4)) != 0;
     s.resp_unframeable = (word & (1u << 5)) != 0;
     s.dirty_abort      = (word & (1u << 6)) != 0;
     s.status_bad       = (word & (1u << 7)) != 0;
     s.reconnects       = static_cast<uint8_t>((word >> 8) & 0xFFu);
-    s.read_slot        = static_cast<uint8_t>((word >> 16) & 0xFFu);
     // Bit 24: the announcement queue's overflow on revision 2; toe_rx's ORed contract errors
     // (order_err | len_err | budget_err) on revision 6. Exactly one of the two is decoded.
     s.toe              = toe_ring;
@@ -1213,8 +1063,6 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     }
     oss << "stalled:";
     if (connect_stalled)  oss << " CONNECT";
-    if (send_stalled)     oss << " SEND";
-    if (read_stalled)     oss << " READ(slot " << static_cast<unsigned>(read_slot) << ")";
     if (init_error)       oss << " init_error";
     if (send_error)       oss << " send_error";
     if (resp_unframeable) oss << " unframeable_response";
@@ -1362,15 +1210,12 @@ std::string HTTPReadConfig::HTTPResponse::describe() const {
     return oss.str();
 }
 
-uint8_t HTTPReadConfig::num_slots() {
-    // Fixed by the bitstream, so read it once.
-    if (num_slots_ < 0) {
-        num_slots_ = static_cast<int>(inflight().slots);
-    }
-    return static_cast<uint8_t>(num_slots_);
+uint8_t HTTPReadConfig::max_inflight() {
+    // 0 and anything at or above the queue depth mean the whole queue.
+    const uint8_t  slots      = inflight().slots;
+    const uint64_t configured = EnvOr("OASIS_HTTP_MAX_INFLIGHT", HTTP_DEFAULT_MAX_INFLIGHT);
+    return (configured == 0 || configured >= slots) ? slots : static_cast<uint8_t>(configured);
 }
-
-uint8_t HTTPReadConfig::max_inflight() { return HttpMaxInflight(num_slots()); }
 
 std::string HTTPReadConfig::debug_dump() {
     std::ostringstream o;
@@ -1380,7 +1225,7 @@ std::string HTTPReadConfig::debug_dump() {
         return h.str();
     };
     const int last = int(HTTP_LANE_POLICY);
-    o << "HTTP CSR dump (revision " << unsigned(raw_revision())
+    o << "HTTP CSR dump (revision " << unsigned(revision())
       << (toe_ring() ? ", TOE receive rings, revision-2 register map" : "") << ", read ids 0.."
       << last << "):\n";
     std::vector<uint64_t> w(static_cast<size_t>(last) + 1, 0);
@@ -1411,7 +1256,7 @@ std::string HTTPReadConfig::debug_dump() {
           << ((static_cast<uint32_t>(w[HTTP_STALL]) >> 24) & 1u) << "; LANE_ERR bit 0 unused (no "
           << "dead lanes), bit 7 = the lane's fifo refused a routed beat\n";
         o << "  host: lane depth " << lane_depth_ << " (0 = not computed yet), split "
-          << (toe_cap_ != 0 ? EffectiveSplit(chunk_bytes(), toe_cap_) : 0) << " B\n";
+          << (toe_cap_ != 0 ? EffectiveSplit(ConfiguredChunkBytes(), toe_cap_) : 0) << " B\n";
     }
     return o.str();
 }

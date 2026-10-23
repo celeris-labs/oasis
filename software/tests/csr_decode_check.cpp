@@ -72,7 +72,7 @@ void rev2_decoders() {
     CHECK(!e.at(2).any());
 
     const auto p = HTTPReadConfig::DecodePolicy(lane_policy_word(2, 4, 64, 65536, 16));
-    CHECK(p.valid() && p.revision == 2 && p.num_conns == 4 && p.queue_depth == 64);
+    CHECK(!p.toe() && p.revision == 2 && p.num_conns == 4 && p.queue_depth == 64);
     CHECK(p.lane_stall_cycles == 65536 && p.lane_stall_log2 == 16);
 
     // Revision-2 host rules: depth = OASIS_HTTP_LANE_DEPTH clamped to the queue, no GET cap.
@@ -102,10 +102,6 @@ void request_split() {
         CHECK(s.rfind("GET ", 0) == 0);
     }
 
-    // No lengths recorded -> the whole text is one request (a batch built by pre-WP4 code).
-    HTTPReadConfig::RequestBatch one;
-    one.text = g1;
-    CHECK(HTTPReadConfig::SplitRequests(one).size() == 1);
     CHECK(HTTPReadConfig::SplitRequests(HTTPReadConfig::RequestBatch {}).empty());
 
     // Lengths that do not add up to the text are refused, both ways.
@@ -223,44 +219,22 @@ size_t check_chunk_split(uint64_t begin, uint64_t size, uint64_t split) {
 }
 
 void rev6_rules() {
-    // --- revision mapping: 6 is driven as 2 (its register map), 2 as itself; below 2 (no per-lane
-    //     registers), 3..5 (the HBM-slot handler) and 7+ refused ---
-    const auto r2 = oasis::HTTPRevision::Classify(2);
-    CHECK(r2.raw == 2 && r2.protocol == 2 && !r2.toe_ring);
-    const auto r6 = oasis::HTTPRevision::Classify(6);
+    // --- revisions: 2 and 6 are driven, every other one is refused ---
     CHECK(oasis::HTTP_CSR_REVISION_TOE == 6);
-    CHECK(r6.raw == 6 && r6.protocol == 2 && r6.toe_ring);
-    for (unsigned raw : {0u, 1u}) {
+    for (unsigned raw : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 0x7Fu, 0xFFu}) {
         std::string what;
         try {
-            (void)oasis::HTTPRevision::Classify(static_cast<uint8_t>(raw));
+            HTTPReadConfig::CheckRevision(static_cast<uint8_t>(raw));
         } catch (const std::runtime_error &e) {
             what = e.what();
         }
-        CHECK(what.find("predates the per-lane registers") != std::string::npos);
-    }
-    for (unsigned raw : {3u, 4u, 5u}) {
-        std::string what;
-        try {
-            (void)oasis::HTTPRevision::Classify(static_cast<uint8_t>(raw));
-        } catch (const std::runtime_error &e) {
-            what = e.what();
-        }
-        CHECK(what.find("HBM-slot handler") != std::string::npos);
-    }
-    for (unsigned raw : {7u, 8u, 0x7Fu, 0xFFu}) {
-        bool threw = false;
-        try {
-            (void)oasis::HTTPRevision::Classify(static_cast<uint8_t>(raw));
-        } catch (const std::runtime_error &) {
-            threw = true;
-        }
-        CHECK(threw);
+        const bool driven = raw == 2 || raw == 6;
+        CHECK(driven ? what.empty() : what.find("reports CSR revision") != std::string::npos);
     }
 
     // --- LANE_POLICY: build-136 shape, 4 lanes, queue 64, GET credit 4, 1 MiB rings ---
     const auto p = HTTPReadConfig::DecodePolicy(toe_policy_word(4, 64, 4, 20));
-    CHECK(p.valid() && p.toe() && p.revision == 6);
+    CHECK(p.toe() && p.revision == 6);
     CHECK(p.num_conns == 4 && p.queue_depth == 64 && p.get_credit == 4 && p.ring_log2 == 20);
     CHECK(p.lane_stall_cycles == 0 && p.lane_stall_log2 == 0); // no HOL watchdog to misreport
     // Field boundaries do not bleed.
@@ -337,7 +311,6 @@ void rev6_rules() {
     CHECK(HTTPReadConfig::LaneDepthFor(2, 64, 4) == 2);
     CHECK(HTTPReadConfig::LaneDepthFor(0, 64, 4) == 1);
     CHECK(HTTPReadConfig::LaneDepthFor(16, 2, 4) == 2);   // and the queue
-    CHECK(HTTPReadConfig::LaneDepthFor(8, 0, 4) == 4);    // queue unknown
     CHECK(HTTPReadConfig::LaneDepthFor(16, 64) == 16);    // revision 2: no credit clamp
     CHECK(HTTPReadConfig::LaneCreditOk(3, 1, 4));
     CHECK(!HTTPReadConfig::LaneCreditOk(4, 1, 4));
