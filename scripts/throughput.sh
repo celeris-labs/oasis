@@ -3,10 +3,11 @@
 # Throughput / latency harness for read_oasis() over httpfpga://.
 #
 # Every measurement brackets the query with a read of oasis_stream_profile(). Reading the last
-# profile register pulses profile[I].stop (column_chunk_decoder_config.sv:96), which returns the
-# profiler to WAIT and HOLDS its counters; they are re-zeroed by the next valid data beat, not by
-# the read (stream_profiler.sv:4-7). So the first call ends whatever window was running and the
-# second reports exactly the cycles this query spent -- PROVIDED the query actually moved data.
+# profile register pulses the decoder's profiler stop (parcore column_chunk_decoder_config.sv),
+# which returns the profiler to WAIT and HOLDS its counters; they are re-zeroed by the next valid
+# data beat, not by the read (libstf stream_profiler.sv). So the first call ends whatever window was
+# running and the second reports exactly the cycles this query spent -- PROVIDED the query actually
+# moved data.
 #
 # If it did not -- a 404, a scan fully pruned by filter statistics, count(*), or an all-string
 # projection -- the second read returns the PREVIOUS query's numbers rather than zero, and a stale
@@ -17,56 +18,67 @@
 # TWO RATES, and only one of them is throughput:
 #
 #   in_mbytes_s  (per decoder)  bytes over the profiler's counted window: the decoder's INTAKE while
-#                               it had streams. On tpch-1 that window is ~3% of the query, so a 3x
-#                               on this number was 5.6% on the query. It is not throughput.
+#                               it had streams. That window can be a small fraction of the query,
+#                               so this is not throughput.
 #   wall_MB/s    (run summary)  bytes of every active decoder over the query's wall clock (`.timer`
 #                               real). This one is throughput.
 #
-# COMPLETENESS. hs summed over the active decoders is the same for every complete run of a workload,
-# whatever the lane count. A run that died part-way moves fewer beats AND loses its idle tail, which
-# INFLATES in_mbytes_s (a truncated run once reported 1036 MB/s, the best single-lane number ever
-# seen). So each workload ends with a verdict marking every repeat OK, INCOMPLETE (hs short of the
-# section's value), FAILED (the query printed an error) or NO WORK. The section's value is
-# EXPECT_HS_<workload> if exported, else the measured value for tpch-1 lineitem (known_hs), else the
-# largest hs among the repeats that did not fail -- which cannot see a run where EVERY repeat died
-# early. Never quote a rate from a run that is not OK.
+# COMPLETENESS. hs summed over the active decoders is the same for every complete run of a workload
+# on the same file and bitstream, whatever the lane count. A run that died part-way moves fewer beats
+# AND loses its idle tail, which INFLATES in_mbytes_s. So each workload ends with a verdict marking
+# every repeat OK, INCOMPLETE (hs short of the expected value), FAILED (the query printed an error)
+# or NO WORK. The expected value is EXPECT_HS_<workload> if exported (take it from a run known to be
+# complete, e.g. EXPECT_HS_wide=...), else the largest hs among the repeats that did not fail --
+# which cannot see a run where EVERY repeat died early. Never quote a rate from a run that is not OK.
 #
-# From those four counters the whole story falls out:
+# The four counters:
 #
 #   handshakes  cycles that moved a 64 B beat into the decoder   -> useful work
-#   starved     inside a column chunk, waiting for network bytes -> TCP / MinIO too slow
+#   starved     inside a column chunk, waiting for network bytes -> network / object store too slow
 #   stalled     decoder backpressured the source                 -> decoder is the bottleneck
-#   idle        BETWEEN column chunks                            -> connect + close + host round trip
+#   idle        BETWEEN column chunks                            -> time to first byte + host round trip
 #
-# The interesting number is almost never the throughput. It is idle/(total): the fraction of the
-# query the decoder spent waiting for the next request to be set up. Divide idle_cycles*4ns by the
-# request count and you have the per-request dead time, which is what actually caps this design.
+# Next to the rate, look at idle/(total): the fraction of the query the decoder spent waiting for the
+# next request. Divide idle_cycles*4ns by the request count and you have the per-request dead time.
 #
-# Usage:
+# After the FPGA repeats, each workload runs once on stock DuckDB (its httpfs file system and its
+# parquet reader, built into the shell) against the same object, as the CPU baseline. It runs last,
+# so it reads a warm server cache.
+#
+# Usage: scripts/throughput.sh [options]
+#   --workload W     latency | q6 | q1 | wide | all (default all)
+#   --file PATH      object to read (default /throughput/tpch-1/lineitem.parquet; a TPC-H lineitem)
+#   --scale N        shorthand for --file /throughput/tpch-N/lineitem.parquet
+#   --repeat N       FPGA runs per workload (default 3)
+#   --server IP      object server address the FPGA can reach (default $OASIS_SERVER, else
+#                    10.253.74.74, the server this was developed against)
+#   --port P         object server port (default $OASIS_PORT, else 9000)
+#   -h, --help       this text
+#
+# Examples:
 #   scripts/throughput.sh                         # all workloads on the default file
 #   scripts/throughput.sh --workload latency      # per-request dead time only
-#   scripts/throughput.sh --file /throughput/tpch-1/lineitem.parquet --repeat 5
+#   scripts/throughput.sh --scale 30 --repeat 5
 #
-# Env overrides: DUCKDB, OASIS_SERVER, OASIS_PORT.
+# Env: DUCKDB (default extension/build/release/duckdb), OASIS_SERVER, OASIS_PORT,
+# OASIS_HTTP_CHUNK_BYTES (largest GET in bytes; default 0 = one GET per column chunk),
+# OASIS_EXTRA_SETUP (extra SET statements for the FPGA runs, e.g.
+# "SET oasis_scheduler_num_streams=1;" for one lane), EXPECT_HS_<workload> (see COMPLETENESS).
 #
-# NOTE: never set OASIS_HTTP_DEBUG=1 while measuring. Its tracing thread calls read_profile() three
-# times per request, and each of those resets the counters you are trying to read.
+# NOTE: never measure with OASIS_HTTP_DEBUG=1 (or SET httpfpga_debug=true). Debug mode reads the
+# decoder profile with every request batch, and each read stops the window this harness reads.
 
 set -uo pipefail
 
 DUCKDB=${DUCKDB:-$(dirname "$0")/../extension/build/release/duckdb}
 SERVER=${OASIS_SERVER:-10.253.74.74}
 PORT=${OASIS_PORT:-9000}
-# 35 characters, which needs the 64-character GET path budget (build-89 and later). On an
-# older 32-character bitstream use a short alias bucket instead, e.g. /tpch1/lineitem.parquet.
 FILE=/throughput/tpch-1/lineitem.parquet
 REPEAT=3
 WORKLOAD=all
-# EXPORTED, not assumed. This used to default to 8192 for its own arithmetic while the library used
-# whatever HTTP_DEFAULT_CHUNK_BYTES had become -- so every derived column (gets, kib_per_get,
-# dead_us_per_get) was computed from a split that was not in force. At the 192 KiB default that made
-# the GET count wrong by 24x. Exporting it means the number printed is the number used.
-# Keep in step with HTTP_DEFAULT_CHUNK_BYTES in software/oasis/configuration.cpp.
+# Exported so the GET count printed below is computed from the split that is actually used. Keep the
+# default in step with HTTP_DEFAULT_CHUNK_BYTES in software/oasis/configuration.cpp (0 = one GET per
+# column chunk).
 export OASIS_HTTP_CHUNK_BYTES=${OASIS_HTTP_CHUNK_BYTES:-0}
 
 while [ $# -gt 0 ]; do
@@ -78,7 +90,7 @@ while [ $# -gt 0 ]; do
         --server)   SERVER="$2"; shift ;;
         --port)     PORT="$2"; shift ;;
         --workload) WORKLOAD="$2"; shift ;;
-        -h|--help)  sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help)  awk 'NR > 1 { if (/^set -uo pipefail/) exit; print }' "$0"; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
     shift
@@ -89,22 +101,28 @@ if [ ! -x "$DUCKDB" ]; then
     exit 1
 fi
 
+# The object server is on the local network: keep a proxy out of the CPU baseline's requests.
+export NO_PROXY="${SERVER},127.0.0.1,localhost,${NO_PROXY:-}"
+export no_proxy="$NO_PROXY"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy 2>/dev/null || true
+
 URL="httpfpga://$FILE"
+CPU_URL="http://$SERVER:$PORT$FILE"
 # enable_progress_bar=false is not cosmetic. The bar redraws with carriage returns and leaves
 # partial lines behind, so a captured run comes out full of blank gaps between the query result and
 # its profile readback -- and the redraw thread runs during the window being measured.
 # Extra SET statements, so the scheduler knobs are reachable without editing this file.
 # The two that matter for isolation:
 #   OASIS_EXTRA_SETUP="SET oasis_scheduler_num_streams=1;"   -- one lane only. THE isolation switch:
-#       OASIS_HTTP_LANE_DEPTH caps pipelining DEPTH, not the lane count, so on a 2-lane bitstream
-#       depth 1 still runs both lanes and still contends for the shared receive path.
+#       OASIS_HTTP_LANE_DEPTH caps pipelining DEPTH, not the lane count, so depth 1 still runs every
+#       lane.
 #   OASIS_EXTRA_SETUP="SET oasis_scheduler_queue_depth=1;"   -- one host pipeline slot per stream.
 SETUP="SET http_server='$SERVER'; SET http_port=$PORT; SET enable_progress_bar=false; ${OASIS_EXTRA_SETUP:-}"
 
 # ---------------------------------------------------------------------------------------------
 # Workload definitions. Each is a query over read_oasis($URL) plus the number of hardware column
 # chunks it fetches PER ROW GROUP. That count times the row groups is the column-chunk count; each
-# chunk is then split into GETs of at most OASIS_HTTP_CHUNK_BYTES on the one open connection.
+# chunk is one GET, or several of at most OASIS_HTTP_CHUNK_BYTES each when that is > 0.
 # ---------------------------------------------------------------------------------------------
 q_sql() {
     case "$1" in
@@ -138,21 +156,23 @@ q_cols() {
     esac
 }
 
-# The CPU comparison: same object, same server, same DuckDB, but fetched over an ordinary host
-# socket and parsed by DuckDB's Parquet reader. This is the honest baseline -- it isolates the
-# decode path rather than the storage.
-q_cpu_sql() { q_sql "$1" | sed "s/read_oasis(/read_parquet(/"; }
+# The CPU comparison: same query, same object, same server, read by stock DuckDB (httpfs over plain
+# HTTP, its own parquet reader). No code of this repository is in the baseline.
+q_cpu_sql() { q_sql "$1" | sed "s|read_oasis('$URL')|read_parquet('$CPU_URL')|"; }
 
+# parquet_metadata over httpfpga:// reads the footer over a host socket; the FPGA is not involved.
 row_groups() {
     "$DUCKDB" -noheader -list -c "
-        $SETUP SET httpfpga_cpu_fallback=true;
+        $SETUP
         SELECT count(DISTINCT row_group_id) FROM parquet_metadata('$URL');" 2>/dev/null | tail -1
 }
 
 run_one() {
     local name=$1 mode=$2 sql=$3 chunks=${4:-0}
-    # GETs actually issued: one per OASIS_HTTP_CHUNK_BYTES slice of every column chunk, or one per
-    # column chunk when splitting is off. Needed to turn the cycle counters into a per-request cost,
+    # GETs issued: one per OASIS_HTTP_CHUNK_BYTES slice of every column chunk, or one per column
+    # chunk when splitting is off. (A --toe-buffer bitstream also caps every GET at its receive-ring
+    # budget, so there the count below is a lower bound.) Needed to turn the cycle counters into a
+    # per-request cost,
     # which is the number that discriminates "the link is slow" from "each request costs a fixed
     # amount no matter how big it is".
     local split=$OASIS_HTTP_CHUNK_BYTES
@@ -160,7 +180,7 @@ run_one() {
     local out_file; out_file=$(mktemp)
     {
         echo "$SETUP"
-        [ "$mode" = cpu ] && echo "SET httpfpga_cpu_fallback=true;"
+        [ "$mode" = cpu ] && echo "LOAD httpfs;"
         # Arm the profiler window, then time the query, then read the window back. The arming read
         # is kept (as PROFILE_BEFORE rows) so the summary can tell which decoders this run touched.
         if [ "$mode" = oasis ]; then
@@ -228,8 +248,7 @@ run_one() {
 # summarize_run <workload> <captured duckdb output>
 #
 # One line per oasis run, then remembered for the workload's verdict. The PROFILE_* rows stay in
-# the log; they are CSV, so they match none of the patterns sumrate (env4dec.sh) parses --
-# `decoder =`, `hs =`, `in_mbytes_s` -- and none of this function's own lines do either.
+# the log as CSV.
 RUN_HS=() RUN_WALL=() RUN_INTAKE=() RUN_ACTIVE=() RUN_ERR=()
 summarize_run() {
     local line
@@ -256,26 +275,13 @@ summarize_run() {
         "$intake" "$active" "$hs_sum" "$([ "$err" = 1 ] && echo ' | QUERY FAILED')"
 }
 
-# Complete hs totals, taken from every build-118/119 log that ran these workloads (66-75 runs
-# each). The same for any lane count and any OASIS_HTTP_CHUNK_BYTES: hs counts bytes into the
-# decoders, not requests. q1 and q6 read the same four columns.
-known_hs() {
-    case "$FILE:$1" in
-        /throughput/tpch-1/lineitem.parquet:latency) echo 146159 ;;
-        /throughput/tpch-1/lineitem.parquet:q6)      echo 751496 ;;
-        /throughput/tpch-1/lineitem.parquet:q1)      echo 751496 ;;
-        /throughput/tpch-1/lineitem.parquet:wide)    echo 1455162 ;;
-    esac
-}
-
 # verdict <workload> -- mark every repeat of the workload just run, then forget them.
-# 0.1% tolerance either way: one log in ~75 read a single beat over the complete total.
+# 0.1% tolerance either way, for a complete run that counts a beat more or fewer than another.
+# q1 and q6 read the same four columns, so a complete run of either has the same hs_total.
 verdict() {
     local w=$1 i expect=0 var="EXPECT_HS_$1" tag src
     if [ -n "${!var:-}" ]; then
         expect=${!var}; src="from $var"
-    elif [ -n "$(known_hs "$w")" ]; then
-        expect=$(known_hs "$w"); src="measured complete value for $FILE"
     else
         src="largest of the repeats that did not fail"
         for i in "${!RUN_HS[@]}"; do
@@ -308,21 +314,9 @@ echo " row groups: ${RG:-unknown}"
 echo "=============================================================================="
 
 # ---------------------------------------------------------------------------------------------
-# Request budget.
-#
-# Every column chunk is a ranged GET, but they no longer cost a TCP connection each: the client
-# holds ONE persistent connection open across every request and every query (the request says
-# `Connection: keep-alive` and strip_http delimits each response by Content-Length). So the 512
-# ephemeral ports the TOE has -- 32768..33279, cursor wrapping at TCP_STACK_MAX_SESSIONS,
-# CUMULATIVE SINCE PROGRAMMING -- are no longer the limit they were. A run that used to need ~2500
-# connections and wedge partway through now needs one.
-#
-# What DOES scale with the request count is the range split. HTTPReadConfig::read cuts each column
-# chunk into GETs of at most OASIS_HTTP_CHUNK_BYTES (default 8 KiB) so that
-# max_inflight() x chunk_bytes() stays under the ~41.5 KB at which the TOE's shared receive fifo
-# starts dropping segments. That multiplies the GET count by chunk_size/8 KiB, which is fine -- they
-# are pipelined on the open connection with no handshake -- but it is the number to look at if the
-# per-request overhead ever shows up in these timings.
+# Requests. Every column chunk is one ranged GET, or one per OASIS_HTTP_CHUNK_BYTES slice when that
+# is > 0. Each lane holds one persistent (keep-alive) TCP session across every request and query,
+# and its GETs are pipelined on it.
 # ---------------------------------------------------------------------------------------------
 [ "$WORKLOAD" = all ] && WORKLOADS="latency q6 q1 wide" || WORKLOADS="$WORKLOAD"
 total_cols=0
@@ -330,9 +324,8 @@ for w in $WORKLOADS; do
     total_cols=$((total_cols + $(q_cols "$w")))
 done
 CHUNKS=$((total_cols * ${RG:-0} * REPEAT))
-echo " estimated column chunks for this run: $CHUNKS (all on one TCP connection)"
-echo " range split: OASIS_HTTP_CHUNK_BYTES=$OASIS_HTTP_CHUNK_BYTES bytes per GET"
-echo " (set OASIS_HTTP_CHUNK_BYTES=0 to send one GET per column chunk and measure what the split costs)"
+echo " estimated column chunks for this run: $CHUNKS (one persistent TCP session per lane)"
+echo " range split: OASIS_HTTP_CHUNK_BYTES=$OASIS_HTTP_CHUNK_BYTES (0 = one GET per column chunk)"
 echo "=============================================================================="
 
 for w in $WORKLOADS; do
@@ -345,7 +338,7 @@ for w in $WORKLOADS; do
         run_one "$w" oasis "$(q_sql "$w")" "$((cols * ${RG:-0}))"
     done
     verdict "$w"
-    echo "--- $w CPU baseline (same object over a host socket, DuckDB parquet reader)"
+    echo "--- $w CPU baseline (stock DuckDB: httpfs + parquet reader, same object)"
     run_one "$w" cpu "$(q_cpu_sql "$w")" "$((cols * ${RG:-0}))"
 done
 
@@ -361,9 +354,9 @@ Reading the counters (all cycles are 4 ns at the 250 MHz user clock):
   duty cycle           = hs / (hs + starved + stalled + idle)
   per-request dead time = idle * 4 ns / (GETs - 1)
 
-If idle dominates you are latency-bound on request setup (TCP connect, MinIO
-time-to-first-byte, close, host round trip) and no amount of decoder speed helps.
+If idle dominates you are latency-bound between requests (the object store's
+time to first byte, the host round trip) and no amount of decoder speed helps.
 If starved dominates, the body itself arrives too slowly. If stalled dominates,
-the decoder is genuinely the bottleneck -- which so far it never is.
+the decoder is the bottleneck.
 ------------------------------------------------------------------------------
 EOF
