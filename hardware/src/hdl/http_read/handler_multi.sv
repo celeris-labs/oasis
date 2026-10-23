@@ -8,10 +8,9 @@ import http_types::*;
 //
 // WHY N CONNECTIONS
 // -----------------
-// The single-session handler this replaced held ONE connection. Everything a query fetches was
-// serialised onto it, and measurement says that connection is the ceiling: one TCP session to MinIO
-// delivers ~0.46 GB/s however deeply pipelined, sixteen sessions deliver 4.60, and the FPGA sat at
-// 0.33. So the gap worth chasing is not inside the decoder -- it is the session count.
+// One TCP session to MinIO is a throughput ceiling however deeply its GETs are pipelined, well
+// below what the decoders take; several sessions together deliver many times more. So each decoder
+// lane gets its own session.
 //
 // THE SHAPE
 // ---------
@@ -35,17 +34,16 @@ import http_types::*;
 // legal on a NEW CONNECTION; between responses the residue holds the first bytes of the next
 // header. A single shared framer would have to save and restore all of it at every packet boundary,
 // which is N copies of the state plus a mux plus a new class of bug. It is also not worth avoiding:
-// strip_http measures 2492 LUTs in build-108, against 84200 for one ColumnChunkDecoder.
+// strip_http is a few thousand LUTs, against ~84k for one ColumnChunkDecoder.
 //
-// The cost that IS real is the decoupling fifo -- 144 RAMB36 per lane at RX_FIFO_DEPTH=8192. That
-// depth exists because a single lane must absorb everything; with rx_dispatch gating per lane on
-// conn_space_ok, a lane needs room for one MSS plus decoder jitter, not for a whole response. Size
-// it accordingly and N lanes cost what one used to.
+// The cost that IS real is the decoupling fifo per lane. With rx_dispatch gating each lane on
+// conn_space_ok, a lane needs room for one MSS plus decoder jitter, not for a whole response:
+// RX_FIFO_DEPTH = 2048 is 36 RAMB36 per lane.
 //
 // HOW THE HOST DRIVES IT
 // ----------------------
-// As the old handler, plus a lane on every beat (req_chunk_dest, already carried in the spare upper
-// bits of the chunk-length register):
+// Per lane, with the lane named on every beat (req_chunk_dest, in the spare upper bits of the
+// chunk-length register):
 //
 //   1. per column chunk: cfg beat, req_total_bytes == 0, {req_chunk_bytes, req_chunk_dest}
 //        -> pushes a chunk-length entry into LANE req_chunk_dest
@@ -53,9 +51,8 @@ import http_types::*;
 //        -> latches the server and ARMS that lane's transfer
 //   3. the request text for that lane, DMA'd into s_axis_req[lane]
 //
-// Ordering within a lane is exactly the single-lane protocol, and for the same reason:
 // ConfigWriteReadyRegister does not back-pressure, so the host must write every parameter, then
-// poll req_ready, then pulse START. req_ready here answers about the lane named in the beat.
+// poll req_ready, then pulse START. req_ready answers about the lane named in the beat.
 //
 // RECONNECT
 // ---------
@@ -76,17 +73,16 @@ import http_types::*;
 //
 // FATAL MEANS THE CONNECTION GOES DOWN
 // ------------------------------------
-// A fatal lane is excluded from reconnect, and for a long time that also meant it was excluded from
-// TEARDOWN: conn_up_q stayed high forever, so clear_framing (which is !conn_up_q) never rose, so the
-// lane's decoupling fifo was never flushed and never discarded. A lane that had already stopped
-// consuming therefore went on refusing space for the rest of time, and rx_dispatch's queue is in
-// arrival order -- so the dead lane held the head and every other lane starved behind it.
+// A fatal lane is excluded from reconnect but not from TEARDOWN. With its session kept, conn_up_q
+// would stay high, so clear_framing (which is !conn_up_q) would never rise and the lane's decoupling
+// fifo would never be flushed. A lane that has stopped consuming would go on refusing space for the
+// rest of time, and rx_dispatch's queue is in arrival order -- so the dead lane would hold the head
+// and every other lane would starve behind it.
 //
-// So fatal now closes the session. Not to reopen it: the lane stays down and only the host can
-// restart it, exactly as before. What the teardown buys is that a lane which is out of the game
-// stops PRETENDING to be in it -- clear_framing resets the framer, empties the fifo, and turns the
-// lane into something that accepts and discards whatever the dispatcher still routes to it. That is
-// what lets everyone else carry on.
+// So fatal closes the session. Not to reopen it: the lane stays down and only the host can restart
+// it. What the teardown buys is that a lane which is out of the game stops PRETENDING to be in it --
+// clear_framing resets the framer, empties the fifo, and turns the lane into something that accepts
+// and discards whatever the dispatcher still routes to it. That is what lets everyone else carry on.
 //
 // It is also what makes a later host-driven restart safe: the fifo is held empty and the framer
 // held in reset for as long as the lane is down, so there is no residue of the dead session left to
@@ -97,8 +93,8 @@ module handler_multi #(
     parameter int NUM_CONNS = 4,
     // Column chunks queued ahead of the data, PER LANE.
     parameter int QUEUE_DEPTH = 64,
-    // Receive decoupling fifo depth per lane, in 64-byte beats. See the note above: this no longer
-    // has to hold a whole response, only one MSS plus slack.
+    // Receive decoupling fifo depth per lane, in 64-byte beats. See the note above: this holds one
+    // MSS plus slack, not a whole response.
     parameter int RX_FIFO_DEPTH = 2048,
     parameter int TX_CHUNK_BYTES = 4096,
     parameter int STALL_CYCLES = 268435456,
@@ -184,9 +180,8 @@ module handler_multi #(
     //
     // Everything above folds N lanes into one 32-bit window with OR, which answers "is anything
     // wrong" and nothing else. These five say WHICH LANE. They are 64 bits wide because eight lanes
-    // need eight bytes, and the AXI-Lite read path is 64 bits (AXIL_DATA_BITS); read register 6
-    // already carries a field at [39:32] and the host already decodes it, so the upper half is not
-    // new ground. See http_config.sv for the register numbers and the field tables.
+    // need eight bytes, and the AXI-Lite read path is 64 bits (AXIL_DATA_BITS). See http_config.sv
+    // for the register numbers and the field tables.
     output logic [63:0] laneOccWord,
     output logic [63:0] laneReadyWord,
     output logic [63:0] laneStateWord,
@@ -215,14 +210,13 @@ module handler_multi #(
 
     // THE TWO ADMISSION CONDITIONS, PER LANE.
     //
-    // req_ready answers about the lane this beat names, exactly as the single-lane version answers
-    // about the only lane there is. An ARM waits for that lane's previous text to have gone out; an
-    // ENTRY waits for that lane's chunk queue to have room. Conflating them deadlocks -- the arm is
-    // what drains the queue, so gating it on queue room means a batch that exactly fills the queue
-    // can never begin.
+    // req_ready answers about the lane this beat names. An ARM waits for that lane's previous text
+    // to have gone out; an ENTRY waits for that lane's chunk queue to have room. Conflating them
+    // deadlocks -- the arm is what drains the queue, so gating it on queue room means a batch that
+    // exactly fills the queue can never begin.
     //
-    // They are named here rather than inlined into req_ready because the host now reads them back
-    // per lane (laneReadyWord). Both are MONOTONE IN THE HOST'S FAVOUR: nothing but a config beat
+    // They are named here rather than inlined into req_ready because the host reads them back per
+    // lane (laneReadyWord). Both are MONOTONE IN THE HOST'S FAVOUR: nothing but a config beat
     // from the host can clear either one, so "poll, then write" is race-free and needs no retry.
     // stream_busy only rises on an ARM this module accepted; rwl_cfg_ready and lane_occ_ok only fall
     // on an ENTRY it accepted. Assigned in gen_lane below, with the signals they read.
@@ -397,19 +391,17 @@ module handler_multi #(
     // resp_done and unblocks the parser at the next header block. So `start` is an EDGE protocol,
     // not a level.
     //
-    // It used to be driven with the level `conn_up && rwl_busy && !fatal`. rwl_busy is high while
-    // ANY chunk entry is queued in axis_rewrite_last, so with two or more requests outstanding on a
-    // lane -- which is the whole point of pipelining, and what the board actually runs -- it never
-    // fell. The reader framed the first response, parked in ST_DONE, and the lane went silent while
-    // the wire kept delivering. The old handler had this stage (a 2-state FSM around the same
-    // condition) and it was lost in the port to N lanes; lane_drain p1/p4/p5/a2/a10 are what found
-    // it missing.
+    // The level `conn_up && rwl_busy && !fatal` would not do: rwl_busy is high while ANY chunk entry
+    // is queued in axis_rewrite_last, so with two or more requests outstanding on a lane -- which is
+    // the whole point of pipelining -- it never falls. The reader would frame the first response,
+    // park in ST_DONE, and the lane would go silent while the wire kept delivering (lane_drain
+    // p1/p4/p5/a2/a10).
     //
-    // Set on the same condition as before, cleared when the reader reports this activation
-    // finished. lane_done covers ST_DONE and ST_ABORT, so an aborted activation releases the stage
-    // too rather than leaving it latched on a reader that has already given up. The clear wins over
-    // the set, so a lane with more work re-arms one cycle later -- exactly one cycle of `start` low,
-    // which is all the reader needs.
+    // Set on that condition, cleared when the reader reports this activation finished. lane_done
+    // covers ST_DONE and ST_ABORT, so an aborted activation releases the stage too rather than
+    // leaving it latched on a reader that has already given up. The clear wins over the set, so a
+    // lane with more work re-arms one cycle later -- exactly one cycle of `start` low, which is all
+    // the reader needs.
     //
     // The set condition still requires rwl_busy, so this cannot re-arm into a pending reconnect:
     // lane_want_reconn_w demands lane_idle_w, which demands !rwl_busy.
@@ -490,9 +482,8 @@ module handler_multi #(
 
         // -- chunk boundaries by byte count -------------------------------------------------------
         //
-        // NUM_DEST is 1 per lane: the lane IS the destination now. The old design had one
-        // rewrite_last with an N-way dest because one body stream fed N decoders; here each lane
-        // has its own stream and its own decoder, so there is nothing left to select.
+        // NUM_DEST is 1 per lane: each lane has its own stream and its own decoder, so there is
+        // nothing to select.
         logic                       rwl_tvalid, rwl_tready, rwl_tlast;
         logic [AXI_DATA_BITS-1:0]   rwl_tdata;
         logic [AXI_DATA_BITS/8-1:0] rwl_tkeep;
@@ -516,23 +507,20 @@ module handler_multi #(
 
         // -- register slice on the body output ----------------------------------------------------
         //
-        // strip_http's skid register -> axis_rewrite_last -> out used to be ONE combinational cone:
-        // rewrite_last derives tlast from $countones(tkeep) against a 32-bit remaining count
-        // (axis_rewrite_last.sv:98-115), straight off strip_http's skid_keep_q. build-117 (3 lanes,
-        // WNS -0.849 ns) has two clusters of violations starting at skid_keep_q_reg and running
-        // through exactly that popcount + compare (10 logic levels, CARRY8 x2):
-        //   * 45 paths into THIS module's lane_occ_q_reg/CE, worst -0.766 ns -- the chunk-retire
-        //     pop below reads m_axis_body_tlast;
-        //   * 24 paths out through vfpga_top, AXIToNData and into the DataNormalizer's
-        //     offset_reg/R (its "tlast resets the offset"), worst -0.727 ns.
-        // And the decoder's tready came back the same way into strip_http's skid clock enables.
+        // Without it, strip_http's skid register -> axis_rewrite_last -> out is ONE combinational
+        // cone: rewrite_last derives tlast from $countones(tkeep) against a 32-bit remaining count,
+        // straight off strip_http's skid register. That cone runs into this module's lane_occ_q
+        // (the chunk-retire pop below reads m_axis_body_tlast) and out through vfpga_top and
+        // AXIToNData into the DataNormalizer's offset register (its "tlast resets the offset"), and
+        // it is where timing fails; the decoder's tready comes back the same way into strip_http's
+        // skid clock enables.
         //
-        // WHY HERE AND NOT IN vfpga_top. A slice between hm_body and AXIToNData would cut the 24
-        // and leave the 45: lane_occ_q's pop is inside this module and would still see the
-        // unregistered tlast. Here the cone ends at the slice's input register, and everything
-        // that reads the body output -- lane_occ_q below, the port, the normalizer beyond it --
-        // starts from the slice's registers instead. lane_occ_q still counts at the PORT
-        // handshake, so a chunk is retired when the decoder side takes its tlast, as before.
+        // WHY HERE AND NOT IN vfpga_top. A slice between hm_body and AXIToNData would cut the paths
+        // into the normalizer and leave the ones into lane_occ_q, whose pop is inside this module.
+        // Here the cone ends at the slice's input register, and everything that reads the body
+        // output -- lane_occ_q below, the port, the normalizer beyond it -- starts from the slice's
+        // registers instead. lane_occ_q still counts at the PORT handshake, so a chunk is retired
+        // when the decoder side takes its tlast.
         //
         // What the slice may hold -- at most two beats -- is past the framer, so clear_framing does
         // not flush it, exactly like a beat the decoder has already taken. It never holds anything
@@ -556,11 +544,10 @@ module handler_multi #(
 
     // A lane may be reconnected only when there is NOTHING TO REPLAY.
     //
-    // The old handler learned this the expensive way: streamed request text is consumed as it is
-    // sent and the hardware cannot reproduce it, so reopening a session with requests outstanding
-    // gives a connection nobody will ever ask anything on. The read errors again, reconnects again,
-    // and each iteration burns one of the TOE's 512 ephemeral ports -- observed as SYN/FIN on
-    // 32769, 32770, 32771 ... with no data on any of them.
+    // Streamed request text is consumed as it is sent and the hardware cannot reproduce it, so
+    // reopening a session with requests outstanding gives a connection nobody will ever ask anything
+    // on. The read errors again, reconnects again, and each iteration burns one of the TOE's
+    // ephemeral ports: SYN/FIN on one port after another with no data on any of them.
     //
     // So "nothing owed" is the whole precondition: the alignment counter is idle (no chunk is
     // part-way through), the transmit side is idle, and the failure was clean rather than dirty.
@@ -707,10 +694,10 @@ module handler_multi #(
     // a response and the whole batch must be reissued on a new lane, the second is a retry -- so the
     // cause has to be latched at the moment it is true.
     //
-    // The other three are transients for the same structural reason: error_dirty is only asserted
-    // while tcp_read sits in ST_ABORT, read_timeout is reset with the framer on a reconnect, and
-    // rx_fifo_stall is a level from the decoupling fifo. The OR-folded copies in stallWord say some
-    // lane saw them; these say which, and still say it afterwards.
+    // Two of the other three are transients: error_dirty is only asserted while tcp_read sits in
+    // ST_ABORT, and read_timeout is reset with the framer on a reconnect. rx_fifo_stall is latched
+    // with them so every cause reads from one place. The OR-folded copies in stallWord say some lane
+    // saw them; these say which, and still say it afterwards.
     logic [NUM_CONNS-1:0] lane_dead_q, lane_dirty_q, lane_timeout_q, lane_fifo_stall_q;
     logic                 conn_stall_q;
     localparam int STALL_BITS = $clog2(STALL_CYCLES) + 1;
@@ -794,9 +781,8 @@ module handler_multi #(
 
                 // A lane that fails stops. It cannot recover on its own: streamed request text is
                 // consumed as it is sent and the hardware cannot reproduce it, so reconnecting
-                // would reopen a session with nothing to ask for -- which is the SYN/FIN-per-port
-                // loop that burned the TOE's ephemeral pool in the single-lane design. The host
-                // still holds the text and reissues.
+                // would reopen a session with nothing to ask for -- the SYN/FIN-per-port loop that
+                // burns the TOE's ephemeral pool. The host still holds the text and reissues.
                 // Fatal ONLY when a reconnect could not fix it -- dirty (body bytes already
                 // reached the decoder, so replay would duplicate them) or with work outstanding
                 // (the request text is gone and only the host can reissue it). A clean error on an
@@ -834,8 +820,8 @@ module handler_multi #(
                 // becomes reconnectable the instant its last chunk retires (lane_idle_w), which is
                 // the same instant the reader is finishing that response: the bring-up FSM closes
                 // and releases the session two or three cycles later, while the reader is still
-                // sitting in ST_DONE waiting for `start` to fall. lane_drain c, f and s_f all set
-                // bit 7 that way, on runs where every byte of every response was correct.
+                // sitting in ST_DONE waiting for `start` to fall (lane_drain c, f and s_f reach
+                // exactly that window, with every byte of every response correct).
                 //
                 // Requiring conn_up_q is sufficient as well as necessary: the framer can only have
                 // been reset if clear_framing was high last cycle, i.e. if conn_up_q was low last
@@ -853,9 +839,9 @@ module handler_multi #(
     end
 
     // =============================================================================================
-    // Readback. Same field positions as the old handler wherever a field still means the same,
-    // so an existing host reads something sensible; the per-lane bits are folded with OR because a
-    // 32-bit window cannot carry N lanes' worth and "any lane is stalled" is what the host acts on.
+    // Readback. The per-lane bits are folded with OR because a 32-bit window cannot carry N lanes'
+    // worth and "any lane is stalled" is what the host acts on; the per-lane registers below say
+    // which lane.
     // =============================================================================================
     logic [7:0] occ_sat, depth_sat;
     always_comb begin
@@ -865,6 +851,12 @@ module handler_multi #(
     end
     assign depth_sat = (QUEUE_DEPTH > 255) ? 8'd255 : 8'(QUEUE_DEPTH);
 
+    // totalWord (read register 2):
+    //   [3:0] 0                      [7:4] tcp_init state          [11:8] lane 0's tcp_read state
+    //   [17:12] 0                    [18] every lane is connected  [19] 0
+    //   [20] some lane is fatal      [21] some lane's TX reservation was refused
+    //   [22] busy (a chunk queued or the transmit path held)       [23] rxd_overflow (reads 0)
+    //   [31:24] 0
     assign totalWord = {8'd0,
                         rxd_overflow,
                         (|rwl_busy) || tx_busy,
@@ -872,21 +864,15 @@ module handler_multi #(
                         6'd0,
                         lane_read_state[0], init_state_debug, 4'd0};
 
-    // EXACTLY 32 BITS. The first draft packed 30 and relied on the lvalue width, which zero-extends
-    // on the LEFT -- so every field still landed where it should but the lane count was
-    // CONN_BITS'(NUM_CONNS), i.e. 4 truncated into 2 bits, reading back as 0. A concat that does
-    // not add up is not a compile error, it is a host that decodes the wrong bits.
+    // EXACTLY 32 BITS. A concat that does not add up is not a compile error: the lvalue width
+    // zero-extends it on the LEFT, and the host decodes the wrong bits.
     //   [7:0] occupancy (max over lanes, saturating)  [15:8] queue depth
     //   [16] any lane has an unread announcement      [17] any peer FINed
     //   [18] every lane is connected                  [19] req_ready for the lane last addressed
     //   [23:20] LANE COUNT -- how many sessions this bitstream has, which is what the host sizes
     //           its per-lane batches from
-    //   [31:24] CSR REVISION. Was a literal zero through revision 1, which is the whole
-    //           compatibility scheme: a host that reads 0 is talking to a bitstream that predates
-    //           the per-lane registers and must not read 16..20 (the read register file answers
-    //           out-of-range addresses with resp_error), and a library that predates this byte
-    //           ignores it. Neither side has to be upgraded in step with the other. The write map
-    //           is FROZEN and this does not touch it.
+    //   [31:24] CSR REVISION. The host reads it first and refuses a revision it does not know.
+    //           The write map is FROZEN and the revision does not touch it.
     localparam logic [7:0] CSR_REVISION = 8'd2;
 
     assign inflightWord = {CSR_REVISION, 4'(NUM_CONNS), req_ready, (&conn_up_q),
@@ -910,12 +896,12 @@ module handler_multi #(
     // =============================================================================================
     // PER-LANE READBACK -- CSR revision 2
     //
-    // The words above answer "is anything wrong". With N lanes that is no longer a useful question:
+    // The words above answer "is anything wrong". With N lanes that is not a useful question:
     // one dead lane sets |lane_fatal_q and the host learns that SOMETHING failed, then has to guess
     // which lane to reissue. Everything below is indexed by lane, at a fixed stride, so software
     // reads one register and shifts.
     //
-    // SLOT WIDTH IS FIXED AT 8 LANES, not NUM_CONNS. A host compiled against one bitstream reads
+    // FIELD STRIDE IS FIXED AT 8 LANES, not NUM_CONNS. A host compiled against one bitstream reads
     // another; a stride that moved with the lane count would silently reinterpret every field the
     // moment a 2-lane bitstream was swapped for a 4-lane one. Lanes this bitstream does not have
     // read 0, and inflightWord[23:20] says how many are real.
