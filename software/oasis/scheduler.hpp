@@ -139,6 +139,9 @@ class Scheduler {
         std::mutex          mutex;
         std::list<InFlight> in_flight;
         std::atomic<size_t> enqueued{0};
+        // Set when a dispatch failed part way: the stream's queues may hold the failed flow's decoder
+        // config and output handle, so no flow is placed here again (see dispatch_to).
+        std::atomic<bool>   out_of_service{false};
     };
 
     OasisContext                 &ctx_;
@@ -226,6 +229,9 @@ class Scheduler {
     // full. Must be called holding dispatch_mutex_. The host-load-only pick: used without HTTP, on a
     // one-lane bitstream, and as the fallback when a lane sample could not be taken.
     std::optional<libstf::stream_t> pick_stream() const;
+
+    // Whether any active stream can still take work (is not out of service).
+    [[nodiscard]] bool any_stream_in_service() const;
 
     // One dispatch iteration's view of the hardware's per-lane admission windows: two CSR reads, or
     // nothing when placement is not lane-aware (and then it reads nothing at all) or the read

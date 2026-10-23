@@ -16,6 +16,7 @@
 #include <cassert>
 #include <chrono>
 #include <exception>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -179,7 +180,9 @@ void Scheduler::watchdog_loop() {
             std::lock_guard<std::mutex> lock(dispatch_mutex_);
             busy = !queue_.empty();
             for (auto &st : streams_) {
-                busy = busy || st->enqueued.load(std::memory_order_relaxed) != 0;
+                // An out-of-service stream keeps its failed flow forever; that is not a stall.
+                busy = busy || (st->enqueued.load(std::memory_order_relaxed) != 0 &&
+                                !st->out_of_service.load(std::memory_order_relaxed));
             }
             auto it = live_channels_.begin();
             while (it != live_channels_.end()) {
@@ -344,7 +347,10 @@ Scheduler::~Scheduler() {
         size_t              abandoned_here = 0;
         {
             std::unique_lock<std::mutex> dlock(dispatch_mutex_);
-            const bool drained = dispatch_cv_.wait_until(dlock, deadline, [&] {
+            dispatch_cv_.wait_until(dlock, deadline, [&] {
+                if (stream->out_of_service.load()) {
+                    return true; // its failed flow never retires
+                }
                 std::lock_guard<std::mutex> slock(stream->mutex);
                 for (const auto &slot : stream->in_flight) {
                     if (!slot.done) {
@@ -355,7 +361,7 @@ Scheduler::~Scheduler() {
             });
             std::lock_guard<std::mutex> slock(stream->mutex);
             reap(*stream, finished);
-            if (!drained && !stream->in_flight.empty()) {
+            if (!stream->in_flight.empty()) {
                 // ABANDON the stragglers, do not destroy them. ~OutputHandle join()s the callback
                 // thread, and the whole reason we are here is that the callback is never going to
                 // run -- joining it would hang the destructor exactly as the unbounded wait did.
@@ -373,12 +379,10 @@ Scheduler::~Scheduler() {
         }
         if (abandoned_here != 0) {
             libstf::log(libstf::LogLevel::ERROR,
-                        "Scheduler: %zu flow(s) never retired after %llds; abandoning them so "
-                        "teardown can finish. A lane the hardware declared fatal does not fire the "
-                        "completion its slot is waiting for -- look for the lane fatal error above.",
-                        abandoned_here,
-                        static_cast<long long>(
-                            std::chrono::duration_cast<std::chrono::seconds>(kDrainTimeout).count()));
+                        "Scheduler: abandoning %zu flow(s) that never retired so teardown can "
+                        "finish. A lane the hardware declared fatal, or a failed dispatch, leaves its "
+                        "flows without a completion -- look for that error above.",
+                        abandoned_here);
         }
         finished.clear(); // destroy / join with no scheduler lock held
     }
@@ -429,6 +433,9 @@ std::optional<libstf::stream_t> Scheduler::pick_stream() const {
     std::optional<libstf::stream_t> best;
     size_t best_load = depth; // Only streams strictly below depth have a free slot.
     for (libstf::stream_t s = 0; s < active; ++s) {
+        if (streams_[s]->out_of_service.load(std::memory_order_relaxed)) {
+            continue;
+        }
         const size_t load = streams_[s]->enqueued.load(std::memory_order_relaxed);
         if (load < best_load) {
             best      = s;
@@ -439,6 +446,16 @@ std::optional<libstf::stream_t> Scheduler::pick_stream() const {
         }
     }
     return best;
+}
+
+bool Scheduler::any_stream_in_service() const {
+    const libstf::stream_t active = std::max<libstf::stream_t>(active_streams_.load(), 1);
+    for (libstf::stream_t s = 0; s < active; ++s) {
+        if (!streams_[s]->out_of_service.load(std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Two CSR reads, once per dispatch iteration, with nothing locked.
@@ -620,7 +637,9 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig
     for (libstf::stream_t s = 0; s < in.active && s < HTTP_LANE_SLOTS && s < num_streams_; ++s) {
         // Read slightly stale by design: `enqueued` is lock-free precisely so the completion
         // callback never has to take dispatch_mutex_ while the dispatcher holds it (see StreamState).
-        in.host_load[s] = streams_[s]->enqueued.load(std::memory_order_relaxed);
+        in.host_load[s] = streams_[s]->out_of_service.load(std::memory_order_relaxed)
+                              ? in.host_depth
+                              : streams_[s]->enqueued.load(std::memory_order_relaxed);
     }
 
     // The stall deadline. It starts the first time there is work, a free host slot and no lane with
@@ -814,6 +833,16 @@ void Scheduler::dispatch_loop() {
             if (stop_ && queue_.empty()) {
                 return;
             }
+            if (!queue_.empty() && !any_stream_in_service()) {
+                // Nothing will ever take the queued flows: fail them rather than park forever.
+                Pending pending = std::move(queue_.front());
+                queue_.pop_front();
+                lock.unlock();
+                pending.completion->channel->fail(std::make_exception_ptr(std::runtime_error(
+                    "every stream is out of service after failed dispatches; reprogram the board")));
+                lock.lock();
+                continue;
+            }
             if (lane_bound_wait) {
                 // Lane credit comes back when the hardware retires a response. No host code runs and
                 // nothing signals dispatch_cv_, so this wait MUST have a timeout -- see kLaneRetry.
@@ -942,10 +971,7 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         });
     }
 
-    // Nothing has been triggered yet, so if an apply() throws no completion callback will EVER fire
-    // for this slot -- it would sit in in_flight forever holding a pipeline slot, and `enqueued`
-    // would never come back down, so the dispatcher would stop placing work on this stream. Retire
-    // it here, then let the exception continue to dispatch_loop, which owns telling the consumer.
+    // The exception continues to dispatch_loop, which fails the consumer's channel.
     try {
         for (auto &op : slot->flow) {
             if (dynamic_cast<LocalSinkOperator *>(op.get()) == nullptr) {
@@ -953,11 +979,14 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
             }
         }
     } catch (...) {
-        {
-            std::lock_guard<std::mutex> slock(ss.mutex);
-            slot->done = true;
-        }
-        ss.enqueued.fetch_sub(1, std::memory_order_relaxed);
+        // The sinks' output handles, and perhaps the decoder config and the lane's chunk entries, are
+        // already queued on this stream, and a later flow placed here would be decoded against them.
+        // So the stream goes out of service, and the slot stays: its sink callbacks capture it.
+        ss.out_of_service.store(true);
+        libstf::log(libstf::LogLevel::ERROR,
+                    "Scheduler: stream %u is out of service after a failed dispatch; reprogram the "
+                    "board to use it again",
+                    static_cast<unsigned>(stream));
         libstf::Profiler::close_regions({profiler_prefix + "dispatch_to"});
         throw;
     }
