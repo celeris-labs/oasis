@@ -32,15 +32,15 @@ import lynxTypes::*;
 //   m_tvalid = tmp_valid || over_valid        two flops: no path from s_tvalid
 //   m_t*     = over_valid ? over : tmp        a 2:1 mux on flops: no path from s_t*
 //
-// m_tready reaches exactly one register, over_valid. That is the point on the backward side: the
-// decoder's ready chain used to end at strip_http's skid clock enables (~1150 flops); here it ends
-// at one flop.
+// m_tready reaches exactly one register, over_valid. That is the point on the backward side:
+// without the slice the decoder's ready chain ends at strip_http's skid clock enables (~1150
+// flops); with it, at one flop.
 //
 // Throughput: s_tready is low only when BOTH registers hold a beat, and then m_tvalid is high -- so
 // the input is refused only while the output has something to offer, and the output idles only
 // while the slice is empty. With the sink always ready it is one beat per cycle at one cycle of
 // latency; under any back-pressure pattern, a source that keeps offering has a beat move on every
-// cycle the sink is ready. unit-tests/rx_perf (slice_tb) checks exactly that, byte for byte.
+// cycle the sink is ready. lane_drain runs every lane through it under its back-pressure patterns.
 // =================================================================================================
 module axis_skid #(
     parameter int DATA_BITS = AXI_DATA_BITS

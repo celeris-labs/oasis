@@ -5,17 +5,15 @@ import lynxTypes::*;
 // =================================================================================================
 // HTTP/1.1 response framer -- strips headers, delimits bodies by Content-Length.
 //
-// WHAT THIS REPLACED AND WHY
-// --------------------------
-// The previous version found "\r\n\r\n" and then streamed everything until the TCP tlast, i.e. it
-// used the server's FIN as the end-of-body marker. That is only correct when the request carries
-// `Connection: close`, which is exactly what forced a fresh TCP connection per ranged GET -- and a
-// connection per GET is what exhausts the TOE's 512-entry ephemeral port pool partway through a
-// benchmark run.
+// WHY CONTENT-LENGTH
+// ------------------
+// Using the server's FIN as the end-of-body marker is only correct when the request carries
+// `Connection: close`, which forces a fresh TCP connection per ranged GET -- and a connection per
+// GET exhausts the TOE's 512-entry ephemeral port pool partway through a query.
 //
 // To reuse one connection the framer has to know where each body ends by itself, because on a
 // persistent connection there is no FIN between responses: body k is followed immediately by the
-// status line of response k+1, frequently inside the SAME 64-byte beat. So this module now
+// status line of response k+1, frequently inside the SAME 64-byte beat. So this module
 //
 //   * parses the status line and the header block byte by byte,
 //   * extracts Content-Length,
@@ -31,17 +29,16 @@ import lynxTypes::*;
 //     shifted_w = res_data_q >> (res_cur_q * 8)
 //
 // which serves both roles at once -- its low byte is the next header character, and the whole word
-// is the already-bottom-justified body beat. The old design had a 64-wide 32-bit comparator tree
-// (the parallel "\r\n\r\n" search across a 67-byte window) feeding that same shifter in one
-// combinational cone; that cone is gone, replaced by an 8-bit compare against a 14-byte ROM. The
-// barrel shift, the skid buffer and the two-register slave-ready function are unchanged.
+// is the already-bottom-justified body beat. The header is matched one byte at a time, an 8-bit
+// compare against a 14-byte ROM, so no wide parallel "\r\n\r\n" search sits in front of the
+// shifter.
 //
 // Header parsing is byte-serial, so a ~200-byte response header costs ~200 cycles (0.8 us at
-// 250 MHz). Bodies still move a full 64-byte beat per cycle: in the body the cursor is 0 and the
-// shift is a no-op except on the first beat after a header, exactly as before.
+// 250 MHz). Bodies move a full 64-byte beat per cycle: in the body the cursor is 0 and the shift is
+// a no-op except on the first beat after a header.
 //
-// BOTTOM-JUSTIFICATION IS STILL THE CONTRACT
-// ------------------------------------------
+// BOTTOM-JUSTIFICATION IS THE CONTRACT
+// ------------------------------------
 // Downstream is the pipelined DataNormalizer with ENABLE_COMPACTOR=0, which places bytes using
 // $countones(tkeep) and therefore requires every beat's valid bytes to start at lane 0. Beats are
 // emitted as `shifted_w` masked to body_n_w bytes, so that holds for every beat, not just the first.
@@ -49,10 +46,10 @@ import lynxTypes::*;
 // THE tlast CONTRACT (body_last)
 // ------------------------------
 // The normalizer resets its running byte offset on tlast, so one decoder stream must carry exactly
-// one tlast. A logical column chunk may be fetched as several ranged GETs (the host splits it to
-// bound how many bytes the server can have in flight -- see software/oasis/configuration.cpp), so
-// the handler tells this module, per response, whether that response ends the decoder stream.
-// body_last=0 means "emit the final beat with tlast=0 and keep going".
+// one tlast. body_last says, per response, whether that response ends the decoder stream;
+// body_last=0 means "emit the final beat with tlast=0 and keep going". Both handlers tie it to 0
+// and take the decoder's tlast from axis_rewrite_last, which counts chunk bytes across ranged GETs;
+// body_last=1 is exercised by the strip_http bench only.
 //
 // HANDSHAKE WITH tcp_read
 // -----------------------
@@ -217,16 +214,14 @@ module strip_http (
     // The status code of the response BEING RETIRED, latched beside cl_latched_q for the same
     // reason and at the same instant. status_q is a live shift register: it takes the digits of
     // whatever status line the parser is walking, so once responses are pipelined it holds the NEXT
-    // response's code while the handler is still sampling the previous one's completion. That is
-    // how a run of perfectly good 206s raised the sticky bad-status bit -- the handler sampled
-    // status on the level of `done` and caught the parser mid-"206". Content-Length was immune only
-    // because it was already latched here; status now is too.
+    // response's code while the handler is still sampling the previous one's completion: sampled
+    // on the level of `done` it would catch the parser mid-"206" and raise the sticky bad-status
+    // bit on a good response. So status is latched here like Content-Length.
     logic [23:0] status_latched_q;
-    // status_ok, REGISTERED beside status_latched_q (2026-09-26, build-133 timing): the two 24-bit
-    // compares used to sit between status_latched_q and the handler's conn_status_bad_q / the CSR
-    // readback, across an SLR boundary whenever the framer and the handler core are placed apart
-    // (build-133: -2.02 ns, strip_http[1] in SLR2 -> handler in SLR1). Loaded in the same branch,
-    // from the same value, so it is status_latched_q's compare in every cycle: no latency.
+    // status_ok, REGISTERED beside status_latched_q, so the two 24-bit compares do not sit between
+    // status_latched_q and the handler's bad-status check / the CSR readback, across an SLR boundary
+    // whenever the framer and the handler core are placed apart. Loaded in the same branch, from the
+    // same value, so it is status_latched_q's compare in every cycle: no latency.
     logic        status_ok_q;
     logic [1:0]  status_sp_q;  // spaces seen in the status line (saturating)
     logic [1:0]  status_cnt_q; // status digits captured (0..3)
@@ -498,8 +493,8 @@ module strip_http (
     end
 
     // ---------------------------------------------------------------------------------------------
-    // Registered output: 2-slot AXI-Stream skid buffer (unchanged from the previous design). It
-    // registers m_axis_* so the barrel-shift cone ends at a flop here.
+    // Registered output: 2-slot AXI-Stream skid buffer. It registers m_axis_* so the barrel-shift
+    // cone ends at a flop here.
     // ---------------------------------------------------------------------------------------------
     assign m_axis_tvalid = skid_valid_q;
     assign m_axis_tdata  = skid_data_q;

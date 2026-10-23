@@ -3,15 +3,12 @@
 import lynxTypes::*;
 
 // =================================================================================================
-// Arrival-order receive dispatcher for N concurrent TCP connections.
-//
-// Replaced the retired session table's per-slot announcement queues. See ARCHITECTURE.md, ADR-1 and
-// ADR-3.
+// Arrival-order receive dispatcher for N concurrent TCP connections (handler_multi).
 //
 // THE CONTRACT
 // ------------
 // The TOE is built with TCP_STACK_RX_DDR_BYPASS_EN=1, so there is no per-session receive buffer:
-// every session shares one axis_data_fifo_512_d1024 (tcp_stack.sv:681, 1024 x 64 B = 64 KB) and
+// every session shares one axis_data_fifo_512_d16384 (tcp_stack.sv, 16384 x 64 B = 1 MiB) and
 // toe.cpp's rxAppMemDataRead() pops the HEAD of it regardless of which session asked. The session id
 // in a readPkg is not an address -- it is only used to advance that session's app read pointer
 // (rx_app_stream_if.cpp: rxSarAppd(sessionID, appd + readLength)). So:
@@ -19,11 +16,11 @@ import lynxTypes::*;
 //     readPkg must be issued in GLOBAL ARRIVAL ORDER across all sessions,
 //     and the drain must never stop.
 //
-// The session table queued announcements per slot and let the reader take them in REQUEST order.
-// That reorders, and reordering hands one session's bytes to another session's reader -- builds
-// 90/91/92. Coyote's own full-throughput receiver satisfies the contract by never buffering at all
-// (examples/13_perf_tcp/.../tcp_perf_server.cpp): read a notification, issue the readPkg, consume to
-// `last`, at II=1. This module is that shape, with two additions it needs and the benchmark does
+// Queuing announcements per connection and taking them in REQUEST order would reorder, and
+// reordering hands one session's bytes to another session's reader. Coyote's own full-throughput
+// receiver satisfies the contract by never buffering at all
+// (examples/13_perf_tcp/.../tcp_perf_server.cpp): read a notification, issue the readPkg, consume
+// to `last`, at II=1. This module is that shape, with two additions it needs and the benchmark does
 // not -- it has to route bytes to the right consumer, and it has to survive a consumer that is
 // slower than the wire.
 //
@@ -33,15 +30,15 @@ import lynxTypes::*;
 // connection's fifo can certainly hold it. Once requested, every beat is accepted unconditionally.
 //
 // That distinction is the whole design. Gating the data stream instead would stall the shared fifo
-// for every other session at once -- including sessions whose consumers are keeping up -- which is
-// the failure mode ADR-2 was about, multiplied by N.
+// for every other session at once -- including sessions whose consumers are keeping up. A beat a
+// connection refuses is therefore not waited for: it is lost, and route_stall latches it.
 //
 // ONE readPkg PER NOTIFICATION
 // ----------------------------
 // A readPkg returns exactly ONE announced segment however many bytes it names, because on the
 // bypass path rxAppMemDataRead forwards words until currWord.last. Naming a larger length does not
-// coalesce segments; it only runs the receive window ahead of what was really consumed. That cost
-// build-90 a day, so the length here is always passed through from the notification unchanged.
+// coalesce segments; it only runs the receive window ahead of what was really consumed, so the
+// length here is always passed through from the notification unchanged.
 //
 // WHAT HAPPENS WHEN A CONSUMER NEVER COMES BACK
 // ---------------------------------------------
@@ -64,45 +61,43 @@ import lynxTypes::*;
 // The threshold is a long time on purpose. It has to sit above the longest transient a lane may
 // legitimately impose (lane_drain d and s_d hold a decoder off for ~58k cycles and must recover
 // with every byte intact) and below the point where the path is indistinguishable from dead. At
-// 250 MHz the default is 262 us -- longer than it takes a decoder running at its measured
-// ~615 MB/s to drain a whole 128 KiB lane fifo, so a lane that has accepted NOTHING for that long
-// is not a lane that is merely behind.
+// 250 MHz the default is 262 us -- longer than it takes a decoder running at ~615 MB/s to drain a
+// whole 128 KiB lane fifo, so a lane that has accepted NOTHING for that long is not a lane that is
+// merely behind.
 //
-// AND WHY THE ANNOUNCEMENT QUEUE NO LONGER DROPS
-// ----------------------------------------------
-// It used to drop an announcement it could not enqueue. That is unrecoverable: the bytes it named
-// stay in the TOE's shared fifo with nobody left to ask for them, so every later packet queues
-// behind them forever (lane_drain s_d hung 3864 bytes short of 400000 exactly this way). Holding
-// the notification interface instead costs nothing in ordering -- an announcement that cannot be
-// enqueued could not have been issued ahead of the head anyway -- so TREADY now falls when, and
-// only when, a slot is genuinely needed and there is none.
+// AND WHY THE ANNOUNCEMENT QUEUE NEVER DROPS
+// ------------------------------------------
+// Dropping an announcement it cannot enqueue would be unrecoverable: the bytes it named stay in the
+// TOE's shared fifo with nobody left to ask for them, so every later packet queues behind them
+// forever. Holding the notification interface instead costs nothing in ordering -- an announcement
+// that cannot be enqueued could not have been issued ahead of the head anyway -- so TREADY falls
+// when, and only when, a slot is genuinely needed and there is none.
 //
 // AND WHY IT QUEUES ANNOUNCEMENTS FOR SESSIONS NOBODY HOLDS
 // ---------------------------------------------------------
 // The same argument, for a session the handler has already let go of. A fatal lane is closed and
 // released in the same cycle, but the TOE is then in FIN_WAIT_1 (or CLOSING/LAST_ACK) and still
 // accepts and announces whatever the peer had in flight. That segment is in the shared fifo like
-// any other. It used to be dropped here "because the session is gone" -- and then the NEXT readPkg,
-// for whichever lane came next, popped it, with that lane's session id echoed as metadata (the TOE
-// checks nothing), so another lane got the dead session's bytes. So every announcement with a
-// length is queued, and one for an unbound session is tagged an ORPHAN: it is issued in arrival
-// order without waiting on anybody's fifo, charged to no connection (no reservation, no pending
-// count, no watchdog time), and its bytes are dropped on the data side because the metadata names
-// a session nobody holds (close-unbind, 2026-09-25; rxd_drain r8, lane_drain cu and cuovf).
+// any other. Dropping its announcement here "because the session is gone" would let the NEXT
+// readPkg, for whichever lane came next, pop it, with that lane's session id echoed as metadata (the
+// TOE checks nothing), so another lane would get the dead session's bytes. So every announcement
+// with a length is queued, and one for an unbound session is tagged an ORPHAN: it is issued in
+// arrival order without waiting on anybody's fifo, charged to no connection (no reservation, no
+// pending count, no watchdog time), and its bytes are dropped on the data side because the metadata
+// names a session nobody holds (rxd_drain r8, lane_drain cu and cuovf).
 // =================================================================================================
 module rx_dispatch #(
     parameter int NUM_CONNS    = 4,
-    // Announcements that may be outstanding across ALL connections. Global now, not per slot: the
-    // TOE announces one segment at a time and the shared fifo holds 64 KB, so at MSS 4096 there can
-    // never be more than 16 unread announcements in existence. 64 is comfortable.
+    // Announcements that may be outstanding across ALL connections, in one queue. It is flow
+    // controlled (the notification interface is held while it is full), so this is a sizing
+    // choice, not a bound: 64 segments in the shared fifo.
     parameter int NOTIFY_DEPTH = 64,
     // Cycles the head of the queue may wait on ONE connection that is accepting nothing before that
     // connection is declared dead. See the note above for the sizing argument.
     parameter int HOL_STALL_CYCLES = 65536,
     // 1: notifications pass through a two-deep register slice before anything looks at them, so
-    // TREADY is a flop and the session lookup starts from a register of ours (2026-09-26,
-    // build-133 timing; see "THE NOTIFICATION SLICE" below). 0 is the original behaviour and the
-    // default, so handler_multi and every bench that does not ask are unchanged.
+    // TREADY is a flop and the session lookup starts from a register (see "THE NOTIFICATION SLICE"
+    // below). 0, the default and handler_multi's: the port feeds the lookup directly.
     parameter bit  NOTE_REG     = 1'b0,
     localparam int CONN_BITS   = (NUM_CONNS > 1) ? $clog2(NUM_CONNS) : 1,
     localparam int PTR_BITS    = $clog2(NOTIFY_DEPTH),
@@ -112,8 +107,8 @@ module rx_dispatch #(
     input  logic clk,
     input  logic rst_n,
 
-    // -- Notification sink. TREADY is hardwired high: back-pressuring this interface stalls every
-    //    session simultaneously, including ones that are perfectly healthy.
+    // -- Notification sink. TREADY falls only when an announcement needs a queue slot and there is
+    //    none (nt_ready_w): back-pressuring this interface stalls every session at once.
     input  logic                       s_axis_notifications_TVALID,
     output logic                       s_axis_notifications_TREADY,
     input  logic [TCP_NOTIFY_BITS-1:0] s_axis_notifications_TDATA,
@@ -142,9 +137,9 @@ module rx_dispatch #(
     input  logic [AXI_DATA_BITS/8-1:0] s_axis_rx_data_TKEEP,
     input  logic                       s_axis_rx_data_TLAST,
 
-    // -- Demultiplexed output, one port per connection. tready is expected to be high (these feed
-    //    the per-connection fifos); if it ever falls the shared fifo is being stalled again, which
-    //    route_stall latches.
+    // -- Demultiplexed output, one port per connection. tready is expected to be high: these feed
+    //    the per-connection fifos, which reserved room for the packet. The shared stream does not
+    //    wait for it, so a beat refused here is lost, which route_stall latches.
     output logic [NUM_CONNS-1:0]       conn_tvalid,
     input  logic [NUM_CONNS-1:0]       conn_tready,
     output logic [AXI_DATA_BITS-1:0]   conn_tdata,
@@ -165,7 +160,7 @@ module rx_dispatch #(
     output logic [NUM_CONNS-1:0]       conn_closed,
 
     output logic [NUM_CONNS-1:0]       dbg_has_pending,
-    output logic                       dbg_overflow,   // sticky: an announcement was dropped
+    output logic                       dbg_overflow,   // sticky: an announcement was dropped (never)
     output logic                       dbg_route_stall,// sticky: a consumer refused a beat
     // Sticky, per connection: this connection blocked the head of the queue for HOL_STALL_CYCLES
     // and its packets are now being read and thrown away. The handler turns this into a fatal lane.
@@ -183,10 +178,8 @@ module rx_dispatch #(
     logic [TCP_SESSION_BITS-1:0] sid_q   [NUM_CONNS];
     logic                        closed_q[NUM_CONNS];
 
-    // Combinational lookup: a flat compare against every bound session. It was written for
-    // NUM_CONNS <= 8; at 32 connections it is a 32-way CAM of 16-bit compares and a priority
-    // encode (build-133: 9 levels into pend_q's clock enables), which is why NOTE_REG feeds it
-    // from a register.
+    // Combinational lookup: a flat compare against every bound session, for NUM_CONNS <= 8.
+    // NOTE_REG feeds it from a register.
     function automatic logic [CONN_BITS-1:0] conn_of(input logic [TCP_SESSION_BITS-1:0] sid);
         conn_of = '0;
         for (int i = 0; i < NUM_CONNS; i++) begin
@@ -209,11 +202,10 @@ module rx_dispatch #(
     logic [TCP_LEN_BITS-1:0]     nq_len [NOTIFY_DEPTH];
     // The connection each queued announcement was accepted FOR, recorded at enqueue time.
     //
-    // The head's destination used to be re-derived with conn_of(head_sid), which stops working the
-    // moment a session is released: an unbound sid matches nothing and conn_of falls through to 0,
-    // so every stale entry claimed lane 0 -- gated on lane 0's fifo and, on the data side, spliced
-    // into lane 0's byte stream. Right by accident when the dead lane WAS lane 0, silent corruption
-    // otherwise. Three bits per entry make it exact and survive the release.
+    // Re-deriving the head's destination with conn_of(head_sid) would stop working the moment a
+    // session is released: an unbound sid matches nothing and conn_of falls through to 0, so every
+    // stale entry would claim lane 0 -- gated on lane 0's fifo and, on the data side, spliced into
+    // lane 0's byte stream. CONN_BITS per entry make it exact and survive the release.
     logic [CONN_BITS-1:0]        nq_conn[NOTIFY_DEPTH];
     // The announcement was for a session nobody holds (released, or never bound). Its segment is in
     // the TOE's shared fifo all the same, so it is still read in arrival order -- and thrown away.
@@ -225,15 +217,10 @@ module rx_dispatch #(
     // without asking its fifo and the bytes are discarded, so the shared drain keeps moving.
     logic [NUM_CONNS-1:0]        dead_q;
 
-    // Announcements queued per connection, maintained incrementally.
-    //
-    // This replaces a combinational sweep of all NOTIFY_DEPTH entries that computed a rotated index
-    // (nq_head_q + j) % NOTIFY_DEPTH and called has_conn()/conn_of() on every one of them -- a
-    // NOTIFY_DEPTH-way barrel rotate over the whole sid array plus 2*NUM_CONNS*NOTIFY_DEPTH session
-    // comparators, 8603 LUTs against 1158 FFs in build-110. It existed only to drive
-    // dbg_has_pending, whose single consumer OR-reduces it into a debug word; and by reading every
-    // queue entry combinationally it also kept nq_sid/nq_len out of RAM. Counters cost NUM_CONNS
-    // registers and say the same thing more exactly.
+    // Announcements queued per connection, maintained incrementally, for dbg_has_pending. Counters
+    // rather than a combinational sweep of all NOTIFY_DEPTH entries: the sweep is a NOTIFY_DEPTH-way
+    // rotate over the sid array plus 2*NUM_CONNS*NOTIFY_DEPTH session comparators, and reading every
+    // entry combinationally would keep nq_sid/nq_len out of RAM.
     logic [CNT_BITS-1:0]         pend_q [NUM_CONNS];
 
     logic nq_empty_w, nq_full_w;
@@ -241,19 +228,16 @@ module rx_dispatch #(
     assign nq_full_w  = (nq_cnt_q == CNT_BITS'(NOTIFY_DEPTH));
 
     // ---------------------------------------------------------------------------------------------
-    // THE NOTIFICATION SLICE (NOTE_REG, 2026-09-26, build-133 timing). Everything below consumes
-    // a notification through nt_valid_w / nt_data_w / nt_ready_w. Without NOTE_REG those are the
-    // port itself. With it, a two-deep slice sits in between: its output (nt_*) is one register,
-    // its spare catches the beat that arrives while the output is held, and TREADY is the spare's
-    // valid flop -- so neither the session lookup (the notification's sid through the 32-entry
-    // CAM into the per-connection pending counters, -1.42 ns from the shell's notify register
-    // slice on build-133) nor the queue-full decision reaches back into the shell any more. It
-    // is exactly the original module fed by a TOE that presents each notification one cycle
-    // later: the lookup, the enqueue, the sticky FIN and the queue-full hold are all evaluated
-    // on the slice's output in the cycle it is consumed, against the binding state of that
-    // cycle, as before. Order is preserved (a two-deep fifo), throughput is one per cycle, and
-    // the queue is still never overrun (nt_ready_w is the original TREADY rule, applied at the
-    // slice's output; the slice itself only holds two more).
+    // THE NOTIFICATION SLICE (NOTE_REG). Everything below consumes a notification through
+    // nt_valid_w / nt_data_w / nt_ready_w. Without NOTE_REG those are the port itself. With it, a
+    // two-deep slice sits in between: its output (nt_*) is one register, its spare catches the beat
+    // that arrives while the output is held, and TREADY is the spare's valid flop -- so neither the
+    // session lookup nor the queue-full decision reaches back into the shell. It behaves like the
+    // module without the slice fed by a TOE that presents each notification one cycle later: the
+    // lookup, the enqueue, the sticky FIN and the queue-full hold are all evaluated on the slice's
+    // output in the cycle it is consumed, against the binding state of that cycle. Order is
+    // preserved (a two-deep fifo), throughput is one per cycle, and the queue is never overrun
+    // (nt_ready_w applies at the slice's output; the slice itself only holds two more).
     // ---------------------------------------------------------------------------------------------
     logic                       nt_valid_w, nt_ready_w;
     logic [TCP_NOTIFY_BITS-1:0] nt_data_w;
@@ -333,9 +317,9 @@ module rx_dispatch #(
     //
     // always_comb, not assign, for every line that calls conn_of()/has_conn(): a continuous
     // assignment is only re-evaluated when the function's ARGUMENTS change, not when bound_q/sid_q
-    // read inside it do, so in xsim a release left these at their old value until the next
+    // read inside it do, so in xsim a release would leave these at their old value until the next
     // notification changed note_sid_w. Synthesis builds the plain combinational logic either way;
-    // only the simulation was wrong, and it hid this very bug.
+    // only the simulation would be wrong.
     logic                 enq_fire_w;
     logic [CONN_BITS-1:0] enq_conn_w;
     logic                 enq_orphan_w;
@@ -408,7 +392,8 @@ module rx_dispatch #(
     assign meta_fire_w = s_axis_rx_metadata_TVALID && s_axis_rx_metadata_TREADY;
 
     // Unconditional acceptance while a packet is in progress. This is the line that must never gain
-    // a term: it is what keeps the shared 64 KB fifo draining for every other session.
+    // a term: it is what keeps the shared 1 MiB fifo draining for every other session. A beat the
+    // destination lane refuses is lost (route_stall), which the lane's reservation rules out.
     assign s_axis_rx_data_TREADY = pkt_active_q;
 
     logic data_fire_w;
@@ -474,9 +459,9 @@ module rx_dispatch #(
                 nq_orphan[nq_tail_q] <= enq_orphan_w;
                 nq_tail_q <= (nq_tail_q == PTR_BITS'(NOTIFY_DEPTH-1)) ? '0 : nq_tail_q + 1'b1;
             end
-            // Unreachable now that TREADY falls instead: an announcement that needs a slot is not
+            // Unreachable: TREADY falls instead, so an announcement that needs a slot is not
             // accepted until it has one. Kept as the assertion that it stays that way -- if this
-            // bit ever reads back set, announcements are being lost again.
+            // bit ever reads back set, announcements are being lost.
             if (note_keep_w && nq_full_w) ovf_q <= 1'b1;
 
             if (issue_fire_w) begin
@@ -490,9 +475,13 @@ module rx_dispatch #(
             endcase
 
             // -- per-connection pending count. A release drops the accounting for that connection:
-            //    its queued entries are already unroutable (conn_of returns 0 for an unbound sid),
-            //    so counting them against the new binding would be worse than forgetting them. The
-            //    decrement is guarded so a stale head cannot underflow a lane back to all-ones.
+            //    counting its still-queued entries against the next binding would be worse than
+            //    forgetting them. Those entries keep their nq_conn, so one that reaches the head
+            //    after the lane is rebound still charges the lane's fifo a segment (handed back at
+            //    the next clear_framing), and its packet is dropped as an unbound session's -- or
+            //    routed into the new stream if the TOE reused the session id. A reconnect happens
+            //    only on an idle lane, so in practice nothing is queued. The decrement is guarded so
+            //    a stale head cannot underflow a lane back to all-ones.
             for (i = 0; i < NUM_CONNS; i++) begin
                 if (release_en && (release_conn == CONN_BITS'(i))) begin
                     pend_q[i] <= '0;
@@ -519,8 +508,8 @@ module rx_dispatch #(
             end
 
             // A consumer that refuses a beat means its fifo filled despite conn_space_ok, i.e. the
-            // space check is wrong or the fifo is undersized. Either way the shared fifo is being
-            // stalled again and the whole point of this module is lost. A dropped packet is not
+            // space check is wrong or the fifo is undersized. The beat is lost (TREADY towards the
+            // TOE does not wait for it) and that lane's stream is corrupt. A dropped packet is not
             // offered to anyone, so it cannot be refused by anyone.
             if (pkt_active_q && !pkt_drop_q && s_axis_rx_data_TVALID && !conn_tready[pkt_conn_q]) begin
                 route_stall_q <= 1'b1;

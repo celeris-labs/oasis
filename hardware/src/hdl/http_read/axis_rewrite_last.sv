@@ -4,16 +4,15 @@ import lynxTypes::*;
 
 // Marks the end of a decoder stream by COUNTING BYTES, not by trusting a per-response flag.
 //
-// WHY THIS REPLACES body_last
-// ---------------------------
+// WHY A BYTE COUNT
+// ----------------
 // The decoder needs to know where one column chunk stops and the next begins; the DataNormalizer
 // resets its running byte offset on tlast, so exactly one tlast per chunk is the contract.
 //
-// That used to be carried per RESPONSE: the host set a body_last bit on the last ranged GET of each
-// chunk, the bit travelled in the request queue, and strip_http asserted tlast when it framed that
-// response. It works, but it makes the bookkeeping scale with the number of REQUESTS -- one bit per
-// outstanding response, thousands of them once requests are pushed in bulk -- and the queue holding
-// them became the only arbitrary limit left in the design.
+// Carrying that per RESPONSE -- a body_last bit on the last ranged GET of each chunk, travelling
+// with the request, strip_http asserting tlast when it frames that response -- makes the
+// bookkeeping scale with the number of REQUESTS: one bit per outstanding response, thousands of them
+// once requests are pushed in bulk, and the queue holding them an arbitrary limit.
 //
 // A byte count scales with the number of COLUMN CHUNKS instead. A row group has a handful of those
 // however finely each one is split into ranged GETs, so CFG_DEPTH can be small and never fill. How
@@ -26,15 +25,14 @@ module axis_rewrite_last #(
     // Column chunks that may be configured ahead of the data. A row group's worth is a handful, so
     // this exists to decouple the host from the wire, not to bound anything.
     parameter int CFG_DEPTH = 64,
-    // Decoder lanes the body stream can be routed to. 1 keeps the original single-lane behaviour
-    // and costs nothing.
+    // Decoder lanes the body stream can be routed to. Both handlers use 1 (one instance per lane),
+    // which costs nothing.
     parameter int NUM_DEST  = 1,
     // Derived, but a parameter so the ports can use it.
     parameter int DEST_BITS = (NUM_DEST > 1) ? $clog2(NUM_DEST) : 1,
-    // 1: a configured length reaches the queue through a register, one cycle after its handshake,
-    // and cfg_ready leaves room for the one still in that register (2026-09-26, build-133 timing;
-    // see "THE CONFIG PUSH" below). 0 is the original behaviour and the default, so handler_multi
-    // and every bench that does not ask are unchanged.
+    // 1 (handler_toe): a configured length reaches the queue through a register, one cycle after
+    // its handshake, and cfg_ready leaves room for the one still in that register (see "THE CONFIG
+    // PUSH" below). 0 (the default, handler_multi): the handshake pushes the length directly.
     parameter bit CFG_REG   = 1'b0
 ) (
     input  logic clk,
@@ -94,17 +92,17 @@ module axis_rewrite_last #(
     assign q_full   = (cnt_q == CNT_BITS'(CFG_DEPTH));
 
     // THE CONFIG PUSH. The length the queue takes this cycle: the port's own handshake, or with
-    // CFG_REG the handshake of the cycle before, held in a register. Why (build-128/133 timing):
-    // in the handler cfg_valid is the entry admission -- the host's config beat, the chunk
-    // occupancy compare and this module's cfg_ready -- and it went straight on into the length
-    // queue's LUTRAM write enable, its pointer and cnt_q (-1.44 ns on build-128, the handler core
-    // placed apart from the decoder lane). With CFG_REG that cone ends at one flop.
+    // CFG_REG the handshake of the cycle before, held in a register. Why: in the handler cfg_valid
+    // is the entry admission -- the host's config beat, the chunk occupancy compare and this
+    // module's cfg_ready -- and without the register it goes straight on into the length queue's
+    // LUTRAM write enable, its pointer and cnt_q, which fails timing when the handler core is placed
+    // apart from the decoder lane. With CFG_REG that cone ends at one flop.
     //
     // WHAT IT CHANGES: a length enters the queue one cycle later, nothing else. cfg_ready counts
     // the length still in the register -- room for this beat on top of it, cnt_q + cfg_pend_q <
-    // CFG_DEPTH, i.e. the original !q_full with the pending push included -- so a length the port
-    // accepts always finds its slot, and the queue still holds at most CFG_DEPTH. busy counts the
-    // pending length, so it rises in the same cycle as before; and data meeting an empty queue
+    // CFG_DEPTH, i.e. !q_full with the pending push included -- so a length the port accepts
+    // always finds its slot, and the queue still holds at most CFG_DEPTH. busy counts the pending
+    // length, so it rises in the cycle of the handshake; and data meeting an empty queue
     // while a length is in the register is not `starved` -- the host did configure it, and the
     // beat simply waits for it, as a beat waits for any pop.
     logic                 cfg_pend_q;

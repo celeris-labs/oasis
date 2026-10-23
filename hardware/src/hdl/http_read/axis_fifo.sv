@@ -3,37 +3,10 @@ import lynxTypes::*;
 // =================================================================================================
 // Plain AXI4-Stream FIFO (tdata / tkeep / tlast).
 //
-// WHY THIS EXISTS
-// ---------------
-// The TOE receive path used to be drained by strip_http directly:
-//
-//     assign s_axis_rx_data_TREADY = (state_q == ST_RECV_DATA) && sh_s_tready;
-//
-// so the TCP stack's back-pressure was decided by whether the HTTP parser happened to be free.
-// strip_http walks header bytes one per cycle -- roughly 550 cycles for a MinIO 206 header -- and
-// for that whole window TREADY sits low while data keeps arriving into the TOE's single shared
-// 64 KB rx fifo (tcp_stack.sv:681, 1024 x 64 B, all sessions).
-//
-// 550 cycles x 64 B is ~35 KB of backlog per response, from the header parse alone. A 32 KiB
-// response plus that backlog still fits in 64 KB; a 64 KiB one does not. That is exactly the cliff
-// measured by scripts/sweep.sh: responses up to 32 KiB scale linearly, 64 KiB ones cost ~10 ms
-// extra each, at every pipeline depth.
-//
-// Coyote's own full-throughput receiver never has this problem because it cannot stall --
-// examples/13_perf_tcp/.../tcp_perf_server.cpp reads a notification, issues the readPkg
-// immediately, and consumes to `last` under `#pragma HLS PIPELINE II=1`.
-//
-// Putting this fifo between the TOE and the parser moves the back-pressure into memory we own and
-// can size. It is also a PREREQUISITE for more than one connection: with several sessions sharing
-// one un-demultiplexed fifo, readPkg has to be issued in global arrival order and the drain may
-// never stop, or one session's bytes are handed to another. That is what broke builds 90/91/92.
-//
-// WHY NOT xpm_fifo_axis / axis_data_fifo
-// --------------------------------------
-// Both would work in hardware, but the unit tests run in xsim straight from these sources with no
-// IP catalog. A plain inferred-BRAM fifo keeps `make -C hardware/unit-tests/tcp_read` self
-// contained, which is the difference between verifying this in seconds and verifying it after a
-// six-hour synthesis.
+// The decoupling fifo of a receive lane (tcp_read): it takes the beats the dispatcher routes to the
+// lane at line rate while the framer walks a header one byte per cycle, so the TCP stack's receive
+// path never waits on the parser. Plain inferred BRAM rather than xpm_fifo_axis or axis_data_fifo,
+// so the unit tests run in xsim straight from these sources with no IP catalog.
 //
 // Almost-full is what drives TREADY, and it leaves ALMOST_FULL_SLACK entries free. One slot would
 // be enough for a purely registered producer, but the TOE side is a long combinational path and the
@@ -64,8 +37,8 @@ module axis_fifo #(
 
     // Occupancy, for the stall watchdogs and for tests that assert the fifo never filled.
     output logic [$clog2(DEPTH+1)-1:0] level,
-    // Sticky: the producer was ever refused. If this sets during a run the fifo is undersized and
-    // back-pressure reached the TCP stack after all, which is the whole thing we are avoiding.
+    // Sticky: the producer was ever refused. The receive dispatchers do not hold a beat for TREADY,
+    // so in tcp_read a refused beat is lost and the stream is corrupt; it should never set.
     output logic                     overflow_stall
 );
 
@@ -73,7 +46,7 @@ module axis_fifo #(
     localparam int WORD_BITS = DATA_BITS + KEEP_BITS + 1;
     localparam int PTR_BITS  = $clog2(DEPTH);
 
-    // Inferred as BRAM/URAM. No reset on the array: the pointers define what is valid.
+    // Inferred as block RAM. No reset on the array: the pointers define what is valid.
     (* ram_style = "block" *) logic [WORD_BITS-1:0] mem [DEPTH];
 
     logic [PTR_BITS-1:0]        wr_ptr_q, rd_ptr_q;

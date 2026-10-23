@@ -20,11 +20,9 @@ import lynxTypes::*;
 //
 // Two consequences worth spelling out:
 //
-//   * The 1-beat-delay concatenator is GONE. It existed to mask the per-readPkg tlast so the
-//     downstream normalizer saw one continuous stream, which meant holding every beat back until
-//     the next one arrived. strip_http now ignores the input tlast entirely and produces the single
-//     tlast itself from the byte count, so rx_data feeds it directly -- one less register stage and
-//     one less place for a seam byte to go wrong.
+//   * A readPkg's tlast is a packet boundary, not a response boundary. strip_http ignores the input
+//     tlast and makes the body's end itself from the byte count, so the received beats feed it
+//     directly, with no stage that holds a beat back to hide the packet seams.
 //
 //   * A response can end in the MIDDLE of a packet, because a TCP segment may carry the tail of
 //     body k and the head of response k+1. The bytes after the boundary stay in the decoupling
@@ -38,46 +36,22 @@ import lynxTypes::*;
 // the stream is corrupt and the handler must not silently reconnect and replay. See handler_multi.sv.
 // =================================================================================================
 module tcp_read #(
-    // Beats of slack between the TCP stack and the parser. The header walk is the worst case: a
-    // MinIO 206 header is ~550 bytes at one byte per cycle, during which 550 beats can arrive at
-    // line rate. 1024 x 64 B = 64 KiB covers that with room to spare and costs a handful of BRAMs.
-    // 4096 x 64 B = 256 KiB. Was 1024 (64 KiB), which measured too small: on build-94 the sticky
-    // rx_fifo_stall bit SET during a scale-30 run at the 128 KiB chunk size, meaning the fifo filled
-    // and back-pressure reached the TOE again -- the exact condition this fifo exists to prevent,
-    // and the reason larger chunks stopped paying off in scripts/sweep.sh.
-    //
-    // Sized against what has to fit: one response (up to OASIS_HTTP_CHUNK_BYTES) plus the ~35 KB the
-    // parser's header walk lets accumulate behind it. At 64 KiB that left nothing spare beyond a
-    // 32 KiB response. 256 KiB covers a 128 KiB chunk with room, and matches the window the TOE
-    // already advertises (2^18), so the host can stop sizing requests around a buffer that is
-    // smaller than what the stack promises the sender.
-    //
-    // Cost is 64 RAMB36 instead of 16, out of 2016 on the U55C -- the design uses 25.8%.
-    //
-    // 4096 -> 8192 (256 KiB -> 512 KiB), build-105. This is slack, not a fix. The decoder ingests
-    // Snappy at ~615 MB/s measured (one vhsnunzip unbuffered core, ~5.5 B/cycle by its own README)
-    // while the server delivers faster, so the imbalance is permanent and no fifo size makes it go
-    // away. What the extra depth buys is TIME: tcp_read can keep issuing readPkg, which advances
-    // rxSar.appd, which keeps the advertised window above rx_engine's 24000-byte accept floor for
-    // roughly twice as long. Doubling absorbs ~1.3 ms of the imbalance instead of ~0.64 ms.
-    //
-    // The actual fix is the window clamp in rx_sar_table.cpp, which stops a dip below that floor
-    // being catastrophic. This only makes the dips rarer. Cost: 128 RAMB36, +3.2% of the device.
+    // Decoupling fifo between the receive dispatcher and the framer, in 64-byte beats. It absorbs
+    // the framer's header walk (one byte per cycle, ~550 cycles for a MinIO 206 header) and decoder
+    // jitter, not whole responses: the dispatcher asks for a packet only once this fifo has
+    // promised room for it (the reservation below). Both handlers use 2048 (128 KiB, 36 RAMB36).
     parameter int RX_FIFO_DEPTH = 8192,
 
     // Cycles to wait for ANY progress before giving up on a response. At 250 MHz, 2^29 is ~2.1 s.
     //
-    // Waiting for data used to have no way out at all: it ended only when the framer finished, an
-    // announcement arrived, or the connection closed. After a reconnect none of those can happen if
-    // the pending announcement was bound to the session that just died -- the reader waits on a
-    // notification that no longer exists and the query hangs until the host's 30 s credit timeout,
-    // leaving the handler outside ST_IDLE where only reprogramming clears it. That cost a 900 s
-    // scale-30 timeout and a board cycle.
+    // Without it, waiting for data ends only when the framer finishes, an announcement arrives or
+    // the connection closes. After a reconnect none of those can happen if the pending announcement
+    // was bound to the session that just died: the reader would wait on a notification that no
+    // longer exists, with the handler outside ST_IDLE where only reprogramming clears it.
     //
-    // A response should land in single-digit milliseconds; the slowest ever measured against MinIO
-    // was ~8 ms. Two seconds is three orders of magnitude of headroom, so this fires only when
-    // something is genuinely never going to arrive -- and then it aborts, which the handler already
-    // knows how to turn into a reconnect and replay.
+    // A response lands in single-digit milliseconds, so two seconds fires only when something is
+    // genuinely never going to arrive. Then it aborts, which the handler turns into a reconnect (an
+    // idle lane) or a fatal lane the host reissues.
     parameter int WATCHDOG_BITS = 29,
 
     // 0 (default): the reservation is one MSS segment per readPkg, handed back at the packet's
@@ -136,17 +110,14 @@ module tcp_read #(
     output logic [31:0]                               content_length,
     output logic [31:0]                               body_remaining,
 
-    // Decoupling fifo occupancy, and a sticky bit saying the TCP stack was ever back-pressured
-    // anyway. If rx_fifo_stall ever sets, the fifo is undersized and we are back to stalling the
-    // TOE -- exactly what this whole change exists to prevent, so it is worth a CSR bit.
+    // Decoupling fifo occupancy, and a sticky bit: a beat routed to this lane was refused by the
+    // fifo and lost, so the stream is corrupt. Should never fire; see the reservation. A CSR bit.
     output logic [$clog2(RX_FIFO_DEPTH+1)-1:0]        rx_fifo_level,
     output logic                                      rx_fifo_stall,
 
-    // Room for a WHOLE MSS, not for one beat. rx_dispatch gates its
-    // readPkg on this, and once it issues, every beat of that packet is accepted unconditionally --
-    // so a lane that says "ok" with room for less than a full segment forces the dispatcher to
-    // stall the shared stream, which stalls every other lane too. That is the one failure this
-    // whole arrangement exists to avoid, so the margin is deliberate.
+    // Room for a WHOLE MSS, not for one beat. rx_dispatch gates its readPkg on this, and once it
+    // issues, it delivers every beat of that packet without looking at TREADY -- so a lane that says
+    // "ok" with room for less than a full segment loses the beats that do not fit.
     output logic                                      rx_space_ok,
     // RSV_EXACT only: beats a new readPkg may still be promised, REGISTERED (one cycle behind the
     // reservation it is computed from; the caller must not grant this lane again before the
@@ -188,7 +159,7 @@ module tcp_read #(
     logic sh_resp_dirty;
     logic sh_resp_error;
 
-    // strip_http slave-side stream. NOT fed straight from the TOE any more -- see inst_rx_fifo.
+    // strip_http slave-side stream, fed from the decoupling fifo (inst_rx_fifo).
     logic                       sh_s_tvalid;
     logic                       sh_s_tready;
     logic [AXI_DATA_BITS-1:0]   sh_s_tdata;
@@ -204,33 +175,26 @@ module tcp_read #(
     logic payload_w0_valid;
     logic payload_w1_valid;
 
-    // THE DECOUPLING. TREADY towards the TCP stack is now decided by fifo space, never by whether
-    // strip_http happens to be free. The parser walks header bytes one per cycle; while it did that
-    // it used to hold TREADY low and let the TOE's single shared 64 KB rx fifo fill behind it --
-    // ~35 KB of backlog per response, which is why a 32 KiB response worked and a 64 KiB one fell
-    // off a cliff at every pipeline depth. See axis_fifo.sv for the full derivation.
+    // THE DECOUPLING. TREADY towards the dispatcher is decided by fifo space, never by whether
+    // strip_http happens to be free. The parser walks header bytes one per cycle, and the TOE's
+    // shared 1 MiB receive fifo (bypass mode) must keep draining for every lane meanwhile.
     //
     // AND DECOUPLED FROM THIS FSM AS WELL.
     //
-    // rx_dispatch accepts every beat of a packet it has issued a readPkg for, unconditionally --
-    // that line is what keeps the TOE's single shared fifo draining for all the other lanes, so it
-    // must never gain a term. The beats it routes here therefore arrive whether or not this state
-    // machine happens to be in ST_RECV_DATA, and it is NOT: between two responses the reader walks
-    // ST_DONE -> ST_IDLE -> ST_ARM -> ST_RECV_DATA, four cycles during which the old gate held
-    // TREADY low. Those beats were pulled off the shared bus by the dispatcher and silently
-    // dropped, and a response boundary lands mid-packet often enough that this is not rare -- it is
-    // the difference between a hang (before the re-arm fix in handler_multi) and corruption after.
+    // rx_dispatch delivers every beat of a packet it has issued a readPkg for, unconditionally --
+    // that is what keeps the TOE's shared fifo draining for all the other lanes, so it must never
+    // gain a term (toe_rx does the same). The beats it routes here therefore arrive whether or not
+    // this state machine is in ST_RECV_DATA, and between two responses it is not: the reader walks
+    // ST_DONE -> ST_IDLE -> ST_ARM -> ST_RECV_DATA, and a response boundary lands mid-packet often.
     //
     // So the FIFO decides, and only the FIFO: it has room or it does not. Its s_axis_tready is
     // independent of `clear`, so a lane being torn down still consumes what is routed to it -- and
-    // DISCARDS it, because those bytes belong to a session that no longer exists. Discarding is the
-    // point: stalling instead would back-pressure the shared bus.
+    // DISCARDS it, because those bytes belong to a session that no longer exists.
     //
     // The `|| clear_framing` makes the discard unconditional rather than merely usual. The fifo's
     // s_axis_tready is almost-full, and `clear` zeroes its level only on the NEXT edge -- so a lane
-    // torn down while its fifo happened to be full would refuse for one cycle, which is one cycle
-    // of the shared bus stalled for every other lane. Discarding must never depend on there being
-    // room to discard into.
+    // torn down while its fifo happened to be full would refuse, and lose, a beat for one cycle.
+    // Discarding must never depend on there being room to discard into.
     assign fifo_s_tvalid         = s_axis_rx_data_TVALID && !clear_framing;
     assign s_axis_rx_data_TREADY = fifo_s_tready || clear_framing;
 
@@ -252,11 +216,6 @@ module tcp_read #(
     // them delivers a full segment. With N in flight the fifo takes N*MSS into space that was only
     // ever checked once. It is not the fifo that is undersized, it is over-committed.
     //
-    // Measured on build-116 against MinIO, with the host varying lane_depth x chunk_bytes:
-    //   256 KiB in flight per lane -> completes;  512 KiB -> overruns, framing desynchronises and
-    //   the response comes out unframeable. 8192 beats / 66 beats-per-segment is 124 segments,
-    //   i.e. ~508 KiB, which is exactly where it broke. The arithmetic is the bug.
-    //
     // One readPkg returns exactly ONE announced segment however many bytes it names (rx_dispatch's
     // header says so), so a segment is the right unit and MSS_BEATS the right size -- no length has
     // to be plumbed across the module boundary.
@@ -272,10 +231,12 @@ module tcp_read #(
             if (!rst_n) begin
                 rsv_beats_q <= '0;
             end else if (clear_framing) begin
-                // The session is gone and the fifo is being cleared, so every outstanding promise dies
-                // with it. This is also what stops the one leak: a packet rx_dispatch DROPS (a released
-                // or dead session) never reaches this fifo, so its tlast never arrives and nothing else
-                // would ever hand the reservation back. clear_framing is exactly when that happens.
+                // The session is gone and the fifo is being cleared, so every outstanding promise
+                // dies with it. This is also what hands back the reservation of a packet rx_dispatch
+                // DROPS (a released or dead session): it never reaches this fifo, so its tlast never
+                // arrives. An announcement of the old session still queued when the lane is rebound
+                // can charge one more segment that only the next clear_framing returns; a reconnect
+                // happens only on an idle lane, so in practice nothing is queued.
                 rsv_beats_q <= '0;
             end else begin
                 case ({rx_pkg_issued, rx_pkt_done_w})
@@ -387,8 +348,8 @@ module tcp_read #(
         .overflow_stall(rx_fifo_stall)
     );
 
-    // Nothing left anywhere between the TCP stack and the parser: the fifo is empty and its output
-    // register has been taken. Used by ST_DRAIN to know when resp_dirty is finally trustworthy.
+    // The fifo is empty and its output register has been taken. strip_http may still hold a residue
+    // beat and its skid; ST_DRAIN gives it DRAIN_SETTLE more cycles before it trusts resp_dirty.
     assign parser_quiet_w  = (rx_fifo_level == '0) && !sh_s_tvalid;
     assign drain_settled_w = parser_quiet_w && (drain_cnt_q == 8'd0);
 
@@ -464,8 +425,11 @@ module tcp_read #(
             // may still hold some, and strip_http walks header bytes one per cycle. Sampling
             // resp_dirty now would report CLEAN for a response whose body bytes are still queued,
             // the handler would treat the abort as replayable, and those bytes would be duplicated
-            // in the decoder stream. So: let the parser finish everything already pulled, and only
-            // then decide.
+            // in the decoder stream. So: wait until the fifo is empty and DRAIN_SETTLE quiet cycles
+            // have passed, and only then decide. That covers the framer's residue while its output
+            // moves; a decoder that stalls longer than that after a FIN can turn a response that
+            // would still have completed into an abort (a FIN mid-response fails on keep-alive
+            // either way).
             ST_DRAIN: begin
                 if (sh_resp_error) begin
                     abort_dirty_d = sh_resp_dirty;

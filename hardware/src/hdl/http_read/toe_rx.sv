@@ -117,7 +117,8 @@ module toe_rx #(
 
     // -- To the lanes. The reservation (one cycle after the grant) and the routed beats, both
     //    from registers. conn_tready is expected to be 1 whenever conn_tvalid is (the reservation
-    //    guarantees it); route_stall latches it if not.
+    //    guarantees it); if not, the beat is lost (TREADY towards the TOE is constant 1) and
+    //    route_stall latches it.
     output logic [NUM_CONNS-1:0]       lane_pkg_issued,
     output logic [FREE_BITS-1:0]       lane_pkg_beats,
     output logic [NUM_CONNS-1:0]       conn_tvalid,
@@ -165,8 +166,8 @@ module toe_rx #(
     logic [TCP_SESSION_BITS-1:0] sid_q [NUM_CONNS];
 
     // =============================================================================================
-    // Notifications: one register stage, then counted. The slice of 1419da6 degenerates to one
-    // register here because its consumer never stalls (TREADY is constant 1).
+    // Notifications: one register stage, then counted. One stage is enough because its consumer
+    // never stalls (TREADY is constant 1).
     // =============================================================================================
     logic                        nt_v_q, nt_closed_q;
     logic [TCP_SESSION_BITS-1:0] nt_sid_q;
@@ -278,7 +279,7 @@ module toe_rx #(
 
     // =============================================================================================
     // Data routing: by the order queue's head, one register stage in front of the lane fifos
-    // (b7ff974's idea: the lane fifos see a flop, not the shell's slice through a select).
+    // (the lane fifos see a flop, not the shell's slice through a select).
     // =============================================================================================
     logic                        oq_has_d_w, oq_has_m_w;
     logic [CONN_BITS-1:0]        h_lane_w;
