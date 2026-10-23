@@ -280,16 +280,20 @@ std::string HTTPReadConfig::BuildGet(const std::string &host, uint16_t port, con
     return oss.str();
 }
 
-void HTTPReadConfig::read_streamed(uint32_t server_ip, uint16_t server_port,
-                                   const std::string &path, uint64_t range_begin,
-                                   uint64_t range_end, RequestBatch &batch) {
+void HTTPReadConfig::append_chunk(uint32_t server_ip, uint16_t server_port, const std::string &path,
+                                  uint64_t offset, uint64_t size, RequestBatch &batch) {
+    // Ranges are inclusive, so an empty chunk would become a request for the rest of the object.
+    if (size == 0) {
+        throw std::runtime_error("HTTP column chunk of 0 bytes at offset " + std::to_string(offset) +
+                                 " in '" + path + "'");
+    }
     // chunk_bytes(), capped on a revision-6 bitstream at toe_get_cap() (236 KiB at a 1 MiB ring and
     // GET credit 4). There the split is the WINDOW RULE: GET_CREDIT capped responses plus their
     // headers are exactly what a lane's TOE ring may hold unread, and a bigger GET could close the
     // window for good. Even with OASIS_HTTP_CHUNK_BYTES unset (0, "never split"), split_bytes() is the
     // cap, and a column chunk larger than it is split exactly like an OASIS_HTTP_CHUNK_BYTES split --
     // one entry, several GETs.
-    AppendChunkGets(IpToAscii(server_ip), server_port, path, range_begin, range_end, split_bytes(),
+    AppendChunkGets(IpToAscii(server_ip), server_port, path, offset, offset + size - 1, split_bytes(),
                     batch);
 }
 
@@ -541,66 +545,6 @@ void HTTPReadConfig::await_lane_credit(uint8_t lane, size_t needed) {
     }
 }
 
-// The three status digits strip_http captured, as text. CSR 12 (respWord) carries them as ASCII
-// in bits [23:0]; the handler only kept a bad/good bit, so a failure said "not 200/206" without
-// ever naming the code -- and 416 (range past EOF), 400 (malformed request) and 503 (server out of
-// resources) each mean something completely different about who is at fault.
-std::string HTTPReadConfig::last_http_status() {
-    const uint32_t w = static_cast<uint32_t>(read_register(HTTP_RESP).value());
-    const char d[3] = {static_cast<char>((w >> 16) & 0xFF), static_cast<char>((w >> 8) & 0xFF),
-                       static_cast<char>(w & 0xFF)};
-    for (const char c : d) {
-        if (c < '0' || c > '9') {
-            return "unparsed";
-        }
-    }
-    return std::string(d, 3);
-}
-
-void HTTPReadConfig::submit_batch(uint32_t server_ip, uint16_t server_port,
-                                  const RequestBatch &batch, uint8_t lane) {
-    if (batch.chunk_bytes.empty()) {
-        return;
-    }
-    // Revision 6 refuses for its own reason: the GET credit counts ARMS (+1 per arm, -1 per framed
-    // response), so one arm announcing two GETs is charged once and retired twice -- the credit then
-    // admits more responses than the TOE ring may hold unread, and the window rule is gone.
-    if (toe_ring() && batch.request_bytes.size() > 1) {
-        std::ostringstream msg;
-        msg << "HTTP batch of " << batch.request_bytes.size() << " GETs cannot be submitted as one "
-            << "arm on a CSR revision-6 (TOE receive ring) bitstream: the GET credit counts one GET "
-            << "per arm, so every GET needs its own arm. Use push_entries() + arm_transfer() per "
-            << "request (HTTPBatchSourceOperator does).";
-        throw std::runtime_error(msg.str());
-    }
-    push_entries(batch, lane);
-    arm_transfer(server_ip, server_port, static_cast<uint32_t>(batch.text.size()), lane);
-
-    if (http_debug_enabled()) {
-        // Print the handler's state with EVERY batch, not just the sizes.
-        //
-        // The state registers cannot be read while a query is stuck: that query holds vfid 0, so a
-        // second process cannot attach, and a process blocked in the driver often cannot be killed
-        // to release it. scripts/util/http_state.sh therefore returns nothing in exactly the case
-        // it exists for. Printing here means the LAST line before a hang carries the state going
-        // into the batch that hung, which is the reading that was otherwise unobtainable.
-        const auto f = inflight();
-        const auto st = stall();
-        std::fprintf(stderr,
-                     "[oasis-http] batch: lane %u, %zu column chunks, %zu bytes of request text | "
-                     "%s | %s\n",
-                     unsigned(lane), batch.chunk_bytes.size(), batch.text.size(),
-                     f.describe().c_str(), st.any() ? st.describe().c_str() : "no stalls");
-        std::fprintf(stderr, "[oasis-http]   %s\n", lanes().describe().c_str());
-        // Name the status the moment it goes bad. It is a live register, so it must be read while
-        // the failure is on the board -- by the time the run ends it may have been overwritten.
-        if (st.status_bad) {
-            std::fprintf(stderr, "[oasis-http]   HTTP status from the server: %s\n",
-                         last_http_status().c_str());
-        }
-    }
-}
-
 void HTTPReadConfig::push_entries(const RequestBatch &batch, uint8_t lane) {
     if (batch.chunk_bytes.empty()) {
         return;
@@ -778,12 +722,11 @@ uint8_t HTTPReadConfig::revision() {
 }
 
 uint8_t HTTPReadConfig::lane_for_stream(libstf::stream_t stream) {
-    const uint8_t lanes = lane_count();
-    // See the header: on handler_multi this field is the LANE (which owns the decoder too), on the
-    // single-session handler it is the DECODER index and folding it to 0 would send every column's
-    // bytes to decoder 0.
-    return (lanes > 1) ? static_cast<uint8_t>(static_cast<uint32_t>(stream) % lanes)
-                       : static_cast<uint8_t>(static_cast<uint32_t>(stream) & 0xFu);
+    if (stream >= lane_count()) {
+        throw std::runtime_error("decode stream " + std::to_string(stream) + " has no HTTP lane: the "
+                                 "bitstream has " + std::to_string(lane_count()));
+    }
+    return static_cast<uint8_t>(stream);
 }
 
 HTTPReadConfig::HTTPLanes HTTPReadConfig::DecodeLanes(uint64_t occ_word, uint64_t ready_word,
@@ -1154,7 +1097,7 @@ std::string HTTPReadConfig::HTTPStall::describe() const {
     if (status_bad) {
         oss << ". The server answered something other than 200/206, so whatever reached the decoder "
                "is an error document, not column data. The three digits are in CSR 12 bits [23:0] "
-               "as ASCII -- HTTPReadConfig::last_http_status() decodes them. 416 means a range past "
+               "as ASCII -- HTTPReadConfig::response() decodes them. 416 means a range past "
                "end of file (a metadata/offset bug on our side), 400 a malformed request (request "
                "text corruption), 5xx the server itself";
     }

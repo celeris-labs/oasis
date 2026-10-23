@@ -94,25 +94,20 @@ class HTTPBatchSourceOperator final : public SourceOperator {
     uint32_t           server_ip_;
     uint16_t           server_port_;
     std::vector<Chunk> chunks_;
-    /// One per sub-batch. The DMA is asynchronous, so each must outlive its own transfer -- a
-    /// single member would free the bytes the hardware is still reading when the next batch
-    /// overwrote it.
+    /// One per batch. The DMA is asynchronous, so each must outlive its own transfer.
     std::vector<std::shared_ptr<libstf::Buffer>> text_buffers_;
     /// Host-side progress, for the stall dump (print() reads these from the watchdog thread while
     /// apply() may be running on the dispatcher, hence atomics). -1 = not placed yet.
     std::atomic<int>    lane_ {-1};
     std::atomic<size_t> gets_total_ {0};
-    std::atomic<size_t> gets_armed_ {0};
     std::atomic<size_t> gets_sent_ {0};
 
-    void build_chunk(HTTPReadConfig &config, const Chunk &c, HTTPReadConfig::RequestBatch &batch);
-    void emit_batch(libstf::stream_t stream, OasisContext &ctx,
+    void emit_batch(libstf::stream_t stream, OasisContext &ctx, HTTPReadConfig &config,
                     const HTTPReadConfig::RequestBatch &batch);
-    /// emit_batch() on a CSR revision-6 (TOE receive ring) bitstream: one arm, one padded region and
-    /// one DMA per GET. See the definition.
-    void emit_one_get_per_arm(OasisContext &ctx, HTTPReadConfig &config,
-                              const HTTPReadConfig::RequestBatch &batch, uint8_t lane);
 };
+
+/// GETs and body bytes the HTTP sources have requested per lane since the process started.
+std::string HttpLaneTrafficSummary();
 
 /**
  * DMA read host bytes into the stream via Coyote LOCAL_READ. Owns the input buffer for the

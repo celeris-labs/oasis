@@ -149,8 +149,6 @@ Scheduler::Scheduler(OasisContext &ctx)
     }
 }
 
-std::string HttpLaneTrafficSummary(); // operator.cpp: per-lane host traffic, for the dumps
-
 void Scheduler::note_progress() {
     last_progress_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())

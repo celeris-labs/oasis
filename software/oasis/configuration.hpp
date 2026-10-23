@@ -129,11 +129,12 @@ class HTTPReadConfig : public libstf::Config {
         std::vector<uint32_t> request_bytes;
     };
 
-    /// Append one column chunk's GETs to `batch`, splitting at split_bytes().
-    void read_streamed(uint32_t server_ip, uint16_t server_port, const std::string &path,
-                       uint64_t range_begin, uint64_t range_end, RequestBatch &batch);
+    /// Append the GETs of the column chunk [offset, offset + size) to `batch`, split at
+    /// split_bytes(). Throws on an empty chunk.
+    void append_chunk(uint32_t server_ip, uint16_t server_port, const std::string &path,
+                      uint64_t offset, uint64_t size, RequestBatch &batch);
 
-    /// read_streamed()'s body, pure: append the GETs of the column chunk [range_begin, range_end]
+    /// append_chunk()'s body, pure: append the GETs of the column chunk [range_begin, range_end]
     /// (inclusive) to `batch`, each asking for at most `split` bytes (0 = one GET), and ONE
     /// chunk_bytes entry for the whole chunk -- the hardware marks the decoder's tlast by counting
     /// those bytes down, so the chunk ends exactly once however many GETs it was split into.
@@ -163,27 +164,10 @@ class HTTPReadConfig : public libstf::Config {
     /// one deadlocks -- the arm that would drain the queue is the beat being withheld.
     enum class LaneAdmit : uint8_t { Arm, Entry };
 
-    /// Push the batch's chunk-length entries, then arm the transfer, ALL ON `lane`. The caller DMAs
-    /// `batch.text` into that lane's request stream afterwards -- this only tells the hardware what
-    /// is coming.
-    ///
-    /// `lane` is what the hardware routes by (req_chunk_dest, bits [35:32] of the chunk-length
-    /// register); get it from lane_for_stream(). It used to be derived from the decode stream inside
-    /// here while operator.cpp derived the DMA sink from the same stream a different way, so the two
-    /// could disagree; and the arm carried no lane of its own at all, inheriting whatever the last
-    /// entry left in the register. Both are now one explicit parameter.
-    ///
-    /// On a revision-6 bitstream this is legal only for a batch of ONE request: the GET credit counts
-    /// arms, so every GET needs its own arm. It throws rather than corrupt; the operator drives
-    /// revision 6 through push_entries() + arm_transfer() per request instead.
-    void submit_batch(uint32_t server_ip, uint16_t server_port, const RequestBatch &batch,
-                      uint8_t lane);
-
-    /// The first half of submit_batch(): reserve credit for, and push, the batch's chunk-length
-    /// entries on `lane`. Nothing is armed.
+    /// Reserve credit for, and push, the batch's chunk-length entries on `lane`. Nothing is armed.
     void push_entries(const RequestBatch &batch, uint8_t lane);
 
-    /// The second half: arm ONE transfer of `text_bytes` bytes of request text on `lane` (write the
+    /// Arm ONE transfer of `text_bytes` bytes of request text on `lane` (write the
     /// arm registers, wait for ARM_READY, pulse START). The caller DMAs the text afterwards.
     ///
     /// On a revision-6 bitstream ARM_READY includes the lane's GET credit, so this blocks while the
@@ -235,10 +219,6 @@ class HTTPReadConfig : public libstf::Config {
     /// Fatal is checked first, so a dead lane fails immediately instead of never draining.
     void await_lane_credit(uint8_t lane, size_t needed);
 
-    /// The three HTTP status digits from the last response strip_http parsed, as text ("206",
-    /// "416", ...), or "unparsed". Reads CSR 12. Meaningful mainly when stall().status_bad is set.
-    std::string last_http_status();
-
     /// One ranged GET (keep-alive) as request text.
     static std::string BuildGet(const std::string &host, uint16_t port, const std::string &path,
                                 uint64_t range_begin, uint64_t range_end);
@@ -276,24 +256,10 @@ class HTTPReadConfig : public libstf::Config {
     /// Throws unless `revision` is HTTP_CSR_REVISION_MULTI or HTTP_CSR_REVISION_TOE.
     static void CheckRevision(uint8_t revision);
 
-    /// The value written into req_chunk_dest -- bits [35:32] of the chunk-length register -- for a
-    /// chunk that decodes on `stream`.
-    ///
-    /// TWO BITSTREAMS READ THAT FIELD DIFFERENTLY, and it is the same four bits:
-    ///   - handler_multi (lane_count() > 1): it is the LANE. The lane owns a TCP session, a framer,
-    ///     a chunk queue and the decoder its body bytes come out on, so the lane index IS the
-    ///     decoder index. `stream % lanes`, matching what operator.cpp already does when it picks
-    ///     the axis_host_recv sink for the request text -- the two MUST agree or a lane's entries
-    ///     and its request text land on different lanes.
-    ///   - a one-lane bitstream (lane_count() == 1): there is one connection and the field is
-    ///     purely the DECODER index, so it stays `stream & 0xF`. Folding it to 0 would send every
-    ///     column's bytes to decoder 0.
-    ///
-    /// WP5: the modulo is a routing hazard, not a design. A chunk placed on a decode stream the
-    /// bitstream has no lane for is silently rerouted to `stream % lanes` -- correct today only
-    /// because the scheduler's stream count is the decoder count and the bitstream is built with one
-    /// lane per decoder. Lane-aware dispatch should choose the lane and let the decode stream follow
-    /// it, not the other way round.
+    /// The lane that fetches a column chunk decoding on `stream`, i.e. the req_chunk_dest of its
+    /// beats (bits [35:32] of the chunk-length register) and the axis_host_recv stream of its request
+    /// text. Lane L owns a TCP session and decoder L (NUM_CONNS == NUM_DECODERS), so it is `stream`;
+    /// throws for a stream the bitstream has no lane for.
     uint8_t lane_for_stream(libstf::stream_t stream);
 
     /**

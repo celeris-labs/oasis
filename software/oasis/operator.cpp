@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -30,55 +29,19 @@ void RDMASourceOperator::print(std::ostream &os) const {
 void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     auto config = ctx.config<HTTPReadConfig>();
 
-    // Split so no batch is larger than the hardware queue. The queue holds one entry per expected
-    // response and every entry is pushed BEFORE the transfer is armed, so an oversized batch does
-    // not back-pressure, it deadlocks: the host waits on a free entry, and entries are only freed
-    // by responses, which cannot arrive until the arm that comes after them.
-    //
-    // A wide scale-30 row group at a 768 KiB chunk is thousands of GETs, so this is the normal path
-    // rather than a guard against an exotic case. Successive sub-batches self-pace: the next one
-    // blocks on entries the previous one is already draining.
-    const size_t max_per_batch = config->max_batch_chunks();
-    size_t       chunk_lo      = 0;
-    while (chunk_lo < chunks_.size()) {
+    // Split so no batch is larger than the hardware queue. The queue holds one entry per column
+    // chunk and every entry is pushed BEFORE the transfer is armed, so an oversized batch does not
+    // back-pressure, it deadlocks: the host waits on a free entry, and entries are only freed by
+    // responses, which cannot arrive until the arm that comes after them. Successive batches
+    // self-pace: the next one blocks on entries the previous one is already draining.
+    const size_t per_batch = config->max_batch_chunks();
+    for (size_t lo = 0; lo < chunks_.size(); lo += per_batch) {
         HTTPReadConfig::RequestBatch batch;
-        size_t                       chunk_hi = chunk_lo;
-        while (chunk_hi < chunks_.size()) {
-            HTTPReadConfig::RequestBatch probe;
-            build_chunk(*config, chunks_[chunk_hi], probe);
-            if (!batch.chunk_bytes.empty() &&
-                batch.chunk_bytes.size() + probe.chunk_bytes.size() > max_per_batch) {
-                break;
-            }
-            batch.text += probe.text;
-            batch.chunk_bytes.insert(batch.chunk_bytes.end(), probe.chunk_bytes.begin(),
-                                     probe.chunk_bytes.end());
-            batch.request_bytes.insert(batch.request_bytes.end(), probe.request_bytes.begin(),
-                                       probe.request_bytes.end());
-            chunk_hi++;
+        for (size_t i = lo; i < std::min(chunks_.size(), lo + per_batch); i++) {
+            config->append_chunk(server_ip_, server_port_, path_, chunks_[i].offset, chunks_[i].size,
+                                 batch);
         }
-        // A single column chunk that alone exceeds the queue would loop forever otherwise.
-        if (batch.chunk_bytes.size() > max_per_batch) {
-            throw std::runtime_error(
-                "HTTPBatchSourceOperator: column chunk at offset " +
-                std::to_string(chunks_[chunk_lo].offset) + " needs " +
-                std::to_string(batch.chunk_bytes.size()) +
-                " queue entries, more than the hardware holds (" + std::to_string(max_per_batch) +
-                ").");
-        }
-        // Revision 6 pads every GET on its own in emit_one_get_per_arm(): there each GET is a
-        // transfer of its own, and padding only the last one would leave the others with a DMA tail
-        // that the hardware's drain would swallow together with the start of the next request.
-        if (!config->toe_ring()) {
-            const size_t before = batch.text.size();
-            oasis::PadRequestTextToBeat(batch.text);
-            // Keep the per-request lengths adding up to the text: the padding is inserted into
-            // the LAST request.
-            if (!batch.request_bytes.empty()) {
-                batch.request_bytes.back() += static_cast<uint32_t>(batch.text.size() - before);
-            }
-        }
-        emit_batch(stream, ctx, batch);
+        emit_batch(stream, ctx, *config, batch);
 
         // The decoder's handshake counters alongside every batch line. Without them a trace shows
         // the queue filling but not WHY nothing retires, because a chunk only retires when it
@@ -107,33 +70,20 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
                          static_cast<unsigned long long>(prof.out.stalled_cycles),
                          static_cast<unsigned long long>(prof.out.idle_cycles));
         }
-        chunk_lo = chunk_hi;
     }
 }
 
-void HTTPBatchSourceOperator::build_chunk(HTTPReadConfig &config, const Chunk &c,
-                                          HTTPReadConfig::RequestBatch &batch) {
-    // Ranges are inclusive on both ends and the chunk extent is [offset, offset + size). A
-    // zero-length chunk would underflow into a range ending at 2^64-1, i.e. a request for the
-    // rest of the object.
-    if (c.size == 0) {
-        throw std::runtime_error("HTTPBatchSourceOperator: zero-length column chunk at offset " +
-                                 std::to_string(c.offset) + " in '" + path_ + "'");
-    }
-    config.read_streamed(server_ip_, server_port_, path_, c.offset, c.offset + c.size - 1, batch);
-}
-
-// Per-lane host-side traffic counters for the exit/stall dump. File-local on purpose (no header or
-// class-layout change): GETs armed and body bytes requested, per lane, since the process started.
+// Per-lane host-side traffic counters for the exit/stall dump: GETs armed and body bytes requested,
+// per lane, since the process started.
 namespace {
-std::atomic<uint64_t> g_lane_gets[16];
-std::atomic<uint64_t> g_lane_bytes[16];
+std::atomic<uint64_t> g_lane_gets[HTTP_LANE_SLOTS];
+std::atomic<uint64_t> g_lane_bytes[HTTP_LANE_SLOTS];
 } // namespace
 
 std::string HttpLaneTrafficSummary() {
     std::ostringstream o;
     o << "host traffic per lane (since process start):";
-    for (int l = 0; l < 16; l++) {
+    for (int l = 0; l < HTTP_LANE_SLOTS; l++) {
         const auto g = g_lane_gets[l].load();
         if (g != 0) {
             o << " [lane " << l << ": " << g << " GETs, " << g_lane_bytes[l].load() << " body bytes]";
@@ -168,180 +118,57 @@ void RefuseCrossStreamBatch(OasisContext &ctx, const HTTPReadConfig::RequestBatc
     }
 }
 
+constexpr size_t BEAT = 64;
+
+size_t RoundUpToBeat(size_t bytes) { return (bytes + BEAT - 1) / BEAT * BEAT; }
+
+// The handler's state with every revision-2 batch: a hang blocks the board for other processes, so
+// the last line before it is the only reading of the state going into the batch that hung.
+void PrintLaneState(HTTPReadConfig &config, uint8_t lane, size_t chunks, size_t text_bytes) {
+    const auto f  = config.inflight();
+    const auto st = config.stall();
+    std::fprintf(stderr,
+                 "[oasis-http] batch: lane %u, %zu column chunks, %zu bytes of request text | %s | "
+                 "%s\n",
+                 unsigned(lane), chunks, text_bytes, f.describe().c_str(),
+                 st.any() ? st.describe().c_str() : "no stalls");
+    std::fprintf(stderr, "[oasis-http]   %s\n", config.lanes().describe().c_str());
+    if (st.status_bad) {
+        std::fprintf(stderr, "[oasis-http]   %s\n", config.response().describe().c_str());
+    }
+}
+
 } // namespace
 
+// Tells the hardware what is coming -- one chunk-length entry per column chunk, then an arm per
+// transfer -- and DMAs the request text into the lane's request stream.
+//
+// Revision 2 sends the whole batch as ONE transfer. Revision 6 sends ONE TRANSFER PER GET: its GET
+// credit counts arms (+1 per arm, -1 per framed response), so an arm announcing several GETs would
+// be charged once and retired several times. There the (GET_CREDIT+1)-th GET of a lane is armed only
+// after that lane's oldest response has been framed, on this (dispatcher) thread. That cannot
+// deadlock: the response's decoder config and output buffer were placed before its GET.
 void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &ctx,
+                                         HTTPReadConfig &config,
                                          const HTTPReadConfig::RequestBatch &batch) {
     if (batch.chunk_bytes.empty()) {
         return;
     }
-    auto config = ctx.config<HTTPReadConfig>();
     RefuseCrossStreamBatch(ctx, batch);
+    const uint8_t lane = config.lane_for_stream(stream);
+    const bool    toe  = config.toe_ring();
 
-    // CSR revision 6 (TOE receive rings, handler_toe): one arm per GET -- the GET credit counts
-    // arms -- on the revision-2 register map. Everything below this branch is the revision-2 path.
-    if (config->toe_ring()) {
-        emit_one_get_per_arm(ctx, *config, batch, config->lane_for_stream(stream));
-        return;
-    }
-
-    // Into a Coyote-visible buffer. LOCAL_READ needs a 64 B-aligned source or it emits databeats
-    // with a broken keep signal, which the memory pool guarantees.
-    //
-    // Kept in a vector, not a single member: the DMA is asynchronous, so a sub-batch's buffer must
-    // stay alive until its transfer completes. Overwriting one member per sub-batch would free the
-    // bytes the hardware is still reading.
-    // Round the allocation up to a whole 64-byte beat and ZERO the tail.
-    //
-    // Coyote moves whole beats, so a 132-byte buffer is transferred as 192. The hardware discards
-    // what follows the announced length (ST_DRAIN in http_req_stream), but the pool recycles
-    // buffers, so those trailing bytes hold the PREVIOUS batch's request text. Before the drain
-    // existed they became the next request's prefix and the server saw "osGET ..." -- "os" out of
-    // an older "Host:" -- and answered 400.
-    //
-    // Zeroing does not fix that; the drain does. It makes the next occurrence obvious instead of
-    // plausible: NUL bytes are visibly wrong on the wire, whereas fragments of real HTTP look like
-    // a protocol bug and cost days.
-    // The text was already padded to a whole beat when the batch was assembled, so this is a
-    // no-op in the normal case; it stays as a backstop for any path that skips that.
-    const size_t beat    = 64;
-    const size_t padded  = ((batch.text.size() + beat - 1) / beat) * beat;
-    libstf::Status status;
-    auto           buf = libstf::make_buffer(ctx.memory_pool(), padded, status);
-    if (!buf) {
-        throw std::runtime_error("HTTPBatchSourceOperator: could not allocate " +
-                                 std::to_string(padded) + " bytes for request text");
-    }
-    std::memcpy(buf->ptr, batch.text.data(), batch.text.size());
-    std::memset(static_cast<std::byte *>(buf->ptr) + batch.text.size(), 0,
-                padded - batch.text.size());
-    // The hardware is told the REAL length; the padding exists only to make the DMA's beat count
-    // exact, and never reaches the wire.
-    buf->size = padded;
-    ctx.tlb_manager()->ensure_tlb_mapping(buf->ptr, buf->capacity);
-    text_buffers_.push_back(buf);
-
-    // Tell the hardware what is coming: one bit per expected response, then the arm. This must
-    // precede the DMA -- the arm is what opens the connection, and the queue entries have to be in
-    // place before any response can arrive. (The cross-stream refusal that used to sit here runs
-    // at the top of this function now, before anything is allocated.)
-    // ONE lane for the whole batch, decided here and passed to everything that needs it. It used to
-    // be re-derived at each use -- submit_batch from `stream & 0xF`, the DMA sink from
-    // `stream % lanes` -- which are the same number only while the scheduler keeps its stream count
-    // at or below the bitstream's lane count. When they disagreed, a batch's queue entries and its
-    // request text went to DIFFERENT lanes, and nothing on either side could notice.
-    const uint8_t lane = config->lane_for_stream(stream);
-
-    lane_.store(lane);
-    gets_total_.fetch_add(batch.request_bytes.empty() ? 1 : batch.request_bytes.size());
-    g_lane_gets[lane & 15].fetch_add(batch.request_bytes.empty() ? 1 : batch.request_bytes.size());
-    for (const auto b : batch.chunk_bytes) {
-        g_lane_bytes[lane & 15].fetch_add(b);
-    }
-    config->submit_batch(server_ip_, server_port_, batch, lane);
-    gets_armed_.fetch_add(batch.request_bytes.empty() ? 1 : batch.request_bytes.size());
-
-    // Then the text itself.
-    //
-    // TWO DIFFERENT THINGS ARE CALLED A "STREAM" HERE, and sending the text to the wrong one
-    // deadlocks the handler:
-    //
-    //   - the DECODE LANE, which is `stream`. It travels in bits [35:32] of the chunk-length
-    //     register, set by submit_batch above, and never through the DMA descriptor.
-    //   - the HOST-DMA SINK, which is this `dest`, the axis_host_recv index the FPGA reads the
-    //     request text from.
-    //
-    // Which sink is correct depends on the bitstream, so ask it rather than assume:
-    //
-    //   - ONE lane (lane_count()==1): only axis_host_recv[0] carries request text. All text goes
-    //     to 0 whatever decode lane the chunk is bound for.
-    //   - N lanes (lane_count()>1): each lane owns a session AND its own request stream, so lane
-    //     L's text must go to axis_host_recv[L]. Sending it to 0 would hand every lane's GETs to
-    //     lane 0's connection.
-    //
-    // Getting this wrong is silent. A tied-off stream holds tready high and discards, so the DMA
-    // reports success while the text vanishes; the handler has already been armed by submit_batch,
-    // so it waits for bytes that no longer exist -- await_cfg_ready times out at 30 s, the read
-    // watchdog fires a dirty_abort, the body stream stops draining, and the receive window
-    // collapses to zero with the TOE retransmitting into a dead peer. One wrong descriptor field.
-    //
-    // It stayed invisible until the second decoder existed, because every flow was on stream 0.
-    const uint8_t          lanes    = config->lane_count();
-    const libstf::stream_t req_dest = (lanes > 1) ? static_cast<libstf::stream_t>(lane)
-                                                  : static_cast<libstf::stream_t>(0);
-    auto *byte_ptr = static_cast<std::byte *>(buf->ptr);
-    for (size_t off = 0; off < buf->size; off += coyote::MAX_TRANSFER_SIZE) {
-        coyote::localSg sg;
-        sg.addr   = reinterpret_cast<void *>(byte_ptr + off);
-        sg.len    = std::min(buf->size - off, coyote::MAX_TRANSFER_SIZE);
-        sg.stream = coyote::STRM_HOST;
-        sg.dest   = req_dest;
-        const bool last = off + coyote::MAX_TRANSFER_SIZE >= buf->size;
-        ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last);
-    }
-
-    // WAIT FOR THE TRANSFER TO DRAIN BEFORE RETURNING.
-    //
-    // The DMA is asynchronous and this buffer belongs to the operator, so it is freed when the
-    // query's operator is destroyed. If the query ends first, the hardware is left mid-transfer:
-    // http_req_stream sits in ST_SEND_DATA waiting for bytes that will never come, stream_busy
-    // never clears, and since an arm is only admitted when !stream_busy, EVERY LATER QUERY blocks
-    // forever waiting for a config beat.
-    //
-    // It is not subtle on the wire once you see it: a q4 run was still transmitting q2's request
-    // text -- GETs for supplier and region, two queries after the query that built them -- onto a
-    // connection the server had already reset.
-    //
-    // req_total_bytes still holds this batch's length, so req_ready currently reports the ARM
-    // condition, which is exactly !stream_busy. Waiting on it here is therefore a wait for this
-    // transfer to finish sending. It costs only as long as a few KB of request text takes to go
-    // out, and it guarantees the buffer outlives the DMA reading it.
-    //
-    // Asked of THIS LANE, not of the config port in general. ARM_READY for lane L is !stream_busy[L]
-    // -- exactly "this lane's transfer has finished sending" -- whereas the old OR-folded req_ready
-    // answered for whichever lane was addressed last, which after a neighbour's beat is a different
-    // lane's answer to a different question. The wait would then end early and the buffer be freed
-    // under a DMA still reading it.
-    config->await_cfg_ready("request text to finish sending", lane, HTTPReadConfig::LaneAdmit::Arm);
-}
-
-// CSR revision 6 (TOE receive rings, handler_toe): the same protocol as the revision-2 path above,
-// one GET at a time, on the revision-2 registers: push_entries (reads 15/16/17, writes 41/40/39),
-// arm_transfer on the lane (writes 0/1/41/40/39, polls 17), await_arm_taken (ARM_READY must fall:
-// reads 16/17), and one DMA per GET.
-//
-// WHY ONE ARM PER GET. The GET credit counts arms (gets_out +1 per arm, -1 per framed response), so an
-// arm announcing several GETs would be charged once and retired several times. Each GET is therefore
-// its own arm, its own DMA and, because the hardware drains its request stream to the DMA's TLAST, its
-// own beat-padded region of the buffer.
-//
-// WHY THE ARM MAY WAIT. ARM_READY also requires gets_out < GET_CREDIT, so the (GET_CREDIT+1)-th GET
-// of a lane is armed only after that lane's oldest response has been framed -- on this (dispatcher)
-// thread, so other lanes get no new work for that long. It cannot deadlock: the response's decoder
-// config and output buffer were placed before its GET. Every GET is at most toe_get_cap()
-// (read_streamed splits).
-//
-// The chunk-length entries go first, all of them, exactly as on revision 2: one per COLUMN CHUNK,
-// however many GETs it was split into, because axis_rewrite_last marks tlast by byte count.
-void HTTPBatchSourceOperator::emit_one_get_per_arm(OasisContext &ctx, HTTPReadConfig &config,
-                                                   const HTTPReadConfig::RequestBatch &batch,
-                                                   uint8_t lane) {
-    auto requests = HTTPReadConfig::SplitRequests(batch);
-    if (requests.empty()) {
-        return;
-    }
-
-    // Pad every GET to a whole beat on its own (see PadRequestTextToBeat), and lay them out at
-    // 64-byte aligned offsets in ONE buffer: LOCAL_READ needs an aligned source, and each GET is a
-    // separate transfer ending in its own TLAST.
-    constexpr size_t beat = 64;
-    std::vector<size_t> offs, lens;
-    size_t              total = 0;
-    for (auto &r : requests) {
-        oasis::PadRequestTextToBeat(r);
-        offs.push_back(total);
-        lens.push_back(r.size());
-        total += ((r.size() + beat - 1) / beat) * beat;
+    // Each transfer is padded to whole beats (PadRequestTextToBeat) and starts at a 64-byte aligned
+    // offset of one buffer: LOCAL_READ needs an aligned source, and http_req_stream drains every
+    // transfer to its TLAST. The tail of the buffer is zeroed, so a stray tail is visibly NUL.
+    std::vector<std::string> texts = toe ? HTTPReadConfig::SplitRequests(batch)
+                                         : std::vector<std::string> {batch.text};
+    std::vector<size_t>      offsets;
+    size_t                   total = 0;
+    for (auto &text : texts) {
+        PadRequestTextToBeat(text);
+        offsets.push_back(total);
+        total += RoundUpToBeat(text.size());
     }
     libstf::Status status;
     auto           buf = libstf::make_buffer(ctx.memory_pool(), total, status);
@@ -349,63 +176,60 @@ void HTTPBatchSourceOperator::emit_one_get_per_arm(OasisContext &ctx, HTTPReadCo
         throw std::runtime_error("HTTPBatchSourceOperator: could not allocate " +
                                  std::to_string(total) + " bytes for request text");
     }
-    auto *byte_ptr = static_cast<std::byte *>(buf->ptr);
-    std::memset(byte_ptr, 0, total);
-    for (size_t i = 0; i < requests.size(); i++) {
-        std::memcpy(byte_ptr + offs[i], requests[i].data(), requests[i].size());
+    auto *bytes = static_cast<std::byte *>(buf->ptr);
+    std::memset(bytes, 0, total);
+    for (size_t i = 0; i < texts.size(); i++) {
+        std::memcpy(bytes + offsets[i], texts[i].data(), texts[i].size());
     }
     buf->size = total;
     ctx.tlb_manager()->ensure_tlb_mapping(buf->ptr, buf->capacity);
-    // Lives as long as this operator, i.e. until the flow retires -- which needs every response,
-    // which needs every GET to have been sent. So the DMA can never outlive its source.
+    // Lives as long as this operator, i.e. until the flow retires, which needs every response.
     text_buffers_.push_back(buf);
 
     lane_.store(lane);
-    gets_total_.fetch_add(requests.size());
-    g_lane_gets[lane & 15].fetch_add(requests.size());
+    gets_total_.fetch_add(batch.request_bytes.size());
+    g_lane_gets[lane].fetch_add(batch.request_bytes.size());
     for (const auto b : batch.chunk_bytes) {
-        g_lane_bytes[lane & 15].fetch_add(b);
+        g_lane_bytes[lane].fetch_add(b);
     }
+
     config.push_entries(batch, lane);
-
-    // The request-text sink is the lane on a multi-connection bitstream (see emit_batch).
-    const uint8_t          lanes    = config.lane_count();
-    const libstf::stream_t req_dest = (lanes > 1) ? static_cast<libstf::stream_t>(lane)
-                                                  : static_cast<libstf::stream_t>(0);
-    for (size_t i = 0; i < requests.size(); i++) {
-        // The REAL length, not the padded one: the hardware sends exactly this many bytes and
-        // swallows the rest of the transfer up to TLAST.
-        config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(lens[i]), lane);
-        // Proof the arm was taken before anything else is written -- the next GET's arm, or the
-        // next flow's entries, would otherwise rewrite the registers it is sampled from.
-        config.await_arm_taken(lane);
-        gets_armed_.fetch_add(1);
-
-        const size_t padded = ((lens[i] + beat - 1) / beat) * beat;
-        for (size_t off = 0; off < padded; off += coyote::MAX_TRANSFER_SIZE) {
-            coyote::localSg sg;
-            sg.addr   = reinterpret_cast<void *>(byte_ptr + offs[i] + off);
-            sg.len    = std::min(padded - off, coyote::MAX_TRANSFER_SIZE);
-            sg.stream = coyote::STRM_HOST;
-            sg.dest   = req_dest;
-            // TLAST on every GET's final beat: http_req_stream drains to TLAST after the
-            // announced length, so a transfer spanning two GETs would lose the second.
-            const bool last = off + coyote::MAX_TRANSFER_SIZE >= padded;
-            ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last);
+    for (size_t i = 0; i < texts.size(); i++) {
+        config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(texts[i].size()), lane);
+        if (toe) {
+            // Proof the arm was taken before anything else is written -- the next GET's arm, or the
+            // next flow's entries, would otherwise rewrite the registers it is sampled from.
+            config.await_arm_taken(lane);
+        } else if (http_debug_enabled()) {
+            PrintLaneState(config, lane, batch.chunk_bytes.size(), texts[i].size());
         }
-        gets_sent_.fetch_add(1);
+        // The request text goes to the lane's own axis_host_recv stream (sg.dest); the lane rides in
+        // the chunk-length register, set above, and never in the DMA descriptor.
+        const size_t len = RoundUpToBeat(texts[i].size());
+        for (size_t off = 0; off < len; off += coyote::MAX_TRANSFER_SIZE) {
+            coyote::localSg sg;
+            sg.addr   = reinterpret_cast<void *>(bytes + offsets[i] + off);
+            sg.len    = std::min(len - off, coyote::MAX_TRANSFER_SIZE);
+            sg.stream = coyote::STRM_HOST;
+            sg.dest   = lane;
+            ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg,
+                                  off + coyote::MAX_TRANSFER_SIZE >= len);
+        }
+        gets_sent_.fetch_add(toe ? 1 : batch.request_bytes.size());
     }
 
-    // No wait for "the text has gone out" here, unlike the revision-2 path. There that wait is
-    // ARM_READY, which is !stream_busy on handler_multi. On handler_toe ARM_READY also carries the
-    // GET credit, so the same wait would block this (dispatcher) thread until a RESPONSE had been
-    // framed, serialising every lane behind this one. And it is not needed: the arm was proven taken
-    // above, and the buffer lives until the flow retires (see above).
-    if (http_debug_enabled()) {
+    if (!toe) {
+        // Revision 2: wait for the text to have gone out (ARM_READY is !stream_busy there). If the
+        // query ended first, the buffer would be freed under the DMA, http_req_stream would wait in
+        // ST_SEND_DATA for bytes that never come, and every later arm on the lane would be refused.
+        // On revision 6 ARM_READY also carries the GET credit, so the same wait would hold this
+        // thread until a response is framed; the arm-taken proof above is enough there.
+        config.await_cfg_ready("request text to finish sending", lane, HTTPReadConfig::LaneAdmit::Arm);
+    } else if (http_debug_enabled()) {
         std::fprintf(stderr,
                      "[oasis-http] toe batch: lane %u, %zu column chunk(s), %zu GET(s), %zu bytes of "
                      "request text | %s\n",
-                     unsigned(lane), batch.chunk_bytes.size(), requests.size(), total,
+                     unsigned(lane), batch.chunk_bytes.size(), texts.size(), total,
                      config.lanes().describe().c_str());
     }
 }
@@ -415,8 +239,8 @@ void HTTPBatchSourceOperator::print(std::ostream &os) const {
     for (const auto &c : chunks_) {
         os << " [" << c.offset << "+" << c.size << "]";
     }
-    os << ", lane=" << lane_.load() << ", GETs armed " << gets_armed_.load() << " / DMA'd "
-       << gets_sent_.load() << " / total " << gets_total_.load() << ")";
+    os << ", lane=" << lane_.load() << ", GETs sent " << gets_sent_.load() << " / "
+       << gets_total_.load() << ")";
 }
 
 void LocalSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
