@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# Re-apply the out-of-tree TOE patches (0001 receive-window clamp, 0002 seeded ephemeral-port
-# cursor, 0007 receive buffer in card memory) to the nested network submodule, 0008 (that receive
-# buffer wired into the shell: tcp_mem_mux + network_stack + the CMake/lynx_pkg flag) to the Coyote
-# submodule itself, and 0006 (StreamProfiler input register) to parcore/libstf.
+# Apply the patches in this directory to the submodules: 0001 (receive-window clamp), 0002 (seeded
+# ephemeral-port cursor) and 0007 (receive buffer in card memory) to the nested network submodule,
+# 0008 (that receive buffer wired into the shell: tcp_mem_mux, network_stack and the CMake/lynx_pkg
+# flag) to Coyote, and 0006 (StreamProfiler input register) to parcore/libstf. The driver patches
+# 0003-0005 are not applied (see README.md).
 #
 # Idempotent: run it as often as you like. It never resets, stashes or reverts anything --
 # every check is a dry run (`git apply --check`, or a throw-away index), so a working tree that
 # already carries a patch is left exactly as it is. 0001 and 0002 touch disjoint files and apply in
 # either order; 0007 rewrites lines 0001 added (rx_sar_table.cpp) and goes on top of both.
 #
-# See README.md in this directory for what the clamp does and why it lives here.
+# See the table in README.md in this directory for what each patch changes.
 
 set -euo pipefail
 
@@ -63,8 +64,8 @@ if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
   expected: ${EXPECTED_SHA} (${EXPECTED_BRANCH})
   actual:   ${ACTUAL_SHA} (${ACTUAL_BRANCH})
 
-  The two commits on '${EXPECTED_BRANCH}' exist nowhere but this machine and the bundle
-  shipped beside this script. Restore them with:
+  The two commits on '${EXPECTED_BRANCH}' are not upstream; they ship in the bundle beside
+  this script. Restore them with:
 
       git -C ${SUBMODULE_REL} fetch ${BUNDLE} '${EXPECTED_BRANCH}:${EXPECTED_BRANCH}'
       git -C ${SUBMODULE_REL} checkout ${EXPECTED_BRANCH}
