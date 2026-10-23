@@ -234,10 +234,13 @@ module tcp_read #(
     assign fifo_s_tvalid         = s_axis_rx_data_TVALID && !clear_framing;
     assign s_axis_rx_data_TREADY = fifo_s_tready || clear_framing;
 
-    // Space for one maximum segment, in beats. MSS is 4096 on this stack (see the TOE's
-    // MSS/mss_table); at 512 bit that is 64 beats. The +2 covers the fifo's own registered
-    // output stage, which is occupied but not counted in rx_fifo_level.
-    localparam int MSS_BEATS = (4096 / (AXI_DATA_BITS/8)) + 2;
+    // One maximum segment, in beats. MSS is 4096 on this stack (see the TOE's MSS/mss_table); at
+    // 512 bit that is 64 beats. A readPkg reserves two beats more than that, a margin. AF_SLACK is
+    // the decoupling fifo's ALMOST_FULL_SLACK (passed to it below): it refuses a beat once its level
+    // reaches RX_FIFO_DEPTH - AF_SLACK.
+    localparam int SEG_BEATS = 4096 / (AXI_DATA_BITS/8);
+    localparam int MSS_BEATS = SEG_BEATS + 2;
+    localparam int AF_SLACK  = 4;
 
     // ---------------------------------------------------------------------------------------------
     // readPkg reservation. WHY rx_space_ok CANNOT SIMPLY ASK THE FIFO.
@@ -315,7 +318,6 @@ module tcp_read #(
         // visible here.
         // ---------------------------------------------------------------------------------------
         localparam int FREE_BITS = $clog2(RX_FIFO_DEPTH+1);
-        localparam int AF_SLACK  = 4;   // axis_fifo's ALMOST_FULL_SLACK (default, not overridden)
 
         logic                 beat_in_w;
         logic [RSV_BITS:0]    rsv_next_w;   // one bit wider: rsv + beats before the -1
@@ -354,15 +356,18 @@ module tcp_read #(
         assign rx_free_beats = free_q;
     end
 
-    // Room for everything already promised PLUS the segment this would admit. Written as an
-    // addition, not as (DEPTH - level - reserved), because level + reserved may legitimately exceed
-    // the depth for a cycle and the subtraction would wrap to a huge unsigned "yes".
-    assign rx_space_ok = (RSV_BITS'(rx_fifo_level) + rsv_beats_q + RSV_BITS'(MSS_BEATS))
-                         < RSV_BITS'(RX_FIFO_DEPTH);
+    // Room for everything already promised PLUS the segment this would admit, with every promised
+    // beat accepted even if the reader takes nothing: level + reserved + one segment must stay
+    // within RX_FIFO_DEPTH - AF_SLACK. Written as an addition, not as (DEPTH - level - reserved),
+    // because level + reserved may legitimately exceed the depth for a cycle and the subtraction
+    // would wrap to a huge unsigned "yes".
+    assign rx_space_ok = (RSV_BITS'(rx_fifo_level) + rsv_beats_q + RSV_BITS'(SEG_BEATS))
+                         <= RSV_BITS'(RX_FIFO_DEPTH - AF_SLACK);
 
     axis_fifo #(
         .DATA_BITS(AXI_DATA_BITS),
-        .DEPTH(RX_FIFO_DEPTH)
+        .DEPTH(RX_FIFO_DEPTH),
+        .ALMOST_FULL_SLACK(AF_SLACK)
     ) inst_rx_fifo (
         .clk(clk),
         .rst_n(rst_n),
