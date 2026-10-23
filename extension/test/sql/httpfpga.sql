@@ -6,6 +6,7 @@
 .bail off
 
 INSTALL parquet; LOAD parquet;
+-- The object server that holds the objects below (anonymous ranged GET): change it to yours.
 SET http_server='10.253.74.74';
 SET http_port=9000;
 SET httpfpga_debug=true;
