@@ -201,11 +201,7 @@ Scheduler &OasisContext::scheduler() {
 }
 
 bool OasisContext::isRDMAEnabled() {
-    // The hardware exposes one MemConfig stream per column-chunk decoder plus an extra bypass
-    // stream when RDMA is wired in. If the counts match, RDMA wasn't synthesized into this shell.
-    auto mem_config = config<libstf::MemConfig>();
-    auto cc_config = config<parcore::ColumnChunkDecoderConfig>();
-    return !(mem_config->num_streams() == cc_config->num_decoders());
+    return global_config_.has_config(RDMA_READ_CONFIG_ID);
 }
 
 libstf::stream_t OasisContext::rdmaBypassStream() {
