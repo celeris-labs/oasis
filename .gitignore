@@ -24,11 +24,5 @@ __pycache__
 **/._.DS_Store
 jemalloc-5.3.0/
 
-# transient debug logs from scripts/util/repeat_query.sh
-.repeat-logs/
-.ila/
+# traces of failed queries kept by scripts/tpch_demo.sh
 .traces/
-.raw/
-# A/B results from scripts/util/decoder_ab.sh
-.decoder-ab/
-minio/
