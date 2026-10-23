@@ -780,7 +780,7 @@ module lane_drain_tb #(
     //                a token bucket per session that fills only while it has bytes to send (at most
     //                two segments) and, under SRVSER, starts EMPTY at each response -- idle credit
     //                would send the first 8 KiB of every response the instant its TTFB ends.
-    //   +LINKBPC=    the shared wire in bytes per cycle (64 = the old line rate; 50 = 100 Gb/s).
+    //   +LINKBPC=    the shared wire in bytes per cycle (64 = one beat per cycle; 50 = 100 Gb/s).
     bit srv_ser     = 1'b0;
     int srv_rate_mb = 0;
     int link_bpc    = 64;
