@@ -38,7 +38,7 @@ constexpr const uint8_t HTTP_CSR_REVISION_TOE   = 6;
 
 // Lanes the per-lane CSRs (read ids 16 to 20) address, at a fixed stride whatever the bitstream's lane
 // count. Lanes the bitstream does not have read 0.
-constexpr const uint8_t HTTP_LANE_SLOTS = 8;
+constexpr const uint8_t HTTP_MAX_LANES = 8;
 
 // Revision 6: the part of each ring the window budget keeps free (toe_rx's budget_err fires above
 // 2^RING_LOG2 minus this), and what each GET is charged for its response header on top of its body.
@@ -184,7 +184,7 @@ class HTTPReadConfig : public libstf::Config {
     // Read id 10 (inflightWord). Occupancy is the maximum over lanes.
     struct HTTPInflight {
         uint8_t occupied    = 0;     // chunk entries queued, saturating at 255
-        uint8_t slots       = 0;     // the per-lane queue depth, saturating at 255
+        uint8_t depth       = 0;     // the per-lane queue depth, saturating at 255
         bool    has_pending = false; // [16] rev 2: a segment waits to be read; rev 6: notified bytes
         bool    peer_closed = false; // [17] rev 2: the peer sent FIN; rev 6: a FIN has settled
         bool    conn_up     = false; // [18] every lane is connected
@@ -210,7 +210,7 @@ class HTTPReadConfig : public libstf::Config {
     };
     struct HTTPLanes {
         uint8_t                               count = 0; // the bitstream's lanes
-        std::array<HTTPLane, HTTP_LANE_SLOTS> lane {};
+        std::array<HTTPLane, HTTP_MAX_LANES> lane {};
 
         // Throws std::out_of_range for a lane the bitstream does not have.
         const HTTPLane &at(uint8_t l) const;
@@ -238,7 +238,7 @@ class HTTPReadConfig : public libstf::Config {
     };
     struct HTTPLaneErrors {
         uint8_t                                    count = 0;
-        std::array<HTTPLaneError, HTTP_LANE_SLOTS> lane {};
+        std::array<HTTPLaneError, HTTP_MAX_LANES> lane {};
 
         const HTTPLaneError &at(uint8_t l) const;
         std::string describe() const;

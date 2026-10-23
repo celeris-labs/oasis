@@ -60,7 +60,7 @@ class Scheduler {
     // checks can call.
     struct LaneInputs {
         HTTPReadConfig::HTTPLanes           lanes {};     // sampled once per iteration
-        std::array<size_t, HTTP_LANE_SLOTS> host_load {}; // flows placed per stream, not yet retired
+        std::array<size_t, HTTP_MAX_LANES> host_load {}; // flows placed per stream, not yet retired
         size_t           host_depth     = 1;     // flows one stream may hold (configs and buffers)
         size_t           lane_depth     = 1;     // lane_depth_limit()
         size_t           needed         = 1;     // entries the queue head reserves; 0 = no HTTP source

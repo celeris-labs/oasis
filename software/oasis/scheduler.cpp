@@ -532,7 +532,7 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig
     in.needed     = needed;
     in.active     = std::max<libstf::stream_t>(active_streams_.load(), 1);
     in.rr         = lane_rr_;
-    for (libstf::stream_t s = 0; s < in.active && s < HTTP_LANE_SLOTS && s < num_streams_; ++s) {
+    for (libstf::stream_t s = 0; s < in.active && s < HTTP_MAX_LANES && s < num_streams_; ++s) {
         in.host_load[s] = streams_[s]->out_of_service.load(std::memory_order_relaxed)
                               ? in.host_depth
                               : streams_[s]->enqueued.load(std::memory_order_relaxed);
@@ -609,7 +609,7 @@ void Scheduler::fail_flows_on_fatal_lanes(const HTTPReadConfig::HTTPLanes &lanes
     // meant to be safe, and neither is worth betting the process on. The lane is already latched in
     // lane_fatal_reported_, so a failure here costs the report, not correctness.
     try {
-        for (uint8_t s = 0; s < HTTP_LANE_SLOTS; ++s) {
+        for (uint8_t s = 0; s < HTTP_MAX_LANES; ++s) {
             if ((reporting & (1u << s)) == 0) {
                 continue;
             }

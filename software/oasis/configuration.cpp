@@ -430,10 +430,10 @@ uint8_t HTTPReadConfig::lane_count() {
     // From LANE_POLICY, which has NUM_CONNS untruncated (inflightWord[23:20] is four bits).
     if (lane_count_ == 0) {
         const auto conns = policy().num_conns;
-        if (conns == 0 || conns > HTTP_LANE_SLOTS) {
+        if (conns == 0 || conns > HTTP_MAX_LANES) {
             throw std::runtime_error("FPGA HTTP handler reports " + std::to_string(conns) +
                                      " lanes (LANE_POLICY); this library drives 1 to " +
-                                     std::to_string(HTTP_LANE_SLOTS));
+                                     std::to_string(HTTP_MAX_LANES));
         }
         lane_count_ = conns;
     }
@@ -509,9 +509,9 @@ uint64_t HTTPReadConfig::toe_get_cap() {
 }
 
 uint8_t HTTPReadConfig::max_inflight() {
-    const uint8_t  slots      = inflight().slots;
+    const uint8_t  depth      = inflight().depth;
     const uint64_t configured = EnvOr("OASIS_HTTP_MAX_INFLIGHT", HTTP_DEFAULT_MAX_INFLIGHT);
-    return (configured == 0 || configured >= slots) ? slots : static_cast<uint8_t>(configured);
+    return (configured == 0 || configured >= depth) ? depth : static_cast<uint8_t>(configured);
 }
 
 bool HTTPReadConfig::LaneCreditOk(size_t occ, size_t needed, size_t limit) {
@@ -542,7 +542,7 @@ HTTPReadConfig::HTTPInflight HTTPReadConfig::inflight() {
     const auto word = static_cast<uint32_t>(read_register(HTTP_INFLIGHT).value());
     HTTPInflight f {};
     f.occupied    = static_cast<uint8_t>(word & 0xFFu);
-    f.slots       = static_cast<uint8_t>((word >> 8) & 0xFFu);
+    f.depth       = static_cast<uint8_t>((word >> 8) & 0xFFu);
     f.has_pending = (word & (1u << 16)) != 0;
     f.peer_closed = (word & (1u << 17)) != 0;
     f.conn_up     = (word & (1u << 18)) != 0;
@@ -586,7 +586,7 @@ HTTPReadConfig::HTTPResponse HTTPReadConfig::response() {
 HTTPReadConfig::HTTPLanes HTTPReadConfig::DecodeLanes(uint64_t occ_word, uint64_t ready_word,
                                                      uint8_t count) {
     HTTPLanes l {};
-    l.count = (count > HTTP_LANE_SLOTS) ? HTTP_LANE_SLOTS : count;
+    l.count = (count > HTTP_MAX_LANES) ? HTTP_MAX_LANES : count;
     for (uint8_t i = 0; i < l.count; i++) {
         const auto nib        = static_cast<unsigned>((ready_word >> (4u * i)) & 0xFu);
         l.lane[i].occ         = static_cast<uint8_t>((occ_word >> (8u * i)) & 0xFFu);
@@ -600,7 +600,7 @@ HTTPReadConfig::HTTPLanes HTTPReadConfig::DecodeLanes(uint64_t occ_word, uint64_
 
 HTTPReadConfig::HTTPLaneErrors HTTPReadConfig::DecodeLaneErrors(uint64_t err_word, uint8_t count) {
     HTTPLaneErrors e {};
-    e.count = (count > HTTP_LANE_SLOTS) ? HTTP_LANE_SLOTS : count;
+    e.count = (count > HTTP_MAX_LANES) ? HTTP_MAX_LANES : count;
     for (uint8_t i = 0; i < e.count; i++) {
         const auto byte         = static_cast<uint8_t>((err_word >> (8u * i)) & 0xFFu);
         e.lane[i].raw           = byte;
@@ -728,7 +728,7 @@ std::string HTTPReadConfig::HTTPLanePolicy::describe() const {
 
 std::string HTTPReadConfig::HTTPInflight::describe() const {
     std::ostringstream oss;
-    oss << "inflight=" << static_cast<unsigned>(occupied) << "/" << static_cast<unsigned>(slots)
+    oss << "inflight=" << static_cast<unsigned>(occupied) << "/" << static_cast<unsigned>(depth)
         << " conn=" << (conn_up ? "up" : "down") << (has_pending ? " pending" : "")
         << (peer_closed ? " peer-closed" : "") << " rev=" << static_cast<unsigned>(revision);
     return oss.str();

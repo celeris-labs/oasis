@@ -66,14 +66,14 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
 // GETs armed and body bytes requested per lane since the process started, for the stall and exit
 // dumps.
 namespace {
-std::atomic<uint64_t> g_lane_gets[HTTP_LANE_SLOTS];
-std::atomic<uint64_t> g_lane_bytes[HTTP_LANE_SLOTS];
+std::atomic<uint64_t> g_lane_gets[HTTP_MAX_LANES];
+std::atomic<uint64_t> g_lane_bytes[HTTP_MAX_LANES];
 } // namespace
 
 std::string HttpLaneTrafficSummary() {
     std::ostringstream o;
     o << "host traffic per lane (since process start):";
-    for (int l = 0; l < HTTP_LANE_SLOTS; l++) {
+    for (int l = 0; l < HTTP_MAX_LANES; l++) {
         const auto g = g_lane_gets[l].load();
         if (g != 0) {
             o << " [lane " << l << ": " << g << " GETs, " << g_lane_bytes[l].load() << " body bytes]";
