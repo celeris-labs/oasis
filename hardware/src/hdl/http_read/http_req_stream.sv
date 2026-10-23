@@ -4,18 +4,14 @@ import lynxTypes::*;
 
 // Forwards pre-built HTTP request bytes from the host into the TCP transmit path.
 //
-// WHY THIS REPLACES THE REQUEST RING
-// ----------------------------------
-// The handler used to hold a ring of NUM_SLOTS request DESCRIPTORS -- server IP, host string, 16
-// path words, both range endpoints -- and rebuild the GET text in hardware from them for every
-// request. That put a hard ceiling on how many requests could be queued: each one
-// costs 1160 bits of registers, so the ring was 4 deep and the elaboration guard stopped at 8. The
-// host then had to poll for a free slot before every GET.
-//
-// None of that is necessary. Every byte range a query needs is known the moment the Parquet footer
-// is parsed -- nothing is discovered later and nothing is revised -- so the host can build ALL of
-// the GET text up front, hand it over as one byte stream, and let TCP carry it. A request is only
-// text; there is nothing to store per-request on the FPGA at all.
+// WHY THE HOST BUILDS THE TEXT
+// ----------------------------
+// Rebuilding each GET in hardware from a request DESCRIPTOR -- server IP, host string, 16 path
+// words, both range endpoints -- costs ~1160 bits of registers per queued request, which puts a
+// hard ceiling on how many requests can be queued. Every byte range a query needs is known the
+// moment the Parquet footer is parsed -- nothing is discovered later and nothing is revised -- so
+// the host builds ALL of the GET text up front, hands it over as one byte stream, and lets TCP carry
+// it. A request is only text; there is nothing to store per-request on the FPGA at all.
 //
 // So the queue depth stops being an amount of FPGA memory and becomes an amount of HOST memory,
 // which is not a constraint worth designing around. What arrives here is a flat concatenation:
@@ -25,8 +21,8 @@ import lynxTypes::*;
 //     ... one after another, for the whole query
 //
 // The server answers them in order on the one connection, the bodies concatenate into one stream,
-// and where each column chunk ends is decided downstream by byte count (DataRewriteLast) rather
-// than by a per-request flag travelling with a descriptor.
+// and where each column chunk ends is decided downstream by byte count (axis_rewrite_last) rather
+// than by a per-request flag.
 //
 // WHY A LENGTH REGISTER RATHER THAN TLAST
 // ---------------------------------------
@@ -88,9 +84,9 @@ module http_req_stream #(
     // only leaves ST_IDLE while it holds the grant.
     //
     // Granting for a whole TRANSFER rather than per chunk is deliberate. Request text is a few
-    // hundred bytes per GET against a ~1 ms server round trip, so serialising transmit costs
-    // nothing measurable and removes every interleaving hazard. Tie bus_grant high for single-lane
-    // use and this module behaves exactly as before.
+    // hundred bytes per GET against a server round trip of the better part of a millisecond, so
+    // serialising transmit costs nothing measurable and removes every interleaving hazard. Tie
+    // bus_grant high for single-lane use.
     output logic        bus_req,
     input  logic        bus_grant,
 
@@ -242,16 +238,13 @@ module http_req_stream #(
 
     // ASK FOR THE BUS ONLY WHILE THIS LANE CAN ACTUALLY USE IT.
     //
-    // `remaining_q != 0` alone was a lane that lies to the arbiter. Leaving ST_IDLE needs conn_up,
-    // so a lane whose connection goes away between the arm and the grant -- which is what
-    // handler_multi produces when a lane goes fatal with request text armed but not yet granted --
-    // goes on claiming a bus it can never leave ST_IDLE to use. The arbiter, holding the grant until
-    // the holder drops its request, hands the dead lane the bus and waits forever. ONE dead lane
-    // stops the transmit path for EVERY lane.
-    //
-    // Not reachable while request text fits in one chunk and one lane is armed at a time, which is
-    // why every bench passed; reachable on hardware with multi-chunk text, where a lane is armed and
-    // waiting behind another for a real length of time.
+    // `remaining_q != 0` alone would be a lane that lies to the arbiter. Leaving ST_IDLE needs
+    // conn_up, so a lane whose connection goes away between the arm and the grant -- which is what
+    // the handlers produce when a lane goes fatal with request text armed but not yet granted --
+    // would go on claiming a bus it can never leave ST_IDLE to use. The arbiter, holding the grant
+    // until the holder drops its request, would hand the dead lane the bus and wait forever: ONE
+    // dead lane would stop the transmit path for EVERY lane. It takes a lane armed and waiting
+    // behind another for a real length of time, i.e. multi-chunk request text.
     //
     // The `state_q != ST_IDLE` term is not belt and braces, it is the half that keeps the fix safe.
     // Once ST_SEND_META is entered a reservation is open at the TOE, and the bytes that fill it must

@@ -16,14 +16,12 @@ always_comb cq_rd.tie_off_s();
 always_comb rq_wr.tie_off_s();
 // The ColumnChunkDecoders are fed by the HTTP stack rather than by host DMA, so the host-recv
 // streams carry the REQUEST TEXT instead: the host builds every GET of a query itself and DMAs the
-// lot in, instead of writing a descriptor per request for the FPGA to rebuild the text from. That
-// is what removes the queue-depth limit.
+// lot in, instead of writing a descriptor per request for the FPGA to rebuild the text from.
 //
 // One request stream PER LANE, so only the streams past the lane count are tied off. Sending a
 // lane's text to a tied-off stream is silent data loss -- the tie-off holds tready high and
 // discards, the DMA reports success, and the armed handler then waits for bytes that no longer
-// exist. That exact mistake cost a 30 s timeout, a dirty_abort and a collapsed receive window; see
-// the comment on req_dest in software/oasis/operator.cpp.
+// exist.
 for (genvar I = NUM_HTTP_LANES; I < N_STRM_AXI; I++) begin
     always_comb axis_host_recv[I].tie_off_s();
 end
@@ -53,8 +51,8 @@ localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
 localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
 
 `ifdef EN_TCP
-// HttpConfig: 39 param regs + START at 39, so 40 in use. The GET path takes 16 of them (64
-// characters); with 8 words this fit in exactly 32. Rounded up to the next power of two.
+// HttpConfig: parameters 0..38, 40 and 41 with START at 39, 42 registers. Rounded up to the next
+// power of two.
 localparam HTTP_CONFIG_ADDR_SPACE = 64;
 localparam NUM_CONFIGS   = 3;
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
@@ -139,10 +137,9 @@ ColumnChunkDecoderConfig #(
 // register.
 localparam int HTTP_QUEUE_DEPTH = 64;
 
-// HttpConfig latches params; a START write emits one http_config_t beat, which the handler accepts
-// straight into a free slot. The slot ring IS the request queue, so there is no separate FIFO and
-// no runTx pulse any more -- the old one-cycle pulse was sampled only in ST_IDLE and was silently
-// dropped if it arrived mid-transfer, which is exactly the wedge this replaces.
+// HttpConfig latches params; a START write emits one http_config_t beat, which the handler takes
+// as a per-lane chunk entry or a transfer arm (see http_types.sv). ConfigWriteReadyRegister does not
+// back-pressure, so the host polls the lane's admission bits before it writes START.
 http_config_t                  http_cfg_live;
 ready_valid_i #(http_config_t) http_start();
 logic [3:0]                    http_client_state;
@@ -153,18 +150,15 @@ logic [31:0]                   http_stall_word;
 logic [31:0]                   http_resp_word;
 logic [31:0]                   http_content_length_word;
 logic [31:0]                   http_body_remaining_word;
-// Per-lane readback (CSR revision 2, read registers 16..20). 64 bits because eight lanes need eight
-// bytes and the AXI-Lite data path is 64 wide; see the read map in http_config.sv.
+// Per-lane readback (read registers 16..20). 64 bits because eight lanes need eight bytes and the
+// AXI-Lite data path is 64 wide; see the read map in http_config.sv.
 logic [63:0]                   http_lane_occ_word;
 logic [63:0]                   http_lane_ready_word;
 logic [63:0]                   http_lane_state_word;
 logic [63:0]                   http_lane_err_word;
 logic [63:0]                   http_lane_policy_word;
 
-// 39 param regs (0..38) with START at 39. These were left at 31/31 when the GET path widened from
-// 8 to 16 words, which put START on top of RANGE_BEGIN_W1: writing that parameter fired the request
-// mid-configuration, so registers 32..38 -- the rest of the Range begin and all of the Range end --
-// never reached the snapshot and the FPGA sent "Range: bytes=<truncated>-" with no end at all.
+// Parameters 0..38, 40 and 41; START at 39 (see http_config.sv).
 HttpConfig #(
     .NUM_PARAM_REGS(42),
     .START_ADDR    (39)
@@ -229,8 +223,8 @@ CQDemultiplexer #(
 
 // -- Decoders -------------------------------------------------------------------------------------
 AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
-// EN_TCP feeds its single ColumnChunkDecoder from the HTTP stack below (mirrors the RDMA decoder
-// path), so this host-DMA / RDMA-fed decoder loop is only built for the non-TCP modes.
+// EN_TCP feeds its NUM_DECODERS ColumnChunkDecoders from the HTTP lanes below, so this host-DMA /
+// RDMA-fed decoder loop is only built for the non-TCP modes.
 `ifndef EN_TCP
 generate
 for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
@@ -295,12 +289,11 @@ end
 endgenerate
 `endif
 
-// -- Bypass stream (last slot, no decoder) --------------------------------------------------------
+// -- Bypass stream (last stream, no decoder) ------------------------------------------------------
 localparam BYPASS_ID = NUM_STREAMS - 1;
 
 `ifdef EN_TCP
-// Open/listen/close are Coyote user ports again (restored in user_logic_tmplt).
-// Listen unused for the HTTP client; open/close driven by handler.
+// Listen is unused; open/close are driven by the handler.
 always_comb tcp_listen_req.tie_off_m();
 always_comb tcp_listen_rsp.tie_off_s();
 
@@ -312,12 +305,11 @@ always_comb tcp_listen_rsp.tie_off_s();
 // The demux sits in the receive path (rx_dispatch / toe_rx), not after one shared framer: each
 // lane owns a session, a decoupling fifo and a framer, and the dispatcher decides whether to ASK
 // for a packet rather than whether to accept one, so a lane busy on a large chunk does not
-// back-pressure the others. See hdl/http_read/handler_multi.sv and unit-tests/{http_multilane,
+// back-pressure the others. See hdl/http_read/handler_multi.sv and unit-tests/{lane_drain,
 // handler_multi}.
 //
-// One connection is the throughput ceiling being escaped here: measured against MinIO, one TCP
-// session delivers ~0.46 GB/s however deeply pipelined and sixteen deliver 4.60, with the FPGA at
-// 0.33.
+// One TCP connection to MinIO is a throughput ceiling however deeply its GETs are pipelined; the
+// sessions together are what reach the decoders' rate.
 // -------------------------------------------------------------------------------------------------
 logic [NUM_DECODERS-1:0]       hm_body_tvalid, hm_body_tready, hm_body_tlast;
 logic [AXI_DATA_BITS-1:0]      hm_body_tdata [NUM_DECODERS];
@@ -423,9 +415,8 @@ handler_toe #(
 handler_multi #(
     .NUM_CONNS    (NUM_DECODERS),
     .QUEUE_DEPTH  (HTTP_QUEUE_DEPTH),
-    // Per lane, and it no longer has to hold a whole response -- rx_dispatch gates each lane on
-    // room for one MSS, so this only absorbs decoder jitter. 2048 x 64 B = 128 KiB = 36 RAMB36,
-    // so four lanes cost the 144 RAMB36 that the single-lane 8192-deep fifo used on its own.
+    // Per lane. rx_dispatch gates each lane on room for one MSS, so this only absorbs decoder
+    // jitter, not a whole response. 2048 x 64 B = 128 KiB = 36 RAMB36.
     .RX_FIFO_DEPTH(2048)
 ) inst_handler (
     .ap_clk  (clk),
@@ -539,7 +530,7 @@ for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_http_decoders
     );
 end
 
-// Raw bypass removed — nothing flows to the bypass output slot now.
+// No traffic on the bypass output stream in HTTP mode.
 always_comb axi_out[BYPASS_ID].tie_off_m();
 `elsif EN_RDMA
 AXI4S axi_in (.aclk(clk), .aresetn(rst_n));

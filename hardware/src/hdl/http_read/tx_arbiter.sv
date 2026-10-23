@@ -24,8 +24,8 @@
 // ------------------------------------
 // Per-chunk grants would let lanes interleave at CHUNK_BYTES (4 KiB) granularity and would work,
 // with a more delicate hand-off at each chunk boundary. It is not worth it: request text is a few
-// hundred bytes per GET against a ~800 us server round trip (ARCHITECTURE.md ADR-3), so transmit is
-// nowhere near the critical path and serialising it costs nothing measurable. Buying zero
+// hundred bytes per GET against a server round trip of the better part of a millisecond, so
+// transmit is nowhere near the critical path and serialising it costs nothing measurable. Buying zero
 // throughput with a new class of interleaving bug is a bad trade.
 //
 // FAIRNESS

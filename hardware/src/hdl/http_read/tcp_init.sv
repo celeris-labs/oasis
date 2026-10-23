@@ -57,10 +57,10 @@ module tcp_init (
                     session_id_d = s_axis_open_status_TDATA[15:0];
                     // tcp_open_rsp_t = {ip_port[71:56], ip_address[55:24], success[23:16], sid[15:0]}.
                     // success == 1 means the connection was established (cThread::openConnTcp
-                    // throws when this bit is clear), so an error is success == 0. The polarity
-                    // used to be inverted.
+                    // throws when this bit is clear), so an error is success == 0.
                     // The handler acts on this: an open that fails leaves nothing bound and
-                    // nothing sent, so it simply retries after a backoff and latches init_err_q.
+                    // nothing sent. During bring-up it retries that lane after a backoff; a refused
+                    // reconnect makes the lane fatal. Either way it latches the lane's init error.
                     // Note the common connect failure -- ephemeral-port reuse against the peer's
                     // TIME_WAIT -- does NOT land here: there openStatus never arrives at all, the
                     // FSM waits in ST_WAIT, and the handler's connect watchdog is the only signal.
