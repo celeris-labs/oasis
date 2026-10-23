@@ -94,30 +94,6 @@ std::string HttpLaneTrafficSummary() {
 
 namespace {
 
-// A batch carries ONE lane for all its chunks, so every chunk in it must belong to the stream
-// this operator runs on. That holds when each flow submits its own chunk (OASIS_HTTP_BATCH=0):
-// the decode config and the request are applied on the same stream by construction.
-//
-// It does NOT hold for a row-group batch, whose chunks come from sibling flows the scheduler
-// may have placed on other streams. With one decoder that was harmless -- every stream was 0.
-// With more than one it would route a column's bytes to a decoder configured for a different
-// column, which corrupts silently. Refuse rather than corrupt.
-void RefuseCrossStreamBatch(OasisContext &ctx, const HTTPReadConfig::RequestBatch &batch) {
-    if (batch.chunk_bytes.size() > 1) {
-        const auto decoders = ctx.config<parcore::ColumnChunkDecoderConfig>()->num_decoders();
-        if (decoders > 1) {
-            throw std::runtime_error(
-                "HTTPBatchSourceOperator: a multi-chunk batch cannot target " +
-                std::to_string(decoders) +
-                " decoders -- its chunks may belong to different streams. Run with "
-                "OASIS_HTTP_BATCH=0 (one request per column chunk), or give the batch a per-chunk "
-                "lane before enabling multi-decoder batching. Each lane owns its own TCP connection "
-                "and its own request-text stream, so a batch spanning lanes has no single "
-                "destination to be DMA'd to.");
-        }
-    }
-}
-
 constexpr size_t BEAT = 64;
 
 size_t RoundUpToBeat(size_t bytes) { return (bytes + BEAT - 1) / BEAT * BEAT; }
@@ -154,7 +130,6 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     if (batch.chunk_bytes.empty()) {
         return;
     }
-    RefuseCrossStreamBatch(ctx, batch);
     const uint8_t lane = config.lane_for_stream(stream);
     const bool    toe  = config.toe_ring();
 
