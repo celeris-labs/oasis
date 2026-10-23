@@ -6,8 +6,6 @@ import http_types::*;
 import lynxTypes::*;
 import libstf::*;
 
-`include "oasis_defines.svh"
-
 // Decoder lanes on the HTTP path. Each lane owns its own TCP session and its own request stream.
 localparam NUM_HTTP_LANES = N_STRM_AXI - 1;
 
@@ -337,14 +335,14 @@ for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_hm_req
     assign hm_req_tlast[L]         = axis_host_recv[L].tlast;
 end
 
-`ifdef HTTP_TOE_BUF
+`ifdef EN_TCP_RX_DDR
 // -------------------------------------------------------------------------------------------------
 // The TOE keeps the receive buffer itself (ENABLE_HTTP_TOE_BUFFER: TCP_STACK_RX_DDR_BYPASS_EN = 0, a
-// 1 MiB ring per session in card memory, patches 0007/0008). handler_toe is handler_multi with
-// toe_rx in place of rx_dispatch: readPkg for any session in any order, so no arrival-order
-// coupling between lanes. Same ports and the same revision-2 HttpConfig map as handler_multi; the
-// readback says revision 6 (one GET per arm, GET credit). hdl/http_read/handler_toe.sv,
-// unit-tests/lane_drain --dut toe.
+// 1 MiB ring per session in card memory, patches 0007/0008; lynx_pkg defines EN_TCP_RX_DDR exactly
+// then). handler_toe is handler_multi with toe_rx in place of rx_dispatch: readPkg for any session
+// in any order, so no arrival-order coupling between lanes. Same ports and the same revision-2
+// HttpConfig map as handler_multi; the readback says revision 6 (one GET per arm, GET credit).
+// hdl/http_read/handler_toe.sv, unit-tests/lane_drain --dut toe.
 // -------------------------------------------------------------------------------------------------
 handler_toe #(
     .NUM_CONNS    (NUM_DECODERS),
@@ -497,7 +495,7 @@ handler_multi #(
     .laneErrWord      (http_lane_err_word),
     .lanePolicyWord   (http_lane_policy_word)
 );
-`endif // HTTP_TOE_BUF
+`endif // EN_TCP_RX_DDR
 
 // Each lane is already its own stream -- there is nothing left to select.
 AXI4S axi_http_lane [NUM_DECODERS] (.aclk(clk), .aresetn(rst_n));

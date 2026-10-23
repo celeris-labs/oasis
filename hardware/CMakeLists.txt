@@ -34,9 +34,12 @@ endif()
 
 # The one knob for both halves: Coyote derives the TOE's toe_config.hpp (HLS) AND the shell's
 # tcp_stack parameter + memory mux (lynx_pkg EN_TCP_RX_DDR) from this cache variable, and checks it is
-# 0 or 1. FORCE in both directions, so a reconfigured build directory cannot keep a stale value. This
-# runs before validation_checks_hw() and create_hw() below, which is where Coyote reads it and adds
-# the network subproject (hls/toe/CMakeLists.txt's own set(CACHE) default is then a no-op).
+# 0 or 1. vfpga_top.svh picks handler_toe over handler_multi on the same EN_TCP_RX_DDR, which lives in
+# each build directory's own lynx_pkg.sv, so build directories of both configurations can be
+# configured from one tree. FORCE in both directions, so a reconfigured build directory cannot keep a
+# stale value. This runs before validation_checks_hw() and create_hw() below, which is where Coyote
+# reads it and adds the network subproject (hls/toe/CMakeLists.txt's own set(CACHE) default is then a
+# no-op).
 if(ENABLE_HTTP_TOE_BUFFER)
     # Without 0008 the shell would stay in bypass while the TOE's HLS does not (a port mismatch that
     # synthesis only reports half an hour in); without 0007 the TOE's receive ring is broken.
@@ -53,30 +56,9 @@ else()
     set(TCP_STACK_RX_DDR_BYPASS_EN 1 CACHE BOOL "Enabling DDR bypass on the RX path" FORCE)
 endif()
 
-# Coyote generates lynx_pkg.sv from its own template, so oasis cannot add a `define there without
-# editing the submodule. This generated header is oasis's own, included by vfpga_top.svh.
-# vfpga_top.svh instantiates handler_toe (toe_rx: readPkg for any session, any order) instead of
-# handler_multi when the TOE keeps the receive rings.
-if(ENABLE_HTTP_TOE_BUFFER)
-    set(OASIS_DEF_HTTP_TOE_BUF "`define HTTP_TOE_BUF")
-else()
-    set(OASIS_DEF_HTTP_TOE_BUF "// HTTP_TOE_BUF off: TOE in bypass mode (one shared rx fifo), handler_multi's rx_dispatch")
-endif()
-# Generated into src/hdl/, NOT src/ -- Coyote's cr_user.tcl copies `src/hdl/*` and `vfpga_top.svh`
-# into the Vivado project and nothing else, so a header generated one level up never reaches
-# synthesis. Until 2026-08-28 an untracked hand-copy at src/hdl/oasis_defines.svh was covering for
-# that; it was deleted along with a vfpga_top.svh edit and build-111 failed elaboration with
-# "cannot open include file 'oasis_defines.svh'". Keep this path in step with the glob.
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/oasis_defines.svh.in
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/hdl/oasis_defines.svh
-    @ONLY
-)
-
 # Number of vFPGAs (user applications)
 set(N_REGIONS 1)
 set(EN_STRM 1)
-
 
 if(ENABLE_HTTP)
     math(EXPR N_STREAMS "${N_DECODERS} + 1")
