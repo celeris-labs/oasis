@@ -32,6 +32,17 @@ void check(bool ok, const char *what) {
 
 #define CHECK(expr) check((expr), #expr)
 
+// Whether f() throws an E.
+template <typename E, typename F>
+bool throws(F f) {
+    try {
+        f();
+    } catch (const E &) {
+        return true;
+    }
+    return false;
+}
+
 // One lane nibble as handler_multi / handler_toe pack it: {fatal, conn_up, entry, arm}.
 uint64_t nib(bool fatal, bool up, bool entry, bool arm) {
     return (uint64_t(fatal) << 3) | (uint64_t(up) << 2) | (uint64_t(entry) << 1) | uint64_t(arm);
@@ -55,13 +66,7 @@ void rev2_decoders() {
     CHECK(l.at(1).fatal && !l.at(1).arm_ready);
     CHECK(l.at(2).occ == 7 && l.at(2).arm_ready && l.at(2).entry_ready && !l.at(2).conn_up);
     CHECK(l.at(3).occ == 255 && l.at(3).arm_ready);
-    bool threw = false;
-    try {
-        (void)l.at(4);
-    } catch (const std::out_of_range &) {
-        threw = true;
-    }
-    CHECK(threw);
+    CHECK(throws<std::out_of_range>([&] { (void)l.at(4); }));
 
     // LANE_ERR bit 7 means RX_FIFO_STALL at revision 2.
     const uint64_t err = 0x81ULL | (0x08ULL << 8);
@@ -114,21 +119,9 @@ void request_split() {
     // Lengths that do not add up to the text are refused, both ways.
     HTTPReadConfig::RequestBatch bad = b;
     bad.request_bytes.back() -= 1;
-    bool threw = false;
-    try {
-        (void)HTTPReadConfig::SplitRequests(bad);
-    } catch (const std::runtime_error &) {
-        threw = true;
-    }
-    CHECK(threw);
+    CHECK(throws<std::runtime_error>([&] { (void)HTTPReadConfig::SplitRequests(bad); }));
     bad.request_bytes.back() += 2;
-    threw = false;
-    try {
-        (void)HTTPReadConfig::SplitRequests(bad);
-    } catch (const std::runtime_error &) {
-        threw = true;
-    }
-    CHECK(threw);
+    CHECK(throws<std::runtime_error>([&] { (void)HTTPReadConfig::SplitRequests(bad); }));
 }
 
 // At lane depth 1 (OASIS_HTTP_LANE_DEPTH=1) a lane still owing a chunk is NOT a placement candidate --
@@ -293,20 +286,11 @@ void rev6_rules() {
         HTTPReadConfig::AppendChunkGets("h", 1, "/p", UINT64_MAX - 999999, UINT64_MAX, cap, t);
         CHECK(t.chunk_bytes.size() == 1 && t.chunk_bytes[0] == 1000000u);
         CHECK(HTTPReadConfig::SplitRequests(t).size() == 5);
-        bool threw = false;
-        try {
-            HTTPReadConfig::AppendChunkGets("h", 1, "/p", 10, 9, cap, t);   // empty range
-        } catch (const std::runtime_error &) {
-            threw = true;
-        }
-        CHECK(threw);
-        threw = false;
-        try {
-            HTTPReadConfig::AppendChunkGets("h", 1, "/p", 0, 1ULL << 32, cap, t); // > 32-bit entry
-        } catch (const std::runtime_error &) {
-            threw = true;
-        }
-        CHECK(threw);
+        // An empty range and one too large for the 32-bit chunk-length entry are refused.
+        CHECK(throws<std::runtime_error>(
+            [&] { HTTPReadConfig::AppendChunkGets("h", 1, "/p", 10, 9, cap, t); }));
+        CHECK(throws<std::runtime_error>(
+            [&] { HTTPReadConfig::AppendChunkGets("h", 1, "/p", 0, 1ULL << 32, cap, t); }));
     }
 
     // --- lane depth: protocol 2 + the GET credit ---
