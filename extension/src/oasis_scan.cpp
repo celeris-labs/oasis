@@ -1,8 +1,5 @@
 #include "oasis_scan.hpp"
 
-#include <cstdio>
-#include <cstdlib>
-
 #include "coalesced_fetcher.hpp"
 #include "column_reader.hpp"
 #include "duckdb/common/exception.hpp"
@@ -24,6 +21,7 @@
 #include "thrift_tools.hpp" // ThriftFileTransport, for the per-group ClearPrefetch in BeginGroup
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -184,12 +182,6 @@ static bool HttpBatchMode(oasis::OasisContext &ctx) {
 				                            static_cast<unsigned>(decoders));
 			}
 			return e[0] != '0';
-		}
-		if (decoders > 1) {
-			std::fprintf(stderr,
-			             "[oasis] OASIS_HTTP_BATCH unset: one HTTP source per column chunk (%u "
-			             "decoders; a row-group batch is single-decoder only)\n",
-			             static_cast<unsigned>(decoders));
 		}
 		return decoders <= 1;
 	}();
