@@ -1,12 +1,44 @@
 # Oasis -- Data Processing SmartNIC
 
 Oasis is a data processing SmartNIC for cloud-native data lakes. It offloads Parquet decoding into
-the network data path. The main components are a hardware design that embeds 
-[ParCore](https://github.com/celeris-labs/parcore) into an RDMA-enabled 
-[Coyote](https://github.com/fpgasystems/Coyote) vFPGA and a software abstraction for easy 
+the network data path. The main components are a hardware design that embeds
+[ParCore](https://github.com/celeris-labs/parcore) into an RDMA-enabled
+[Coyote](https://github.com/fpgasystems/Coyote) vFPGA and a software abstraction for easy
 integration into query engines.
 
-The hardware component requires the ParCore submodule and its dependencies to be loaded by either 
+This repository adds an HTTP mode for the AMD Alveo U55C: the vFPGA fetches the Parquet column
+chunks itself, with ranged HTTP `GET`s over the TCP/IP stack in the Coyote shell, from an
+S3-compatible object store such as MinIO, and streams the bodies into four ParCore column-chunk
+decoders (one TCP session per decoder); those bytes never touch host memory. The host
+library (`software/`) plans the requests and collects the decoded columns; the DuckDB extension
+(`extension/`) exposes it as the table function `read_oasis()`.
+
+## Repository layout
+
+| path | contents |
+| --- | --- |
+| `hardware/` | vFPGA design (`src/`), decoder floorplans (`constraints/`), patches to the submodules (`patches/`), RTL benches (`unit-tests/`), `CMakeLists.txt` for the Coyote build |
+| `software/` | the Oasis host library (`oasis/`) and a board-free check (`tests/csr_decode_check.cpp`) |
+| `extension/` | the DuckDB extension (`src/`, SQL tests in `test/sql/`); submodules `duckdb` and `extension-ci-tools` |
+| `rdma_server/` | the file server for the RDMA mode |
+| `scripts/` | hardware build (`synthesize.sh`), TPC-H run (`tpch_demo.sh`, queries in `tpch/`), throughput harness (`throughput.sh`), simulation setup, Arrow install |
+| `parcore/` | submodule: ParCore, with libstf and Coyote nested in it (`parcore/libstf/coyote`) |
+| `celeris/` | submodule from the upstream project; no build below uses it |
+
+## Requirements
+
+- Vivado and Vitis HLS 2024.2, and `tmux` (the hardware build runs in a detached session).
+- CMake 3.16 or newer and a C++17 compiler; jemalloc (`./parcore/libstf/scripts/install_jemalloc.sh`)
+  and Apache Arrow 24.0.0 (`./scripts/install_arrow.sh`). Both scripts install into `~/opt` by
+  default (`INSTALL_PATH` changes it).
+- An Alveo U55C with the Coyote driver, and 1 GiB huge pages on its host: the library maps 4 of them
+  by default (`LIBSTF_HUGE_PAGES=N` changes the count).
+- For the HTTP mode, an object store the FPGA's network port can reach that serves anonymous
+  ranged `GET`s with `Content-Length` (MinIO does).
+
+## Getting the sources
+
+The hardware component requires the ParCore submodule and its dependencies to be loaded by either
 cloning this repo with submodules directly:
 
 ```bash
@@ -22,11 +54,76 @@ git submodule update --init --recursive parcore
 git submodule update --init celeris
 ```
 
+The TCP stack (`parcore/libstf/coyote/hw/services/network`) is pinned to a commit that is not
+upstream; it ships as `hardware/patches/oasis-cmake-defined-guard.bundle`. If the recursive update
+cannot find commit `e9edcc4` there, restore it from the bundle. Then, and after every later
+submodule update, apply the patches; every hardware build needs them:
+
+```bash
+SM=parcore/libstf/coyote/hw/services/network
+git -C $SM fetch "$PWD/hardware/patches/oasis-cmake-defined-guard.bundle" \
+      'oasis/cmake-defined-guard:oasis/cmake-defined-guard'
+git -C $SM checkout oasis/cmake-defined-guard
+bash hardware/patches/apply.sh
+```
+
+`apply.sh` can be run any number of times. [hardware/patches/README.md](hardware/patches/README.md)
+lists what each patch changes.
+
 ## Hardware
-The functionality of the hardware component can be verified with unit tests that are built on top of 
-the Coyote unit test framework. We also describe how to synthesize the hardware.
+
+### Synthesis
+
+From the repository root:
+
+```bash
+./scripts/synthesize.sh --http --decoders 4                 # the HTTP design
+./scripts/synthesize.sh --http --decoders 4 --toe-buffer    # ... with the TCP receive buffer in card memory
+```
+
+| option | meaning |
+| --- | --- |
+| `--http` | the FPGA HTTP client feeding the decoders (`ENABLE_HTTP=ON`, RDMA off). Without it the build is the RDMA design |
+| `--decoders N` | number of decoders, one HTTP lane each (default 1) |
+| `--toe-buffer` | the TCP offload engine keeps a 1 MiB receive ring per session in card memory instead of one shared receive FIFO; the handler becomes `handler_toe`. Needs `--http` and patches 0007 and 0008 (CMake refuses otherwise) |
+| `--cores N` | parallel Vivado jobs (default 64, about 170 GB of memory; use 16 when two builds share a host) |
+| `--build-num N` | build into `hardware/build-N` instead of the next free number |
+| `--no-rdma` | leave out the RDMA stack (`--http` already does) |
+
+With `--http` and four decoders, the decoders are pinned to SLRs by the floorplan in
+`hardware/constraints/` that matches the variant; the build hooks it in automatically
+(`ENABLE_DECODER_PBLOCKS`, on by default).
+
+The script spins off the synthesis in the background in a way that the user can disconnect from
+the server without the synthesis stopping (tmux session `bitgen-<build directory>`). You can check
+the progress in `hardware/build-N/bitgen.log`. It is expected that the synthesis takes multiple
+hours to finish, sometimes not printing anything new to the log for a while. The script refuses to
+build into an existing directory and records its configuration in `hardware/build-N/PROVENANCE.txt`.
+
+The result is `hardware/build-N/bitstreams/cyt_top.bit`. Read
+`hardware/build-N/reports/shell_timing_summary.rpt` before programming a build. Afterwards the
+script writes `timing_report.txt`, `utilization_report.txt` and `analysis.txt` into the build
+directory and, if `BOT_GMAIL_USER`, `BOT_GMAIL_PASSWORD` and `BOT_RECIPIENT_EMAIL` are set, mails
+the analysis.
+
+### Programming the board
+
+Build the Coyote driver once (`make` in `parcore/libstf/coyote/driver`, which writes
+`build/coyote_driver.ko` there). On the ETH Zurich HACC cluster, program the FPGA and insert the
+driver from the host with the board, using Coyote's script (it needs Vivado on `PATH`):
+
+```bash
+cd parcore/libstf/coyote/util
+./program_hacc_local.sh <repo>/hardware/build-N/bitstreams/cyt_top.bit \
+                        <repo>/parcore/libstf/coyote/driver/build/coyote_driver.ko
+```
+
+The extension opens the FPGA when it loads, so program the board before starting DuckDB. The host
+library drives the HTTP handlers of both variants (CSR revisions 2 and 6) and refuses an HTTP
+bitstream with any other revision at startup.
 
 ### Unit tests
+
 To run the unit tests, the Vivado simulation project needs to be set up:
 
 ```bash
@@ -36,536 +133,133 @@ To run the unit tests, the Vivado simulation project needs to be set up:
 After this is finished, VSCode shows the unit tests as a test flask on the left side. The simulation
 project needs to be regenerated whenever new files are added (also for the dependencies).
 
-The HTTP client additionally has standalone `xsim` benches under `hardware/unit-tests/`, each with
-its own `run.sh` and no dependency on the Coyote build:
-
-| | |
-|---|---|
-| `http_pipeline/` | the whole *descriptor-ring* client — handler + session table + init/send/read — against a TOE model serving several concurrent sessions. Checks bodies byte-exact and in order, one `tlast` each, and that request k+1's GET goes out before body k finishes. Runs at 4 slots and at 1. **Mixes live and archived sources** (`handler`, `tcp_send_http`, `http_req_builder` come from `hardware/archive/http_read/`) — a frozen design, not what is built today |
-| `tcp_read/` | receive path against realistic MinIO responses: multi-segment, back-pressured, unaligned. `case_burst_notifications` announces every segment (and the FIN) before a single `readPkg` is served, which is what pins the one-readPkg-per-announcement contract |
-| `http_req_builder/` | the assembled GET, byte for byte, including 64-character paths and multi-beat sends. **Archived module** — the GET text is built on the host now |
-| `strip_http/` | header strip in isolation: two responses back to back with the boundary mid-beat, a chunk split across 3 GETs producing exactly one `tlast`, 7-byte ragged beats, back-pressure across a response boundary, `Content-Length: 0`, lowercase header names, a missing `Content-Length` → `resp_error`, 404 capture, `resp_dirty` |
-| `rx_dispatch/` | the arrival-order receive dispatcher: it owns the notification and `readPkg` handshake for all lanes and hands each one pre-routed bytes |
-| `tx_arbiter/` | round-robin grant for N lanes sharing the TOE's single transmit interface, where `meta → status → data` may not interleave |
-| `handler_multi/` | N TCP sessions, one per decode lane, end to end through the handler |
-| `http_multilane/` | `rx_dispatch` + N × `tcp_read`: N responses interleaved **at packet granularity** on one shared receive stream come out correctly framed on their own lanes, and a lane whose consumer stalls does not stall the others |
-
-`hardware/archive/http_read/README.md` says which of these drive retired modules and why they are
-kept. Last run 2026-08-23, all green: `http_pipeline` PASS, `tcp_read` 11/11, `strip_http` 20/20,
-`rx_dispatch` 10/10, `tx_arbiter` 6/6, `handler_multi` 15/15, `http_multilane` 16/16. Each bench
-prints its own tally, so re-run `run.sh` rather than trusting this line.
-
-### Synthesis
-For synthesis, execute the following command:
+The HTTP client has standalone benches under `hardware/unit-tests/`, each with its own `run.sh`:
+`strip_http` (response framing), `tcp_read` (the receive side of one session), `http_req_stream`
+(request text to the TCP transmit path), `handler_multi` (N sessions end to end), `toe_rx` (the
+receive side with per-session rings), `lane_drain` (liveness and recovery of both handlers),
+`tcp_mem_mux` (the shell's TCP memory multiplexer from patch 0008) and `toe_csim` (C simulation of
+the patched TCP offload engine with its receive ring in card memory). Run all of them with:
 
 ```bash
-./scripts/synthesize.sh [--http] [--multi] [--no-rdma] [--decoders <number-of-decoders>]
+hardware/unit-tests/run_all.sh            # or: hardware/unit-tests/run_all.sh tcp_read toe_rx
 ```
 
-`--http` builds the FPGA HTTP client (`ENABLE_HTTP=ON`, and implies `ENABLE_RDMA=OFF`) — see
-[HTTP read path](#http-read-path) below.
-
-`--multi` (`ENABLE_HTTP_MULTI=ON`) gives **each decode lane its own TCP session** instead of sharing
-one session across all of them. Pair it with `--decoders N`; the host reads the lane count off the
-bitstream, so nothing needs recompiling to match. First such build is build-110 (4 lanes,
-2026-08-26) and it has **not** been measured on hardware yet — see
-`hardware/src/hdl/http_read/ARCHITECTURE.md`, ADR-4.
-
-The script spins off the synthesis in the background in a way that the user can disconnect from 
-the server without the synthesis stopping. You can check the progress in `hardware/build-**/bitgen.log`. 
-It is expected that the synthesis takes multiple hours to finish sometimes not printing anything new 
-to the log for a while.
-
-Each build archives the exact RTL it was synthesized from under
-`hardware/build-NN/oasis_config_0/user_c0_0/hdl/`. That archive is the authority on what a given
-bitstream actually contains — `CMakeCache.txt` is not, because `hardware/CMakeLists.txt` sets the
-build options with plain `set()`, which shadows the cache. Check `build-NN/export.cmake` or the
-synthesized `lynx_pkg.sv` instead.
-
-Always read `hardware/build-NN/reports/shell_timing_summary.rpt` before programming a build.
-
-## HTTP read path
-
-With `--http`, the vFPGA issues its own ranged HTTP `GET` for each Parquet column chunk, strips the
-response headers, normalizes the body and streams it straight into a `ColumnChunkDecoder` — the
-compressed bytes never touch host memory. The host reads decoded, typed output back from stream 0,
-exactly as the RDMA flow does.
-
-Use `read_oasis('httpfpga://<path>')` to exercise this. `read_parquet('httpfpga://<path>')` treats
-the URL purely as a byte source and parses on the CPU; on an `ENABLE_HTTP` bitstream the raw bypass
-stream is tied off, so those reads are served over an ordinary host socket and the FPGA is not
-involved at all.
-
-### Keep-alive and request pipelining
-
-> **One TCP connection carries every request** (on a default build; with `--multi` it is one per
-> decode lane, and everything below holds per lane). It is opened lazily on the first ranged GET and
-> then held open across every request and every query; `strip_http` delimits each response by
-> `Content-Length` instead of by the server's FIN, which is what makes that possible.
->
-> This is not a latency optimisation, it is what makes the client usable at all. The TOE hands out
-> ephemeral ports from a pool of exactly 512, by a linear cursor, released with no quiet time and
-> **cumulative since the bitstream was programmed** — and `Connection: close` meant the *server*
-> closed first, so Linux held each 4-tuple in `TIME_WAIT` for 60 s. A full benchmark run needed
-> thousands of connections and wedged partway through. It now needs one.
->
-> It also makes pipelining safe again. Depth > 1 used to wedge the receive path, and the reason was
-> never the depth — it was concurrent **sessions**. With `TCP_STACK_RX_DDR_BYPASS_EN=1` there is one
-> shared packet fifo for the whole stack (`axis_data_fifo_512_d16384 rx_buffer_fifo` in
-> `tcp_stack.sv`), `rx_app_stream_if` answers a `readPkg` by echoing back the session id **the
-> application asked for** plus a bare one-bit token, and `rxAppMemDataRead` pops one packet from the
-> **head** of that fifo without ever looking at the session. The real contract is *"readPkg must be
-> issued in the global arrival order of segments across all sessions"*, which a handler draining
-> slots in **request** order cannot honour with several connections open. Builds 90, 91 and 92 all
-> died that way, and the duplicate-ACK storm on the wire *was* the wedge, not a separate fault.
-> **With a single session, arrival order and request order are the same thing**, so the contract
-> holds by construction and HTTP/1.1 pipelining over that connection is both legal and safe.
-
-The unit of work is one `(row group, column)` column chunk, so a query fetches hundreds of them —
-TPC-H Q6 over `lineitem` at sf1 is 4 columns x 49 row groups = 196 ranged GETs to move 48 MB. When
-each of those was a full connect / GET / body / teardown cycle with nothing overlapping it, the
-per-request round trips dominated: the decoder's input port carries 64 B/cycle at 250 MHz (16 GB/s
-of line rate, more than the 100 GbE link delivers) and it spent the overwhelming majority of a query
-idle between requests. **That port rate is not the decode rate** — on a real query the decoder
-ingests ~1.0 GB/s while a chunk is streaming and is idle 68 % of the wall clock (2026-08-19), which
-is still twice what one TCP session supplies (0.46 GB/s) but is a factor of two, not of sixteen.
-
-**`handler_stream.sv` is what is built today (`handler_multi.sv` with `--multi`), and neither is a
-descriptor ring.** `handler.sv` (a ring of `HTTP_NUM_SLOTS` = 4 slots, each holding a full 1160-bit
-`http_config_t`) shipped in bitstreams up to build-95 and now lives in `hardware/archive/http_read/`,
-out of the synthesis path. Its depth was an amount of FPGA registers rather than a design choice: measured on a scale-30 `lineitem` scan that ring was full for 1462 of 1465 requests,
-so the host spent essentially the whole query blocked on a slot.
-
-Every byte range is known once the Parquet footer is parsed, so the host now builds all of the GET
-text up front and DMAs it in. A request is only text; nothing about it has to be stored on the FPGA.
-What still needs a queue is the *column-chunk boundary*, because the host may split one chunk across
-several ranged GETs and the `DataNormalizer` resets its byte offset on `tlast`. That is a byte count
-per column chunk, so `HTTP_QUEUE_DEPTH` (64, `vfpga_top.svh:139`) scales with columns per row group
-rather than with requests.
-
-The host drives it in three steps (`HTTPReadConfig::submit_batch`):
-
-```
-1.  one cfg beat per column chunk, req_total_bytes == 0   -> pushes a queue entry
-2.  one cfg beat with req_total_bytes != 0                -> latches the server, ARMS the transfer
-                                                             (this is what opens the connection)
-3.  the request text itself, DMA'd over s_axis_req (Coyote LOCAL_READ)
-```
-
-The order is part of the protocol and is not optional — see the comment on `await_cfg_ready`.
-
-There is no `conn_ptr` any more — the connection is a property of the client, not of a request, and
-a small FSM beside the ring opens it, holds it, and reopens it if it dies. Slots advance strictly in
-order, so the ring needs no free list and the bodies necessarily arrive in the order the host
-enqueued them, which matters because they are concatenated into one decoder stream. HTTP/1.1
-guarantees responses in request order on one connection, so that ordering costs nothing on the
-receive side: `tcp_session_table` is instantiated with a single slot and simply queues the
-announcements for that session in arrival order.
-
-The GET for request k+1 goes out while request k's body is streaming, so the server's
-time-to-first-byte overlaps the previous transfer rather than following it.
-
-**Reconnect and replay.** A persistent connection still dies — MinIO closes an idle one on its own
-timeout. `tcp_read` reports that as an error and the recovery is in the ring: roll `send_ptr` back to
-`read_ptr` and every request that was sent but not answered goes out again on the new connection.
-The descriptors are still in their slots, so that is the whole fix.
-
-That is only safe while the failure is **clean**, i.e. no body byte of the response being read has
-reached the decoder yet. `strip_http` reports `resp_dirty` when it has, and the handler latches a
-fatal flag and stalls visibly instead of replaying — replaying would duplicate those bytes in the
-column. The host sees it as a stalled read plus the dirty bit in the `STALL` CSR.
-
-Two things this depends on:
-
-- **`tcp_session_table.sv` owns the notification stream.** `tcp_read` used to pop notifications and
-  discard any whose session did not match the one it was reading. With a second connection open that
-  silently loses the announcement for it, and the reader then waits forever for news that already
-  came and went. The table queues the announced segment lengths and the FIN per slot instead.
-- **One `readPkg` per announcement, naming exactly that announcement's length.** Coyote builds the
-  TOE with `TCP_STACK_RX_DDR_BYPASS_EN=1`, so the receive buffer is a shared on-chip *packet* fifo
-  rather than a per-session circular buffer in DDR. On that path `rx_app_stream_if` turns a readPkg
-  into a bare one-bit token and `rxAppMemDataRead` forwards exactly one queued packet, whatever
-  length was asked for; the length is used only to advance the app read pointer the advertised
-  window is computed from. Build-90 and build-91 got this wrong — the table kept a running byte
-  balance and the reader asked for `min(balance, 32 KB)` — so a single readPkg drained one ~4 KB
-  segment while telling the TOE that 32 KB had been consumed. The window ran ahead of reality, the
-  shared fifo backed up until `rx_engine` started dropping segments with `ACK_NODELAY`, and the
-  decoder sat ~100% starved behind a duplicate-ACK storm. **Do not reintroduce coalescing here.**
-- **The host must respect the ring depth.** `ConfigWriteReadyRegister` does not back-pressure: a
-  `START` write arriving while the previous one is unconsumed overwrites it and that request is gone
-  without a trace. `HttpConfig` read register 10 (`INFLIGHT`) reports occupancy, the scheduler sets
-  its HTTP pipeline depth from `max_inflight()`, and `HTTPReadConfig::read` blocks until occupancy
-  is below that cap before every request. Both use the cap, not the raw slot count — see the note at
-  the top of this section.
-
-Pre-pipelining bitstreams have no `INFLIGHT` register and read it back as zero; the software treats
-that as "one request at a time" and keeps the old busy-bit guard, so `build-87` still works
-unchanged. Setting `HTTP_NUM_SLOTS` to 1 restores sequential behaviour in hardware if it ever has to
-be ruled out — that configuration is covered by the simulation.
-
-### Response framing
-
-`strip_http` parses the status line and header block byte by byte, extracts `Content-Length`, counts
-the body down and raises `tlast` on the beat carrying its last byte — then keeps the leftover bytes
-of that beat and resumes header parsing at the exact byte after the body. On a persistent connection
-that is mandatory: body *k* is followed immediately by the status line of response *k+1*, frequently
-inside the same 64-byte beat.
-
-One input beat is held in a residue register and consumed through a byte cursor, and everything
-reads it through **one** 512-bit barrel shift — the low byte is the next header character, the whole
-word is the already-bottom-justified body beat. The 64-wide 32-bit comparator tree that used to
-search for `\r\n\r\n` across a 67-byte window is gone, replaced by an 8-bit compare against a
-14-byte ROM, so the module that owned the worst timing cluster on the device now has a shorter cone
-than before. Header parsing costs ~1 cycle per byte (~200 cycles per response, 0.8 µs); bodies still
-move a full beat per cycle.
-
-Two consequences worth knowing:
-
-- **A header block with no `Content-Length` is a hard error.** It cannot be framed, so `resp_error`
-  latches and the framer stops rather than guessing. That covers `Transfer-Encoding: chunked`
-  without parsing it — a ranged GET of a static object must never produce either.
-- **The status code is captured.** A 404 or 416 used to flow into the decoder as if its XML body
-  were column data. `HttpConfig` read register 12 now carries the three status digits.
-
-### Splitting a column chunk across several GETs — off by default
-
-**`HTTP_DEFAULT_CHUNK_BYTES` is now `0`: one GET per column chunk, no split.** The split still
-exists as a knob (`OASIS_HTTP_CHUNK_BYTES=<bytes>`, no rebuild needed) and 192 KiB is the
-known-good fallback, but it is not the default any more.
-
-When splitting is on, `HTTPReadConfig::read` cuts a byte range into GETs of at most that size and
-marks only the last one `body_last`, so the whole chunk still arrives as **one** decoder stream with
-exactly one `tlast` — the `DataNormalizer` resets its running byte offset on `tlast`, so an extra one
-mid-chunk would desynchronise everything after it. The flag rides in `REQ_FLAGS` (register 25,
-formerly a dead `num_sessions` field, so the address map did not move). On the streamed path the
-boundary is a byte count rather than a flag, so the split is invisible to the hardware either way.
-
-**Why it was turned off.** The split was never a throughput optimisation — it was a host-side cap
-against a receive fifo four times smaller than the advertised window, and that mismatch is fixed in
-hardware (see *Receive window* below). What remains is cost: a ranged GET takes the object store
-roughly the same time whatever its size, and HTTP/1.1 serialises that time — ADR-3 measured per-GET
-cost falling only 1020 → 848 → 822 µs across pipeline depth 1 → 2 → 4, because MinIO answers request
-1 fully before reading request 2. Splitting a 2 MB column chunk eleven ways pays that fixed cost
-eleven times for the same bytes.
-
-**What this has not been measured against yet.** The published size curve (192 KiB → 148 MB/s,
-256 KiB → 179, 512 KiB → 294, 1 MiB → 423) was taken 2026-08-12 with a host raw socket on one
-keep-alive connection, 48 MB per point — what MinIO delivers, not what the FPGA does.
-(`scripts/util/conn_scaling.sh MODE=chunk` reproduces and extends it; `one_conn_ceiling.sh` is the
-other axis, pipeline depth at a fixed 768 KiB.) It is the right shape and the right ceiling, but
-it is *not* the FPGA path, which sits at ~0.33 GB/s. The equivalent sweep through the FPGA has not
-been run at these sizes, and unsplit column chunks at scale 30 exceed every size on that curve.
-Re-run `scripts/sweep.sh` and `scripts/throughput.sh` before quoting a speedup.
-
-**What reports trouble.** `rx_fifo_stall` (the drain stopping, `stallWord` bit 25) with the reconnect
-count beside it. There is also a Coyote-side hazard that larger responses make more likely:
-`rx_engine` accepts a segment only with >375 beats (24000 B) free while `rx_sar_table` advertises
-`(appd − recvd) − 1` and knows nothing about that floor, so an advertised window landing in 1..24000
-deadlocks rather than back-pressures. The clamp shipped in build-105 and lives in the `parcore`
-submodule — it does **not** survive a `git submodule update`.
-
-### Receive window (fixed in hardware since build-95 — the old text here was wrong for months)
-
-`rx_sar_table.cpp:71` still computes the advertised window from the application read pointer alone
-and still has no knowledge of the fifo behind it — grep `rx_sar_table` for `data_count` and you get
-nothing. **That stopped mattering when the two numbers were made equal.**
-
-| | value | where |
-|---|---|---|
-| `WINDOW_SCALE_BITS` | 4 | `toe/toe_config.hpp.in` |
-| `WINDOW_BITS` | `16 + 4` = 20 → **1 MiB** advertised | same file, scaling is enabled |
-| `rx_buffer_fifo` | `axis_data_fifo_512_d16384` = 16384 × 64 B = **1 MiB** | `tcp_stack.sv:681` |
-| `axis_max_data_count` | `16'd16384` | `tcp_stack.sv:544`, `:671` |
-
-So the stack advertises exactly what it can hold. **Anything in this repo still quoting "256 KB
-against a 64 KB fifo", `WINDOW_BITS = 18`, `d1024`, or a "~41.5 KB drop threshold" is describing
-hardware that has not been built since build-94** — that arithmetic came from `WINDOW_SCALE_BITS = 2`
-and a 1024-deep fifo, and both moved.
-
-Raising the window is why chunk size buys throughput at all: 256 KiB → 179 MB/s, 512 KiB → 294,
-1 MiB → 423, measured against MinIO. If the window is ever raised again, `rx_buffer_fifo` and both
-`axis_max_data_count` literals **must** move with it; the stack advertises `BUFFER_SIZE` regardless
-of real free space, so a window larger than the fifo invites exactly the drops it used to cause, and
-recovery is go-back-N with out-of-order buffering disabled.
-
-### Row group size
-
-Because one decoded column chunk must fit a single output buffer, the buffer size is a hard cap on
-row group size — and therefore on how few requests a query needs. `OBM_BUFFER_CAPACITY`
-(`extension/src/include/oasis_context_cache_entry.hpp`) is 8 MiB, which allows roughly 1M rows of an
-8-byte type. DuckDB's default 122,880-row groups decode to 960 KiB, so files written with
-
-```sql
-COPY tbl TO 'x.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1000000);
-```
-
-need ~8x fewer requests for the same bytes.
-
-**This no longer buys what it used to, and it was never free.** Larger row groups were the mitigation
-for port exhaustion, which keep-alive removes outright — a whole query now costs one connection
-whatever the row group size.
-
-The "bigger row groups are slower" measurement (build-92: 49 → 7 row groups took the `latency`
-workload from 3.068 s to 6.0–9.1 s) **was taken under the drop cliff and should not be relied on
-now.** It was caused by 1.3 MB chunks living permanently in go-back-N against a 64 KB fifo, and that
-fifo is now 1 MiB. Re-measure before quoting it. In either case the GET size is decoupled from the
-row group size by the range split above, so pick row groups for decode efficiency and leave the wire
-to `OASIS_HTTP_CHUNK_BYTES`.
-
-**The real cap on row groups in flight is host-side and is a deadlock, not a slowdown** — see
-*The dispatcher deadlock* below.
-
-### The CSR map must match the bitstream
-
-`HttpConfig` is a flat register file, and the software map in `software/oasis/configuration.cpp`
-must agree with the `HttpConfig` instantiation in `hardware/src/vfpga_top.svh` **register for
-register**. There is no version handshake: a mismatched map writes every parameter to the wrong
-address, the writes all succeed silently, and the FPGA emits a corrupt request — typically a
-truncated `Range:` header containing NUL bytes and fragments of unrelated parameters.
-
-Two consequences worth internalising:
-
-- **Rebuild `software/` after switching branches.** `make` in `extension/` does *not* rebuild the
-  Oasis library, so a stale `liboasis.so` silently outlives a branch switch. Run
-  `cmake --build software/build -j` and re-install before blaming the hardware.
-- **Program the new bitstream before installing a library built for it**, not the other way round.
-
-Builds up to and including `build-88` instantiate `HttpConfig` with `START_ADDR=31` while the
-software map places `START` at 39; `HTTP_LEGACY_START` in `configuration.cpp` documents the
-write-ordering workaround that keeps both working. `http_config.sv` now carries
-`ASSERT_ELAB(START_ADDR > LAST_PARAM_ADDR)`, so that class of mistake fails at elaboration rather
-than six hours later on the wire.
-
-### Limits and known gaps
-
-| | |
-|---|---|
-| GET path budget | 64 characters (16 CSR words). Was 32 up to `build-88`; longer paths throw rather than truncate |
-| Decoded column chunk | must fit one output buffer (8 MiB), i.e. ~1M rows of an 8-byte type |
-| Compression | SNAPPY and uncompressed only — other codecs throw `codec N not supported by ParCore` |
-| Requests in flight | bounded by `HTTP_QUEUE_DEPTH` = **64** column-chunk entries (`handler_stream.sv`), pipelined over one persistent connection — or over one per lane with `--multi`, where `rx_dispatch` keeps the arrival-order contract that a single session gets for free. The old 4-slot `handler.sv` ring and the `max_inflight() × OASIS_HTTP_CHUNK_BYTES` bytes-in-flight cap are both gone |
-| Receive window | 1 MiB advertised against a 1 MiB fifo — matched, see *Receive window* above. Raising one without the other reintroduces the drops |
-| Column chunks in flight | **the binding limit in practice.** 64 hardware queue entries against a scheduler that dispatches 64 flows, and only 2 FPGA output buffers. See *The dispatcher deadlock* |
-| Response framing | `Content-Length` only. A response without one (e.g. `Transfer-Encoding: chunked`) latches `resp_error` and stalls rather than misparsing |
-| NULLs | **not supported.** The decoder is configured from `num_values`, which counts NULLs, but the page only holds the non-null values, so the read hangs waiting for values that do not exist. TPC-H is unaffected (no NULLs) |
-| Trailing page bytes | a data page carrying padding past the last declared value hangs the decoder. `fastparquet` emits exactly 8 such bytes per page; DuckDB-written files are fine |
-
-### The dispatcher deadlock — RESOLVED 2026-08-19
-
-**Fixed in software, and confirmed by measurement rather than by reading.** `oasis_stream_profile()`
-sampled twice while the board was wedged showed `out_stalled = 1,632,080` against
-`out_starved = 150,185`, counters otherwise frozen: the decoder had finished results that **nobody
-was collecting**. One reading told the candidate mechanisms apart — a decoder starved of input looks
-nothing like a decoder whose output is not drained.
-
-The hypothesis below was right in shape (a host-side circular wait) and wrong in detail. Two
-independent host-side bugs, both fixed; 22/22 at scale 30 has passed on builds 104 and 105 since:
-
-1. **`oasis_context.cpp` built `OutputBufferManager` with a hardcoded `2`** while the scheduler
-   dispatches up to 64 flows, each of whose sinks needs a buffer. Flows 3..64 had nowhere to put
-   decoder output, and those 2 buffers free only when the scan collects them — so if the head row
-   group's columns were among the starved flows, nothing was ever freed. Fixed in **`c1afd00`**: the
-   count is now derived (64, clamped to the bitstream's `maximum_num_enqueued_buffers`, override
-   `OASIS_OBM_BUFFERS`). At 8 MiB a buffer that is 512 MiB against 32 GiB of huge pages — the `2`
-   was never a memory decision.
-2. **`submit_batch` checked that a batch fits an EMPTY queue, never that there was room NOW.** At
-   `groups_in_flight(16) × 4 columns = 64 = QUEUE_DEPTH` exactly, a 4-entry batch could push one
-   entry, hit 64/64 and block forever — the arm that would drain it comes after all its entries.
-   That is why q1–q4 passed and q5, the first four-hardware-column query, hung. Fixed in
-   **`df2067d`** (reserve room for the whole batch before pushing any of it).
-
-Everything seen on the wire — the rx fifo filling, the advertised window walking down, dup-ACK
-storms, RST — was downstream of these two.
-
-**Dead ends, recorded so nobody retries them:** `align_starved`; `oasis_scheduler_queue_depth`;
-LIMIT pruning; `oasis_scan_groups_in_flight` (it does not throttle the FPGA at all —
-`Scheduler::submit` never blocks); "the timeout kills it" (q5 hung at 600 s too).
-
-The rest of this section is the original derivation, kept because the mechanism is the useful part.
-
-What was directly observed, from `scripts/util/http_state.sh` on a board left wedged by a failed run:
-`conn=up`, `reconnects=0`, no `dirty_abort`, no `read_timeout`, no `notify_overflow`. What you see is:
-
-```
-Invalid Error: FPGA HTTP config port has refused a chunk-length entry for 30s
-  [inflight=64/64 conn=up pending; stalled: CONNECT READ(slot 0) rx_fifo_stall]
-```
-
-Read `inflight=64/64` as *the 64-entry column-chunk queue is full*, and remember the stall bits are
-**sticky** — `CONNECT` latching does not mean the connection is stalled now, it means it stalled once
-during the run. The two live readings are the queue occupancy and `rx_fifo_stall`.
-
-Three resources are involved, and they are badly matched:
-
-| resource | depth | set in |
-|---|---|---|
-| scheduler flows in flight | `min(max_inflight(), maximum_num_enqueued_configs())` = `min(64, 64)` = **64** | `scheduler.cpp`, `default_pipeline_depth` |
-| HTTP column-chunk queue | **64** entries | `HTTP_QUEUE_DEPTH`, `vfpga_top.svh:139` |
-| FPGA output buffers | **2** at the time; **64** since `c1afd00` | `computeObmBuffers()` in `oasis_context.cpp`, override `OASIS_OBM_BUFFERS` |
-
-The `min()` in `default_pipeline_depth` was added to stop the scheduler over-committing the decoder,
-but on this hardware `MAX_NUM_ENQUEUED_BUFFERS` is also 64 (`column_chunk_decoder_config.sv:38`), so
-**the `min()` is a no-op** and the scheduler still dispatches 64 flows. A flow is one *batch* of
-column chunks, not one chunk, so 64 flows routinely need far more than 64 queue entries.
-
-The deadlock is a circular wait on a single thread:
-
-```
-dispatch_loop (ONE thread)
-  └─ dispatch_to
-       ├─ sink->apply()      -> acquire_output_handle() -> ensure_stream_has_buffers()
-       │                        ...the ONLY code path that tops FPGA output buffers back up to 2
-       └─ source->apply()    -> submit_batch() -> await_cfg_ready()   <-- BLOCKS up to 30 s
-```
-
-1. The queue fills, so `await_cfg_ready` blocks the dispatcher.
-2. Blocked, the dispatcher cannot acquire another output handle, so **no output buffers are added**.
-   `ensure_stream_has_buffers` is called from exactly one site — inside `acquire_output_handle`
-   (`output_buffer_manager.cpp:135`). The completion path pops a buffer (`:238`) and never replaces it.
-3. The decoder drains its remaining ≤ 2 buffers and then has nowhere to write.
-4. It stops consuming → `strip_http` back-pressures → the rx fifo fills (**`rx_fifo_stall`**) → the
-   TOE back-pressures → responses stop arriving.
-5. Responses are what free queue entries, so step 1 never clears. 30 s later the host throws.
-
-That is why it "fails at a different query each run": what matters is how many column chunks have
-accumulated, not which query asked for them. It is also why `--groups` helps — fewer row groups in
-flight means fewer chunks, so the queue is less likely to fill while the dispatcher is the only thing
-holding the buffer supply open. **`--groups` is a workaround for this bug, not a tuning knob.**
-
-Fixes considered, and what actually shipped:
-
-1. **Replenish output buffers off the dispatcher** — call `ensure_stream_has_buffers` when a buffer
-   is popped in `move_current_buffer_to_handle`, so the buffer supply stops depending on a thread
-   that can block on FPGA credit. Still the structurally cleanest fix. **Not done:** raising the
-   count to 64 made the window wide enough that the cycle has not been reachable since, and the
-   second bug (`df2067d`) turned out to be the one that fired in practice.
-2. **Raise the buffer count above 2** — **shipped** in `c1afd00`, derived rather than hardcoded.
-3. **Make the two depths genuinely different** — **shipped** in `df2067d`, from the other end:
-   `submit_batch` now reserves room for a whole batch, so a full queue throttles instead of wedging.
-
-### Competing explanations for the same symptom — settled 2026-08-19
-
-Every hypothesis below ends in *the decoder stops consuming*, and from there the downstream signature
-(`rx_fifo_stall`, back-pressure to the TOE, queue never drains, `64/64`) is **identical**. The stall
-bits cannot tell them apart, which is why this list existed.
-
-**How it was settled:** not by the signature but by the `out_stalled` / `out_starved` delta above —
-(1) predicts output stalled, (2) and (3) predict output starved. It read stalled by an order of
-magnitude, and fixing the two host-side bugs made 22/22 pass. The list is kept because the
-discriminating tests are the reusable part.
-
-1. **The dispatcher deadlock above.** Predicts: the hung process has its `dispatch_loop` thread
-   parked inside `await_cfg_ready`, and the failure tracks the number of column chunks in flight
-   (so `--groups` moves it) rather than the query text.
-2. **build-103 does not close timing.** WNS **-0.949 ns** on the 250 MHz user clock, 30,719 failing
-   endpoints, and 689 of the 1000 worst paths inside `inst_http_column_chunk_decoder`
-   (524 `hybrid_page_decoder`, 113 Snappy `vhsnunzip`). build-102 was -0.436 ns with 200. A decoder
-   that violates setup can hang or corrupt data-dependently. Predicts: build-102 survives runs that
-   build-103 fails. **Not the cause here** — but note that no bitstream since closes timing either
-   (build-105 **-0.383 ns**, build-108 **-0.620 ns**), so this stays on the list for any *new*
-   intermittent, query-dependent fault. In build-105 the largest failing cluster is
-   `inst_handler/inst_tbl`, not the decoder; check `analysis.txt` before assuming otherwise.
-3. **A decoder input it cannot handle.** The NULL and trailing-page-bytes limits in *Limits and known
-   gaps* both hang the decoder by construction. Predicts: deterministic — the *same* query fails
-   every time on the same data.
-
-**Discriminating test, cheapest first:** run the failing suite under `gdb` and look at the thread
-backtraces at the hang (1 is confirmed or refuted outright); then repeat the same run on build-102
-(separates 2); then check whether the failure is query-deterministic (separates 3). Note
-`ptrace_scope` is 2 on `alveo-u55c-04`, so `gdb` must **launch** duckdb rather than attach to it.
-
-`--groups 4` was a mitigation of an unknown mechanism and is no longer needed: with both fixes in,
-the default `groups_in_flight` of 16 passes 22/22 at scale 30.
-
-### Ephemeral port exhaustion (fixed by keep-alive; the mechanism is worth keeping in mind)
-
-The TOE has **512 ephemeral ports** — 32768–33279, `pt_cursor` wrapping at `TCP_STACK_MAX_SESSIONS`
-(`toe/port_table/port_table.cpp`, `toe/CMakeLists.txt:16`) — and releases each one the instant the
-connection closes, with no quiet time. When every column chunk was its own connection and the
-request said `Connection: close`, the **server** closed first and therefore held the 4-tuple in
-`TIME_WAIT` for 60 s.
-
-Any run exceeding 512 connections in under a minute reused a port the server still owned. The TOE's
-ISN is random and uncorrelated with that port's previous sequence space (`tx_engine.cpp:541`), so
-Linux usually refuses to recycle the `TIME_WAIT` socket and answers with a challenge ACK. That ACK
-reaches `rx_engine.cpp:1078`, which writes `clearRetransmitTimer` **one line above** the state check
-that excludes `SYN_SENT`, and the timer update zeroes the retry counter unconditionally
-(`retransmit_timer.cpp:102`). The retry count never reaches its limit of 4, the SYN is re-sent at
-~1.25 s forever, and `openStatus` is never emitted — so `tcp_init` does not even report an error, it
-simply never completes. A full `scripts/throughput.sh` run needed ~2,500 connections and died
-partway through; **the port cursor lives in the bitstream, so the count was cumulative since
-programming** and restarting DuckDB did not reset it.
-
-A query now costs one connection, so the pool is no longer reachable in normal use. Two things
-survive from this:
-
-- The symptom is still worth recognising: a CONNECT stage stalled with **no** `init_error` means
-  `openStatus` never arrived at all, which is this. `HttpConfig` read register 11 reports it and the
-  host's credit timeout names it. If it appears now, look at the reconnect count next to it —
-  something is dropping the connection repeatedly.
-- The two TOE bugs are still there. **A monotonic ISN** (`tx_engine.cpp:541`) would make a collision
-  survivable rather than fatal, and **moving the `clearRetransmitTimer` write inside the state
-  check** would turn an infinite SYN retry into a reported failure after ~31 s. Both are HLS changes
-  needing a TOE re-run, and neither is done.
-
-Raising `TCP_STACK_MAX_SESSIONS` was never the answer: covering a 60 s peer `TIME_WAIT` at ~1 ms per
-request needs ~60,000 ports and only 32,768 exist above 32768. A connection-per-request model cannot
-outrun that at any pool size — which is why the fix had to be to stop opening connections.
-
-### When a read hangs
-
-On a pipelined bitstream, `HTTPReadConfig::read` waits for a free request slot and throws after 30 s
-with the ring occupancy and the decoded FSM state. A full ring means the pipeline stopped draining:
-a response that never arrived, or a connection that never opened. Neither is retried — error
-handling in the handler is still minimal, and one stuck request stalls everything behind it. There
-is no reset CSR, so reprogramming is the only way out.
-
-On a pre-pipelining bitstream the failure is different: the handler sampled its start trigger only
-in `ST_IDLE` as a one-cycle pulse, so a request issued mid-transfer was dropped and never retried,
-and the wedge **outlived the process** — every later run inherited it, which reads as "it worked a
-minute ago and now nothing does". The busy-bit guard still catches that case.
-
-Set `OASIS_HTTP_DEBUG=1` for a per-stage trace. Read it as:
-
-- `decoder in.hs == 0` — the body never arrived; look at the request and the network
-- `in.hs > 0`, `out.hs == 0` — the decoder consumed the body and produced nothing; page-header or encoding problem
-- `out.hs > 0` but no result — output was produced but not delivered
-
-Note that `Sent local writes` in Coyote's statistics counts **host**-initiated transfers only. It
-reads 0 on runs that deliver correct data; `Notifications received` is the signal that FPGA-initiated
-DMA completed.
+The RTL benches need Vivado's `xsim` (their `run.sh` sources
+`/tools/Xilinx/Vivado/2024.2/settings64.sh` if it is not on `PATH`). `tcp_mem_mux` and `toe_csim`
+need the patches applied, and `toe_csim` runs Vitis HLS (`VITIS_HLS`, default
+`/tools/Xilinx/Vitis_HLS/2024.2/bin/vitis_hls`).
 
 ## Software
+
 The software consists of the Oasis software library and a DuckDB extension.
 
 ### Oasis library
-The Oasis software library has dependencies on the Coyote, libSTF, and ParCore software libraries to 
-be installed or includes them from the submodules. In case they are not installed already, libSTF 
-also has a dependency on jemalloc that can be installed with `./parcore/libstf/scripts/install_jemalloc.sh` 
-and ParCore currently has a dependency on Arrow 21.0.0 which can be installed with `./parcore/scripts/install_arrow.sh`. 
-The Oasis software library can be built as follows:
+
+The Oasis software library has dependencies on the Coyote, libSTF, and ParCore software libraries to
+be installed or includes them from the submodules. In case they are not installed already, libSTF
+also has a dependency on jemalloc and ParCore on Arrow (see Requirements). The Oasis software
+library can be built and installed as follows:
 
 ```bash
-mkdir software/build
-cmake -S software -B software/build
+cmake -S software -B software/build -DCMAKE_INSTALL_PREFIX=$HOME/opt
 cmake --build software/build -j
+cmake --install software/build
 ```
 
-If you want to install it to e.g., `~/opt`, you need to add `-DCMAKE_INSTALL_PREFIX=$HOME/opt` to 
-the first `cmake` command and execute `cmake --install software/build` after the build.
+Add `-DOASIS_BUILD_TESTS=ON` to the first command to also build `csr_decode_check`, a board-free
+check of how the library decodes the HTTP handler's registers: `./software/build/csr_decode_check`.
 
 ### DuckDB extension
-The DuckDB Oasis extension can be built as follows and requires the Oasis software library to be 
+
+The DuckDB Oasis extension can be built as follows and requires the Oasis software library to be
 installed first:
 
 ```bash
+export CMAKE_PREFIX_PATH=$HOME/opt
 cd extension
 make -j
 ```
 
-More detail can be found in the `extension/README.md`.
+This builds `extension/build/release/duckdb`, a DuckDB shell with the extension (and `httpfs`, for
+the CPU baselines) built in. It finds the installed libraries at run time through
+`LD_LIBRARY_PATH=$HOME/opt/lib`. Building the extension does not rebuild the library: after a
+change in `software/`, rebuild and re-install it first. More detail can be found in the
+`extension/README.md`.
+
+## Reading Parquet with read_oasis()
+
+The scripts expect the eight TPC-H tables as `/throughput/tpch-<scale>/<table>.parquet`, i.e. in a
+bucket `throughput` that allows anonymous reads. Any DuckDB (e.g. the stock CLI) writes them:
+
+```sql
+INSTALL tpch; LOAD tpch; CALL dbgen(sf = 1);
+COPY lineitem TO 'lineitem.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880);
+-- ... the same for orders, customer, part, partsupp, supplier, nation, region
+```
+
+With MinIO's client: `mc mb <alias>/throughput`, `mc cp *.parquet <alias>/throughput/tpch-1/` and
+`mc anonymous set download <alias>/throughput` (the FPGA's requests carry no credentials).
+
+Then, on the host with the programmed board:
+
+```sql
+SET http_server = '<object store IP>';
+SET http_port = 9000;
+SELECT sum(l_extendedprice * l_discount) FROM read_oasis('httpfpga:///throughput/tpch-1/lineitem.parquet');
+```
+
+| setting | meaning |
+| --- | --- |
+| `http_server`, `http_port` | the object store (defaults `127.0.0.1` and 18488). Fixed after the first `httpfpga://` access of a session |
+| `httpfpga_debug` | print the HTTP client's state with every request batch to stderr (same as `OASIS_HTTP_DEBUG=1`) |
+| `oasis_scheduler_num_streams` | decoders the scheduler uses (0 = all) |
+| `oasis_scheduler_queue_depth` | work the scheduler keeps in flight per decoder (0 = the depth of the bitstream's config FIFO) |
+| `oasis_scan_groups_in_flight` | row groups a scan keeps submitted (default 16) |
+| `oasis_logging_level` | libSTF/ParCore log level (default `ERROR`) |
+| `oasis_rdma_server`, `oasis_rdma_port` | the RDMA file server (RDMA mode) |
+
+Environment variables of the library: `OASIS_HTTP_LANE_DEPTH` (column chunks one lane may owe,
+default 4), `OASIS_HTTP_MAX_INFLIGHT` (requests per stream, default the bitstream's queue depth),
+`OASIS_HTTP_CHUNK_BYTES` (largest GET in bytes, default 0 = one GET per column chunk; the
+`--toe-buffer` design also caps every GET at its receive-ring budget), `OASIS_HTTP_BATCH` (one
+request batch per row group; the default on single-decoder bitstreams, refused on more),
+`OASIS_OBM_BUFFERS` (output buffers per stream, default 64), `OASIS_STALL_DUMP_S` (print a state
+dump after that many seconds without progress; 30 by default on `--toe-buffer` bitstreams),
+`OASIS_DUMP_DIR` (also write that dump to a file there), `OASIS_EXIT_DUMP=1` (print it at exit).
+
+What runs where:
+
+- Fixed-width columns (BOOLEAN, INT32, INT64, FLOAT, DOUBLE) are fetched and decoded by the FPGA.
+  String (BYTE_ARRAY) columns are decoded on the host from bytes fetched over a host socket. Other
+  physical types are refused.
+- Only SNAPPY and uncompressed files are supported. A decoded column chunk must fit one 8 MiB
+  output buffer (about one million 8-byte values per row group).
+- `read_parquet('httpfpga://...')` reads over a host socket; the FPGA is not involved.
+- A bare `count(*)` is answered from the Parquet footer with the FPGA idle.
+
+## Benchmarks
+
+Both scripts take the object store from `OASIS_SERVER` and `OASIS_PORT` (or `--server`, `--port`;
+the default address is the server they were developed against) and use
+`extension/build/release/duckdb` (`DUCKDB` overrides it). `-h` prints every option.
+
+- `./scripts/tpch_demo.sh` runs the 22 TPC-H queries on `read_oasis()` views and again on stock
+  DuckDB (httpfs and its parquet reader, same objects), compares the answers cell for cell and sums
+  the wall clock of both sides. For example
+  `./scripts/tpch_demo.sh --scale 30 --single-session --cache metadata --threads 1 --cpu-threads 0`.
+- `./scripts/throughput.sh` runs four `lineitem` scans (`--workload latency|q6|q1|wide`), reads the
+  decoders' cycle counters around each run, and reports the wall-clock rate, a completeness verdict
+  per run and a stock-DuckDB baseline.
+
+## RDMA mode
+
+Without `--http`, the build is the RDMA design: the vFPGA reads the Parquet files over RDMA from
+`rdma_server`, which hosts them in a Coyote RDMA memory region (see
+[rdma_server/README.md](rdma_server/README.md)). Set `oasis_rdma_server` (and `oasis_rdma_port`)
+and read them with `read_oasis('rdma://<file>')`.
 
 ## License
-The Oasis code is licensed under the terms in 
-[LICENSE.md](https://github.com/fpgasystems/libstf/blob/master/LICENSE.md), which corresponds to the 
+
+The Oasis code is licensed under the terms in
+[LICENSE.md](https://github.com/fpgasystems/libstf/blob/master/LICENSE.md), which corresponds to the
 MIT Licence. Any contributions to libstf will be accepted under the terms of the same license.
