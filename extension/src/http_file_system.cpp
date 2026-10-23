@@ -12,16 +12,21 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace duckdb {
 
 namespace {
+
+// Send and receive timeout of the host socket, the same as liboasis's wait for a lane's credit.
+constexpr time_t HTTP_SOCKET_TIMEOUT_S = 30;
 
 string GetStringSetting(optional_ptr<FileOpener> opener, const string &key, const string &fallback) {
 	Value value;
@@ -233,8 +238,9 @@ int64_t OasisHTTPFileSystem::GetFileSize(FileHandle &handle) {
 }
 
 HttpReply OasisHTTPFileSystem::HttpExchange(const string &request, const char *what, const string &resource) {
-	const auto socket_error = [&]() {
-		return IOException("%s for '%s': socket error to %s:%u", what, resource, server_host_, server_port_);
+	const auto socket_error = [&](const char *reason) {
+		return IOException("%s for '%s': socket error to %s:%u (%s)", what, resource, server_host_, server_port_,
+		                   reason);
 	};
 
 	addrinfo hints {};
@@ -242,7 +248,7 @@ HttpReply OasisHTTPFileSystem::HttpExchange(const string &request, const char *w
 	hints.ai_socktype = SOCK_STREAM;
 	addrinfo *result = nullptr;
 	if (getaddrinfo(server_host_.c_str(), std::to_string(server_port_).c_str(), &hints, &result) != 0) {
-		throw socket_error();
+		throw socket_error("cannot resolve the server");
 	}
 	int sock = -1;
 	for (auto *rp = result; rp != nullptr; rp = rp->ai_next) {
@@ -250,6 +256,10 @@ HttpReply OasisHTTPFileSystem::HttpExchange(const string &request, const char *w
 		if (sock < 0) {
 			continue;
 		}
+		// A server that stops answering must not block the DuckDB thread for good.
+		const timeval timeout {HTTP_SOCKET_TIMEOUT_S, 0};
+		setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+		setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 		if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
 			break;
 		}
@@ -258,12 +268,20 @@ HttpReply OasisHTTPFileSystem::HttpExchange(const string &request, const char *w
 	}
 	freeaddrinfo(result);
 	if (sock < 0) {
-		throw socket_error();
+		throw socket_error(std::strerror(errno));
 	}
 
-	if (send(sock, request.data(), request.size(), 0) < 0) {
-		close(sock);
-		throw socket_error();
+	for (size_t sent = 0; sent < request.size();) {
+		const auto n = send(sock, request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
+		if (n < 0 && errno == EINTR) {
+			continue;
+		}
+		if (n <= 0) {
+			const int err = errno;
+			close(sock);
+			throw socket_error(std::strerror(err));
+		}
+		sent += static_cast<size_t>(n);
 	}
 	// Every request says Connection: close, so the server sends the whole reply and then FINs.
 	string response;
@@ -271,7 +289,15 @@ HttpReply OasisHTTPFileSystem::HttpExchange(const string &request, const char *w
 	char buffer[4096];
 	while (true) {
 		const auto n = recv(sock, buffer, sizeof(buffer), 0);
-		if (n <= 0) {
+		if (n < 0 && errno == EINTR) {
+			continue;
+		}
+		if (n < 0) {
+			const int err = errno;
+			close(sock);
+			throw socket_error(err == EAGAIN || err == EWOULDBLOCK ? "timed out" : std::strerror(err));
+		}
+		if (n == 0) {
 			break;
 		}
 		response.append(buffer, static_cast<size_t>(n));
