@@ -5,6 +5,7 @@ build*
 hardware/unit-tests/**/xsim.dir/
 hardware/unit-tests/**/*.wdb
 hardware/unit-tests/**/*.pb
+hardware/unit-tests/**/mut/
 
 # Vivado generated files
 .Xil
