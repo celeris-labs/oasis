@@ -57,15 +57,9 @@ class RDMASourceOperator final : public SourceOperator {
 };
 
 /**
- * Fetches column chunks with the FPGA's own HTTP client: the ranged GETs are built as text on the
- * host and handed over in one go, and the handler streams each response body straight into the
- * stream's ColumnChunkDecoder -- the bytes never touch host memory, mirroring RDMASourceOperator.
- *
- * This builds the text for every chunk it was given, pushes one chunk-length entry per column chunk,
- * arms the transfer and DMAs the text. The FPGA stores nothing per request, so how many requests may
- * be outstanding becomes a question about host memory.
- *
- * The buffer must outlive the DMA, which is why it is a member rather than a local.
+ * Fetches column chunks with the FPGA's own HTTP client, mirroring RDMASourceOperator: the ranged GETs
+ * are built as text on the host and DMAed into the lane's request stream, and the handler streams each
+ * response body straight into the stream's ColumnChunkDecoder, so the bytes never touch host memory.
  */
 class HTTPBatchSourceOperator final : public SourceOperator {
   public:
@@ -84,9 +78,8 @@ class HTTPBatchSourceOperator final : public SourceOperator {
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
 
-    /// Column chunks this flow will ask a lane to queue, one entry each whatever each splits into.
-    /// The scheduler needs it BEFORE apply() runs: a batch reserves room for all of its entries
-    /// before pushing any of them, so this is the credit the lane it is placed on has to have.
+    // Column chunks this flow queues on its lane, one entry each: the credit the scheduler must find
+    // on a lane before placing the flow there.
     [[nodiscard]] size_t chunk_count() const { return chunks_.size(); }
 
   private:
@@ -94,10 +87,9 @@ class HTTPBatchSourceOperator final : public SourceOperator {
     uint32_t           server_ip_;
     uint16_t           server_port_;
     std::vector<Chunk> chunks_;
-    /// One per batch. The DMA is asynchronous, so each must outlive its own transfer.
+    // One per batch. The DMA is asynchronous, so each must outlive its own transfer.
     std::vector<std::shared_ptr<libstf::Buffer>> text_buffers_;
-    /// Host-side progress, for the stall dump (print() reads these from the watchdog thread while
-    /// apply() may be running on the dispatcher, hence atomics). -1 = not placed yet.
+    // Progress for the stall dump; print() reads it from the watchdog thread. -1 = not placed yet.
     std::atomic<int>    lane_ {-1};
     std::atomic<size_t> gets_total_ {0};
     std::atomic<size_t> gets_sent_ {0};
@@ -106,7 +98,7 @@ class HTTPBatchSourceOperator final : public SourceOperator {
                     const HTTPReadConfig::RequestBatch &batch);
 };
 
-/// GETs and body bytes the HTTP sources have requested per lane since the process started.
+// GETs and body bytes the HTTP sources have requested per lane since the process started.
 std::string HttpLaneTrafficSummary();
 
 /**

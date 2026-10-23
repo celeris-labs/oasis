@@ -19,15 +19,10 @@ public:
     OasisContext(OasisContext &&) = delete;
     OasisContext &operator=(OasisContext &&) = delete;
 
-    /// `http_config_bytes` is NOT for callers to pass. Its default is evaluated at the CALL SITE,
-    /// i.e. with the headers the caller was compiled against, and init() compares it to the
-    /// library's own sizeof(HTTPReadConfig). GlobalConfig::get_config<T>() is a header template, so
-    /// a caller compiled against stale oasis headers (a leftover $HOME/opt/include/oasis ahead of
-    /// the new ones) instantiates make_shared<HTTPReadConfig> with the OLD size, the linker may pick
-    /// that instantiation for the library too, and every member added since writes past the
-    /// allocation. That corrupted the heap on the first build-124 bring-up; this turns it into a
-    /// clear error. (The extra parameter also changes the symbol, so a caller built against the
-    /// old signature fails to link instead of running.)
+    // `http_config_bytes` is not for callers to pass: its default is evaluated with the caller's
+    // headers, and init() compares it with the library's sizeof(HTTPReadConfig). A caller built
+    // against stale oasis headers (GlobalConfig::get_config<T>() is a header template) then fails
+    // instead of corrupting the heap. The extra parameter also changes the symbol.
     static void init(std::shared_ptr<libstf::MemoryPool> memory_pool, size_t obm_buffer_capacity,
                      size_t http_config_bytes = sizeof(HTTPReadConfig));
     static void shutdown();

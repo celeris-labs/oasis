@@ -26,46 +26,17 @@ namespace {
 
 const std::string profiler_prefix = "oasis::Scheduler::";
 
-// How long the dispatcher parks when it has work, a free host pipeline slot, and no lane with
-// credit.
-//
-// IT MUST BE BOUNDED. Every other reason the dispatcher parks is ended by host code that signals
-// dispatch_cv_: a submit pushes work, a completion callback frees a pipeline slot. Lane credit is
-// not like that -- a lane's occupancy falls when the HARDWARE retires a response, which runs no host
-// code and signals nothing. An indefinite wait here would sleep straight through the credit it is
-// waiting for and only wake on the next unrelated event, which on the last flows of a query is never.
-//
-// 100 us against two CSR reads per wake is at most ~20k reads/s while genuinely starved, and zero
-// otherwise; the loop does not spin, it sleeps. Shorter buys nothing: nothing on the critical path of
-// one batch runs here -- await_lane_credit inside submit_batch does that, at its own 20 us -- this
-// only decides how quickly a lane that just drained is noticed by the NEXT placement.
+// How long the dispatcher parks when it has work and a free host slot but no lane has credit. It must
+// be bounded: lane credit comes back when the hardware retires a response, which signals nothing.
 constexpr auto kLaneRetry = std::chrono::microseconds(100);
 
-// How long every lane may refuse credit before the dispatcher stops being polite about it.
-//
-// Without this, lane-aware picking would trade a loud failure for a silent hang: the pre-WP5 loop
-// dispatched regardless and blocked inside await_lane_credit, which gives up after HTTP_CREDIT_TIMEOUT
-// and throws naming the lane, its sticky errors and the stall word. A pick that merely SKIPS a lane
-// that never drains would poll forever instead, with no query ever failing and nothing in the log.
-//
-// So after this long with work queued, a free host slot and not one lane able to take it, the
-// dispatcher places the flow anyway on the least-loaded healthy lane and lets the hardware wait
-// report what is wrong. Matched to HTTP_CREDIT_TIMEOUT in configuration.cpp: a shorter grace would
-// fire on a pipeline that is merely slow, and this deliberately does not diagnose anything itself --
-// it hands the question to the code that already knows how to answer it.
+// How long every lane may refuse credit before the dispatcher places the flow anyway, on the
+// least-loaded healthy lane, so that await_lane_credit reports the lane that stopped draining
+// instead of the dispatcher polling forever. Matches HTTP_CREDIT_TIMEOUT.
 constexpr auto kLaneStallGrace = std::chrono::seconds(30);
 
-// How long ~Scheduler waits, in total, for flows already in flight to retire.
-//
-// IT MUST BE BOUNDED, for the same reason kLaneStallGrace exists and for a sharper one. The slots
-// this waits on retire from a completion callback fired by the hardware interrupt path -- and a lane
-// the handler has declared FATAL never fires it: handler_multi tears that session down and
-// deliberately does not reopen it, because a dirty abort cannot be replayed. So the predicate
-// "every slot is done" is not merely slow to become true, it is false forever, and the unbounded
-// wait that used to be here turned one dead lane into a process that could not exit.
-//
-// Matched to kLaneStallGrace, and it is a TOTAL deadline across all streams rather than per stream,
-// so a wedged board costs the teardown this once and not once per decoder.
+// How long ~Scheduler waits in total (not per stream) for flows in flight to retire. It must be
+// bounded: a fatal lane never fires the completion of the flows on it.
 constexpr auto kDrainTimeout = std::chrono::seconds(30);
 
 libstf::stream_t default_num_streams(OasisContext &ctx) {
@@ -73,16 +44,9 @@ libstf::stream_t default_num_streams(OasisContext &ctx) {
 }
 
 size_t default_pipeline_depth(OasisContext &ctx) {
-    // On an HTTP bitstream the depth is also bounded by what the HTTP handler can queue:
-    // max_inflight() column-chunk entries (the bitstream's queue depth, or OASIS_HTTP_MAX_INFLIGHT).
-    //
-    // TWO DIFFERENT RESOURCES, and conflating them deadlocks the pipeline. max_inflight() is how many
-    // chunk LENGTHS the HTTP handler can hold -- 64, and cheap, because an entry is a byte count.
-    // maximum_num_enqueued_configs() is how many column chunks the DECODER will accept, and every
-    // flow the scheduler dispatches also acquires an output buffer. The depth has to respect both:
-    // with max_inflight() alone, 64 flows in flight claim 64 decoder configs and 64 output buffers
-    // against a decoder that takes far fewer. The decoder then stops accepting, chunks never reach
-    // tlast so they never retire, and back-pressure runs all the way out to the TOE.
+    // On an HTTP bitstream also bounded by the HTTP handler's queue (max_inflight()). Both limits
+    // hold: a flow takes a chunk entry and a decoder config, and a decoder given more configs than
+    // it takes stops accepting, so its chunks never reach tlast.
     const auto decoder_depth =
         ctx.config<parcore::ColumnChunkDecoderConfig>()->maximum_num_enqueued_configs();
     if (ctx.isHTTPEnabled()) {
@@ -102,15 +66,10 @@ Scheduler::Scheduler(OasisContext &ctx)
         streams_.push_back(std::make_unique<StreamState>());
     }
 
-    // Resolve the lane geometry ONCE, before the dispatcher exists. Every value here is fixed by the
-    // programmed bitstream (or by the environment) and the accessors cache their first read.
-    // default_pipeline_depth() above already read CSRs, so this adds no new ordering requirement on
-    // when the Scheduler may be built.
+    // The lane geometry, read once before the dispatcher exists. With one lane there is nothing to
+    // choose between, so placement stays on host load.
     if (ctx.isHTTPEnabled()) {
         http_ = ctx.config<HTTPReadConfig>();
-        // With ONE lane the beats route by the decoder index rather than by a lane, so there is no
-        // per-lane window that a decode stream can be metered against, and lane-aware picking would
-        // be metering the wrong thing.
         lane_aware_ = http_->lane_count() > 1;
         if (lane_aware_) {
             lane_depth_       = http_->lane_depth_limit();
@@ -149,21 +108,14 @@ void Scheduler::note_progress() {
                             std::memory_order_relaxed);
 }
 
-// THE NO-PROGRESS WATCHDOG. Three jobs, every 500 ms, none of which touch the datapath:
-//
-// 1. WAKE every consumer blocked on a splinter channel (SplinterResultChannel::kick). A DuckDB
-//    task blocked on a flow the hardware never finishes is otherwise never run again, and DuckDB
-//    only checks the interrupt flag when a task runs -- which is why SIGINT did nothing for minutes
-//    on a hung query. After a kick the task re-polls, finds nothing, and either re-arms or,
-//    if the query was interrupted, throws InterruptException from its pipeline.
-//    That unwind is SAFE: it drops the scan's handle on the result channel and nothing else. The
-//    in-flight flow -- its operators, its request text and its output buffers, i.e. everything the
-//    card may still DMA into -- is owned by this Scheduler's in-flight list, which the unwind does
-//    not touch; it is released only by the flow's own completion (or abandoned, never freed, by
-//    ~Scheduler after kDrainTimeout).
-// 2. WAKE the dispatcher, so fail_flows_on_fatal_lanes() also runs while the queue is empty, which
-//    otherwise parks it indefinitely.
-// 3. DUMP, once per stall, the full state when flows are outstanding and nothing has retired or
+// The no-progress watchdog. Every 500 ms it
+// 1. kicks every consumer blocked on a splinter channel (SplinterResultChannel::kick): DuckDB checks
+//    the interrupt flag only when a task runs, so this is what lets SIGINT end a scan blocked on a
+//    flow the hardware never finishes. The unwind drops only the scan's handle; the flow, its request
+//    text and its output buffers stay with this Scheduler until the flow retires (or ~Scheduler
+//    abandons it);
+// 2. wakes the dispatcher, so fail_flows_on_fatal_lanes() runs while the queue is empty too;
+// 3. dumps the full state once per stall, when flows are outstanding and nothing has retired or
 //    been dispatched for stall_dump_s_ seconds: to stderr, and to $OASIS_DUMP_DIR/ if set.
 void Scheduler::watchdog_loop() {
     const auto tick     = std::chrono::milliseconds(500);
@@ -306,9 +258,7 @@ void Scheduler::set_pipeline_depth(size_t depth) {
 }
 
 Scheduler::~Scheduler() {
-    // OASIS_EXIT_DUMP: the same state dump the watchdog prints on a stall, once, at teardown -- the
-    // per-query measurement hook (lane traffic, CSR stall/error words, decoder counters) for runs
-    // that did NOT stall. Diagnostics only; any revision.
+    // OASIS_EXIT_DUMP: the watchdog's state dump, once, at teardown.
     if (const char *e = std::getenv("OASIS_EXIT_DUMP"); e != nullptr && *e != '\0' && *e != '0') {
         try {
             std::fprintf(stderr, "%s", describe_stall(-1.0).c_str());
@@ -332,7 +282,7 @@ Scheduler::~Scheduler() {
     dispatcher_.join();
 
     // The dispatcher is gone, but flows it already placed may still be in flight with callbacks
-    // pending. Wait (bounded -- see kDrainTimeout) until every slot's callback has run, then reap.
+    // pending. Wait (bounded, see kDrainTimeout) until every slot's callback has run, then reap.
     // Erasing only after `done` guarantees ~OutputHandle (which joins the callback thread) never
     // runs while that callback is still executing. The callback signals dispatch_cv_, so wait on
     // that.
@@ -364,16 +314,10 @@ Scheduler::~Scheduler() {
             std::lock_guard<std::mutex> slock(stream->mutex);
             reap(*stream, finished);
             if (!stream->in_flight.empty()) {
-                // ABANDON the stragglers, do not destroy them. ~OutputHandle join()s the callback
-                // thread, and the whole reason we are here is that the callback is never going to
-                // run -- joining it would hang the destructor exactly as the unbounded wait did.
-                //
-                // The leak is deliberate and is the lesser evil. It is not free: the callback lambda
-                // captures `this`, so if the hardware ever DID fire it after this returns it would
-                // touch a destroyed Scheduler. That cannot happen for the case this exists for (a
-                // fatal lane's session is gone, no interrupt is coming), and against a hypothetical
-                // late callback stands a process that certainly cannot exit. Documented rather than
-                // hidden: if a late-callback crash is ever seen on teardown, this is where it is.
+                // Abandon the stragglers rather than destroy them: their sink callbacks capture
+                // `this` and the slot, and their request-text buffers may still be read by a DMA. A
+                // callback that fired after this returns would touch a destroyed Scheduler; on a
+                // fatal lane none is coming.
                 static auto *abandoned = new std::list<InFlight>();
                 abandoned_here         = stream->in_flight.size();
                 abandoned->splice(abandoned->end(), stream->in_flight);
@@ -460,17 +404,9 @@ bool Scheduler::any_stream_in_service() const {
     return false;
 }
 
-// Two CSR reads, once per dispatch iteration, with nothing locked.
-//
-// It is deliberately NOT per candidate: lanes() folds every lane's occupancy and admission bits into
-// one pair of registers precisely so that a scan over four lanes costs the same as a look at one, and
-// re-reading per candidate would put four hardware round trips into a decision that has to be cheap
-// enough to run at kLaneRetry.
-//
-// A failure to read is not fatal here. Reporting it from this thread would kill the dispatcher (it
-// has no handler above it) and take the whole session with it; falling back to the host-load pick
-// instead means the flow is placed and the SAME hardware fault is met by await_lane_credit inside
-// dispatch_to, where dispatch_loop already routes exceptions to the query that asked.
+// Two CSR reads per dispatch iteration, not per candidate lane. A read that fails is not reported
+// here (the dispatcher has no handler above it): the flow is placed by host load, and the same fault
+// meets await_lane_credit inside dispatch_to, whose exception reaches the query.
 std::optional<HTTPReadConfig::HTTPLanes> Scheduler::sample_lanes() {
     if (!http_) {
         return std::nullopt;
@@ -488,14 +424,8 @@ std::optional<HTTPReadConfig::HTTPLanes> Scheduler::sample_lanes() {
     }
 }
 
-// Column-chunk entries the queue head will reserve on a lane.
-//
-// A batch reserves room for ALL of its entries before it pushes any of them -- the arm that starts
-// the transfer is written last, so a batch that fills the queue part way through deadlocks against
-// its own arm -- and that reservation is what the lane's credit has to cover. Capped at
-// max_batch_chunks_ because a flow larger than that is split into sub-batches inside the operator,
-// and only the first of them has to be admitted for the flow to start making progress; the rest
-// self-pace against entries the previous sub-batch is already draining.
+// Chunk entries the queue head reserves on a lane before its arm, capped at max_batch_chunks_: a
+// larger flow is split into batches, and only the first has to be admitted.
 size_t Scheduler::pending_lane_entries(const Pending &pending) const {
     size_t chunks = 0;
     for (const auto &op : pending.flow) {
@@ -504,33 +434,18 @@ size_t Scheduler::pending_lane_entries(const Pending &pending) const {
         }
     }
     if (chunks == 0) {
-        // A flow with no HTTP source -- in row-group batch mode every flow but the last is decode
-        // plus sink -- reserves nothing on a lane, so it asks for no credit, exactly as
-        // await_lane_credit(needed == 0) returns immediately. It is still gated on a free HOST slot,
-        // which is what a decoder config and an output buffer actually cost.
+        // No HTTP source (in row-group batch mode every flow but the last): only a host slot needed.
         return 0;
     }
     return std::min(chunks, max_batch_chunks_);
 }
 
-// Place by lane credit: the least-loaded lane that can still owe `needed` more responses.
-//
-// Stream index IS lane index (see the class comment), so choosing the lane chooses the stream, and
-// the decode stream follows it rather than the other way round. Only the first `lanes.count` streams
-// are candidates: `stream % lanes` would route a fifth stream's request text to lane 0 while its
-// column chunk was configured on decoder 4, and the bytes would reach a decoder set up for a
-// different column -- silent corruption rather than a failure. A bitstream with fewer lanes than
-// decoders simply gets fewer streams used.
-//
-// Outcomes, and they park differently:
+// The least-loaded lane that can still owe `needed` more entries; stream S is lane S. Outcomes:
 //   - a lane with credit          -> that stream
-//   - lanes healthy but all full  -> nothing, lane_bound_wait: POLL, hardware frees this silently
-//   - no stream with a host slot  -> nothing, no flag: SLEEP, a completion callback frees this
+//   - lanes healthy but all full  -> nothing, lane_bound_wait: poll, the hardware frees credit silently
+//   - no stream with a host slot  -> nothing: sleep, a completion callback frees one
 //   - grace expired               -> the least-loaded healthy lane anyway, `forced`
-//   - every candidate lane fatal  -> one of them, `fatal`, so the failure surfaces now
-//
-// Pure: no scheduler state is read or written, so the whole rule can be exercised against synthetic
-// lane windows with no board (as HTTPReadConfig::DecodeLanes is).
+//   - every candidate lane fatal  -> one of them, so the failure surfaces now
 Scheduler::LanePlacement Scheduler::PlaceOnLane(const LaneInputs &in) {
     LanePlacement out;
     out.next_rr           = in.rr;
@@ -541,39 +456,29 @@ Scheduler::LanePlacement Scheduler::PlaceOnLane(const LaneInputs &in) {
         return out;
     }
 
-    // Exactly await_lane_credit's rule, and it must stay exactly it: a batch bigger than the host's
-    // pipelining cap is legal -- the cap is a policy, the lane's queue is the hardware limit -- and
-    // it simply gets the lane to itself instead of never being admissible.
+    // await_lane_credit's rule: a batch above the host's cap gets the lane to itself.
     const size_t limit = std::max<size_t>(std::max<size_t>(in.lane_depth, 1), in.needed);
 
     std::optional<libstf::stream_t> ready, waiting, fatal;
     size_t                          ready_occ = 0, waiting_occ = 0;
 
-    // Start the scan at the rotation cursor so that among equally loaded lanes the pick advances
-    // instead of always landing on the lowest index. With `<` below, the first lane reached at the
-    // best occupancy wins, which makes the rotation the tie-break.
+    // Scan from the rotation cursor: among equally loaded lanes the first one reached wins.
     for (libstf::stream_t i = 0; i < span; ++i) {
         const auto s = static_cast<libstf::stream_t>((in.rr + i) % span);
         if (in.host_load[s] >= in.host_depth) {
-            continue; // no HOST slot: decoder configs and output buffers, not lane credit
+            continue; // no host slot (decoder configs and output buffers)
         }
         const auto &l = in.lanes.at(static_cast<uint8_t>(s));
         if (l.fatal) {
-            // Out of the game until the host reissues. Remembered only so that a queue with NO other
-            // option fails loudly instead of polling a dead board; as long as any other lane can
-            // take work, a fatal lane costs nothing but its own throughput.
+            // Taken only when no other lane is a candidate, so the failure surfaces.
             if (!fatal) {
                 fatal = s;
             }
             continue;
         }
         const size_t occ = l.occ;
-        // conn_up is false on a lane that has never been armed -- the arm is what opens the
-        // connection -- so it cannot be a hard skip or the FIRST batch could never be placed
-        // anywhere. It is only meaningful together with occupancy: a lane that owes responses and
-        // has no session is mid-connect or mid-reconnect, and piling more entries on it while it is
-        // neither sending nor receiving only deepens the queue it has to work through. Idle and
-        // unconnected is the normal cold state and is fully admissible.
+        // A lane that owes entries and has no session is reconnecting; an idle unconnected lane is
+        // the cold state (the arm opens the session) and takes work.
         const bool connecting = !l.conn_up && occ > 0;
         if (occ + in.needed <= limit && !connecting) {
             if (!ready || occ < ready_occ) {
@@ -596,8 +501,6 @@ Scheduler::LanePlacement Scheduler::PlaceOnLane(const LaneInputs &in) {
     if (waiting) {
         out.occ = waiting_occ;
         if (!in.credit_expired) {
-            // Healthy lanes, none with room. Normal, and normally over in microseconds -- but the
-            // hardware frees it without telling anyone, so the caller polls (kLaneRetry).
             out.lane_bound_wait = true;
             return out;
         }
@@ -608,23 +511,16 @@ Scheduler::LanePlacement Scheduler::PlaceOnLane(const LaneInputs &in) {
     }
 
     if (fatal) {
-        // Every candidate lane is dead. Waiting cannot help -- a fatal lane never retires anything --
-        // so place the flow on one NOW and let await_lane_credit throw the decoded reason (a
-        // head-of-line kill, which means reissue the whole batch, or an unreplayable read error).
-        // That exception reaches the query that asked, via dispatch_loop, and the loop keeps running
-        // so work already in flight on other streams still drains. Reissue is deliberately not
-        // attempted here: a clear failure beats a silent retry of a batch whose bytes are gone.
+        // Every candidate lane is fatal: await_lane_credit throws the decoded reason to the query.
         out.stream = fatal;
         out.occ    = in.lanes.at(static_cast<uint8_t>(*fatal)).occ;
         return out;
     }
 
-    // Every stream is at its host pipeline depth. A completion callback frees that and signals
-    // dispatch_cv_, so the caller may sleep indefinitely -- exactly as it did before lanes existed.
     return out;
 }
 
-// The dispatcher's side of PlaceOnLane: gather the inputs, keep the stall deadline, report.
+// Gathers PlaceOnLane's inputs, keeps the stall deadline and logs a forced placement.
 std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig::HTTPLanes &lanes,
                                                             size_t needed, bool &lane_bound_wait) {
     lane_bound_wait = false;
@@ -637,17 +533,13 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig
     in.active     = std::max<libstf::stream_t>(active_streams_.load(), 1);
     in.rr         = lane_rr_;
     for (libstf::stream_t s = 0; s < in.active && s < HTTP_LANE_SLOTS && s < num_streams_; ++s) {
-        // Read slightly stale by design: `enqueued` is lock-free precisely so the completion
-        // callback never has to take dispatch_mutex_ while the dispatcher holds it (see StreamState).
         in.host_load[s] = streams_[s]->out_of_service.load(std::memory_order_relaxed)
                               ? in.host_depth
                               : streams_[s]->enqueued.load(std::memory_order_relaxed);
     }
 
-    // The stall deadline. It starts the first time there is work, a free host slot and no lane with
-    // credit, and is cleared by any placement. On shutdown it is skipped: the destructor is blocked
-    // on this loop draining the queue, and a lane that is not draining gets reported by
-    // await_lane_credit either way, so going straight there costs the teardown 30 s less.
+    // The stall deadline starts when no lane has credit and is cleared by any placement. On shutdown
+    // the flow is placed at once: await_lane_credit reports a lane that is not draining either way.
     const auto now = std::chrono::steady_clock::now();
     if (lane_stall_since_ == std::chrono::steady_clock::time_point {}) {
         in.credit_expired = stop_;
@@ -668,8 +560,7 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig
     lane_rr_ = out.next_rr;
     if (out.stream) {
         if (out.forced) {
-            // Zero when the shutdown path forced this on the first starved iteration, where the
-            // stall clock was never started -- not "since the epoch".
+            // Zero when shutdown forced it before the stall clock started.
             const auto stalled_for =
                 (lane_stall_since_ == std::chrono::steady_clock::time_point {})
                     ? std::chrono::seconds(0)
@@ -685,48 +576,24 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig
     return out.stream;
 }
 
-// Report a lane that went fatal with work already dispatched to it.
-//
-// THE HANG THIS EXISTS FOR. handler_multi declares a lane fatal when a read fails in a way it cannot
-// replay -- a head-of-line kill, or a dirty abort where body bytes already reached the decoder -- and
-// then tears the session down and deliberately does NOT reopen it (BR_CLOSE with close_only, which is
-// what holds clear_framing high). Every flow already on that lane is orphaned at that instant: its
-// completion callback fires from the hardware interrupt path and no interrupt is ever coming, so the
-// slot never goes `done`, `enqueued` never comes back down, the splinter's outstanding_sinks never
-// reaches zero, and the channel is never closed.
-//
-// Nothing else notices, and that is the subtle part. throw_lane_fatal() is on the ADMISSION path
-// (await_cfg_ready), which only runs when the host pushes another beat AT that lane -- and
-// PlaceOnLane skips fatal lanes by design, so as long as one healthy lane remains the admission path
-// is never taken for the dead one again. The one place that knows how to report the failure is the
-// one place the scheduler now guarantees it will never reach. The query then blocks forever in
-// SplinterResultChannel::get_next_batch(), which is how a hardware fault the board diagnosed
-// correctly, and printed sticky flags for, became a silent hang with nothing in the log.
-//
-// So it is reported here, off the per-iteration lane sample the dispatcher already takes.
-//
-// ONLY THE CHANNEL IS FAILED. The in-flight slot is deliberately left alone: the callback owns
-// `flow_outstanding`, `outstanding_sinks` and `enqueued`, and retiring the slot from this thread
-// would race a callback that might still fire (after a reprogram, or a late retire) into a double
-// decrement of counters it has no lock on. ~Scheduler bounds its own wait for those slots instead.
+// Fails the flows already on a lane that went fatal. Their completions never come, and the admission
+// path that reports a fatal lane is not taken for it again (placement skips fatal lanes). Only the
+// channels are failed: the slots stay with their callbacks, which own the counters.
 void Scheduler::fail_flows_on_fatal_lanes(const HTTPReadConfig::HTTPLanes &lanes,
                                           std::unique_lock<std::mutex> &lock) {
-    // Collect under the lock, act outside it. fail() runs the channel's readiness callback, which
-    // reschedules a consumer task, and throw_lane_fatal() reads CSRs -- neither belongs under
-    // dispatch_mutex_, for exactly the reasons sample_lanes() is taken unlocked.
+    // Collect under the lock, report outside it: throw_lane_fatal() reads CSRs and fail() runs the
+    // consumer's readiness callback.
     std::vector<std::pair<uint8_t, std::shared_ptr<SplinterResultChannel>>> victims;
     uint32_t   reporting = 0;
     const auto span      = std::min<size_t>(lanes.count, streams_.size());
     for (uint8_t s = 0; s < span; ++s) {
         const uint32_t bit = 1u << s;
         if (!lanes.at(s).fatal) {
-            // Only a reprogram clears a fatal lane, and that builds a new Scheduler -- but clearing
-            // the bit costs nothing and keeps this an edge detector rather than a latch.
             lane_fatal_reported_ &= ~bit;
             continue;
         }
         if (lane_fatal_reported_ & bit) {
-            continue; // already reported; do not re-walk the list every kLaneRetry
+            continue; // reported once, not every iteration
         }
         reporting |= bit;
         std::lock_guard<std::mutex> slock(streams_[s]->mutex);
@@ -752,8 +619,6 @@ void Scheduler::fail_flows_on_fatal_lanes(const HTTPReadConfig::HTTPLanes &lanes
             if ((reporting & (1u << s)) == 0) {
                 continue;
             }
-            // The decoded diagnosis, not a bare "lane is fatal": whether this was a head-of-line kill
-            // (the batch is gone, reissue it) or an unreplayable read error, plus the sticky causes.
             std::exception_ptr err;
             try {
                 http_->throw_lane_fatal(s, "an in-flight batch");
@@ -799,29 +664,21 @@ void Scheduler::dispatch_loop() {
         {
             // Destroy the reaped slots with no scheduler lock held (see above). Do it before any
             // re-lock so the dispatcher never holds dispatch_mutex_ across a join.
-            //
-            // The same unlocked window takes the hardware's per-lane view: two CSR reads, ONCE per
-            // iteration rather than once per candidate, and outside every scheduler lock. Holding
-            // dispatch_mutex_ across a hardware read would stall every submit() and every completion
-            // callback for as long as the bus takes; holding a stream mutex would additionally
-            // invert the dispatch_mutex_ -> stream.mutex order the destructor depends on. The
-            // snapshot stays usable after the relock because both admission bits are monotone in the
-            // host's favour -- nothing but a beat this thread writes can clear either.
+            // The same unlocked window samples the lanes. The sample stays valid after the relock:
+            // only a beat this thread writes clears an admission bit.
             lock.unlock();
             finished.clear();
             lanes = sample_lanes();
             lock.lock();
         }
 
-        // A lane may have gone fatal since the last iteration with flows already placed on it. They
-        // will never retire, and this is the only thread that looks -- see the function comment.
         if (lanes) {
             fail_flows_on_fatal_lanes(*lanes, lock);
         }
 
         std::optional<libstf::stream_t> stream;
-        // Whether an empty pick means "the hardware has no room" (poll) or "the host has no slot"
-        // (sleep until a completion says otherwise). Only the lane-aware path can set it.
+        // Whether an empty pick means the hardware has no room (poll) or the host has no slot
+        // (sleep until a completion signals).
         bool lane_bound_wait = false;
         if (!queue_.empty()) {
             stream = (lanes && lane_aware_)
@@ -847,8 +704,6 @@ void Scheduler::dispatch_loop() {
                 continue;
             }
             if (lane_bound_wait) {
-                // Lane credit comes back when the hardware retires a response. No host code runs and
-                // nothing signals dispatch_cv_, so this wait MUST have a timeout -- see kLaneRetry.
                 dispatch_cv_.wait_for(lock, kLaneRetry);
             } else {
                 dispatch_cv_.wait(lock);
@@ -863,12 +718,8 @@ void Scheduler::dispatch_loop() {
         streams_[*stream]->enqueued.fetch_add(1, std::memory_order_relaxed);
 
         lock.unlock();
-        // dispatch_to runs operator apply() -- which talks to the FPGA and throws on any hardware
-        // fault (a credit timeout, a wedged handler, an exhausted huge-page pool). This thread has
-        // no handler above it, so an escaping exception meant std::terminate: the process died
-        // mid-transfer and left the handler outside ST_IDLE, costing a reprogram to recover. Route
-        // it to the consumer instead, where it surfaces as an ordinary query error, and keep the
-        // dispatcher running so the remaining flows and the shutdown path still work.
+        // apply() throws on a hardware fault (a credit timeout, a fatal lane, an exhausted pool). The
+        // dispatcher has no handler above it: route the error to the consumer and keep running.
         try {
             dispatch_to(*stream, pending);
         } catch (...) {
@@ -939,9 +790,7 @@ void Scheduler::dispatch_to(libstf::stream_t stream, Pending &pending) {
         // Both counters are atomic, so this never nests dispatch_mutex_ with ss.mutex. acq_rel makes
         // the channel pushes happen-before the observed close/done.
         handle->add_callback([this, &ss, stream, slot, completion, handle, tag](libstf::stream_t) {
-            // Same reasoning as dispatch_loop, on the interrupt path: this runs on the handle's own
-            // thread with nothing above it, so a throw here would terminate the process too. The
-            // bookkeeping below MUST still run either way or the slot never retires.
+            // The handle's thread has no handler above it, and the bookkeeping below must run anyway.
             try {
                 while (handle->stream_has_more_output(stream)) {
                     completion->channel->push_batch(tag, handle->get_next_stream_output(stream));

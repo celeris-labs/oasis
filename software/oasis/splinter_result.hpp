@@ -52,17 +52,9 @@ class SplinterResultChannel {
         }
     }
 
-    // Producer: the flow died. Stores the exception, closes the channel, and every consumer call
-    // from here on rethrows it.
-    //
-    // Without this a failed flow could only close() -- indistinguishable from a clean end of stream,
-    // so a hardware error became a SILENTLY TRUNCATED result rather than an error. The alternative
-    // that was actually happening is worse still: the exception escaped the dispatcher thread, which
-    // has no handler, and std::terminate killed the process mid-transfer -- leaving the FPGA handler
-    // outside ST_IDLE, where only reprogramming the bitstream recovers it.
-    //
-    // Queued batches are deliberately discarded. The result is incomplete by definition, and handing
-    // the consumer a prefix of it is the one outcome worse than either failure above.
+    // Producer: the flow died. Stores the exception and closes the channel; every consumer call from
+    // here on rethrows it, so a failed flow does not read as a clean end of stream. Queued batches
+    // are discarded: the result is incomplete.
     void fail(std::exception_ptr err) {
         std::function<void()> cb;
         {
@@ -129,20 +121,10 @@ class SplinterResultChannel {
         return {true, pop_locked()};
     }
 
-    // Consumer: Register a one-shot callback fired exactly once when the channel next becomes ready
-    // (a batch arrives or it closes), and return true. Used to wake a blocked task. The callback 
-    // must be cheap and must not touch this channel. Replaces any previously registered callback.
-    //
-    // If the channel is ALREADY ready, the callback is NOT registered and NOT called; the function
-    // returns false. The caller must treat this as "ready now" and re-poll rather than block -- the
-    // callback is never invoked synchronously on the registering thread, which would otherwise let 
-    // a task reschedule (and re-enter the scan) while it is still executing.
-    /// Fire an armed readiness callback WITHOUT data: a spurious wake. The consumer re-polls, finds
-    /// nothing, and re-arms -- or, if its query has been interrupted meanwhile, notices that and
-    /// unwinds. This is what makes SIGINT reach a scan blocked on a flow the hardware will never
-    /// finish: DuckDB checks the interrupt flag only when a task RUNS, and a task blocked on this
-    /// channel runs again only when its callback fires. See Scheduler's watchdog. Returns whether a
-    /// callback was armed.
+    // Fires an armed readiness callback without data, a spurious wake: the consumer re-polls and
+    // re-arms, or unwinds if its query was interrupted. DuckDB checks the interrupt flag only when a
+    // task runs, so this is how SIGINT reaches a scan blocked on a flow that never finishes (see the
+    // Scheduler's watchdog). Returns whether a callback was armed.
     bool kick() {
         std::function<void()> cb;
         {
@@ -156,6 +138,14 @@ class SplinterResultChannel {
         return false;
     }
 
+    // Consumer: Register a one-shot callback fired exactly once when the channel next becomes ready
+    // (a batch arrives or it closes), and return true. Used to wake a blocked task. The callback 
+    // must be cheap and must not touch this channel. Replaces any previously registered callback.
+    //
+    // If the channel is ALREADY ready, the callback is NOT registered and NOT called; the function
+    // returns false. The caller must treat this as "ready now" and re-poll rather than block -- the
+    // callback is never invoked synchronously on the registering thread, which would otherwise let 
+    // a task reschedule (and re-enter the scan) while it is still executing.
     [[nodiscard]] bool set_ready_callback(std::function<void()> cb) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!batches_.empty() || closed_) {

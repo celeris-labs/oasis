@@ -1,6 +1,5 @@
 #include "oasis/oasis_context.hpp"
 
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -44,8 +43,8 @@ static void handle_fpga_interrupt(int value) {
 }
 
 static libstf::stream_mask_t computeManagedStreams(libstf::GlobalConfig &global_config) {
-    // Decoder streams are managed. When HTTP (or RDMA) is wired in, the extra MemConfig stream
-    // past the decoders is the bypass stream and is unmanaged (transfer size known per request).
+    // Decoder streams are managed. The extra MemConfig stream past the decoders is unmanaged: RDMA
+    // uses it as its bypass (transfer size known per request); on HTTP it is unused.
     auto mem_config = global_config.get_config<libstf::MemConfig>();
     auto cc_config = global_config.get_config<parcore::ColumnChunkDecoderConfig>();
     libstf::stream_mask_t managed = ~libstf::stream_mask_t(0);
@@ -55,22 +54,9 @@ static libstf::stream_mask_t computeManagedStreams(libstf::GlobalConfig &global_
     return managed;
 }
 
-
-// How many output buffers to keep enqueued per stream.
-//
-// This was a hardcoded 2 while the scheduler dispatches up to 64 flows, and every flow's sink needs
-// a buffer for the decoder to write its results into. Flows past the second had nowhere to put
-// their output, so the decoder stalled on its OUTPUT side -- observed directly as
-// out_stalled=1632080 against out_starved=150185, with the counters frozen.
-//
-// It deadlocks rather than throttling. The two buffers are released only when the scan collects
-// them, the scan collects its HEAD row group, and if the head's columns are among the flows that
-// never got a buffer, nothing is ever released. Everything downstream follows: the decoder stops
-// accepting input, the reader stops draining, the rx fifo fills, the advertised window crosses
-// rx_engine's 24000-byte floor and the connection dies in go-back-N.
-//
-// At 8 MiB a buffer, 64 of them is 512 MiB against 32 GiB of huge pages -- the 2 was never a
-// memory decision. Clamped to what the bitstream reports it can hold.
+// Output buffers to keep enqueued per stream: one per flow the scheduler may have in flight (64;
+// OASIS_OBM_BUFFERS overrides), clamped to what the bitstream holds. A flow without a buffer stalls
+// the decoder's output, and the scan's head row group could then never be collected.
 static size_t computeObmBuffers(libstf::GlobalConfig &global_config) {
     size_t desired = 64;
     if (const char *e = std::getenv("OASIS_OBM_BUFFERS")) {
@@ -107,7 +93,7 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool,
         throw std::runtime_error(msg.str());
     }
 
-    // Before anything else talks to the HTTP handler. See setup_http().
+    // Before anything else talks to the HTTP handler.
     if (isHTTPEnabled()) {
         setup_http();
     }
@@ -151,11 +137,10 @@ void OasisContext::shutdown() {
     libstf::Profiler::flush();
 }
 
-// Classify the HTTP handler's CSR revision once, before anything else touches its registers: a
-// revision this library does not drive is refused here, at startup, rather than on the first query.
-// On revision 6 (handler_toe) also validate the GET cap (toe_get_cap() throws on an unusable
-// LANE_POLICY) and name the datapath -- on stderr as well as the log sink, because the context is
-// built while the extension LOADS, before any statement could have enabled DuckDB's logger.
+// Reads the HTTP handler's CSR revision before anything else touches its registers, so one this
+// library does not drive is refused at startup. On revision 6 it also checks the GET cap and names
+// the datapath, on stderr as well: the context is built while the extension loads, before DuckDB
+// logs.
 void OasisContext::setup_http() {
     auto http = config<HTTPReadConfig>();
     if (!http->toe_ring()) {
@@ -164,9 +149,8 @@ void OasisContext::setup_http() {
     const auto p = http->policy();
     char line[256];
     std::snprintf(line, sizeof(line),
-                  "OasisContext: TOE receive ring bitstream (CSR rev %u, revision-2 register map): "
-                  "%u lane(s), GET credit %u per lane, ring 2^%u B per session, GETs capped at %llu B; "
-                  "no slot page, no card memory of ours",
+                  "OasisContext: TOE receive ring bitstream (CSR rev %u): %u lane(s), GET credit %u "
+                  "per lane, ring 2^%u B per session, GETs capped at %llu B",
                   unsigned(http->revision()), unsigned(p.num_conns), unsigned(p.get_credit),
                   unsigned(p.ring_log2), static_cast<unsigned long long>(http->toe_get_cap()));
     std::fprintf(stderr, "[oasis] %s\n", line);

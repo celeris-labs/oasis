@@ -29,11 +29,9 @@ void RDMASourceOperator::print(std::ostream &os) const {
 void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     auto config = ctx.config<HTTPReadConfig>();
 
-    // Split so no batch is larger than the hardware queue. The queue holds one entry per column
-    // chunk and every entry is pushed BEFORE the transfer is armed, so an oversized batch does not
-    // back-pressure, it deadlocks: the host waits on a free entry, and entries are only freed by
-    // responses, which cannot arrive until the arm that comes after them. Successive batches
-    // self-pace: the next one blocks on entries the previous one is already draining.
+    // Batches of at most max_batch_chunks() column chunks: every entry of a batch is pushed before its
+    // arm, so a larger batch could never drain. A later batch waits on entries the earlier one is
+    // draining.
     const size_t per_batch = config->max_batch_chunks();
     for (size_t lo = 0; lo < chunks_.size(); lo += per_batch) {
         HTTPReadConfig::RequestBatch batch;
@@ -43,21 +41,13 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
         }
         emit_batch(stream, ctx, *config, batch);
 
-        // The decoder's handshake counters alongside every batch line. Without them a trace shows
-        // the queue filling but not WHY nothing retires, because a chunk only retires when it
-        // reaches tlast, and that needs the decoder to be accepting.
-        //
-        //   in stalled climbing   -> the decoder refuses input; nothing can retire
-        //   in starved climbing   -> the decoder is idle waiting; the stall is upstream
-        //   out handshakes flat   -> the decoder is not producing, so it is waiting, not busy
+        // The decoder's counters with every batch line: a chunk only retires at tlast, which needs
+        // the decoder to accept. in stalled growing: the decoder refuses input; in starved growing:
+        // the stall is upstream; idle counts the cycles between chunks. Reading the last profile
+        // register stops the profiler, so each line holds the counts since the previous read, and
+        // debug mode also disturbs later oasis_stream_profile() readings.
         if (http_debug_enabled()) {
             const auto prof = ctx.config<parcore::ColumnChunkDecoderConfig>()->read_profile(stream);
-            // idle is the counter that was missing, and it is the one that matters. handshake /
-            // starved / stalled only describe cycles WHILE a column chunk is streaming; the
-            // profiler sits in IDLE between chunks and counts none of them. So a decoder that
-            // looks 80% stalled in-chunk can still be idle most of the wall clock, waiting for the
-            // host to configure the next chunk -- with the receive buffer already full of data it
-            // has not been told about yet. Without this field the two cannot be told apart.
             std::fprintf(stderr,
                          "[oasis-http]   decoder in: hs=%llu starved=%llu stalled=%llu idle=%llu | "
                          "out: hs=%llu starved=%llu stalled=%llu idle=%llu\n",
@@ -73,8 +63,8 @@ void HTTPBatchSourceOperator::apply(libstf::stream_t stream, OasisContext &ctx) 
     }
 }
 
-// Per-lane host-side traffic counters for the exit/stall dump: GETs armed and body bytes requested,
-// per lane, since the process started.
+// GETs armed and body bytes requested per lane since the process started, for the stall and exit
+// dumps.
 namespace {
 std::atomic<uint64_t> g_lane_gets[HTTP_LANE_SLOTS];
 std::atomic<uint64_t> g_lane_bytes[HTTP_LANE_SLOTS];
@@ -98,8 +88,8 @@ constexpr size_t BEAT = 64;
 
 size_t RoundUpToBeat(size_t bytes) { return (bytes + BEAT - 1) / BEAT * BEAT; }
 
-// The handler's state with every revision-2 batch: a hang blocks the board for other processes, so
-// the last line before it is the only reading of the state going into the batch that hung.
+// The handler's state with every revision-2 batch. A process hung on the board keeps others off it,
+// so the last such line is the only reading of the state going into the batch that hung.
 void PrintLaneState(HTTPReadConfig &config, uint8_t lane, size_t chunks, size_t text_bytes) {
     const auto f  = config.inflight();
     const auto st = config.stall();

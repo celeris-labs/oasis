@@ -32,11 +32,8 @@ class HTTPReadConfig;
  * Two knobs are tunable at runtime: the number of *active* streams (the span the dispatcher load-
  * balances across) and the per-stream pipeline depth.
  *
- * On an HTTP bitstream with more than one lane, the dispatcher additionally places work by LANE CREDIT rather than by host load alone: each
- * iteration samples the hardware's per-lane admission windows and picks the least-loaded lane that
- * can still owe another response. Stream index and lane index are the SAME index -- the lane owns
- * the TCP session, the framer, the chunk queue and the decoder its body bytes come out on -- so
- * picking the lane is picking the stream. Everything below is unchanged on any other bitstream.
+ * On an HTTP bitstream with more than one lane the dispatcher places work by lane credit: stream S
+ * is fetched on lane S, so it picks the least-loaded lane that can still owe another response.
  */
 class Scheduler {
   public:
@@ -59,49 +56,31 @@ class Scheduler {
     void                 set_pipeline_depth(size_t depth);
     [[nodiscard]] size_t pipeline_depth() const { return queue_depth_.load(); }
 
-    /// Everything the lane placement decision reads. Gathered by the dispatcher; the decision itself
-    /// (PlaceOnLane) touches no scheduler state, so it can be exercised against synthetic lane
-    /// windows with no board attached -- the same reason HTTPReadConfig::DecodeLanes is a static.
+    // Everything the lane placement reads, so that PlaceOnLane is a pure function the board-free
+    // checks can call.
     struct LaneInputs {
-        /// The hardware's per-lane admission windows, as sampled once for this iteration.
-        HTTPReadConfig::HTTPLanes lanes {};
-        /// Flows already placed on each stream and not yet retired (StreamState::enqueued).
-        std::array<size_t, HTTP_LANE_SLOTS> host_load {};
-        /// Flows one stream may hold at once: decoder configs and output buffers, not lane credit.
-        size_t host_depth = 1;
-        /// Chunk entries the host will let one lane owe (lane_depth_limit()).
-        size_t lane_depth = 1;
-        /// Entries the queue head will reserve before it can be armed; 0 for a flow that
-        /// touches no lane, which then only needs a free host slot.
-        size_t needed = 1;
-        /// Streams the dispatcher may use; clamped to the lane count inside.
-        libstf::stream_t active = 0;
-        /// Rotation cursor, so equally loaded lanes are not always tried in index order.
-        libstf::stream_t rr = 0;
-        /// The stall grace has run out (or the scheduler is shutting down): place the flow even
-        /// without credit, so the hardware wait reports why rather than the host polling forever.
-        bool credit_expired = false;
+        HTTPReadConfig::HTTPLanes           lanes {};     // sampled once per iteration
+        std::array<size_t, HTTP_LANE_SLOTS> host_load {}; // flows placed per stream, not yet retired
+        size_t           host_depth     = 1;     // flows one stream may hold (configs and buffers)
+        size_t           lane_depth     = 1;     // lane_depth_limit()
+        size_t           needed         = 1;     // entries the queue head reserves; 0 = no HTTP source
+        libstf::stream_t active         = 0;     // streams the dispatcher may use
+        libstf::stream_t rr             = 0;     // rotation cursor for equally loaded lanes
+        bool             credit_expired = false; // place even without credit (grace over, shutdown)
     };
 
-    /// What the decision came to. `stream` unset means park -- on a timeout if lane_bound_wait
-    /// (hardware frees lane credit silently), otherwise indefinitely (a completion will signal).
+    // `stream` unset means park: on a timeout if lane_bound_wait (the hardware frees lane credit
+    // silently), otherwise until a completion signals.
     struct LanePlacement {
         std::optional<libstf::stream_t> stream;
-        libstf::stream_t                next_rr = 0;
-        /// Nothing was placed because no LANE had credit, as opposed to no stream having a slot.
-        bool lane_bound_wait = false;
-        /// Placed on a lane with no credit, because the grace expired. The wait moves to the
-        /// hardware, which reports which lane stopped draining.
-        bool forced = false;
-        /// The chosen (or best rejected) lane's occupancy, for logging.
-        size_t occ = 0;
+        libstf::stream_t                next_rr         = 0;
+        bool                            lane_bound_wait = false; // no lane had credit
+        bool                            forced          = false; // placed without credit
+        size_t                          occ             = 0;     // the lane's occupancy, for logging
     };
 
-    /// The lane-aware placement rule, as a pure function of `in`.
-    ///
-    /// THE INVARIANT IT EXISTS FOR: a lane that is full, fatal, or mid-connect must never hold up a
-    /// lane that has credit. The pre-WP5 loop asked one folded question -- "is the board ready?" --
-    /// whose answer a single busy lane could dictate for all of them.
+    // The lane-aware placement rule: a lane that is full, fatal or reconnecting never holds up a lane
+    // that has credit.
     [[nodiscard]] static LanePlacement PlaceOnLane(const LaneInputs &in);
 
   private:
@@ -140,7 +119,7 @@ class Scheduler {
         std::list<InFlight> in_flight;
         std::atomic<size_t> enqueued{0};
         // Set when a dispatch failed part way: the stream's queues may hold the failed flow's decoder
-        // config and output handle, so no flow is placed here again (see dispatch_to).
+        // config and output handle, so no flow is placed here again.
         std::atomic<bool>   out_of_service{false};
     };
 
@@ -151,42 +130,15 @@ class Scheduler {
 
     std::vector<std::unique_ptr<StreamState>> streams_;
 
-    // ---------------------------------------------------------------------------------------------
-    // Lane-aware dispatch. Every field here is resolved ONCE, in the constructor, from registers the
-    // bitstream cannot change while it is programmed, so the dispatch loop never re-reads them.
-    // ---------------------------------------------------------------------------------------------
-
-    /// The HTTP read config, or null when this bitstream has none. Held so the dispatcher does not
-    /// walk the config map on every iteration.
-    std::shared_ptr<HTTPReadConfig> http_;
-
-    /// Whether to place work by lane credit. Requires more than one lane: with a single lane the
-    /// field the beats carry is the DECODER index, not a lane, so there is no per-lane window to
-    /// meter a decode stream against.
-    bool lane_aware_ = false;
-
-    /// The chunk entries the host will let ONE lane owe (lane_depth_limit(), i.e.
-    /// OASIS_HTTP_LANE_DEPTH). Fixed by the bitstream / environment.
-    size_t lane_depth_ = 1;
-
-    /// max_batch_chunks(): the hardware's per-batch ceiling, used to cap how much credit a queued
-    /// flow is judged to need (its first sub-batch can be no larger than this).
-    size_t max_batch_chunks_ = 1;
-
-    /// Rotation cursor for breaking ties between equally loaded lanes, so a run of same-occupancy
-    /// picks spreads instead of always landing on the lowest index. Guarded by dispatch_mutex_.
-    libstf::stream_t lane_rr_ = 0;
-
-    /// When the dispatcher first found queued work, a free host slot, and NO lane with credit. Reset
-    /// on every successful placement. Dispatcher thread only. Its purpose is a deadline: lane credit
-    /// comes back in hardware with no host notification, so "no lane admissible" is normally a
-    /// microsecond-scale wait -- but if it persists, the pipeline has stopped and the host must find
-    /// out rather than poll forever. See kLaneStallGrace in scheduler.cpp.
+    // Lane-aware dispatch; the first four are read once, in the constructor.
+    std::shared_ptr<HTTPReadConfig> http_;                 // null without HTTP
+    bool                            lane_aware_ = false;   // more than one lane
+    size_t                          lane_depth_ = 1;       // lane_depth_limit()
+    size_t                          max_batch_chunks_ = 1; // caps the credit a queued flow needs
+    libstf::stream_t                lane_rr_ = 0;          // rotation cursor; dispatch_mutex_
+    // Since when no lane had credit for the queue head (kLaneStallGrace); dispatcher thread only.
     std::chrono::steady_clock::time_point lane_stall_since_ {};
-
-    /// Lanes already reported fatal, one bit per lane. A fatal lane is reported ONCE, not once every
-    /// kLaneRetry: the bit is what makes the report an edge rather than a 100 us log storm.
-    /// Dispatcher thread only.
+    // Lanes already reported fatal, one bit each, so a lane is reported once; dispatcher thread only.
     uint32_t lane_fatal_reported_ = 0;
 
     std::mutex              dispatch_mutex_;
@@ -195,63 +147,49 @@ class Scheduler {
     bool                    stop_ = false;
     std::thread             dispatcher_;
 
-    // ---------------------------------------------------------------------------------------------
     // No-progress watchdog (see watchdog_loop). On every HTTP bitstream; its state dump is on by
     // default only on revision 6 and otherwise needs OASIS_STALL_DUMP_S.
-    // ---------------------------------------------------------------------------------------------
     bool                    watchdog_on_ = false;
     double                  stall_dump_s_ = 30.0; // 0 = kick only, never dump
     std::thread             watchdog_;
     std::mutex              watchdog_mutex_;
     std::condition_variable watchdog_cv_;
     bool                    watchdog_stop_ = false;
-    /// steady_clock nanoseconds of the last flow retirement or dispatch.
-    std::atomic<int64_t>    last_progress_ns_ {0};
-    /// Channels of splinters submitted and not yet destroyed, so the watchdog can wake their
-    /// consumers. Guarded by dispatch_mutex_.
+    std::atomic<int64_t>    last_progress_ns_ {0}; // steady_clock time of the last retire or dispatch
+    // Channels of the submitted splinters, for the watchdog's kicks. Guarded by dispatch_mutex_.
     std::vector<std::weak_ptr<SplinterResultChannel>> live_channels_;
 
     void watchdog_loop();
     void note_progress();
-    /// Host-side view (queue, per-stream in-flight flows with their operators) + the HTTP CSR dump
-    /// + the decoder profiles. Takes dispatch_mutex_ and the stream mutexes itself.
+    // The queue, each stream's in-flight flows, the HTTP CSR dump and the decoder profiles. Takes
+    // dispatch_mutex_ and the stream mutexes itself.
     std::string describe_stall(double stalled_s);
 
     // The dispatcher loop: Pops the queue head, picks the least-loaded active stream with a free
-    // pipeline slot -- and, where the hardware reports them, a lane with credit -- and dispatches
-    // there. Parks on dispatch_cv_ when the queue is empty or every active stream is full; polls it
-    // on a short timeout when the only thing missing is lane credit. Reaps finished slots before
-    // measuring load.
+    // pipeline slot (and a lane with credit, when placing by lane) and dispatches there. Parks on
+    // dispatch_cv_ when the queue is empty or every active stream is full, with a short timeout when
+    // only lane credit is missing. Reaps finished slots before measuring load.
     void dispatch_loop();
 
     // Returns the least-loaded active stream that has a free pipeline slot, or nullopt if all are
-    // full. Must be called holding dispatch_mutex_. The host-load-only pick: used without HTTP, on a
-    // one-lane bitstream, and as the fallback when a lane sample could not be taken.
+    // full. Must be called holding dispatch_mutex_. Used when not placing by lane.
     std::optional<libstf::stream_t> pick_stream() const;
 
     // Whether any active stream can still take work (is not out of service).
     [[nodiscard]] bool any_stream_in_service() const;
 
-    // One dispatch iteration's view of the hardware's per-lane admission windows: two CSR reads, or
-    // nothing without HTTP (and then it reads nothing at all) or when the read failed. MUST be called with no scheduler lock held: holding dispatch_mutex_ across a hardware
-    // read would block every submitter and every completion callback for the duration.
+    // One dispatch iteration's view of the lanes: two CSR reads, or nothing without HTTP or when the
+    // read failed. Called with no scheduler lock held.
     std::optional<HTTPReadConfig::HTTPLanes> sample_lanes();
 
-    // The lane-aware pick: the least-loaded lane that can still owe `needed` more responses, skipping
-    // lanes that are full, fatal, or mid-connect. `needed` is the credit the QUEUE HEAD will ask for.
-    //
-    // Sets `lane_bound_wait` when it returns nullopt because no lane has CREDIT (as opposed to no
-    // stream having a free host slot). The two park differently: a host slot is freed by a completion
-    // callback, which signals dispatch_cv_, while lane credit is returned by hardware retiring a
-    // response, which signals nothing -- so the caller must poll rather than sleep.
-    //
-    // Must be called holding dispatch_mutex_; it reads stop_ and advances the rotation cursor.
+    // PlaceOnLane for the queue head, which reserves `needed` entries. Sets `lane_bound_wait` when no
+    // lane has credit, so the caller polls instead of sleeping. Must be called holding
+    // dispatch_mutex_.
     std::optional<libstf::stream_t> pick_lane_stream(const HTTPReadConfig::HTTPLanes &lanes,
                                                      size_t needed, bool &lane_bound_wait);
 
-    // Chunk entries the queued flow will reserve on a lane before it can be armed: the column chunks
-    // its HTTP source carries, capped at max_batch_chunks_ because that is the largest sub-batch it
-    // can submit at once. 0 for a flow with no HTTP source, which reserves nothing on any lane.
+    // Chunk entries the queued flow reserves on a lane, capped at max_batch_chunks_; 0 without an
+    // HTTP source.
     [[nodiscard]] size_t pending_lane_entries(const Pending &pending) const;
 
     // Applies a flow on `stream` and registers a completion callback per sink, parking it in the
@@ -259,14 +197,8 @@ class Scheduler {
     // (enqueued atomically bumped).
     void dispatch_to(libstf::stream_t stream, Pending &pending);
 
-    // Fails every in-flight flow on a lane the hardware has just declared FATAL, because those flows
-    // can never complete and nothing else will ever notice: throw_lane_fatal() sits on the ADMISSION
-    // path, and PlaceOnLane deliberately routes work away from a fatal lane, so on a board with any
-    // healthy lane left that path is never taken again.
-    //
-    // Called with `lock` (dispatch_mutex_) HELD. It releases and re-acquires it around the CSR reads
-    // and the channel callbacks, exactly as the sampling window in dispatch_loop does -- neither
-    // belongs under dispatch_mutex_.
+    // Fails the in-flight flows of a lane that went fatal. Called with `lock` (dispatch_mutex_) held;
+    // releases it around the CSR reads and the channel callbacks.
     void fail_flows_on_fatal_lanes(const HTTPReadConfig::HTTPLanes &lanes,
                                    std::unique_lock<std::mutex> &lock);
 
