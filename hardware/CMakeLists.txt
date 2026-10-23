@@ -91,3 +91,34 @@ load_apps (
 )
 
 create_hw()
+
+# Decoder floorplan. With four decoders the placer's own SLR split leaves more logic in SLR1 than its
+# routing can carry, so whole decoders are pinned to SLRs by pblocks (constraints/, one file per
+# configuration). Coyote's flow reads no user implementation constraints, so the hook is a line added
+# to this build directory's generated pnr_shell.tcl: it sources decoder_pblocks.tcl on the opened
+# design right after opt_design, before place_design. Directives and every other step are Coyote's.
+option(ENABLE_DECODER_PBLOCKS "Pin the HTTP decoders to SLRs (hardware/constraints, 4 decoders)" ON)
+if(ENABLE_HTTP AND ENABLE_DECODER_PBLOCKS AND N_DECODERS EQUAL 4)
+    if(ENABLE_HTTP_TOE_BUFFER)
+        set(OASIS_PBLOCK_XDC ${CMAKE_CURRENT_SOURCE_DIR}/constraints/decoder_pblocks_toe_buffer.xdc)
+    else()
+        set(OASIS_PBLOCK_XDC ${CMAKE_CURRENT_SOURCE_DIR}/constraints/decoder_pblocks_bypass.xdc)
+    endif()
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/constraints/decoder_pblocks.tcl.in
+                   ${CMAKE_BINARY_DIR}/decoder_pblocks.tcl @ONLY)
+    file(READ ${CMAKE_BINARY_DIR}/pnr_shell.tcl OASIS_PNR)
+    set(OASIS_PNR_AT "write_checkpoint -force \"$dcp_dir/shell_opted.dcp\"\n")
+    set(OASIS_PNR_HOOK "source \"${CMAKE_BINARY_DIR}/decoder_pblocks.tcl\"\n")
+    string(FIND "${OASIS_PNR}" "${OASIS_PNR_AT}" OASIS_PNR_POS)
+    if(OASIS_PNR_POS EQUAL -1)
+        message(FATAL_ERROR "decoder pblocks: pnr_shell.tcl has no line `write_checkpoint ... shell_opted.dcp` to hook after")
+    endif()
+    string(FIND "${OASIS_PNR}" "${OASIS_PNR_HOOK}" OASIS_PNR_HOOKED)
+    if(OASIS_PNR_HOOKED EQUAL -1)
+        string(REPLACE "${OASIS_PNR_AT}" "${OASIS_PNR_AT}${OASIS_PNR_HOOK}" OASIS_PNR "${OASIS_PNR}")
+        file(WRITE ${CMAKE_BINARY_DIR}/pnr_shell.tcl "${OASIS_PNR}")
+    endif()
+    message(STATUS "Decoder pblocks: ${OASIS_PBLOCK_XDC}")
+elseif(ENABLE_HTTP)
+    message(STATUS "Decoder pblocks: none (${N_DECODERS} decoders; the floorplans are for 4)")
+endif()
