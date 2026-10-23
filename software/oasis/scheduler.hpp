@@ -196,9 +196,8 @@ class Scheduler {
     std::thread             dispatcher_;
 
     // ---------------------------------------------------------------------------------------------
-    // No-progress watchdog (see watchdog_loop). On by default on a CSR revision-6 (TOE ring)
-    // bitstream, and on any other only when OASIS_STALL_DUMP_S is set, so revision-2 runs are
-    // untouched unless asked.
+    // No-progress watchdog (see watchdog_loop). On every HTTP bitstream; its state dump is on by
+    // default only on revision 6 and otherwise needs OASIS_STALL_DUMP_S.
     // ---------------------------------------------------------------------------------------------
     bool                    watchdog_on_ = false;
     double                  stall_dump_s_ = 30.0; // 0 = kick only, never dump
@@ -234,8 +233,7 @@ class Scheduler {
     [[nodiscard]] bool any_stream_in_service() const;
 
     // One dispatch iteration's view of the hardware's per-lane admission windows: two CSR reads, or
-    // nothing when placement is not lane-aware (and then it reads nothing at all) or the read
-    // failed. MUST be called with no scheduler lock held: holding dispatch_mutex_ across a hardware
+    // nothing without HTTP (and then it reads nothing at all) or when the read failed. MUST be called with no scheduler lock held: holding dispatch_mutex_ across a hardware
     // read would block every submitter and every completion callback for the duration.
     std::optional<HTTPReadConfig::HTTPLanes> sample_lanes();
 

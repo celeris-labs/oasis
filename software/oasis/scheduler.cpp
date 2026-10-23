@@ -124,14 +124,17 @@ Scheduler::Scheduler(OasisContext &ctx)
 
     dispatcher_ = std::thread([this] { dispatch_loop(); });
 
-    // The no-progress watchdog. On by default on the TOE-ring bitstream (CSR revision 6): its GET
-    // credit makes the dispatcher wait on responses (see emit_one_get_per_arm), so a stalled lane
-    // shows up as "no progress" here first, and the dump plus the dispatcher wake below are the
-    // in-process view. Elsewhere only on request.
-    const char *env = std::getenv("OASIS_STALL_DUMP_S");
-    watchdog_on_    = (http_ && http_->toe_ring()) || (env != nullptr && *env != '\0');
-    if (env != nullptr && *env != '\0') {
+    // The no-progress watchdog: on every HTTP bitstream, so a lane that goes fatal with nothing
+    // queued is still reported and SIGINT reaches a blocked scan. The state dump is on by default
+    // only on revision 6, whose GET credit makes a stalled lane show up here first; it reads every
+    // decoder's profile, which stops the profiler, so elsewhere only OASIS_STALL_DUMP_S turns it on.
+    const char *env      = std::getenv("OASIS_STALL_DUMP_S");
+    const bool  dump_set = env != nullptr && *env != '\0';
+    watchdog_on_         = http_ != nullptr || dump_set;
+    if (dump_set) {
         stall_dump_s_ = std::max(0.0, std::atof(env));
+    } else if (!(http_ && http_->toe_ring())) {
+        stall_dump_s_ = 0.0;
     }
     if (watchdog_on_) {
         note_progress();
@@ -158,9 +161,8 @@ void Scheduler::note_progress() {
 //    card may still DMA into -- is owned by this Scheduler's in-flight list, which the unwind does
 //    not touch; it is released only by the flow's own completion (or abandoned, never freed, by
 //    ~Scheduler after kDrainTimeout).
-// 2. On the TOE-ring bitstream, WAKE the dispatcher, so fail_flows_on_fatal_lanes() also runs while
-//    the queue is empty. It used to run only when the dispatcher iterated, and an empty queue parks it
-//    indefinitely -- so a lane that went fatal with the last flows of a query on it hung silently.
+// 2. WAKE the dispatcher, so fail_flows_on_fatal_lanes() also runs while the queue is empty, which
+//    otherwise parks it indefinitely.
 // 3. DUMP, once per stall, the full state when flows are outstanding and nothing has retired or
 //    been dispatched for stall_dump_s_ seconds: to stderr, and to $OASIS_DUMP_DIR/ if set.
 void Scheduler::watchdog_loop() {
@@ -201,7 +203,7 @@ void Scheduler::watchdog_loop() {
         } catch (...) { // a consumer callback must never take this thread down
         }
         channels.clear();
-        if (http_ && http_->toe_ring()) {
+        if (http_) {
             dispatch_cv_.notify_one();
         }
 
@@ -470,8 +472,8 @@ bool Scheduler::any_stream_in_service() const {
 // instead means the flow is placed and the SAME hardware fault is met by await_lane_credit inside
 // dispatch_to, where dispatch_loop already routes exceptions to the query that asked.
 std::optional<HTTPReadConfig::HTTPLanes> Scheduler::sample_lanes() {
-    if (!lane_aware_) {
-        return std::nullopt; // one lane, or no HTTP at all: read nothing, decide by host load
+    if (!http_) {
+        return std::nullopt;
     }
     try {
         return http_->lanes();
@@ -822,9 +824,10 @@ void Scheduler::dispatch_loop() {
         // (sleep until a completion says otherwise). Only the lane-aware path can set it.
         bool lane_bound_wait = false;
         if (!queue_.empty()) {
-            stream = lanes ? pick_lane_stream(*lanes, pending_lane_entries(queue_.front()),
-                                              lane_bound_wait)
-                           : pick_stream();
+            stream = (lanes && lane_aware_)
+                         ? pick_lane_stream(*lanes, pending_lane_entries(queue_.front()),
+                                            lane_bound_wait)
+                         : pick_stream();
         }
 
         // Park until there is a queued flow *and* a stream with a free slot, or until shutdown.
