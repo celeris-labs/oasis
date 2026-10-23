@@ -7,7 +7,6 @@
 #include "oasis_settings.hpp"
 #include "oasis_log_sink.hpp"
 #include "http_file_system.hpp"
-#include "oasis_http_debug.hpp"
 #include "rdma_file_system.hpp"
 #include "duckdb.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -71,7 +70,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Print HTTP FPGA FSM status to stderr during httpfpga:// reads", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(false), SetHttpFpgaDebug);
 
-	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<OasisHTTPFileSystem>(instance));
+	FileSystem::GetFileSystem(instance).RegisterSubSystem(make_uniq<OasisHTTPFileSystem>());
 
 	// Get the OasisContext to establish the connection to the FPGA.
 	Connection conn(instance);

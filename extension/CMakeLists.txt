@@ -60,7 +60,7 @@ endif()
 # Extension
 # ---------------------------------------------------------------------------
 set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/oasis_profile.cpp
-                      src/rdma_file_system.cpp src/http_file_system.cpp src/oasis_http_debug.cpp
+                      src/rdma_file_system.cpp src/http_file_system.cpp
                       src/filter_pushdown.cpp src/parcore_metadata_util.cpp src/oasis_settings.cpp
                       src/coalesced_fetcher.cpp)
 

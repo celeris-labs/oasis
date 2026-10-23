@@ -1,5 +1,6 @@
 #pragma once
 
+#include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 
 #include <cstdint>
@@ -9,9 +10,12 @@
 
 namespace duckdb {
 
-class DatabaseInstance;
-class OasisHTTPFileHandle; // defined below; ReadBuffered takes it by reference
 class FileOpener;
+class OasisHTTPFileHandle;
+
+// The httpfpga_debug setting. Turns on the host-socket trace of this file system and liboasis's
+// FPGA request trace (oasis::set_http_debug).
+void SetHttpFpgaDebug(ClientContext &context, SetScope scope, Value &parameter);
 
 // A reply read off a host socket. `raw` owns the bytes; the rest index into it.
 struct HttpReply {
@@ -22,16 +26,14 @@ struct HttpReply {
 	bool partial = false; // 206 Partial Content rather than 200 OK
 };
 
-// NAMED WITH THE PREFIX ON PURPOSE. DuckDB's own httpfs extension declares duckdb::HTTPFileSystem
-// and duckdb::HTTPFileHandle, and scripts/tpch_demo.sh now links httpfs into the same binary to use
-// it as the CPU baseline. Sharing the unqualified names produced a wall of "multiple definition of
-// duckdb::HTTPFileSystem::Read" at link time. Anything added here that mirrors a stock httpfs type
-// needs the prefix too.
+// httpfpga:// objects on the server named by the http_server / http_port settings. read_oasis has the
+// FPGA fetch column chunks itself (HTTPBatchSourceOperator); every raw byte read through this file
+// system (the Parquet footer, the CPU-decoded columns) goes over an ordinary host socket.
+//
+// Prefixed because DuckDB's httpfs declares HTTPFileSystem and HTTPFileHandle in the same namespace,
+// and tpch_demo.sh's CPU baseline links both into one binary.
 class OasisHTTPFileSystem : public FileSystem {
 public:
-	explicit OasisHTTPFileSystem(DatabaseInstance &db);
-	~OasisHTTPFileSystem() override;
-
 	static constexpr const char *URL_PREFIX = "httpfpga://";
 
 	std::string GetName() const override {
@@ -59,72 +61,52 @@ public:
 
 private:
 	void EnsureInitialized(optional_ptr<FileOpener> opener);
-	void HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst);
 	void ReadBuffered(OasisHTTPFileHandle &h, void *dst, size_t size, uint64_t location);
-	// Fetch the range over an ordinary host socket. Every raw httpfpga:// byte read goes this way;
-	// column chunks reach the decoder through read_oasis instead.
-	void HTTPReadRangeCpu(const string &path, uint64_t offset, size_t size, void *dst);
+	// One ranged GET over a host socket into `dst`.
+	void HTTPReadRange(const string &path, uint64_t offset, size_t size, void *dst);
+	// The object's Content-Length, from at most one HEAD per path for the session.
+	uint64_t CachedContentLength(const string &resource_path);
 	uint64_t ProbeContentLength(const string &resource_path);
-	// Connect to the configured server, send `request`, read the full response until the peer
-	// closes. Returns false on any socket error.
-	bool HttpSocketRequest(const std::string &request, std::string &response);
-	// HttpSocketRequest plus response parsing. Throws on a transport error, a malformed reply, or a
-	// status other than 200/206; `what` names the operation in those messages.
+	// Sends `request` on a new connection and reads the reply until the server closes it. Throws on a
+	// socket error, a malformed reply or a status other than 200/206; `what` names the request.
 	HttpReply HttpExchange(const string &request, const char *what, const string &resource);
 
-	DatabaseInstance &instance;
 	std::mutex init_mtx;
 	bool initialized = false;
-
 	std::string server_host_;
 	uint32_t server_ip_ = 0;
 	uint16_t server_port_ = 0;
 
-	// Content-Length cache, keyed by resource path. DuckDB opens the same object several times per
-	// query (bind, glob, per-worker reader init), and GetFileSize probes with a HEAD whenever the
-	// handle reports 0. Caching on the handle meant every reopen paid another round trip -- about
-	// six HEADs for one scan. Keyed on the path here instead, so it is one per object per session.
-	// Objects are assumed immutable for the session's lifetime, which is already assumed elsewhere:
-	// the Parquet footer is read once at bind and reused for every row group.
+	// DuckDB opens an object several times per query (bind, glob, each worker's reader), so the size
+	// is cached per path. Objects are assumed immutable for the session.
 	std::mutex size_cache_mtx_;
 	std::unordered_map<std::string, uint64_t> size_cache_;
-
-	uint64_t CachedContentLength(const string &resource_path);
 };
 
-// `path` is the resource path only ("/bucket/object.parquet"), already normalized — that is exactly
-// what the GET line needs, so read_oasis can hand it to HTTPBatchSourceOperator unchanged.
-//
-// server_ip / server_port are snapshotted at open time rather than read from the filesystem on
-// demand: read_oasis builds its source operators on DuckDB worker threads, and the settings behind
-// those fields are only resolved under the filesystem's init lock.
+// `path` is the resource path ("/bucket/object.parquet"), which is what a GET line takes, so read_oasis
+// hands it to HTTPBatchSourceOperator unchanged. server_ip and server_port are taken at open time:
+// read_oasis builds its source operators on worker threads.
 class OasisHTTPFileHandle : public FileHandle {
 public:
-	OasisHTTPFileHandle(FileSystem &fs, string path, FileOpenFlags flags, uint64_t file_size, uint32_t server_ip,
-	               uint16_t server_port)
-	    : FileHandle(fs, std::move(path), flags), cursor(0), known_file_size(file_size), server_ip(server_ip),
-	      server_port(server_port) {
+	OasisHTTPFileHandle(FileSystem &fs, string path, FileOpenFlags flags, uint32_t server_ip, uint16_t server_port)
+	    : FileHandle(fs, std::move(path), flags), server_ip(server_ip), server_port(server_port) {
 	}
 
 	void Close() override {
 	}
 
-	uint64_t cursor;
-	uint64_t known_file_size;
+	uint64_t cursor = 0;
+	uint64_t known_file_size = 0; // 0 until GetFileSize probed it
 	uint32_t server_ip;
 	uint16_t server_port;
 
-	// Read-ahead cache. DuckDB's ColumnReader walks a Parquet file in very small steps -- a page
-	// header is ~256 bytes -- and without a buffer every one of those became its own HTTP request
-	// AND its own TCP connection (HTTPReadRangeCpu sends Connection: close). Observed on the wire:
-	// a full SYN / SYN-ACK / GET / 206 / FIN / FIN-ACK exchange to move 256 bytes, repeated for
-	// every page of every BYTE_ARRAY column. DuckDB's own HTTPFileHandle buffers for this reason.
-	//
-	// Reads larger than the buffer bypass it entirely and stream straight into the caller.
-	static constexpr uint64_t READ_BUFFER_LEN = 1ULL << 20; // 1 MiB
+	// Read-ahead buffer. DuckDB's ColumnReader walks a Parquet file in small steps (a page header is
+	// about 256 bytes); without it every one of them would be its own GET and TCP connection. Reads
+	// of at least the buffer size bypass it.
+	static constexpr uint64_t READ_BUFFER_LEN = 1ULL << 20;
 	duckdb::unique_ptr<data_t[]> read_buffer;
 	uint64_t buffer_start = 0;
-	uint64_t buffer_end = 0; // exclusive; buffer_end == buffer_start means empty
+	uint64_t buffer_end = 0; // exclusive; equal to buffer_start when empty
 };
 
 } // namespace duckdb
