@@ -17,23 +17,25 @@ import http_types::*;
 //     bus, ready to be sampled when the START write arrives.
 //   * Emits one ready/valid beat carrying the entire http_config_t struct
 //     when the host writes the START register (ConfigWriteReadyRegister).
-//   * Exposes a small ConfigReadRegisterFile so the host can poll status
-//     (CLIENT_STATE, TOTAL_WORD) and identify the config (HTTP_CONFIG_ID).
+//   * Exposes a read register file so the host can poll status and identify
+//     the config (HTTP_CONFIG_ID).
 //
-// Register map (write side, addressed within this config's AXI-Lite space):
+// Register map (write side, addressed within this config's AXI-Lite space). The host writes
+// SERVER_IP, SERVER_PORT, REQ_TOTAL_BYTES, REQ_CHUNK_BYTES and START; it builds the request text
+// itself, so 2..38 are latched and echoed (read registers 3..9) but no handler reads them.
 //   0  SERVER_IP        ([31:0])     -- TCP connect target, BE in low bytes
 //   1  SERVER_PORT      ([31:0])     -- TCP port (uses [15:0])
-//   2  PORT_HEX         ([31:0])     -- ASCII bytes of port (for HTTP Host:)
+//   2  PORT_HEX         ([31:0])     -- ASCII bytes of port
 //   3  IP_HEX_LEN       ([7:0])      -- Length of ASCII IP string
 //   4  IP_HEX_W0..7     ([31:0])     -- ASCII IP bytes packed little endian
 //   5  IP_HEX_W1
 //   6  IP_HEX_W2
 //   7  IP_HEX_W3
-//   8  FILE_LEN         ([31:0])     -- Length of GET path
+//   8  FILE_LEN         ([31:0])     -- Length of a GET path
 //   9  FILE_W0          ([31:0])     -- Path bytes packed little endian
 //   .. FILE_W1..W14                     (9 + n for word n)
 //   24 FILE_W15
-//   25 REQ_FLAGS        ([15:0])     -- bit 0: this response ends the decoder stream
+//   25 REQ_FLAGS        ([15:0])
 //   26 PKG_WORD_COUNT   ([31:0])
 //   27 USER_FREQUENCY   ([31:0])
 //   28 TIME_IN_SECONDS  ([31:0])
@@ -48,61 +50,73 @@ import http_types::*;
 //   37 RANGE_END_W2     ([31:0])
 //   38 RANGE_END_W3     ([31:0])
 //   39 START            (ConfigWriteReadyRegister)  -- value ignored, write triggers
-//   41 REQ_CHUNK_BYTES  ([31:0])     -- bytes in ONE decoder stream (a column chunk). Queued ahead
-//                                       of the data; axis_rewrite_last counts them down and marks
-//                                       tlast. One per COLUMN CHUNK, not per request.
-//   40 REQ_TOTAL_BYTES  ([31:0])     -- bytes of pre-built request text about to be streamed in
-//                                       over axis_host_recv. NON-ZERO selects the streamed request
-//                                       path and every per-request field above is ignored. Sits
-//                                       ABOVE START because 0..38 was full and moving START would
-//                                       shift the whole map; write it BEFORE START, which snapshots
-//                                       the live cfg.
+//   41 REQ_CHUNK_BYTES  ([31:0] bytes, [35:32] lane) -- bytes in ONE decoder stream (a column
+//                                       chunk) and the lane it is for. Queued ahead of the data;
+//                                       axis_rewrite_last counts them down and marks tlast. One per
+//                                       COLUMN CHUNK, not per request.
+//   40 REQ_TOTAL_BYTES  ([31:0])     -- 0: the START beat is a chunk-length ENTRY for the lane in
+//                                       REQ_CHUNK_BYTES[35:32]. Non-zero: the beat ARMS that lane,
+//                                       and this many bytes of request text follow on its host
+//                                       stream.
+//                                       Sits ABOVE START because 0..38 was full and moving START
+//                                       would shift the whole map; write it BEFORE START, which
+//                                       snapshots the live cfg.
 //
-// The 16 FILE_W words carry a 64-character GET path. Widening from 8 words pushed the map past
-// 32 registers, so HTTP_CONFIG_ADDR_SPACE in vfpga_top.svh is 64 and every address after FILE_W7
-// shifted by +8. software/oasis/configuration.cpp mirrors this map exactly -- if the two ever
-// disagree, every parameter after the path lands in the wrong register and the FPGA builds a
-// garbage request out of whatever happened to be there.
+// The 16 FILE_W words put the map past 32 registers, so HTTP_CONFIG_ADDR_SPACE in vfpga_top.svh
+// is 64. software/oasis/configuration.cpp mirrors these addresses.
 //
-// Register map (read side):
-//   0  HTTP_CONFIG_ID
-//   1  CLIENT_STATE     ([3:0])      -- the handler's state_debug (aliased; prefer STATUS)
-//   2  STATUS           ([31:0])     -- packed FSM status, see the handler's totalWord
-//   3  ECHO_FILE_LEN    ([31:0])
-//   4  ECHO_FILE_W0     ([31:0])     -- path chars 0..3
-//   5  ECHO_FILE_W4     ([31:0])     -- path chars 16..19
-//   9  ECHO_FILE_W8     ([31:0])     -- path chars 32..35 (only meaningful for long paths)
+// Register map (read side). Revision 2 is handler_multi, revision 6 handler_toe (INFLIGHT[31:24]);
+// a field without a revision note means the same in both. Bits not listed read 0.
+//   0  HTTP_CONFIG_ID   "HTT"
+//   1  CLIENT_STATE     ([3:0])      -- lane 0's tcp_read state (also STATUS[11:8])
+//   2  STATUS           ([31:0])     -- the handler's totalWord: [7:4] tcp_init state, [11:8] lane
+//                                       0's tcp_read state, [18] every lane connected, [20] some
+//                                       lane fatal, [21] some TX reservation refused, [22] busy,
+//                                       [23] as STALL[24]
+//   3  ECHO_FILE_LEN    ([31:0])     -- registers 3..9 echo write registers the host does not
+//   4  ECHO_FILE_W0     ([31:0])        write, so they read 0
+//   5  ECHO_FILE_W4     ([31:0])
 //   6  ECHO_RANGE_BEGIN ([39:32] len, [31:0] first 4 ASCII digits)
 //   7  ECHO_RANGE_END   ([39:32] len, [31:0] first 4 ASCII digits)
 //   8  ECHO_SERVER      ([47:32] port, [31:0] ip)
-//   10 INFLIGHT         ([7:0] slots occupied, [15:8] NUM_SLOTS, [16] announcement pending,
-//                        [17] peer FINed, [18] connection up) -- see the handler's inflightWord
-//   11 STALL            ([0] connect stalled, [1] send stalled, [2] read stalled, [3] init error,
-//                        [4] send error, [5] response had no Content-Length, [6] fatal dirty abort,
-//                        [7] status not 200/206, [15:8] reconnects, [23:16] read slot,
-//                        [24] announcement queue overflow)
-//   12 RESP             ([23:0] status digits ASCII, [24] status ok, [25] unframeable response,
-//                        [26] body bytes already emitted for the current response)
-//   13 BODY_REMAINING   ([31:0]) -- bytes of the current body still to stream; a read that is stuck
-//                        with this non-zero is waiting on the network, not on the decoder
-//   14 CONTENT_LENGTH   ([31:0]) -- Content-Length the server sent for the last response, LATCHED.
-//   15 QUEUE_DEPTH      ([31:0]) -- entries the response queue holds. 0 on bitstreams predating it.
-//                        The host knows what it asked for; this is what arrived. The two differing
-//                        is the difference between a slow network and a server answering a
-//                        different question (a 200 instead of a 206, a range clamped at EOF, an
-//                        error document). BODY_REMAINING alone cannot say this -- it counts down
-//                        to zero and is meaningless once the response is over.
+//   9  ECHO_FILE_W8     ([31:0])
+//   10 INFLIGHT         ([7:0] the most chunk entries any lane has queued, saturating,
+//                        [15:8] QUEUE_DEPTH, saturating,
+//                        [16] rev 2: some lane has an announcement queued in rx_dispatch;
+//                             rev 6: some lane has notified bytes it has not asked for yet,
+//                        [17] rev 2: some lane's peer FINed; rev 6: some lane's FIN has settled,
+//                        [18] every lane connected, [19] req_ready for the lane the beat names,
+//                        [23:20] lane count, [31:24] CSR revision) -- the handler's inflightWord
+//   11 STALL            (sticky, OR over the lanes: [0] an open was not answered within the connect
+//                        watchdog, [3] an open was refused, [4] a TX reservation was refused,
+//                        [5] a response could not be framed (no Content-Length), [6] some lane is
+//                        fatal, [7] a status read as neither 200 nor 206, [15:8] reconnects,
+//                        saturating,
+//                        [24] rev 2: rx_dispatch dropped an announcement (never: the interface is
+//                             held instead); rev 6: the TOE broke its contract (order, length) or a
+//                             lane's ring passed the window budget,
+//                        [25] a lane's decoupling fifo refused a routed beat, which is lost,
+//                        [26] a read watchdog expired, [27] body bytes arrived with no chunk length
+//                        queued, [28] the dispatcher routed a beat its lane refused, which is lost)
+//   12 RESP             ([23:0] lane 0's status digits ASCII, [24] every lane's status is 200/206,
+//                        [25] some lane's response could not be framed, [26] some lane is aborting
+//                        with body bytes of the response already emitted)
+//   13 BODY_REMAINING   ([31:0]) -- lane 0: bytes of the current body still to stream; a read that
+//                        is stuck with this non-zero is waiting on the network, not on the decoder
+//   14 CONTENT_LENGTH   ([31:0]) -- lane 0: the Content-Length the server sent for the last
+//                        response, LATCHED. The host knows what it asked for; this is what arrived.
+//                        The two differing is the difference between a slow network and a server
+//                        answering a different question (a 200 instead of a 206, a range clamped at
+//                        EOF, an error document). BODY_REMAINING alone cannot say this -- it counts
+//                        down to zero and is meaningless once the response is over.
+//   15 QUEUE_DEPTH      ([31:0]) -- chunk entries per lane, untruncated (INFLIGHT[15:8] saturates)
 //
-// Registers 16..20 are CSR REVISION 2 and did not exist before it. Read INFLIGHT[31:24] first: it
-// reads 2 here and 0 on every earlier bitstream, and reading 16..20 on one of those comes back as
-// resp_error, not as zeros. Registers 0..15 and the ENTIRE WRITE MAP are unchanged -- a library
-// that knows nothing about revision 2 keeps working, and a host that knows about it keeps working
-// against a revision-1 bitstream by not reading these.
+// The host reads INFLIGHT[31:24] first and refuses a revision it does not know. The read register
+// file answers an address above 20 with resp_error, not with a plausible zero.
 //
-// Everything below is indexed by LANE at a fixed stride of 8 lanes, whatever NUM_CONNS the
+// Registers 16..20 are indexed by LANE at a fixed stride of 8 lanes, whatever NUM_CONNS the
 // bitstream was built with. Lanes that do not exist read 0; INFLIGHT[23:20] says how many are real.
-// Widths are 64 bits -- the AXI-Lite data path is AXIL_DATA_BITS = 64 and registers 6/7/8 above
-// already carry fields above bit 31 that the host decodes today.
+// Widths are 64 bits (AXIL_DATA_BITS).
 //
 //   16 LANE_OCC        -- chunk entries QUEUED AND NOT YET RETIRED, one byte per lane, saturating
 //                         at 255. Lane L at [8L+7:8L]. Retired means a tlast completed the chunk's
@@ -111,6 +125,7 @@ import http_types::*;
 //   17 LANE_READY      -- the ADMISSION WINDOW, one nibble per lane at [4L+3:4L]:
 //                           [4L+0] ARM_READY   the lane will accept an ARM beat (req_total_bytes
 //                                              != 0) -- its previous request text has gone out
+//                                              (rev 6: and it has GET credit left)
 //                           [4L+1] ENTRY_READY the lane will accept a chunk ENTRY beat
 //                                              (req_total_bytes == 0) -- its queue has room
 //                           [4L+2] CONN_UP     the lane holds an established TCP session
@@ -129,45 +144,54 @@ import http_types::*;
 //                         reconnect does not clear them, which is the point -- the conditions that
 //                         matter are transient at the hardware and long gone by the time anyone
 //                         polls:
-//                           [8L+0] LANE_DEAD      rx_dispatch's head-of-line watchdog declared this
-//                                                 lane dead and started discarding its packets.
-//                                                 THE ONE THAT CANNOT BE INFERRED: the handler
-//                                                 tears the session down in response, which clears
-//                                                 rx_dispatch's own dead bit, so without this a
-//                                                 HOL kill and an unreplayable read failure look
-//                                                 identical. Bytes were dropped out of the MIDDLE
-//                                                 of a response -- the whole batch must be reissued
+//                           [8L+0] LANE_DEAD      rev 2: rx_dispatch's head-of-line watchdog
+//                                                 declared this lane dead and started discarding
+//                                                 its packets. THE ONE THAT CANNOT BE INFERRED:
+//                                                 the handler tears the session down in response,
+//                                                 which clears rx_dispatch's own dead bit, so
+//                                                 without this a HOL kill and an unreplayable read
+//                                                 failure look identical. Bytes were dropped out
+//                                                 of the MIDDLE of a response -- the whole batch
+//                                                 must be reissued. Rev 6: reads 0 (no watchdog).
 //                           [8L+1] DIRTY          the read aborted after body bytes had already
 //                                                 reached the decoder, so a replay would duplicate
-//                           [8L+2] INIT_ERR       a connect attempt for this lane failed
-//                           [8L+3] RESP_ERR       a response could not be framed (no Content-Length)
+//                           [8L+2] INIT_ERR       an open for this lane was refused; with FATAL it
+//                                                 was the open of a reconnect
+//                           [8L+3] RESP_ERR       a response could not be framed (no
+//                                                 Content-Length)
 //                           [8L+4] STATUS_BAD     a response retired with a status read as neither
 //                                                 200 nor 206
 //                           [8L+5] TX_REFUSED     the TOE refused at least one transmit reservation
 //                                                 (informational; it is re-announced)
 //                           [8L+6] READ_TIMEOUT   the read watchdog expired -- nothing arrived, as
 //                                                 opposed to the server saying no
-//                           [8L+7] RX_FIFO_STALL  this lane's decoupling fifo back-pressured the
-//                                                 TCP stack, i.e. the decoder could not keep up
-//                         FATAL lives in 17, not here. fatal AND lane_dead is a HOL kill; fatal and
-//                         not lane_dead is a read that could not be replayed, and the other bits
-//                         say which.
+//                           [8L+7] RX_FIFO_STALL  this lane's decoupling fifo refused a beat routed
+//                                                 to it, and the beat was lost: the stream is
+//                                                 corrupt. Should never fire; see the reservation
+//                                                 in tcp_read.sv
+//                         FATAL lives in 17, not here. On rev 2, fatal AND lane_dead is a HOL kill;
+//                         fatal and not lane_dead is a read that could not be replayed or a refused
+//                         reconnect, and the other bits say which.
 //   20 LANE_POLICY     -- fixed at elaboration, for the host to sanity-check itself against:
-//                           [7:0]   CSR revision (2 -- same value as INFLIGHT[31:24])
+//                           [7:0]   CSR revision (same value as INFLIGHT[31:24])
 //                           [15:8]  NUM_CONNS
 //                           [31:16] QUEUE_DEPTH, chunk entries PER LANE, saturating at 65535
+//                           rev 2:
 //                           [55:32] LANE_STALL_CYCLES, the HOL watchdog threshold in cycles,
-//                                   saturating at 2^24-1
+//                                   saturating at 2^24-1 -- a software watchdog shorter than it
+//                                   declares a lane dead that the hardware is still waiting on
 //                           [61:56] log2 of it, exact even where the 24-bit field saturates
+//                           rev 6:
+//                           [55:32] GET_CREDIT, GETs (arms) per lane whose responses may be
+//                                   unfinished
+//                           [61:56] RING_LOG2, the TOE's receive ring per session (20 = 1 MiB),
+//                                   which the host's window budget is computed from
 //                           [63:62] zero
-//                         A software watchdog shorter than LANE_STALL_CYCLES declares a lane dead
-//                         that the hardware is still waiting on; that is what this exists to stop.
 //
-// INFLIGHT is not optional bookkeeping. ConfigWriteReadyRegister does NOT back-pressure: a START
-// write that lands while the previous one is still unconsumed overwrites it, and the earlier request
-// is lost without a trace. With the handler pipelined over several slots the host can legitimately
-// have requests outstanding, so it needs to know how many before pushing another. The host reads
-// this register and treats (NUM_SLOTS - occupied) as its credit.
+// The admission bits are not optional bookkeeping. ConfigWriteReadyRegister does NOT back-pressure:
+// a START write that lands while the previous one is still unconsumed overwrites it, and the
+// earlier beat is lost without a trace. So the host polls LANE_READY for the lane a beat names
+// before it writes START, and LANE_OCC against QUEUE_DEPTH is its chunk credit.
 //
 // =================================================================================================
 module HttpConfig #(
@@ -200,7 +224,7 @@ module HttpConfig #(
     input  logic [31:0] content_length_word,
     input  logic [31:0] body_remaining_word,
 
-    // Per-lane readback, CSR revision 2. See the read map above for the field tables.
+    // Per-lane readback, read registers 16..20. See the read map above for the field tables.
     input  logic [63:0] lane_occ_word,
     input  logic [63:0] lane_ready_word,
     input  logic [63:0] lane_state_word,
@@ -215,14 +239,13 @@ localparam logic [AXIL_DATA_BITS - 1:0] HTTP_CONFIG_ID = 64'h0000_0000_0048_5454
 // The map below is hardcoded in the ConfigWriteRegister instantiations, so these parameters cannot
 // move it -- they only place START and size the address space. An instantiation that leaves them at
 // a stale value drops START on top of a parameter register, and a write to that parameter then fires
-// the request mid-configuration: every register after it keeps its previous value while the read-side
-// echo, which reads the LIVE cfg rather than the snapshot the handler took, still shows the correct
-// values. build-88 shipped exactly that (START_ADDR=31, i.e. RANGE_BEGIN_W1). Catch it at elaboration
-// rather than on the wire.
-// Parameters occupy 0..38 and 40. START sits at 39, in the gap between them, because 0..38 was
+// the request mid-configuration: every register after it keeps its previous value while the
+// read-side echo, which reads the LIVE cfg rather than the snapshot the handler took, still shows
+// the correct values. Catch it at elaboration rather than on the wire.
+// Parameters occupy 0..38, 40 and 41. START sits at 39, in the gap between them, because 0..38 was
 // already full and moving START would shift every address after it -- exactly the failure described
-// above. The guard therefore can no longer be "START is above every parameter"; what actually has to
-// hold is that START ALIASES no parameter, and that the address space covers the highest one.
+// above. So the guard is not "START is above every parameter": what has to hold is that START
+// ALIASES no parameter, and that the address space covers the highest one.
 localparam int LAST_PARAM_ADDR   = 38;   // highest contiguous parameter, below START
 localparam int STREAM_PARAM_ADDR = 41;   // req_total_bytes at 40, req_chunk_bytes at 41
 `ASSERT_ELAB(START_ADDR > LAST_PARAM_ADDR)
@@ -390,12 +413,9 @@ assign start_raw.ready = start_cfg.ready;
 // -------------------------------------------------------------------------------------------------
 // Read register file: host can poll status here.
 //
-// Registers 3..8 echo back the latched request parameters. The write registers above are
-// write-only, so without these there is no way for the host to tell whether the parameters it
-// wrote actually reached the hardware before START sampled them -- which is exactly the blind spot
-// that made the "request is one run behind" bug so hard to pin down. The echoed fields are the
-// discriminating ones: file_w4 covers path characters 16..19, which is where ".../tpch-1/" and
-// ".../tpch-10/" first differ, and the range words differ immediately between any two reads.
+// Registers 3..9 echo latched write parameters: the write registers are write-only, and an echo is
+// the only way to see what a register holds. The host does not write 2..38, so these read 0; 8
+// echoes the server it does write.
 // -------------------------------------------------------------------------------------------------
 // 21 (0..20). The read register file answers anything above NUM_READ_REGS-1 with resp_error, which
 // is the whole compatibility scheme -- a host that reads a register this bitstream does not have
@@ -413,36 +433,30 @@ assign read_registers[5] = {32'b0, cfg.file_w4};
 assign read_registers[6] = {24'b0, cfg.range_begin_len, cfg.range_begin_w0};
 assign read_registers[7] = {24'b0, cfg.range_end_len,   cfg.range_end_w0};
 assign read_registers[8] = {16'b0, cfg.server_port[15:0], cfg.server_ip};
-// Path chars 32..35. With 64-character paths the two prefixes under test can now agree all the way
-// through file_w4, so w0/w4 alone no longer discriminate between two long paths.
+// Path chars 32..35.
 assign read_registers[9] = {32'b0, cfg.file_w8};
-// Request-ring occupancy. The host's credit before it may push another START. See the map above.
+// Lane occupancy, the lane count and the CSR revision. See the map above.
 assign read_registers[10] = {32'b0, inflight_word};
-// Which stage stalled, so a full ring can be told apart from a dead connect. See the handler.
+// Sticky stall and error causes, OR-folded over the lanes. See the handler.
 assign read_registers[11] = {32'b0, stall_word};
 // HTTP response framing. On a persistent connection the body is delimited by Content-Length rather
 // than by the FIN, so "the response was a 404 whose XML body happened to parse as column data" and
-// "the response could not be framed at all" are now distinguishable from the host. See strip_http.sv.
+// "the response could not be framed at all" are distinguishable from the host. See strip_http.sv.
 assign read_registers[12] = {32'b0, resp_word};
 assign read_registers[13] = {32'b0, body_remaining_word};
 assign read_registers[14] = {32'b0, content_length_word};
-// How many requests may be queued before the transfer is armed. inflightWord's slot/occupancy
-// fields are byte-wide and saturate at 255 -- widening them would have silently broken every host
-// reading an older bitstream -- so the true depth lives here. A host that reads 0 is on a bitstream
-// that predates this register and must fall back to the saturated byte.
+// Chunk entries per lane, untruncated: INFLIGHT's occupancy and depth bytes saturate at 255.
 assign read_registers[15] = {32'b0, queue_depth_word};
 
 // -------------------------------------------------------------------------------------------------
-// CSR revision 2: per-lane visibility.
+// Per-lane visibility.
 //
-// Everything from 10 to 15 folds N lanes into one 32-bit window with OR, which was right when there
-// was one lane and says almost nothing with four: the host learns that SOMETHING failed and then has
-// to guess which lane to reissue. These five are indexed by lane at a fixed stride.
+// Everything from 10 to 15 folds N lanes into one 32-bit window with OR: the host learns that
+// SOMETHING failed, not which lane to reissue. These five are indexed by lane at a fixed stride.
 //
-// They are APPENDED at previously unused addresses, and nothing at 0..15 moved. That, plus the
-// revision byte in INFLIGHT, is the entire compatibility story -- deployed bitstreams and installed
-// libraries disagree about maps whenever a map is edited rather than extended, and that failure is
-// silent in both directions.
+// They sit above 15 and nothing at 0..15 depends on them. Extend the map, never edit it: bitstreams
+// and libraries disagree about a map whenever it is edited, and that failure is silent in both
+// directions. The revision byte in INFLIGHT says which map a bitstream has.
 // -------------------------------------------------------------------------------------------------
 assign read_registers[16] = lane_occ_word;
 assign read_registers[17] = lane_ready_word;
@@ -450,30 +464,29 @@ assign read_registers[18] = lane_state_word;
 assign read_registers[19] = lane_err_word;
 assign read_registers[20] = lane_policy_word;
 
+// The read side shares HTTP_CONFIG_ADDR_SPACE (vfpga_top.svh) with the write side, which is sized
+// for the parameters and START; the read map must not be the larger of the two.
 `ASSERT_ELAB(NUM_READ_REGS <= NUM_PARAM_REGS + 1)
-// The read side shares HTTP_CONFIG_ADDR_SPACE with the write side (vfpga_top.svh), and the read
-// register file answers anything above NUM_READ_REGS-1 with resp_error. Both have to cover 20.
+// Registers 16..20 are 64 bits wide.
 `ASSERT_ELAB(AXIL_DATA_BITS >= 64)
 
 // -------------------------------------------------------------------------------------------------
-// The read register file, IN TWO REGISTERED STAGES (2026-09-26, build-128/133 timing).
+// The read register file, IN TWO REGISTERED STAGES.
 //
-// This used to be libstf's ConfigReadRegisterFile: on the read handshake it compared the address
-// against every register and OR-muxed the 39 64-bit words straight into resp_data, in one cycle.
-// Both ends of that cone were far away: the address is libstf's inst_config.read_addr (a subtract
-// in the read splitter, fanout ~780 into every register file of the design), and the words are
-// combinational status from all over the handler and the decoder lanes. It was build-128's worst
-// path (read_addr -> resp_data, -1.457 ns), and on build-133 strip_http's status compare ran into
-// resp_data across an SLR boundary (-2.00 ns) and read_addr into it at -1.67 ns.
+// libstf's ConfigReadRegisterFile compares the address against every register on the read
+// handshake and OR-muxes the 64-bit words straight into resp_data, in one cycle. Both ends of that
+// cone are far away: the address is libstf's inst_config.read_addr (a subtract in the read
+// splitter, fanning out into every register file of the design), and the words are combinational
+// status from all over the handler and the decoder lanes, across SLR boundaries. It fails timing.
 //
-// Now, with the same protocol towards the splitter (read_ready only while idle, resp_valid held
+// Here, with the same protocol towards the splitter (read_ready only while idle, resp_valid held
 // until resp_ready):
 //   * every word is registered each cycle (read_words_q), so the mux reads flops of this module;
 //   * the handshake cycle h only registers the address decode (rd_match_q);
 //   * cycle h+1 muxes rd_match_q over read_words_q -- which hold the words of cycle h -- into
 //     resp_data/resp_error and raises resp_valid.
-// So a read returns exactly the values the old register file returned (the words and the decode of
-// the handshake cycle), one cycle later. The splitter waits for resp_valid however long it takes
+// So a read returns exactly what ConfigReadRegisterFile would (the words and the decode of the
+// handshake cycle), one cycle later. The splitter waits for resp_valid however long it takes
 // (it matches responses to reads through its own fifo), so the extra cycle is legal on the AXI-Lite
 // side too: rvalid simply comes a cycle later.
 // -------------------------------------------------------------------------------------------------
