@@ -75,6 +75,14 @@ void rev2_decoders() {
     CHECK(!p.toe() && p.revision == 2 && p.num_conns == 4 && p.queue_depth == 64);
     CHECK(p.lane_stall_cycles == 65536 && p.lane_stall_log2 == 16);
 
+    // totalWord as both handlers pack it: {8'd0, rx_err, busy, |tx_refused, |fatal, 1'b0, &conn_up,
+    // 6'd0, lane 0's read state, init state, 4'd0}.
+    const uint32_t total = (1u << 23) | (1u << 20) | (1u << 18) | (5u << 8) | (3u << 4);
+    CHECK(HTTPReadConfig::describe_status(total) ==
+          "init=3 lane0_read=5 all_up=1 any_fatal=1 any_tx_refused=0 busy=0 rx_err=1");
+    CHECK(HTTPReadConfig::describe_status((1u << 21) | (1u << 22)) ==
+          "init=0 lane0_read=0 all_up=0 any_fatal=0 any_tx_refused=1 busy=1 rx_err=0");
+
     // Revision-2 host rules: depth = OASIS_HTTP_LANE_DEPTH clamped to the queue, no GET cap.
     CHECK(HTTPReadConfig::LaneDepthFor(4, 64) == 4);
     CHECK(HTTPReadConfig::LaneDepthFor(100, 64) == 64);

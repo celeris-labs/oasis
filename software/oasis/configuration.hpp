@@ -530,7 +530,7 @@ class HTTPReadConfig : public libstf::Config {
     /// in-process state capture.
     std::string debug_dump();
 
-    /// Renders the packed status word (read id 2) into per-sub-FSM fields.
+    /// Decodes the packed status word (read id 2, totalWord).
     static std::string describe_status(uint32_t status);
 
     static constexpr uint64_t ID = HTTP_READ_CONFIG_ID;

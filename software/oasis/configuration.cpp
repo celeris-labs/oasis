@@ -650,21 +650,14 @@ void HTTPReadConfig::await_arm_taken(uint8_t lane) {
     }
 }
 
-// Mirrors the totalWord layout in hardware/src/hdl/http_read/handler_multi.sv (and handler_toe.sv).
-// The 4-bit client_state CSR multiplexes several sub-FSMs onto one value (2, 6, 9 and 10 each alias
-// two states), so only this packed word can say which stage is actually stuck.
+// Mirrors totalWord in handler_multi.sv and handler_toe.sv; the bits not named here read 0. Bit 23
+// is rxd_overflow on revision 2 and toe_rx's contract or budget error on revision 6.
 std::string HTTPReadConfig::describe_status(uint32_t status) {
-    static const char *handler_states[] = {"IDLE", "CONNECT", "SEND", "READ", "RECONNECT"};
-    const auto top = status & 0xFu;
-
     std::ostringstream oss;
-    oss << "handler=" << (top < 5 ? handler_states[top] : "?") << "(" << top << ")"
-        << " init=" << ((status >> 4) & 0xFu) << " send=" << ((status >> 8) & 0xFu)
-        << " read=" << ((status >> 12) & 0xFu) << " | done i/s/r=" << ((status >> 16) & 1u) << "/"
-        << ((status >> 18) & 1u) << "/" << ((status >> 20) & 1u)
-        << " err i/s/r=" << ((status >> 17) & 1u) << "/" << ((status >> 19) & 1u) << "/"
-        << ((status >> 21) & 1u) << " busy=" << ((status >> 22) & 1u)
-        << " sid=" << ((status >> 24) & 0xFFu);
+    oss << "init=" << ((status >> 4) & 0xFu) << " lane0_read=" << ((status >> 8) & 0xFu)
+        << " all_up=" << ((status >> 18) & 1u) << " any_fatal=" << ((status >> 20) & 1u)
+        << " any_tx_refused=" << ((status >> 21) & 1u) << " busy=" << ((status >> 22) & 1u)
+        << " rx_err=" << ((status >> 23) & 1u);
     return oss.str();
 }
 
