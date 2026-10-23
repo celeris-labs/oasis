@@ -93,11 +93,8 @@ class Scheduler {
         /// Placed on a lane with no credit, because the grace expired. The wait moves to the
         /// hardware, which reports which lane stopped draining.
         bool forced = false;
-        /// Placed on a FATAL lane because every candidate was fatal, to surface the failure now.
-        bool fatal = false;
-        /// The chosen (or best rejected) lane's occupancy and the streams considered, for logging.
-        size_t           occ  = 0;
-        libstf::stream_t span = 0;
+        /// The chosen (or best rejected) lane's occupancy, for logging.
+        size_t occ = 0;
     };
 
     /// The lane-aware placement rule, as a pure function of `in`.
@@ -144,13 +141,6 @@ class Scheduler {
         std::atomic<size_t> enqueued{0};
     };
 
-    /// One dispatch iteration's view of the hardware's per-lane admission windows. Sampled ONCE per
-    /// iteration and with NO scheduler lock held: it costs two CSR reads, and holding
-    /// dispatch_mutex_ across a hardware read would block every submitter and every completion
-    /// callback for the duration. Defined in scheduler.cpp so this header stays clear of the CSR
-    /// layer; `valid` is false whenever the pick must fall back to the host-load-only path.
-    struct LaneSnapshot;
-
     OasisContext                 &ctx_;
     const libstf::stream_t        num_streams_;
     std::atomic<libstf::stream_t> active_streams_;
@@ -172,10 +162,9 @@ class Scheduler {
     /// meter a decode stream against.
     bool lane_aware_ = false;
 
-    /// Lanes the bitstream has, and the chunk entries the host will let ONE of them owe
-    /// (lane_depth_limit(), i.e. OASIS_HTTP_LANE_DEPTH). Both fixed by the bitstream / environment.
-    uint8_t lane_count_ = 0;
-    size_t  lane_depth_ = 1;
+    /// The chunk entries the host will let ONE lane owe (lane_depth_limit(), i.e.
+    /// OASIS_HTTP_LANE_DEPTH). Fixed by the bitstream / environment.
+    size_t lane_depth_ = 1;
 
     /// max_batch_chunks(): the hardware's per-batch ceiling, used to cap how much credit a queued
     /// flow is judged to need (its first sub-batch can be no larger than this).
@@ -191,9 +180,6 @@ class Scheduler {
     /// microsecond-scale wait -- but if it persists, the pipeline has stopped and the host must find
     /// out rather than poll forever. See kLaneStallGrace in scheduler.cpp.
     std::chrono::steady_clock::time_point lane_stall_since_ {};
-
-    /// So the "more active streams than lanes" warning is printed once, not once per iteration.
-    bool lane_span_warned_ = false;
 
     /// Lanes already reported fatal, one bit per lane. A fatal lane is reported ONCE, not once every
     /// kLaneRetry: the bit is what makes the report an edge rather than a 100 us log storm.
@@ -241,9 +227,11 @@ class Scheduler {
     // one-lane bitstream, and as the fallback when a lane sample could not be taken.
     std::optional<libstf::stream_t> pick_stream() const;
 
-    // Two CSR reads into a LaneSnapshot, or an invalid snapshot when placement is not lane-aware
-    // (and then it reads nothing at all). MUST be called with no scheduler lock held.
-    LaneSnapshot sample_lanes();
+    // One dispatch iteration's view of the hardware's per-lane admission windows: two CSR reads, or
+    // nothing when placement is not lane-aware (and then it reads nothing at all) or the read
+    // failed. MUST be called with no scheduler lock held: holding dispatch_mutex_ across a hardware
+    // read would block every submitter and every completion callback for the duration.
+    std::optional<HTTPReadConfig::HTTPLanes> sample_lanes();
 
     // The lane-aware pick: the least-loaded lane that can still owe `needed` more responses, skipping
     // lanes that are full, fatal, or mid-connect. `needed` is the credit the QUEUE HEAD will ask for.
@@ -254,8 +242,8 @@ class Scheduler {
     // response, which signals nothing -- so the caller must poll rather than sleep.
     //
     // Must be called holding dispatch_mutex_; it reads stop_ and advances the rotation cursor.
-    std::optional<libstf::stream_t> pick_lane_stream(const LaneSnapshot &view, size_t needed,
-                                                     bool &lane_bound_wait);
+    std::optional<libstf::stream_t> pick_lane_stream(const HTTPReadConfig::HTTPLanes &lanes,
+                                                     size_t needed, bool &lane_bound_wait);
 
     // Chunk entries the queued flow will reserve on a lane before it can be armed: the column chunks
     // its HTTP source carries, capped at max_batch_chunks_ because that is the largest sub-batch it
@@ -275,7 +263,8 @@ class Scheduler {
     // Called with `lock` (dispatch_mutex_) HELD. It releases and re-acquires it around the CSR reads
     // and the channel callbacks, exactly as the sampling window in dispatch_loop does -- neither
     // belongs under dispatch_mutex_.
-    void fail_flows_on_fatal_lanes(const LaneSnapshot &view, std::unique_lock<std::mutex> &lock);
+    void fail_flows_on_fatal_lanes(const HTTPReadConfig::HTTPLanes &lanes,
+                                   std::unique_lock<std::mutex> &lock);
 
     // Splices in-flight slots whose callback has run into `finished` (without destroying them, so
     // the caller can destroy them outside the locks -- ~OutputHandle join()s the callback thread).

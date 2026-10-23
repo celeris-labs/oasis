@@ -93,16 +93,6 @@ size_t default_pipeline_depth(OasisContext &ctx) {
 
 } // namespace
 
-// The per-lane view the dispatch loop works from. It is a value, not a handle: both admission bits
-// are monotone in the host's favour (only a config beat the host itself writes can clear either), so
-// a sample stays true until this thread acts on it, and the pick needs no lock and no re-read.
-struct Scheduler::LaneSnapshot {
-    /// False without HTTP, on a one-lane bitstream, and on a sample that could not be taken. The pick
-    /// then falls back to pick_stream(), i.e. to placement by host load alone.
-    bool                      valid = false;
-    HTTPReadConfig::HTTPLanes lanes {};
-};
-
 Scheduler::Scheduler(OasisContext &ctx)
     : ctx_(ctx), num_streams_(default_num_streams(ctx)), active_streams_(num_streams_),
       queue_depth_(std::max<size_t>(default_pipeline_depth(ctx), 1)) {
@@ -122,13 +112,12 @@ Scheduler::Scheduler(OasisContext &ctx)
         // be metering the wrong thing.
         lane_aware_ = http_->lane_count() > 1;
         if (lane_aware_) {
-            lane_count_       = http_->lane_count();
-            lane_depth_       = std::max<size_t>(http_->lane_depth_limit(), 1);
-            max_batch_chunks_ = std::max<size_t>(http_->max_batch_chunks(), 1);
+            lane_depth_       = http_->lane_depth_limit();
+            max_batch_chunks_ = http_->max_batch_chunks();
             libstf::log(libstf::LogLevel::INFO,
                         "Scheduler: lane-aware dispatch over %u lane(s), depth %zu entries per lane "
                         "(OASIS_HTTP_LANE_DEPTH), host pipeline depth %zu per stream",
-                        static_cast<unsigned>(lane_count_), lane_depth_, queue_depth_.load());
+                        static_cast<unsigned>(http_->lane_count()), lane_depth_, queue_depth_.load());
         }
     }
 
@@ -463,14 +452,12 @@ std::optional<libstf::stream_t> Scheduler::pick_stream() const {
 // has no handler above it) and take the whole session with it; falling back to the host-load pick
 // instead means the flow is placed and the SAME hardware fault is met by await_lane_credit inside
 // dispatch_to, where dispatch_loop already routes exceptions to the query that asked.
-Scheduler::LaneSnapshot Scheduler::sample_lanes() {
-    LaneSnapshot view;
+std::optional<HTTPReadConfig::HTTPLanes> Scheduler::sample_lanes() {
     if (!lane_aware_) {
-        return view; // one lane, or no HTTP at all: read nothing, decide by host load
+        return std::nullopt; // one lane, or no HTTP at all: read nothing, decide by host load
     }
     try {
-        view.lanes = http_->lanes();
-        view.valid = view.lanes.count > 0;
+        return http_->lanes();
     } catch (const std::exception &e) {
         if (libstf::should_log(libstf::LogLevel::DEBUG)) {
             libstf::log(libstf::LogLevel::DEBUG,
@@ -478,9 +465,8 @@ Scheduler::LaneSnapshot Scheduler::sample_lanes() {
                         "iteration",
                         e.what());
         }
-        view.valid = false;
+        return std::nullopt;
     }
-    return view;
 }
 
 // Column-chunk entries the queue head will reserve on a lane.
@@ -532,7 +518,6 @@ Scheduler::LanePlacement Scheduler::PlaceOnLane(const LaneInputs &in) {
     const libstf::stream_t active = std::max<libstf::stream_t>(in.active, 1);
     const auto             span =
         static_cast<libstf::stream_t>(std::min<unsigned>(active, in.lanes.count));
-    out.span = span;
     if (span == 0) {
         return out;
     }
@@ -611,7 +596,6 @@ Scheduler::LanePlacement Scheduler::PlaceOnLane(const LaneInputs &in) {
         // so work already in flight on other streams still drains. Reissue is deliberately not
         // attempted here: a clear failure beats a silent retry of a batch whose bytes are gone.
         out.stream = fatal;
-        out.fatal  = true;
         out.occ    = in.lanes.at(static_cast<uint8_t>(*fatal)).occ;
         return out;
     }
@@ -622,12 +606,12 @@ Scheduler::LanePlacement Scheduler::PlaceOnLane(const LaneInputs &in) {
 }
 
 // The dispatcher's side of PlaceOnLane: gather the inputs, keep the stall deadline, report.
-std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const LaneSnapshot &view, size_t needed,
-                                                            bool &lane_bound_wait) {
+std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig::HTTPLanes &lanes,
+                                                            size_t needed, bool &lane_bound_wait) {
     lane_bound_wait = false;
 
     LaneInputs in;
-    in.lanes      = view.lanes;
+    in.lanes      = lanes;
     in.host_depth = queue_depth_.load();
     in.lane_depth = lane_depth_;
     in.needed     = needed;
@@ -652,17 +636,6 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const LaneSnapshot &
 
     const LanePlacement out = PlaceOnLane(in);
 
-    if (out.span < in.active && !lane_span_warned_) {
-        lane_span_warned_ = true;
-        libstf::log(libstf::LogLevel::WARNING,
-                    "Scheduler: %u active streams but only %u HTTP lane(s); streams %u and above "
-                    "are left idle. A chunk configured on a decoder with no lane of its own would "
-                    "have its request text routed to lane (stream %% lanes) and its bytes decoded "
-                    "as a different column.",
-                    static_cast<unsigned>(in.active), static_cast<unsigned>(out.span),
-                    static_cast<unsigned>(out.span));
-    }
-
     if (out.lane_bound_wait) {
         if (lane_stall_since_ == std::chrono::steady_clock::time_point {}) {
             lane_stall_since_ = now;
@@ -685,11 +658,6 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const LaneSnapshot &
                         "%zu, needs %zu); placing there anyway so the hardware wait reports why",
                         static_cast<long long>(stalled_for.count()),
                         static_cast<unsigned>(*out.stream), out.occ, needed);
-        } else if (out.fatal && libstf::should_log(libstf::LogLevel::DEBUG)) {
-            libstf::log(libstf::LogLevel::DEBUG,
-                        "Scheduler: every candidate HTTP lane is fatal; placing on lane %u so the "
-                        "failure is reported to the query rather than waited on",
-                        static_cast<unsigned>(*out.stream));
         }
         lane_stall_since_ = std::chrono::steady_clock::time_point {};
     }
@@ -720,21 +688,17 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const LaneSnapshot &
 // `flow_outstanding`, `outstanding_sinks` and `enqueued`, and retiring the slot from this thread
 // would race a callback that might still fire (after a reprogram, or a late retire) into a double
 // decrement of counters it has no lock on. ~Scheduler bounds its own wait for those slots instead.
-void Scheduler::fail_flows_on_fatal_lanes(const LaneSnapshot &view,
+void Scheduler::fail_flows_on_fatal_lanes(const HTTPReadConfig::HTTPLanes &lanes,
                                           std::unique_lock<std::mutex> &lock) {
-    if (!view.valid || !http_) {
-        return;
-    }
-
     // Collect under the lock, act outside it. fail() runs the channel's readiness callback, which
     // reschedules a consumer task, and throw_lane_fatal() reads CSRs -- neither belongs under
     // dispatch_mutex_, for exactly the reasons sample_lanes() is taken unlocked.
     std::vector<std::pair<uint8_t, std::shared_ptr<SplinterResultChannel>>> victims;
     uint32_t   reporting = 0;
-    const auto span      = std::min<size_t>(view.lanes.count, streams_.size());
+    const auto span      = std::min<size_t>(lanes.count, streams_.size());
     for (uint8_t s = 0; s < span; ++s) {
         const uint32_t bit = 1u << s;
-        if (!view.lanes.at(s).fatal) {
+        if (!lanes.at(s).fatal) {
             // Only a reprogram clears a fatal lane, and that builds a new Scheduler -- but clearing
             // the bit costs nothing and keeps this an edge detector rather than a latch.
             lane_fatal_reported_ &= ~bit;
@@ -769,14 +733,12 @@ void Scheduler::fail_flows_on_fatal_lanes(const LaneSnapshot &view,
             }
             // The decoded diagnosis, not a bare "lane is fatal": whether this was a head-of-line kill
             // (the batch is gone, reissue it) or an unreplayable read error, plus the sticky causes.
-            // It reads CSRs and can itself throw, which is why it is wrapped rather than called bare.
             std::exception_ptr err;
             try {
                 http_->throw_lane_fatal(s, "an in-flight batch");
             } catch (...) {
                 err = std::current_exception();
             }
-
             size_t failed = 0;
             for (auto &victim : victims) {
                 if (victim.first == s) {
@@ -789,13 +751,7 @@ void Scheduler::fail_flows_on_fatal_lanes(const LaneSnapshot &view,
                         "rather than waiting for a completion the hardware will never send.",
                         static_cast<unsigned>(s), failed);
         }
-    } catch (...) {
-        try {
-            libstf::log(libstf::LogLevel::ERROR,
-                        "Scheduler: could not report a fatal HTTP lane; queries already dispatched "
-                        "to it may still wait for a completion that will not come.");
-        } catch (...) { // NOLINT -- nothing useful is left to do, and terminate is not an option
-        }
+    } catch (...) { // a consumer callback or the log must never take this thread down
     }
     lock.lock();
 }
@@ -818,7 +774,7 @@ void Scheduler::dispatch_loop() {
             std::lock_guard<std::mutex> slock(streams_[s]->mutex);
             reap(*streams_[s], finished);
         }
-        LaneSnapshot view;
+        std::optional<HTTPReadConfig::HTTPLanes> lanes;
         {
             // Destroy the reaped slots with no scheduler lock held (see above). Do it before any
             // re-lock so the dispatcher never holds dispatch_mutex_ across a join.
@@ -832,23 +788,24 @@ void Scheduler::dispatch_loop() {
             // host's favour -- nothing but a beat this thread writes can clear either.
             lock.unlock();
             finished.clear();
-            view = sample_lanes();
+            lanes = sample_lanes();
             lock.lock();
         }
 
         // A lane may have gone fatal since the last iteration with flows already placed on it. They
         // will never retire, and this is the only thread that looks -- see the function comment.
-        fail_flows_on_fatal_lanes(view, lock);
+        if (lanes) {
+            fail_flows_on_fatal_lanes(*lanes, lock);
+        }
 
         std::optional<libstf::stream_t> stream;
         // Whether an empty pick means "the hardware has no room" (poll) or "the host has no slot"
         // (sleep until a completion says otherwise). Only the lane-aware path can set it.
         bool lane_bound_wait = false;
         if (!queue_.empty()) {
-            stream = view.valid
-                         ? pick_lane_stream(view, pending_lane_entries(queue_.front()),
-                                            lane_bound_wait)
-                         : pick_stream();
+            stream = lanes ? pick_lane_stream(*lanes, pending_lane_entries(queue_.front()),
+                                              lane_bound_wait)
+                           : pick_stream();
         }
 
         // Park until there is a queued flow *and* a stream with a free slot, or until shutdown.
