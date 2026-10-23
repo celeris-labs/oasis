@@ -8,8 +8,7 @@ This extension, Oasis, scans Parquet files on an FPGA. It registers the `read_oa
 function, which decodes column chunks in hardware and maps the decoded buffers into DuckDB vectors
 zero-copy, plus the `httpfpga://` and `rdma://` file systems that supply the bytes.
 
-See the [top-level README](../README.md) for the hardware side, the CSR-map-versus-bitstream rule
-and the current limits of the HTTP path.
+See the [top-level README](../README.md) for the hardware side and the limits of the HTTP path.
 
 
 ## Building
@@ -44,25 +43,27 @@ Now we can use the features from the extension directly in DuckDB. `read_oasis()
 file with the column chunks decoded on the FPGA:
 
 ```sql
-SET http_server='10.253.74.74';
+SET http_server='<object server IP>';
 SET http_port=9000;
 SELECT sum(p_partkey) FROM read_oasis('httpfpga:///throughput/tpch-1/part.parquet');
 ```
 
-Settings: `http_server`, `http_port`, `httpfpga_debug`, `httpfpga_cpu_fallback` (fetch over an
-ordinary host socket instead of the FPGA) and `httpfpga_raw_bypass` (legacy raw-byte path).
+Settings: `http_server` and `http_port` (the object server; they cannot change after the first
+`httpfpga://` access of a session), `httpfpga_debug` (print the HTTP client's state to stderr, as
+`OASIS_HTTP_DEBUG=1` does), `oasis_scheduler_num_streams`, `oasis_scheduler_queue_depth`,
+`oasis_scan_groups_in_flight`, `oasis_logging_level`, and `oasis_rdma_server` / `oasis_rdma_port`
+for the `rdma://` file system.
 
 Two things that surprise people:
 
-- `read_parquet('httpfpga://…')` only uses the URL as a byte source and parses on the CPU. On an
-  `ENABLE_HTTP` bitstream the raw bypass is tied off, so the FPGA is not involved. Use
-  `read_oasis()` to exercise the hardware.
+- `read_parquet('httpfpga://…')` only uses the URL as a byte source: the bytes come over an
+  ordinary host socket and are parsed on the CPU, so the FPGA is not involved. Use `read_oasis()` to
+  exercise the hardware.
 - A bare `count(*)` projects no columns and is answered from the Parquet footer with the FPGA idle.
   Project a real fixed-width column if you mean to test the decoder.
 
-Building this extension does **not** rebuild the Oasis library in `../software`. After changing
-branches, rebuild and re-install that first, or a stale `liboasis.so` will drive the FPGA with a
-register map that does not match the loaded bitstream.
+Building this extension does **not** rebuild the Oasis library in `../software`. After a change
+there, rebuild and re-install it first, or the extension keeps using the old `liboasis.so`.
 
 ## Running the tests
 Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
