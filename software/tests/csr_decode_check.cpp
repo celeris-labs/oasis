@@ -1,14 +1,13 @@
 // Board-free check of the HttpConfig readback decoders and the revision-dependent host rules, against
 // register words built the way the RTL builds them (hardware/src/hdl/http_read/handler_multi.sv and
 // handler_toe.sv readback sections, http_config.sv read map). No cThread, no device: only the pure
-// static members of HTTPReadConfig are exercised.
+// static members of HTTPReadConfig and Scheduler::PlaceOnLane are exercised.
 //
 // Build: cmake -DOASIS_BUILD_TESTS=ON, target csr_decode_check. Exit status 0 iff every check passes.
 
 #include "oasis/configuration.hpp"
 #include "oasis/scheduler.hpp"
 
-#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +45,7 @@ uint64_t lane_policy_word(unsigned rev, unsigned conns, unsigned qdepth, unsigne
 }
 
 void rev2_decoders() {
-    // build-119 / build-125: 4 lanes, lane 1 fatal+up, lane 2 arm+entry, occupancy 3/0/7/255.
+    // Revision 2, 4 lanes: lane 1 fatal+up, lane 2 arm+entry, occupancy 3/0/7/255.
     const uint64_t occ   = 3ULL | (0ULL << 8) | (7ULL << 16) | (255ULL << 24);
     const uint64_t ready = nib(false, true, true, false) | (nib(true, true, false, false) << 4) |
                            (nib(false, false, true, true) << 8) | (nib(false, true, true, true) << 12);
@@ -132,7 +131,6 @@ void request_split() {
     CHECK(threw);
 }
 
-
 // At lane depth 1 (OASIS_HTTP_LANE_DEPTH=1) a lane still owing a chunk is NOT a placement candidate --
 // the flow waits in the queue (lane_bound_wait) instead of being admitted and then blocking the
 // dispatcher inside its arm.
@@ -160,8 +158,6 @@ void placement_at_depth() {
     out           = oasis::Scheduler::PlaceOnLane(in);
     CHECK(out.stream.has_value() && !out.lane_bound_wait);
 }
-
-} // namespace
 
 // CSR revision 6 (handler_toe, the TOE keeps a receive ring per session): words as handler_toe.sv
 // packs them. LANE_POLICY = {2'd0, 6'(RING_LOG2), 24'(GET_CREDIT), 16'(QUEUE_DEPTH), 8'(NUM_CONNS),
@@ -240,7 +236,7 @@ void rev6_rules() {
         CHECK(driven ? what.empty() : what.find("reports CSR revision") != std::string::npos);
     }
 
-    // --- LANE_POLICY: build-136 shape, 4 lanes, queue 64, GET credit 4, 1 MiB rings ---
+    // --- LANE_POLICY: revision 6, 4 lanes, queue 64, GET credit 4, 1 MiB rings ---
     const auto p = HTTPReadConfig::DecodePolicy(toe_policy_word(4, 64, 4, 20));
     CHECK(p.toe() && p.revision == 6);
     CHECK(p.num_conns == 4 && p.queue_depth == 64 && p.get_credit == 4 && p.ring_log2 == 20);
@@ -362,6 +358,8 @@ void rev6_rules() {
     out      = oasis::Scheduler::PlaceOnLane(in);
     CHECK(!out.stream && out.lane_bound_wait);
 }
+
+} // namespace
 
 int main() {
     rev2_decoders();

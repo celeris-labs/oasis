@@ -1,13 +1,13 @@
 # name: test/sql/httpfpga_decode.test
 # description: Smallest end-to-end check of the FPGA HTTP -> ColumnChunkDecoder -> host path.
 #   HARDWARE-GATED: needs an ENABLE_HTTP bitstream programmed AND the object server reachable.
-#   Run on alveo-u55c-04:  ./build/release/test/unittest "test/sql/httpfpga_decode.test"
+#   Run on the host with the board:  ./build/release/test/unittest "test/sql/httpfpga_decode.test"
 #
 # Why read_oasis and not read_parquet:
 #   read_parquet('httpfpga://...') only uses httpfpga:// as a byte source and parses on the CPU.
-#   Since the bitstream ties off axi_out[BYPASS_ID], those raw byte reads now go over a host socket
-#   and the FPGA is not involved at all. read_oasis is what builds an HTTPBatchSourceOperator, so
-#   the FPGA issues the GET itself and the body streams into the ColumnChunkDecoder.
+#   Raw httpfpga:// reads always go over a host socket, so the FPGA is not involved at all.
+#   read_oasis is what builds an HTTPBatchSourceOperator, so the FPGA issues the GET itself and the
+#   body streams into the ColumnChunkDecoder.
 #
 # Why not count(*):
 #   A bare count(*) projects no columns, so read_oasis takes the emit_cardinality_only path and

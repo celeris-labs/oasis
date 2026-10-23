@@ -3,16 +3,16 @@
 #
 # SCOPE: these queries use read_parquet(), which treats httpfpga:// purely as a byte source and
 # parses on the CPU. Raw reads are served over a host socket and the FPGA never sees them -- passing
-# here proves the object server and the Parquet plumbing work, nothing more. test/sql/httpfpga_decode.test is the one that
-# exercises the hardware, via read_oasis().
+# here proves the object server and the Parquet plumbing work, nothing more.
+# test/sql/httpfpga_decode.test is the one that exercises the hardware, via read_oasis().
 # group: [sql]
 #
-# Needs a programmed board and a reachable server, so it is not part of the default `make test` run:
+# Needs a programmed board (the extension opens the FPGA when it loads) and the object server:
 #   ./build/release/test/unittest test/sql/httpfpga.test
 #
 # Every expected value was computed from the objects actually stored on the server, not from TPC-H
-# reference tables -- a mismatch means the bytes the FPGA delivered differ from the bytes the server
-# holds. Cases run smallest first so a broken datapath fails cheaply.
+# reference tables -- a mismatch means the bytes the host socket delivered differ from the bytes the
+# server holds. Cases run smallest first so a broken datapath fails cheaply.
 
 require oasis
 
@@ -59,13 +59,13 @@ SELECT n_regionkey, count(*) FROM read_parquet('httpfpga:///throughput/tpch-1/na
 3	5
 4	5
 
-# 794 KB, one row group, path 35 -- first read that spans many FPGA buffers.
+# 794 KB, one row group -- the first read that spans many read-ahead buffers.
 query III
 SELECT count(*), sum(s_suppkey), round(sum(s_acctbal),2) FROM read_parquet('httpfpga:///throughput/tpch-1/supplier.parquet');
 ----
 10000	50005000	45103548.65
 
-# 6.4 MB across 2 row groups, path 31 (also under the old budget).
+# 6.4 MB across 2 row groups.
 query II
 SELECT count(*), round(avg(p_size),4) FROM read_parquet('httpfpga:///throughput/tpch-1/part.parquet');
 ----
@@ -82,14 +82,13 @@ FURNITURE	29968
 HOUSEHOLD	30189
 MACHINERY	29949
 
-# 23 MB, 3 row groups, path 36 -- longest path in the suite.
+# 23 MB, 3 row groups.
 query II
 SELECT count(*), round(sum(s_acctbal),2) FROM read_parquet('httpfpga:///throughput/tpch-30/supplier.parquet');
 ----
 300000	1348760542.11
 
-# 56 MB, 13 row groups. Range offsets reach 9 digits here, which spans three CSR words instead of
-# two -- the case that exposed the truncated Range header.
+# 56 MB, 13 row groups.
 query III
 SELECT o_orderstatus, count(*), round(sum(o_totalprice),2) FROM read_parquet('httpfpga:///throughput/tpch-1/orders.parquet') GROUP BY 1 ORDER BY 1;
 ----
@@ -113,10 +112,7 @@ SELECT count(*), min(o_orderdate), max(o_orderdate) FROM read_parquet('httpfpga:
 ----
 1500000	1992-01-01	1998-08-02
 
-# A missing object must fail rather than hang. This one is also 83 characters, past the 64-character
-# GET path budget, but it does not reach that guard: OpenFile probes size with a host-socket HEAD
-# first, so the 404 is what surfaces. The guard itself is covered by the software unit tests -- it has
-# to be, since any path long enough to trip it names an object the HEAD cannot find.
+# A missing object must fail rather than hang: the size probe (HEAD) returns 404.
 statement error
-SELECT count(*) FROM read_parquet('httpfpga:///throughput/tpch-30/this_prefix_exists_only_to_overflow_the_get_path_budget.parquet');
+SELECT count(*) FROM read_parquet('httpfpga:///throughput/tpch-30/no_such_object.parquet');
 ----
