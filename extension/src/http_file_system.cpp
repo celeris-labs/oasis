@@ -131,6 +131,13 @@ void SetHttpFpgaDebug(ClientContext &, SetScope, Value &parameter) {
 void OasisHTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 	std::lock_guard<std::mutex> lock(init_mtx);
 	if (initialized) {
+		// The FPGA's lanes keep their sessions to the first server, so a later SET cannot take effect.
+		if (GetStringSetting(opener, "http_server", server_host_) != server_host_ ||
+		    GetUIntSetting(opener, "http_port", server_port_) != server_port_) {
+			throw IOException("http_server and http_port cannot change after the first httpfpga:// access "
+			                  "(this session uses %s:%u)",
+			                  server_host_, server_port_);
+		}
 		return;
 	}
 
@@ -144,8 +151,12 @@ void OasisHTTPFileSystem::EnsureInitialized(optional_ptr<FileOpener> opener) {
 		                  "without HTTPReadConfig (rebuild with -DENABLE_HTTP=ON)");
 	}
 
+	const auto port = GetUIntSetting(opener, "http_port", coyote::DEF_PORT);
+	if (port == 0 || port > 65535) {
+		throw IOException("http_port %llu is not a TCP port", (unsigned long long)port);
+	}
 	server_host_ = GetStringSetting(opener, "http_server", "127.0.0.1");
-	server_port_ = static_cast<uint16_t>(GetUIntSetting(opener, "http_port", coyote::DEF_PORT));
+	server_port_ = static_cast<uint16_t>(port);
 	server_ip_ = ParseIpBE(server_host_);
 	if (oasis::http_debug_enabled()) {
 		std::fprintf(stderr, "[httpfpga] init http_server=%s ip=0x%08x port=%u\n", server_host_.c_str(),
@@ -173,11 +184,7 @@ bool OasisHTTPFileSystem::FileExists(const string &filename, optional_ptr<FileOp
 	if (!CanHandleFile(filename)) {
 		return false;
 	}
-	try {
-		EnsureInitialized(opener);
-	} catch (...) {
-		return false;
-	}
+	EnsureInitialized(opener);
 	return true;
 }
 
