@@ -706,8 +706,9 @@ module handler_toe #(
                 if (init_done) begin
                     if (init_error) begin
                         // A refused open leaves nothing bound, so there is nothing to unwind.
-                        // During bring-up, back off in BR_IDLE and retry this same lane; after a
-                        // reconnect, come back to BR_DONE.
+                        // During bring-up, back off in BR_IDLE and retry this same lane. After a
+                        // reconnect the lane is left without a session and goes fatal (below);
+                        // the others carry on from BR_DONE.
                         br_d = bringing_up_q ? BR_IDLE : BR_DONE;
                     end else begin
                         bind_en_w = 1'b1;
@@ -858,6 +859,9 @@ module handler_toe #(
             if ((br_q == BR_OPEN) && init_done && init_error) begin
                 retry_wait_q               <= '1;
                 lane_init_err_q[bring_lane_q] <= 1'b1;
+                // A refused reconnect: the lane has no session, nothing reopens it, and it owes
+                // the host a reissue. Fatal, so the host sees it and routes around it.
+                if (!bringing_up_q) lane_fatal_q[bring_lane_q] <= 1'b1;
             end
 
             // Per-lane chunk accounting, for the readback and the entry admission test. The pop is

@@ -171,8 +171,8 @@ if [ "$DUT" = multi ] || [ "$DUT" = both ]; then
   for s in a b c d e f g h;        do run_hm multi "$s" 2; done
   for s in a2 a8 a9 a10;           do run_hm multi "$s" 2; done
   for s in lz1 lz2;                do run_hm multi "$s" 2; done
-  # an open the TOE refuses during the first bring-up
-  run_hm multi of1 2; run_hm multi of1 4
+  # an open the TOE refuses: during the first bring-up (of1), and on a reconnect (of2)
+  run_hm multi of1 2; run_hm multi of1 4; run_hm multi of2 2
   for s in s_base s_g s_d s_e s_f; do run_hm multi "$s" 2; done
   # a fatal lane's session is released while the peer still has segments in flight: the late
   # segment lands before lane 1's next batch, then in the middle of one of lane 1's bodies
@@ -188,7 +188,7 @@ if [ "$DUT" = toe ] || [ "$DUT" = both ]; then
   for s in a a1 a2 a3 a4 a5 a8 a9 a10; do run_hm toe "$s" 2; done
   for s in b c d f g h;               do run_hm toe "$s" 2; done
   for s in lz1 lz2;                   do run_hm toe "$s" 2; done
-  run_hm toe of1 2; run_hm toe of1 4
+  run_hm toe of1 2; run_hm toe of1 4; run_hm toe of2 2
   for s in s_base s_g s_d s_f;        do run_hm toe "$s" 2; done
   for N in 1 4; do run_hm toe s_base "$N"; run_hm toe a2 "$N"; done
   echo "--- handler_toe : new expectations (no head-of-line kill; late bytes never read) ---"

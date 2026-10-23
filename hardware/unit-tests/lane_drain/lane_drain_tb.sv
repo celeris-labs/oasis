@@ -146,6 +146,8 @@ module lane_drain_tb #(
     // reconnected behind the host's back and one that is honestly down waiting for work.
     function automatic bit lane_conn_up(input int L);  return laneReadyWord[4*L + 2]; endfunction
     function automatic bit lane_is_fatal(input int L); return laneReadyWord[4*L + 3]; endfunction
+    // laneErrWord[8L+2]: an open on lane L was refused (openStatus success = 0), sticky.
+    function automatic bit lane_init_err(input int L); return laneErrWord[8*L + 2]; endfunction
 
     generate
     if (DUT_TOE != 0) begin : g_toe
@@ -2631,6 +2633,54 @@ module lane_drain_tb #(
                                     n_open_req, n_close_req, NL);
             else if (lane_is_fatal(1)) verdict = "FAIL (a refused first open made lane 1 fatal)";
             else verdict = "PASS (only the refused lane was opened again; every other lane kept its session)";
+        end
+
+        // (of2) A reconnect whose open the TOE refuses. Lane 0's peer FINs while the lane is idle,
+        // the handler closes the session and opens a new one, and the TOE answers success = 0. The
+        // lane owes nothing but now has no session, so it must say so: FATAL with INIT_ERR, which
+        // the host routes around. It must not keep opening, and lane 1 must be unaffected. A lane
+        // left down without FATAL looks healthy to the host, and every batch placed on it waits
+        // for the host's timeout.
+        "of2": if (NL < 2) verdict = "SKIP (needs at least 2 lanes)"; else begin
+            int o_before;
+            if (!$value$plusargs("MSS=%d", mss_arg)) mss = 4096;
+            submit_batch(0, 2, 3000, o); submit_batch(1, 2, 3000, o); wait_drain(200000, ok);
+            wait_cycles(500);
+            $display("  [cyc=%0d] warm-up drained=%0b  lane0 session=%0d lane1 session=%0d  opens=%0d",
+                     cyc, ok, ln[0].sid, ln[1].sid, n_open_req);
+            if (!ok) begin verdict = "HANG (warm-up)"; dump("of2"); end
+            else begin
+                o_before = n_open_req;
+                open_refuse.push_back(o_before + 1);     // the reconnect's open
+                peer_close(ln[0].sid);
+                t0 = cyc;
+                while ((cyc - t0) < 100000 && n_open_refused == 0) @(posedge clk);
+                wait_cycles(70000);                      // past the handler's open backoff
+                $display("  [cyc=%0d] after the refused reconnect: opens=%0d (was %0d) closes=%0d  lane0 up=%0b fatal=%0b init_err=%0b  lane1 up=%0b fatal=%0b",
+                         cyc, n_open_req, o_before, n_close_req, lane_conn_up(0), lane_is_fatal(0),
+                         lane_init_err(0), lane_conn_up(1), lane_is_fatal(1));
+                if (n_open_refused != 1)
+                    verdict = "FAIL (the reconnect's open never reached the TOE: the case tested nothing)";
+                else if (lane_conn_up(0))
+                    verdict = "FAIL (lane 0 reports a session after its open was refused)";
+                else if (!lane_is_fatal(0) || !lane_init_err(0))
+                    verdict = $sformatf("FAIL (the refused reconnect left lane 0 down but not fatal: fatal=%0b init_err=%0b)",
+                                        lane_is_fatal(0), lane_init_err(0));
+                else if (n_open_req != o_before + 1)
+                    verdict = $sformatf("FAIL (%0d further open request(s) after the refusal)", n_open_req - o_before - 1);
+                else if (lane_is_fatal(1) || !lane_conn_up(1))
+                    verdict = "FAIL (lane 1 lost its session over lane 0's refused reconnect)";
+                else begin
+                    submit_batch(1, 2, 3000, o);
+                    if (!o) begin verdict = "CONFIG STALL (lane 1)"; dump("of2"); end
+                    else begin
+                        wait_drain(200000, ok);
+                        if (!ok) begin verdict = "HANG (lane 1 after lane 0's refused reconnect)"; dump("of2"); end
+                        else if (n_err) verdict = "FAIL (routing/framing errors)";
+                        else verdict = "PASS (refused reconnect: lane 0 fatal with INIT_ERR, lane 1 unaffected)";
+                    end
+                end
+            end
         end
 
         // ---- LAZY OPEN -----------------------------------------------------------------------------
