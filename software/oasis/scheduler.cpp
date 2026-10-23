@@ -540,17 +540,13 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig
 
     // The stall deadline starts when no lane has credit and is cleared by any placement. On shutdown
     // the flow is placed at once: await_lane_credit reports a lane that is not draining either way.
-    const auto now = std::chrono::steady_clock::now();
-    if (lane_stall_since_ == std::chrono::steady_clock::time_point {}) {
-        in.credit_expired = stop_;
-    } else {
-        in.credit_expired = stop_ || (now - lane_stall_since_ >= kLaneStallGrace);
-    }
+    const auto now      = std::chrono::steady_clock::now();
+    const bool stalling = lane_stall_since_ != std::chrono::steady_clock::time_point {};
+    in.credit_expired   = stop_ || (stalling && now - lane_stall_since_ >= kLaneStallGrace);
 
     const LanePlacement out = PlaceOnLane(in);
-
     if (out.lane_bound_wait) {
-        if (lane_stall_since_ == std::chrono::steady_clock::time_point {}) {
+        if (!stalling) {
             lane_stall_since_ = now;
         }
         lane_bound_wait = true;
@@ -560,16 +556,14 @@ std::optional<libstf::stream_t> Scheduler::pick_lane_stream(const HTTPReadConfig
     lane_rr_ = out.next_rr;
     if (out.stream) {
         if (out.forced) {
-            // Zero when shutdown forced it before the stall clock started.
-            const auto stalled_for =
-                (lane_stall_since_ == std::chrono::steady_clock::time_point {})
-                    ? std::chrono::seconds(0)
-                    : std::chrono::duration_cast<std::chrono::seconds>(now - lane_stall_since_);
+            const auto stalled_s =
+                stalling ? std::chrono::duration_cast<std::chrono::seconds>(now - lane_stall_since_).count()
+                         : 0;
             libstf::log(libstf::LogLevel::WARNING,
                         "Scheduler: no HTTP lane admitted work for %llds (best lane %u at occupancy "
                         "%zu, needs %zu); placing there anyway so the hardware wait reports why",
-                        static_cast<long long>(stalled_for.count()),
-                        static_cast<unsigned>(*out.stream), out.occ, needed);
+                        static_cast<long long>(stalled_s), static_cast<unsigned>(*out.stream), out.occ,
+                        needed);
         }
         lane_stall_since_ = std::chrono::steady_clock::time_point {};
     }
