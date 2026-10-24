@@ -240,7 +240,7 @@ module http_req_stream #(
     //
     // `remaining_q != 0` alone would be a lane that lies to the arbiter. Leaving ST_IDLE needs
     // conn_up, so a lane whose connection goes away between the arm and the grant -- which is what
-    // the handlers produce when a lane goes fatal with request text armed but not yet granted --
+    // the handler produces when a lane goes fatal with request text armed but not yet granted --
     // would go on claiming a bus it can never leave ST_IDLE to use. The arbiter, holding the grant
     // until the holder drops its request, would hand the dead lane the bus and wait forever: ONE
     // dead lane would stop the transmit path for EVERY lane. It takes a lane armed and waiting

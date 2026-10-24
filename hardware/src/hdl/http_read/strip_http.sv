@@ -47,7 +47,7 @@ import lynxTypes::*;
 // ------------------------------
 // The normalizer resets its running byte offset on tlast, so one decoder stream must carry exactly
 // one tlast. body_last says, per response, whether that response ends the decoder stream;
-// body_last=0 means "emit the final beat with tlast=0 and keep going". Both handlers tie it to 0
+// body_last=0 means "emit the final beat with tlast=0 and keep going". handler_multi ties it to 0
 // and take the decoder's tlast from axis_rewrite_last, which counts chunk bytes across ranged GETs;
 // body_last=1 is exercised by the strip_http bench only.
 //

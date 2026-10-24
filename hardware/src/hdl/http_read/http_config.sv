@@ -65,8 +65,8 @@ import http_types::*;
 // The 16 FILE_W words put the map past 32 registers, so HTTP_CONFIG_ADDR_SPACE in vfpga_top.svh
 // is 64. software/oasis/configuration.cpp mirrors these addresses.
 //
-// Register map (read side). Revision 2 is handler_multi, revision 6 handler_toe (INFLIGHT[31:24]);
-// a field without a revision note means the same in both. Bits not listed read 0.
+// Register map (read side), CSR revision 2 (handler_multi, INFLIGHT[31:24]). Bits not listed
+// read 0.
 //   0  HTTP_CONFIG_ID   "HTT"
 //   1  CLIENT_STATE     ([3:0])      -- lane 0's tcp_read state (also STATUS[11:8])
 //   2  STATUS           ([31:0])     -- the handler's totalWord: [7:4] tcp_init state, [11:8] lane
@@ -82,9 +82,8 @@ import http_types::*;
 //   9  ECHO_FILE_W8     ([31:0])
 //   10 INFLIGHT         ([7:0] the most chunk entries any lane has queued, saturating,
 //                        [15:8] QUEUE_DEPTH, saturating,
-//                        [16] rev 2: some lane has an announcement queued in rx_dispatch;
-//                             rev 6: some lane has notified bytes it has not asked for yet,
-//                        [17] rev 2: some lane's peer FINed; rev 6: some lane's FIN has settled,
+//                        [16] some lane has an announcement queued in rx_dispatch,
+//                        [17] some lane's peer FINed,
 //                        [18] every lane connected, [19] req_ready for the lane the beat names,
 //                        [23:20] lane count, [31:24] CSR revision) -- the handler's inflightWord
 //   11 STALL            (sticky, OR over the lanes: [0] an open was not answered within the connect
@@ -92,9 +91,8 @@ import http_types::*;
 //                        [5] a response could not be framed (no Content-Length), [6] some lane is
 //                        fatal, [7] a status read as neither 200 nor 206, [15:8] reconnects,
 //                        saturating,
-//                        [24] rev 2: rx_dispatch dropped an announcement (never: the interface is
-//                             held instead); rev 6: the TOE broke its contract (order, length) or a
-//                             lane's ring passed the window budget,
+//                        [24] rx_dispatch dropped an announcement (never: the interface is held
+//                             instead),
 //                        [25] a lane's decoupling fifo refused a routed beat, which is lost,
 //                        [26] a read watchdog expired, [27] body bytes arrived with no chunk length
 //                        queued, [28] the dispatcher routed a beat its lane refused, which is lost)
@@ -125,7 +123,6 @@ import http_types::*;
 //   17 LANE_READY      -- the ADMISSION WINDOW, one nibble per lane at [4L+3:4L]:
 //                           [4L+0] ARM_READY   the lane will accept an ARM beat (req_total_bytes
 //                                              != 0) -- its previous request text has gone out
-//                                              (rev 6: and it has GET credit left)
 //                           [4L+1] ENTRY_READY the lane will accept a chunk ENTRY beat
 //                                              (req_total_bytes == 0) -- its queue has room
 //                           [4L+2] CONN_UP     the lane holds an established TCP session
@@ -144,7 +141,7 @@ import http_types::*;
 //                         reconnect does not clear them, which is the point -- the conditions that
 //                         matter are transient at the hardware and long gone by the time anyone
 //                         polls:
-//                           [8L+0] LANE_DEAD      rev 2: rx_dispatch's head-of-line watchdog
+//                           [8L+0] LANE_DEAD      rx_dispatch's head-of-line watchdog
 //                                                 declared this lane dead and started discarding
 //                                                 its packets. THE ONE THAT CANNOT BE INFERRED:
 //                                                 the handler tears the session down in response,
@@ -152,7 +149,7 @@ import http_types::*;
 //                                                 without this a HOL kill and an unreplayable read
 //                                                 failure look identical. Bytes were dropped out
 //                                                 of the MIDDLE of a response -- the whole batch
-//                                                 must be reissued. Rev 6: reads 0 (no watchdog).
+//                                                 must be reissued.
 //                           [8L+1] DIRTY          the read aborted after body bytes had already
 //                                                 reached the decoder, so a replay would duplicate
 //                           [8L+2] INIT_ERR       an open for this lane was refused; with FATAL it
@@ -169,23 +166,17 @@ import http_types::*;
 //                                                 to it, and the beat was lost: the stream is
 //                                                 corrupt. Should never fire; see the reservation
 //                                                 in tcp_read.sv
-//                         FATAL lives in 17, not here. On rev 2, fatal AND lane_dead is a HOL kill;
+//                         FATAL lives in 17, not here. Fatal AND lane_dead is a HOL kill;
 //                         fatal and not lane_dead is a read that could not be replayed or a refused
 //                         reconnect, and the other bits say which.
 //   20 LANE_POLICY     -- fixed at elaboration, for the host to sanity-check itself against:
 //                           [7:0]   CSR revision (same value as INFLIGHT[31:24])
 //                           [15:8]  NUM_CONNS
 //                           [31:16] QUEUE_DEPTH, chunk entries PER LANE, saturating at 65535
-//                           rev 2:
 //                           [55:32] LANE_STALL_CYCLES, the HOL watchdog threshold in cycles,
 //                                   saturating at 2^24-1 -- a software watchdog shorter than it
 //                                   declares a lane dead that the hardware is still waiting on
 //                           [61:56] log2 of it, exact even where the 24-bit field saturates
-//                           rev 6:
-//                           [55:32] GET_CREDIT, GETs (arms) per lane whose responses may be
-//                                   unfinished
-//                           [61:56] RING_LOG2, the TOE's receive ring per session (20 = 1 MiB),
-//                                   which the host's window budget is computed from
 //                           [63:62] zero
 //
 // The admission bits are not optional bookkeeping. ConfigWriteReadyRegister does NOT back-pressure:

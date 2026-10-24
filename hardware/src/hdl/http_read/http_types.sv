@@ -6,7 +6,7 @@
 // One packed struct with every HttpConfig write register. HttpConfig latches
 // each field via AXI-Lite writes from the CPU and emits the whole struct as a
 // single beat on a ready/valid interface when the START register is written.
-// The host builds the request text itself; the handlers read only server_ip,
+// The host builds the request text itself; the handler reads only server_ip,
 // server_port, req_total_bytes, req_chunk_bytes and req_chunk_dest.
 // =================================================================================================
 package http_types;
@@ -49,7 +49,7 @@ typedef struct packed {
     logic [31:0] range_end_w1;
     logic [31:0] range_end_w2;
     logic [31:0] range_end_w3;
-    // Unused by the handlers (the chunk boundary is req_chunk_bytes'). Kept so no address moves.
+    // Unused by the handler (the chunk boundary is req_chunk_bytes'). Kept so no address moves.
     logic [15:0] req_flags;
     logic [31:0] pkg_word_count;
     logic [31:0] user_frequency;
@@ -58,7 +58,7 @@ typedef struct packed {
     //
     // NON-ZERO MAKES THE BEAT AN ARM: the host has already built the text for every request of a
     // lane batch and hands it over as one byte stream on that lane's request stream. Zero makes the
-    // beat a chunk-length entry. No per-request field above is read by the handlers -- only
+    // beat a chunk-length entry. No per-request field above is read by the handler -- only
     // server_ip and server_port, to open the connection; the rest of the map is kept so no address
     // moves.
     logic [31:0] req_total_bytes;
