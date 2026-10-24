@@ -170,11 +170,9 @@ row_groups() {
 run_one() {
     local name=$1 mode=$2 sql=$3 chunks=${4:-0}
     # GETs issued: one per OASIS_HTTP_CHUNK_BYTES slice of every column chunk, or one per column
-    # chunk when splitting is off. (A --toe-buffer bitstream also caps every GET at its receive-ring
-    # budget, so there the count below is a lower bound.) Needed to turn the cycle counters into a
-    # per-request cost,
-    # which is the number that discriminates "the link is slow" from "each request costs a fixed
-    # amount no matter how big it is".
+    # chunk when splitting is off. Needed to turn the cycle counters into a per-request cost, which
+    # is the number that discriminates "the link is slow" from "each request costs a fixed amount no
+    # matter how big it is".
     local split=$OASIS_HTTP_CHUNK_BYTES
     local sql_file; sql_file=$(mktemp)
     local out_file; out_file=$(mktemp)

@@ -78,20 +78,18 @@ From the repository root:
 
 ```bash
 ./scripts/synthesize.sh --http --decoders 4                 # the HTTP design
-./scripts/synthesize.sh --http --decoders 4 --toe-buffer    # ... with the TCP receive buffer in card memory
 ```
 
 | option | meaning |
 | --- | --- |
 | `--http` | the FPGA HTTP client feeding the decoders (`ENABLE_HTTP=ON`, RDMA off). Without it the build is the RDMA design |
 | `--decoders N` | number of decoders, one HTTP lane each (default 1) |
-| `--toe-buffer` | the TCP offload engine keeps a 1 MiB receive ring per session in card memory instead of one shared receive FIFO; the handler becomes `handler_toe`. Needs `--http` and patches 0007 and 0008 (CMake refuses otherwise) |
 | `--cores N` | parallel Vivado jobs (default 64, about 170 GB of memory; use 16 when two builds share a host) |
 | `--build-num N` | build into `hardware/build-N` instead of the next free number |
 | `--no-rdma` | leave out the RDMA stack (`--http` already does) |
 
 With `--http` and four decoders, the decoders are pinned to SLRs by the floorplan in
-`hardware/constraints/` that matches the variant; the build hooks it in automatically
+`hardware/constraints/decoder_pblocks.xdc`; the build hooks it in automatically
 (`ENABLE_DECODER_PBLOCKS`, on by default).
 
 The script spins off the synthesis in the background in a way that the user can disconnect from
@@ -119,8 +117,8 @@ cd parcore/libstf/coyote/util
 ```
 
 The extension opens the FPGA when it loads, so program the board before starting DuckDB. The host
-library drives the HTTP handlers of both variants (CSR revisions 2 and 6) and refuses an HTTP
-bitstream with any other revision at startup.
+library drives the HTTP handler's CSR revision 2 and refuses an HTTP bitstream with any other
+revision at startup.
 
 ### Unit tests
 
@@ -135,19 +133,15 @@ project needs to be regenerated whenever new files are added (also for the depen
 
 The HTTP client has standalone benches under `hardware/unit-tests/`, each with its own `run.sh`:
 `strip_http` (response framing), `tcp_read` (the receive side of one session), `http_req_stream`
-(request text to the TCP transmit path), `handler_multi` (N sessions end to end), `toe_rx` (the
-receive side with per-session rings), `lane_drain` (liveness and recovery of both handlers),
-`tcp_mem_mux` (the shell's TCP memory multiplexer from patch 0008) and `toe_csim` (C simulation of
-the patched TCP offload engine with its receive ring in card memory). Run all of them with:
+(request text to the TCP transmit path), `handler_multi` (N sessions end to end) and `lane_drain`
+(liveness and recovery of the handler). Run all of them with:
 
 ```bash
-hardware/unit-tests/run_all.sh            # or: hardware/unit-tests/run_all.sh tcp_read toe_rx
+hardware/unit-tests/run_all.sh            # or: hardware/unit-tests/run_all.sh tcp_read lane_drain
 ```
 
-The RTL benches need Vivado's `xsim` (their `run.sh` sources
-`/tools/Xilinx/Vivado/2024.2/settings64.sh` if it is not on `PATH`). `tcp_mem_mux` and `toe_csim`
-need the patches applied, and `toe_csim` runs Vitis HLS (`VITIS_HLS`, default
-`/tools/Xilinx/Vitis_HLS/2024.2/bin/vitis_hls`).
+The benches need Vivado's `xsim` (their `run.sh` sources `/tools/Xilinx/Vivado/2024.2/settings64.sh`
+if it is not on `PATH`).
 
 ## Software
 
@@ -220,12 +214,11 @@ SELECT sum(l_extendedprice * l_discount) FROM read_oasis('httpfpga:///throughput
 
 Environment variables of the library: `OASIS_HTTP_LANE_DEPTH` (column chunks one lane may owe,
 default 4), `OASIS_HTTP_MAX_INFLIGHT` (requests per stream, default the bitstream's queue depth),
-`OASIS_HTTP_CHUNK_BYTES` (largest GET in bytes, default 0 = one GET per column chunk; the
-`--toe-buffer` design also caps every GET at its receive-ring budget), `OASIS_HTTP_BATCH` (one
-request batch per row group; the default on single-decoder bitstreams, refused on more),
-`OASIS_OBM_BUFFERS` (output buffers per stream, default 64), `OASIS_STALL_DUMP_S` (print a state
-dump after that many seconds without progress; 30 by default on `--toe-buffer` bitstreams),
-`OASIS_DUMP_DIR` (also write that dump to a file there), `OASIS_EXIT_DUMP=1` (print it at exit).
+`OASIS_HTTP_CHUNK_BYTES` (largest GET in bytes, default 0 = one GET per column chunk),
+`OASIS_HTTP_BATCH` (one request batch per row group; the default on single-decoder bitstreams,
+refused on more), `OASIS_OBM_BUFFERS` (output buffers per stream, default 64), `OASIS_STALL_DUMP_S`
+(print a state dump after that many seconds without progress; off by default), `OASIS_DUMP_DIR`
+(also write that dump to a file there), `OASIS_EXIT_DUMP=1` (print it at exit).
 
 What runs where:
 
