@@ -6,18 +6,11 @@ orig_args="$*"
 cmake_args=()
 decoders=1
 enable_http=0
-enable_toe_buffer=0
 build_num=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --http) enable_http=1 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
-        # The TOE keeps the receive buffer itself (TCP_STACK_RX_DDR_BYPASS_EN = 0): a 1 MiB ring per
-        # session in the TCP stack's HBM channel, shared with the transmit rings through Coyote's
-        # tcp_mem_mux (hardware/patches/0008), instead of one 1 MiB rx FIFO for all sessions. Needs
-        # --http. Changes the SHELL: the TOE's non-bypass HLS, the mux, and the rx FIFO's 256 BRAM
-        # gone. EN_MEM stays 0.
-        --toe-buffer) enable_toe_buffer=1 ;;
         # Name the build directory build-N instead of the next free number. For a second checkout
         # (git worktree) whose hardware/ has no build history, so its build carries the number the
         # log and the board notes will refer to. Refuses an existing directory like the default.
@@ -38,9 +31,6 @@ if [ "$enable_http" -eq 1 ]; then
     cmake_args+=(-DENABLE_HTTP=ON -DENABLE_RDMA=OFF)
 fi
 cmake_args+=(-DN_DECODERS="$decoders")
-# TOE receive rings in card memory. OFF unless --toe-buffer, so every other invocation configures
-# exactly as before.
-cmake_args+=(-DENABLE_HTTP_TOE_BUFFER="$([ "$enable_toe_buffer" = 1 ] && echo ON || echo OFF)")
 
 pushd hardware
 
@@ -75,7 +65,7 @@ cmake -S . -B "$build_dir" "${cmake_args[@]}" || { echo "cmake configure failed 
 {
     echo "configured : $(date '+%Y-%m-%d %H:%M %Z') on $(hostname) by $(id -un)"
     echo "command    : scripts/synthesize.sh $orig_args"
-    echo "flags      : http=$enable_http decoders=$decoders toe_buffer=$enable_toe_buffer"
+    echo "flags      : http=$enable_http decoders=$decoders"
     echo "cmake args : ${cmake_args[*]}"
     echo "oasis      : $(git -C "$script_dir/.." rev-parse HEAD 2>/dev/null)" \
          "($(git -C "$script_dir/.." rev-parse --abbrev-ref HEAD 2>/dev/null))"
