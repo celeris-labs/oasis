@@ -147,10 +147,10 @@ class Scheduler {
     bool                    stop_ = false;
     std::thread             dispatcher_;
 
-    // No-progress watchdog (see watchdog_loop). On every HTTP bitstream; its state dump is on by
-    // default only on revision 6 and otherwise needs OASIS_STALL_DUMP_S.
+    // No-progress watchdog (see watchdog_loop). On every HTTP bitstream; its state dump needs
+    // OASIS_STALL_DUMP_S.
     bool                    watchdog_on_ = false;
-    double                  stall_dump_s_ = 30.0; // 0 = kick only, never dump
+    double                  stall_dump_s_ = 0.0; // 0 = kick only, never dump
     std::thread             watchdog_;
     std::mutex              watchdog_mutex_;
     std::condition_variable watchdog_cv_;

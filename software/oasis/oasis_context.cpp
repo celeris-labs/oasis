@@ -1,12 +1,10 @@
 #include "oasis/oasis_context.hpp"
 
-#include <cstdio>
 #include <cstdlib>
 
 #include "oasis/configuration.hpp"
 #include "parcore/configuration.hpp"
 
-#include <libstf/logging.hpp>
 #include <libstf/profiling.hpp>
 
 #include <coyote/cOps.hpp>
@@ -138,23 +136,9 @@ void OasisContext::shutdown() {
 }
 
 // Reads the HTTP handler's CSR revision before anything else touches its registers, so one this
-// library does not drive is refused at startup. On revision 6 it also checks the GET cap and names
-// the datapath, on stderr as well: the context is built while the extension loads, before DuckDB
-// logs.
+// library does not drive is refused at startup.
 void OasisContext::setup_http() {
-    auto http = config<HTTPReadConfig>();
-    if (!http->toe_ring()) {
-        return;
-    }
-    const auto p = http->policy();
-    char line[256];
-    std::snprintf(line, sizeof(line),
-                  "OasisContext: TOE receive ring bitstream (CSR rev %u): %u lane(s), GET credit %u "
-                  "per lane, ring 2^%u B per session, GETs capped at %llu B",
-                  unsigned(http->revision()), unsigned(p.num_conns), unsigned(p.get_credit),
-                  unsigned(p.ring_log2), static_cast<unsigned long long>(http->toe_get_cap()));
-    std::fprintf(stderr, "[oasis] %s\n", line);
-    libstf::log(libstf::LogLevel::INFO, "%s", line);
+    config<HTTPReadConfig>()->revision();
 }
 
 OasisContext &OasisContext::ctx() {

@@ -14,7 +14,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace oasis {
 
@@ -88,8 +87,8 @@ constexpr size_t BEAT = 64;
 
 size_t RoundUpToBeat(size_t bytes) { return (bytes + BEAT - 1) / BEAT * BEAT; }
 
-// The handler's state with every revision-2 batch. A process hung on the board keeps others off it,
-// so the last such line is the only reading of the state going into the batch that hung.
+// The handler's state with every batch. A process hung on the board keeps others off it, so the
+// last such line is the only reading of the state going into the batch that hung.
 void PrintLaneState(HTTPReadConfig &config, uint8_t lane, size_t chunks, size_t text_bytes) {
     const auto f  = config.inflight();
     const auto st = config.stall();
@@ -106,14 +105,9 @@ void PrintLaneState(HTTPReadConfig &config, uint8_t lane, size_t chunks, size_t 
 
 } // namespace
 
-// Tells the hardware what is coming -- one chunk-length entry per column chunk, then an arm per
-// transfer -- and DMAs the request text into the lane's request stream.
-//
-// Revision 2 sends the whole batch as ONE transfer. Revision 6 sends ONE TRANSFER PER GET: its GET
-// credit counts arms (+1 per arm, -1 per framed response), so an arm announcing several GETs would
-// be charged once and retired several times. There the (GET_CREDIT+1)-th GET of a lane is armed only
-// after that lane's oldest response has been framed, on this (dispatcher) thread. That cannot
-// deadlock: the response's decoder config and output buffer were placed before its GET.
+// Tells the hardware what is coming -- one chunk-length entry per column chunk, then one arm for
+// the whole batch -- and DMAs the batch's request text into the lane's request stream as one
+// transfer.
 void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &ctx,
                                          HTTPReadConfig &config,
                                          const HTTPReadConfig::RequestBatch &batch) {
@@ -121,32 +115,23 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
         return;
     }
     const uint8_t lane = config.lane_for_stream(stream);
-    const bool    toe  = config.toe_ring();
 
-    // Each transfer is padded to whole beats (PadRequestTextToBeat) and starts at a 64-byte aligned
-    // offset of one buffer: LOCAL_READ needs an aligned source, and http_req_stream drains every
-    // transfer to its TLAST. The tail of the buffer is zeroed, so a stray tail is visibly NUL.
-    std::vector<std::string> texts = toe ? HTTPReadConfig::SplitRequests(batch)
-                                         : std::vector<std::string> {batch.text};
-    std::vector<size_t>      offsets;
-    size_t                   total = 0;
-    for (auto &text : texts) {
-        PadRequestTextToBeat(text);
-        offsets.push_back(total);
-        total += RoundUpToBeat(text.size());
-    }
+    // The text is padded to whole beats (PadRequestTextToBeat) and copied to the start of a buffer:
+    // LOCAL_READ needs an aligned source, and http_req_stream drains the transfer to its TLAST. The
+    // tail of the buffer is zeroed, so a stray tail is visibly NUL.
+    std::string text = batch.text;
+    PadRequestTextToBeat(text);
+    const size_t   len = RoundUpToBeat(text.size());
     libstf::Status status;
-    auto           buf = libstf::make_buffer(ctx.memory_pool(), total, status);
+    auto           buf = libstf::make_buffer(ctx.memory_pool(), len, status);
     if (!buf) {
         throw std::runtime_error("HTTPBatchSourceOperator: could not allocate " +
-                                 std::to_string(total) + " bytes for request text");
+                                 std::to_string(len) + " bytes for request text");
     }
     auto *bytes = static_cast<std::byte *>(buf->ptr);
-    std::memset(bytes, 0, total);
-    for (size_t i = 0; i < texts.size(); i++) {
-        std::memcpy(bytes + offsets[i], texts[i].data(), texts[i].size());
-    }
-    buf->size = total;
+    std::memset(bytes, 0, len);
+    std::memcpy(bytes, text.data(), text.size());
+    buf->size = len;
     ctx.tlb_manager()->ensure_tlb_mapping(buf->ptr, buf->capacity);
     // Lives as long as this operator, i.e. until the flow retires, which needs every response.
     text_buffers_.push_back(buf);
@@ -159,44 +144,27 @@ void HTTPBatchSourceOperator::emit_batch(libstf::stream_t stream, OasisContext &
     }
 
     config.push_entries(batch, lane);
-    for (size_t i = 0; i < texts.size(); i++) {
-        config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(texts[i].size()), lane);
-        if (toe) {
-            // Proof the arm was taken before anything else is written -- the next GET's arm, or the
-            // next flow's entries, would otherwise rewrite the registers it is sampled from.
-            config.await_arm_taken(lane);
-        } else if (http_debug_enabled()) {
-            PrintLaneState(config, lane, batch.chunk_bytes.size(), texts[i].size());
-        }
-        // The request text goes to the lane's own axis_host_recv stream (sg.dest); the lane rides in
-        // the chunk-length register, set above, and never in the DMA descriptor.
-        const size_t len = RoundUpToBeat(texts[i].size());
-        for (size_t off = 0; off < len; off += coyote::MAX_TRANSFER_SIZE) {
-            coyote::localSg sg;
-            sg.addr   = reinterpret_cast<void *>(bytes + offsets[i] + off);
-            sg.len    = std::min(len - off, coyote::MAX_TRANSFER_SIZE);
-            sg.stream = coyote::STRM_HOST;
-            sg.dest   = lane;
-            ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg,
-                                  off + coyote::MAX_TRANSFER_SIZE >= len);
-        }
-        gets_sent_.fetch_add(toe ? 1 : batch.request_bytes.size());
+    config.arm_transfer(server_ip_, server_port_, static_cast<uint32_t>(text.size()), lane);
+    if (http_debug_enabled()) {
+        PrintLaneState(config, lane, batch.chunk_bytes.size(), text.size());
     }
+    // The request text goes to the lane's own axis_host_recv stream (sg.dest); the lane rides in
+    // the chunk-length register, set above, and never in the DMA descriptor.
+    for (size_t off = 0; off < len; off += coyote::MAX_TRANSFER_SIZE) {
+        coyote::localSg sg;
+        sg.addr   = reinterpret_cast<void *>(bytes + off);
+        sg.len    = std::min(len - off, coyote::MAX_TRANSFER_SIZE);
+        sg.stream = coyote::STRM_HOST;
+        sg.dest   = lane;
+        ctx.cthread()->invoke(coyote::CoyoteOper::LOCAL_READ, sg,
+                              off + coyote::MAX_TRANSFER_SIZE >= len);
+    }
+    gets_sent_.fetch_add(batch.request_bytes.size());
 
-    if (!toe) {
-        // Revision 2: wait for the text to have gone out (ARM_READY is !stream_busy there). If the
-        // query ended first, the buffer would be freed under the DMA, http_req_stream would wait in
-        // ST_SEND_DATA for bytes that never come, and every later arm on the lane would be refused.
-        // On revision 6 ARM_READY also carries the GET credit, so the same wait would hold this
-        // thread until a response is framed; the arm-taken proof above is enough there.
-        config.await_cfg_ready("request text to finish sending", lane, HTTPReadConfig::LaneAdmit::Arm);
-    } else if (http_debug_enabled()) {
-        std::fprintf(stderr,
-                     "[oasis-http] toe batch: lane %u, %zu column chunk(s), %zu GET(s), %zu bytes of "
-                     "request text | %s\n",
-                     unsigned(lane), batch.chunk_bytes.size(), texts.size(), total,
-                     config.lanes().describe().c_str());
-    }
+    // Wait for the text to have gone out (ARM_READY is !stream_busy). If the query ended first, the
+    // buffer would be freed under the DMA, http_req_stream would wait in ST_SEND_DATA for bytes
+    // that never come, and every later arm on the lane would be refused.
+    config.await_cfg_ready("request text to finish sending", lane, HTTPReadConfig::LaneAdmit::Arm);
 }
 
 void HTTPBatchSourceOperator::print(std::ostream &os) const {

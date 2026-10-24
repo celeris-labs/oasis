@@ -84,16 +84,13 @@ Scheduler::Scheduler(OasisContext &ctx)
     dispatcher_ = std::thread([this] { dispatch_loop(); });
 
     // The no-progress watchdog: on every HTTP bitstream, so a lane that goes fatal with nothing
-    // queued is still reported and SIGINT reaches a blocked scan. The state dump is on by default
-    // only on revision 6, whose GET credit makes a stalled lane show up here first; it reads every
-    // decoder's profile, which stops the profiler, so elsewhere only OASIS_STALL_DUMP_S turns it on.
+    // queued is still reported and SIGINT reaches a blocked scan. The state dump reads every
+    // decoder's profile, which stops the profiler, so only OASIS_STALL_DUMP_S turns it on.
     const char *env      = std::getenv("OASIS_STALL_DUMP_S");
     const bool  dump_set = env != nullptr && *env != '\0';
     watchdog_on_         = http_ != nullptr || dump_set;
     if (dump_set) {
         stall_dump_s_ = std::max(0.0, std::atof(env));
-    } else if (!(http_ && http_->toe_ring())) {
-        stall_dump_s_ = 0.0;
     }
     if (watchdog_on_) {
         note_progress();
