@@ -11,9 +11,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --http) enable_http=1 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
-        # Name the build directory build-N instead of the next free number. For a second checkout
-        # (git worktree) whose hardware/ has no build history, so its build carries the number the
-        # log and the board notes will refer to. Refuses an existing directory like the default.
+        # Build into hardware/build-N instead of the next free number (e.g. in a second checkout).
+        # Refuses an existing directory like the default.
         --build-num) build_num="$2"; shift ;;
         --build-num=*) build_num="${1#*=}" ;;
         --decoders) decoders="$2"; shift ;;
@@ -32,15 +31,10 @@ if [ "$enable_http" -eq 1 ]; then
 fi
 cmake_args+=(-DN_DECODERS="$decoders")
 
-pushd hardware
+pushd "$script_dir/../hardware" > /dev/null
 
-# Next build directory: highest existing number + 1.
-#
-# The glob matches TWO OR MORE digits. It used to be `build-[0-9][0-9]`, exactly two, so once
-# build-100 existed it was invisible: the scan found build-99, computed 100, failed to mkdir a
-# directory that already existed -- and then carried on regardless, reconfiguring and REBUILDING the
-# existing build-100 in place. Six hours of synthesis landed on top of an artifact someone might
-# still have been testing, under a name that no longer described it.
+# Next build directory: highest existing build-N plus one. The glob needs two or more digits, so
+# build-100 and above are seen.
 n=0
 for d in build-[0-9][0-9]*; do
     [ -d "$d" ] || continue
@@ -54,14 +48,14 @@ build_dir="$PWD/build-$((n + 1))"
 if [ "$build_num" -gt 0 ]; then
     build_dir="$PWD/build-$build_num"
 fi
-echo Building bitstream in hardware/$build_dir...
+echo "Building bitstream in $build_dir..."
 
-# Fatal, not a warning. Continuing past a collision is what overwrote build-100.
+# Fatal, not a warning: never reconfigure over an existing build.
 mkdir "$build_dir" || { echo "refusing to build into an existing directory: $build_dir" >&2; exit 1; }
 cmake -S . -B "$build_dir" "${cmake_args[@]}" || { echo "cmake configure failed (see above); nothing launched" >&2; exit 1; }
 
 # PROVENANCE.txt: what this directory was configured from. Operator notes go below the header.
-# Only plumbing commands here -- no `git status` (the main tree's NFS checkout hangs on it).
+# Only plumbing commands here, no `git status`.
 {
     echo "configured : $(date '+%Y-%m-%d %H:%M %Z') on $(hostname) by $(id -un)"
     echo "command    : scripts/synthesize.sh $orig_args"
