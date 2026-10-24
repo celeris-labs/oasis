@@ -6,7 +6,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 benches=("$@")
-[ ${#benches[@]} -gt 0 ] || benches=(strip_http tcp_read http_req_stream handler_multi toe_rx lane_drain tcp_mem_mux toe_csim)
+[ ${#benches[@]} -gt 0 ] || benches=(strip_http tcp_read http_req_stream handler_multi lane_drain tcp_mem_mux toe_csim)
 failed=()
 for b in "${benches[@]}"; do
   echo "=== $b"

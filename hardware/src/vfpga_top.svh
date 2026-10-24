@@ -302,11 +302,10 @@ always_comb tcp_listen_rsp.tie_off_s();
 // -------------------------------------------------------------------------------------------------
 // N TCP sessions, one per decoder lane.
 //
-// The demux sits in the receive path (rx_dispatch / toe_rx), not after one shared framer: each
-// lane owns a session, a decoupling fifo and a framer, and the dispatcher decides whether to ASK
-// for a packet rather than whether to accept one, so a lane busy on a large chunk does not
-// back-pressure the others. See hdl/http_read/handler_multi.sv and unit-tests/{lane_drain,
-// handler_multi}.
+// The demux sits in the receive path (rx_dispatch), not after one shared framer: each lane owns a
+// session, a decoupling fifo and a framer, and the dispatcher decides whether to ASK for a packet
+// rather than whether to accept one, so a lane busy on a large chunk does not back-pressure the
+// others. See hdl/http_read/handler_multi.sv and unit-tests/{lane_drain,handler_multi}.
 //
 // One TCP connection to MinIO is a throughput ceiling however deeply its GETs are pipelined; the
 // sessions together are what reach the decoders' rate.
@@ -327,91 +326,6 @@ for (genvar L = 0; L < NUM_DECODERS; L++) begin : gen_hm_req
     assign hm_req_tlast[L]         = axis_host_recv[L].tlast;
 end
 
-`ifdef EN_TCP_RX_DDR
-// -------------------------------------------------------------------------------------------------
-// The TOE keeps the receive buffer itself (ENABLE_HTTP_TOE_BUFFER: TCP_STACK_RX_DDR_BYPASS_EN = 0, a
-// 1 MiB ring per session in card memory, patches 0007/0008; lynx_pkg defines EN_TCP_RX_DDR exactly
-// then). handler_toe is handler_multi with toe_rx in place of rx_dispatch: readPkg for any session
-// in any order, so no arrival-order coupling between lanes. Same ports and the same revision-2
-// HttpConfig map as handler_multi; the readback says revision 6 (one GET per arm, GET credit).
-// hdl/http_read/handler_toe.sv, unit-tests/lane_drain --dut toe.
-// -------------------------------------------------------------------------------------------------
-handler_toe #(
-    .NUM_CONNS    (NUM_DECODERS),
-    .QUEUE_DEPTH  (HTTP_QUEUE_DEPTH),
-    // Per lane, as handler_multi's: toe_rx asks for at most RD_MAX = 16 KiB (256 beats) per
-    // readPkg and only once this fifo has promised room for all of it (exact reservation).
-    .RX_FIFO_DEPTH(2048)
-    // RD_MAX 16384, RD_OUT 4, GET_CREDIT 4, RING_LOG2 20, CLOSE_SETTLE 4096, CSR_REV 6: defaults
-) inst_handler (
-    .ap_clk  (clk),
-    .ap_rst_n(rst_n),
-
-    .m_axis_open_connection_TVALID (tcp_open_req.valid),
-    .m_axis_open_connection_TREADY (tcp_open_req.ready),
-    .m_axis_open_connection_TDATA  (tcp_open_req.data),
-    .s_axis_open_status_TVALID     (tcp_open_rsp.valid),
-    .s_axis_open_status_TREADY     (tcp_open_rsp.ready),
-    .s_axis_open_status_TDATA      (tcp_open_rsp.data),
-    .m_axis_close_connection_TVALID(tcp_close_req.valid),
-    .m_axis_close_connection_TREADY(tcp_close_req.ready),
-    .m_axis_close_connection_TDATA (tcp_close_req.data),
-
-    .s_axis_notifications_TVALID(tcp_notify.valid),
-    .s_axis_notifications_TREADY(tcp_notify.ready),
-    .s_axis_notifications_TDATA (tcp_notify.data),
-    .m_axis_read_package_TVALID (tcp_rd_pkg.valid),
-    .m_axis_read_package_TREADY (tcp_rd_pkg.ready),
-    .m_axis_read_package_TDATA  (tcp_rd_pkg.data),
-    .s_axis_rx_metadata_TVALID  (tcp_rx_meta.valid),
-    .s_axis_rx_metadata_TREADY  (tcp_rx_meta.ready),
-    .s_axis_rx_metadata_TDATA   (tcp_rx_meta.data[TCP_RX_META_BITS-1:0]),
-    .s_axis_rx_data_TVALID      (axis_tcp_recv.tvalid),
-    .s_axis_rx_data_TREADY      (axis_tcp_recv.tready),
-    .s_axis_rx_data_TDATA       (axis_tcp_recv.tdata),
-    .s_axis_rx_data_TKEEP       (axis_tcp_recv.tkeep),
-    .s_axis_rx_data_TLAST       (axis_tcp_recv.tlast),
-
-    .m_axis_tx_meta_TVALID  (tcp_tx_meta.valid),
-    .m_axis_tx_meta_TREADY  (tcp_tx_meta.ready),
-    .m_axis_tx_meta_TDATA   (tcp_tx_meta.data),
-    .m_axis_tx_data_TVALID  (axis_tcp_send.tvalid),
-    .m_axis_tx_data_TREADY  (axis_tcp_send.tready),
-    .m_axis_tx_data_TDATA   (axis_tcp_send.tdata),
-    .m_axis_tx_data_TKEEP   (axis_tcp_send.tkeep),
-    .m_axis_tx_data_TLAST   (axis_tcp_send.tlast),
-    .s_axis_tx_status_TVALID(tcp_tx_stat.valid),
-    .s_axis_tx_status_TREADY(tcp_tx_stat.ready),
-    .s_axis_tx_status_TDATA (tcp_tx_stat.data),
-
-    .req_valid(http_start.valid),
-    .req_ready(http_start.ready),
-    .req_data (http_start.data),
-
-    .s_axis_req_TVALID(hm_req_tvalid), .s_axis_req_TREADY(hm_req_tready),
-    .s_axis_req_TDATA (hm_req_tdata),  .s_axis_req_TKEEP (hm_req_tkeep),
-    .s_axis_req_TLAST (hm_req_tlast),
-
-    .m_axis_body_tvalid(hm_body_tvalid), .m_axis_body_tready(hm_body_tready),
-    .m_axis_body_tdata (hm_body_tdata),  .m_axis_body_tkeep (hm_body_tkeep),
-    .m_axis_body_tlast (hm_body_tlast),
-
-    .totalWord        (http_total_word),
-    .inflightWord     (http_inflight_word),
-    .queueDepthWord   (http_queue_depth_word),
-    .stallWord        (http_stall_word),
-    .respWord         (http_resp_word),
-    .contentLengthWord(http_content_length_word),
-    .bodyRemainingWord(http_body_remaining_word),
-    .state_debug      (http_client_state),
-
-    .laneOccWord      (http_lane_occ_word),
-    .laneReadyWord    (http_lane_ready_word),
-    .laneStateWord    (http_lane_state_word),
-    .laneErrWord      (http_lane_err_word),
-    .lanePolicyWord   (http_lane_policy_word)
-);
-`else
 handler_multi #(
     .NUM_CONNS    (NUM_DECODERS),
     .QUEUE_DEPTH  (HTTP_QUEUE_DEPTH),
@@ -486,7 +400,6 @@ handler_multi #(
     .laneErrWord      (http_lane_err_word),
     .lanePolicyWord   (http_lane_policy_word)
 );
-`endif // EN_TCP_RX_DDR
 
 // Each lane is already its own stream -- there is nothing left to select.
 AXI4S axi_http_lane [NUM_DECODERS] (.aclk(clk), .aresetn(rst_n));
