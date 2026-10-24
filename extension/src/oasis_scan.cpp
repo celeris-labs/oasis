@@ -312,10 +312,10 @@ SubmitRowGroupSplinter(ClientContext &context, oasis::OasisContext &ctx, OasisSc
 			// Decoder config first, as above (dispatch_to applies non-sink operators in flow order).
 			flow.push_back(std::move(decode));
 
-			// One batch for the whole row group (revision 2: one transfer; revision 6: one per GET),
-			// carried by the last flow: it may only fire once every column's decoder config is
-			// enqueued, and the dispatcher places flows in submission order on one thread. It cannot
-			// be a flow of its own: every flow needs a sink to retire.
+			// One batch for the whole row group, sent as one transfer and carried by the last flow:
+			// it may only fire once every column's decoder config is enqueued, and the dispatcher
+			// places flows in submission order on one thread. It cannot be a flow of its own: every
+			// flow needs a sink to retire.
 			if (k + 1 == hw_slot.size()) {
 				std::vector<oasis::HTTPBatchSourceOperator::Chunk> batch_chunks;
 				batch_chunks.reserve(hw_chunks.size());
