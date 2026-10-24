@@ -25,15 +25,11 @@ module axis_rewrite_last #(
     // Column chunks that may be configured ahead of the data. A row group's worth is a handful, so
     // this exists to decouple the host from the wire, not to bound anything.
     parameter int CFG_DEPTH = 64,
-    // Decoder lanes the body stream can be routed to. Both handlers use 1 (one instance per lane),
+    // Decoder lanes the body stream can be routed to. handler_multi uses 1 (one instance per lane),
     // which costs nothing.
     parameter int NUM_DEST  = 1,
     // Derived, but a parameter so the ports can use it.
-    parameter int DEST_BITS = (NUM_DEST > 1) ? $clog2(NUM_DEST) : 1,
-    // 1 (handler_toe): a configured length reaches the queue through a register, one cycle after
-    // its handshake, and cfg_ready leaves room for the one still in that register (see "THE CONFIG
-    // PUSH" below). 0 (the default, handler_multi): the handshake pushes the length directly.
-    parameter bit CFG_REG   = 1'b0
+    parameter int DEST_BITS = (NUM_DEST > 1) ? $clog2(NUM_DEST) : 1
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -90,53 +86,7 @@ module axis_rewrite_last #(
     logic                 q_empty, q_full;
     assign q_empty  = (cnt_q == '0);
     assign q_full   = (cnt_q == CNT_BITS'(CFG_DEPTH));
-
-    // THE CONFIG PUSH. The length the queue takes this cycle: the port's own handshake, or with
-    // CFG_REG the handshake of the cycle before, held in a register. Why: in the handler cfg_valid
-    // is the entry admission -- the host's config beat, the chunk occupancy compare and this
-    // module's cfg_ready -- and without the register it goes straight on into the length queue's
-    // LUTRAM write enable, its pointer and cnt_q, which fails timing when the handler core is placed
-    // apart from the decoder lane. With CFG_REG that cone ends at one flop.
-    //
-    // WHAT IT CHANGES: a length enters the queue one cycle later, nothing else. cfg_ready counts
-    // the length still in the register -- room for this beat on top of it, cnt_q + cfg_pend_q <
-    // CFG_DEPTH, i.e. !q_full with the pending push included -- so a length the port accepts
-    // always finds its slot, and the queue still holds at most CFG_DEPTH. busy counts the pending
-    // length, so it rises in the cycle of the handshake; and data meeting an empty queue
-    // while a length is in the register is not `starved` -- the host did configure it, and the
-    // beat simply waits for it, as a beat waits for any pop.
-    logic                 cfg_pend_q;
-    logic                 push_v_w;
-    logic [31:0]          push_len_w;
-    logic [DEST_BITS-1:0] push_dest_w;
-
-    if (CFG_REG) begin : gen_cfg_reg
-        logic [31:0]          cfg_len_q;
-        logic [DEST_BITS-1:0] cfg_dest_q;
-
-        assign cfg_ready = !q_full && !(cfg_pend_q && (cnt_q == CNT_BITS'(CFG_DEPTH - 1)));
-
-        always_ff @(posedge clk) begin
-            if (!rst_n) cfg_pend_q <= 1'b0;
-            else        cfg_pend_q <= cfg_valid && cfg_ready;
-        end
-        always_ff @(posedge clk) begin
-            if (cfg_valid && cfg_ready) begin
-                cfg_len_q  <= cfg_len;
-                cfg_dest_q <= cfg_dest;
-            end
-        end
-
-        assign push_v_w    = cfg_pend_q;
-        assign push_len_w  = cfg_len_q;
-        assign push_dest_w = cfg_dest_q;
-    end else begin : gen_cfg_direct
-        assign cfg_ready   = !q_full;
-        assign cfg_pend_q  = 1'b0;
-        assign push_v_w    = cfg_valid && cfg_ready;
-        assign push_len_w  = cfg_len;
-        assign push_dest_w = cfg_dest;
-    end
+    assign cfg_ready = !q_full;
 
     // Bytes still owed on the stream currently being counted. Loaded from the queue head.
     logic [31:0] remaining_q;
@@ -148,7 +98,7 @@ module axis_rewrite_last #(
     assign beat_bytes = ($countones(s_tkeep));
 
     logic do_push, do_pop;
-    assign do_push = push_v_w;
+    assign do_push = cfg_valid && cfg_ready;
     assign do_pop  = !active_q && !q_empty;
 
     logic beat_fire, is_last;
@@ -164,7 +114,7 @@ module axis_rewrite_last #(
     assign m_tlast = is_last;
     assign m_tdest = dest_q;
 
-    assign busy          = active_q || !q_empty || cfg_pend_q;
+    assign busy          = active_q || !q_empty;
     assign starved       = starved_q;
     assign remaining_dbg = remaining_q;
 
@@ -181,8 +131,8 @@ module axis_rewrite_last #(
             // Push and pop can happen in the same cycle, so the count is adjusted ONCE from both
             // rather than by two assignments where the later silently wins.
             if (do_push) begin
-                len_mem [wr_ptr_q] <= push_len_w;
-                dest_mem[wr_ptr_q] <= push_dest_w;
+                len_mem [wr_ptr_q] <= cfg_len;
+                dest_mem[wr_ptr_q] <= cfg_dest;
                 wr_ptr_q           <= wr_ptr_q + 1'b1;
             end
             if (do_pop) begin
@@ -210,7 +160,7 @@ module axis_rewrite_last #(
             end
 
             // data with nothing configured: the host under-queued.
-            if (s_tvalid && !active_q && q_empty && !cfg_pend_q) starved_q <= 1'b1;
+            if (s_tvalid && !active_q && q_empty) starved_q <= 1'b1;
         end
     end
 
