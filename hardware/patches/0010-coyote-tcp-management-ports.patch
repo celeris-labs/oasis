@@ -1,0 +1,210 @@
+Oasis patch 0010 for parcore/libstf/coyote (base 003c7344, branch dev/tcp): the TCP open, listen and
+close interfaces are wired to the user logic instead of the MMU, so the vFPGA opens and closes its own
+sessions. Formerly the local commit 46360d8c. Applied by apply.sh.
+
+diff --git a/hw/templates/common/dynamic_top_tmplt.txt b/hw/templates/common/dynamic_top_tmplt.txt
+index 287eca5..328b4d8 100644
+--- a/hw/templates/common/dynamic_top_tmplt.txt
++++ b/hw/templates/common/dynamic_top_tmplt.txt
+@@ -911,6 +911,21 @@ module design_dynamic_top #(
+     metaIntf #(.STYPE(tcp_open_rsp_t)) tcp_open_rsp_ul [N_REGIONS]();
+     metaIntf #(.STYPE(tcp_close_req_t)) tcp_close_req_ul [N_REGIONS]();
+ 
++    // Unused MMU/cnfg_slave TCP management (vFPGA drives open/listen/close instead)
++    metaIntf #(.STYPE(tcp_listen_req_t)) tcp_listen_req_mmu_unused [N_REGIONS]();
++    metaIntf #(.STYPE(tcp_listen_rsp_t)) tcp_listen_rsp_mmu_unused [N_REGIONS]();
++    metaIntf #(.STYPE(tcp_open_req_t))   tcp_open_req_mmu_unused   [N_REGIONS]();
++    metaIntf #(.STYPE(tcp_open_rsp_t))   tcp_open_rsp_mmu_unused   [N_REGIONS]();
++    metaIntf #(.STYPE(tcp_close_req_t))  tcp_close_req_mmu_unused  [N_REGIONS]();
++
++    for (genvar i = 0; i < N_REGIONS; i++) begin : TCP_MMU_MGMT_TIEOFF
++        always_comb tcp_listen_req_mmu_unused[i].ready = 1'b1;
++        always_comb tcp_open_req_mmu_unused[i].ready   = 1'b1;
++        always_comb tcp_close_req_mmu_unused[i].ready  = 1'b1;
++        always_comb tcp_listen_rsp_mmu_unused[i].tie_off_m();
++        always_comb tcp_open_rsp_mmu_unused[i].tie_off_m();
++    end
++
+     metaIntf #(.STYPE(tcp_notify_t)) tcp_notify_ul [N_REGIONS]();
+     metaIntf #(.STYPE(tcp_rd_pkg_t)) tcp_rd_pkg_ul [N_REGIONS]();
+     metaIntf #(.STYPE(tcp_rx_meta_t)) tcp_rx_meta_ul [N_REGIONS]();
+@@ -1132,11 +1147,13 @@ module design_dynamic_top #(
+         .s_rdma_cq(rdma_host_cq_s1),
+ {% endif %}
+ {% if cnfg.en_tcp %}
+-        .m_tcp_listen_req(tcp_listen_req_ul),
+-        .s_tcp_listen_rsp(tcp_listen_rsp_ul),
+-        .m_tcp_open_req  (tcp_open_req_ul),
+-        .s_tcp_open_rsp  (tcp_open_rsp_ul),
+-        .m_tcp_close_req (tcp_close_req_ul),
++        // TCP management driven by vFPGA (user_wrapper), not cnfg_slave.
++        // Swallow unused SW open/listen/close from the MMU path.
++        .m_tcp_listen_req(tcp_listen_req_mmu_unused),
++        .s_tcp_listen_rsp(tcp_listen_rsp_mmu_unused),
++        .m_tcp_open_req  (tcp_open_req_mmu_unused),
++        .s_tcp_open_rsp  (tcp_open_rsp_mmu_unused),
++        .m_tcp_close_req (tcp_close_req_mmu_unused),
+ {% endif %}
+ {% if cnfg.en_wb %}
+         .m_wback(m_wback),
+@@ -1256,6 +1273,23 @@ module design_dynamic_top #(
+         .axis_rdma_src_rsp_tvalid           (axis_rdma_out_rsp_ul[{{ i }}].tvalid),
+ {% endif %}
+ {% if cnfg.en_tcp %}
++        // TCP management (open/listen/close) from vFPGA
++        .tcp_listen_req_valid	(tcp_listen_req_ul[{{ i }}].valid),
++        .tcp_listen_req_ready	(tcp_listen_req_ul[{{ i }}].ready),
++        .tcp_listen_req_data    (tcp_listen_req_ul[{{ i }}].data),
++        .tcp_listen_rsp_valid   (tcp_listen_rsp_ul[{{ i }}].valid),
++        .tcp_listen_rsp_ready   (tcp_listen_rsp_ul[{{ i }}].ready),
++        .tcp_listen_rsp_data    (tcp_listen_rsp_ul[{{ i }}].data),
++        .tcp_open_req_valid	    (tcp_open_req_ul[{{ i }}].valid),
++        .tcp_open_req_ready	    (tcp_open_req_ul[{{ i }}].ready),
++        .tcp_open_req_data	    (tcp_open_req_ul[{{ i }}].data),
++        .tcp_open_rsp_valid	    (tcp_open_rsp_ul[{{ i }}].valid),
++        .tcp_open_rsp_ready	    (tcp_open_rsp_ul[{{ i }}].ready),
++        .tcp_open_rsp_data  	(tcp_open_rsp_ul[{{ i }}].data),
++        .tcp_close_req_valid	(tcp_close_req_ul[{{ i }}].valid),
++        .tcp_close_req_ready	(tcp_close_req_ul[{{ i }}].ready),
++        .tcp_close_req_data	    (tcp_close_req_ul[{{ i }}].data),
++
+         .tcp_notify_valid		(tcp_notify_ul[{{ i }}].valid),
+         .tcp_notify_ready		(tcp_notify_ul[{{ i }}].ready),
+         .tcp_notify_data		(tcp_notify_ul[{{ i }}].data),
+diff --git a/hw/templates/common/user_logic_tmplt.txt b/hw/templates/common/user_logic_tmplt.txt
+index bbe8c1f..76d623a 100644
+--- a/hw/templates/common/user_logic_tmplt.txt
++++ b/hw/templates/common/user_logic_tmplt.txt
+@@ -51,6 +51,12 @@ module design_user_logic_c{{ c_cnfg }}_{{ c_reg }} (
+     metaIntf.s                  rq_rd,
+ {% endif %}
+ {% if cnfg.en_tcp %}
++    // TCP management (open/listen/close) + data path
++    metaIntf.m			       tcp_listen_req,
++    metaIntf.s			       tcp_listen_rsp,
++    metaIntf.m			       tcp_open_req,
++    metaIntf.s			       tcp_open_rsp,
++    metaIntf.m			       tcp_close_req,
+     metaIntf.s			       tcp_notify,
+     metaIntf.m			       tcp_rd_pkg,
+     metaIntf.s			       tcp_rx_meta,
+diff --git a/hw/templates/common/user_wrapper_tmplt.txt b/hw/templates/common/user_wrapper_tmplt.txt
+index 5a35298..4567e70 100644
+--- a/hw/templates/common/user_wrapper_tmplt.txt
++++ b/hw/templates/common/user_wrapper_tmplt.txt
+@@ -153,6 +153,25 @@ module design_user_wrapper_{{ c_reg }} (
+ {% endif %}
+ 
+ {% if cnfg.en_tcp %}
++    // TCP DESCRIPTORS (management + data path)
++    (* io_buffer_type = "none" *) output logic                         tcp_listen_req_valid,
++    (* io_buffer_type = "none" *) input  logic                         tcp_listen_req_ready,
++    (* io_buffer_type = "none" *) output tcp_listen_req_t              tcp_listen_req_data,
++    (* io_buffer_type = "none" *) input  logic                         tcp_listen_rsp_valid,
++    (* io_buffer_type = "none" *) output logic                         tcp_listen_rsp_ready,
++    (* io_buffer_type = "none" *) input  tcp_listen_rsp_t              tcp_listen_rsp_data,
++
++    (* io_buffer_type = "none" *) output logic                         tcp_open_req_valid,
++    (* io_buffer_type = "none" *) input  logic                         tcp_open_req_ready,
++    (* io_buffer_type = "none" *) output tcp_open_req_t                tcp_open_req_data,
++    (* io_buffer_type = "none" *) input  logic                         tcp_open_rsp_valid,
++    (* io_buffer_type = "none" *) output logic                         tcp_open_rsp_ready,
++    (* io_buffer_type = "none" *) input  tcp_open_rsp_t                tcp_open_rsp_data,
++
++    (* io_buffer_type = "none" *) output logic                         tcp_close_req_valid,
++    (* io_buffer_type = "none" *) input  logic                         tcp_close_req_ready,
++    (* io_buffer_type = "none" *) output tcp_close_req_t               tcp_close_req_data,
++
+     (* io_buffer_type = "none" *) input  logic                         tcp_notify_valid,
+     (* io_buffer_type = "none" *) output logic                         tcp_notify_ready,
+     (* io_buffer_type = "none" *) input  tcp_notify_t                  tcp_notify_data,
+@@ -374,6 +393,42 @@ module design_user_wrapper_{{ c_reg }} (
+ 
+ {% endif %}
+ {% if cnfg.en_tcp %}
++    // TCP descriptors
++    metaIntf #(.STYPE(tcp_listen_req_t)) tcp_listen_req ();
++    metaIntf #(.STYPE(tcp_listen_req_t)) tcp_listen_req_int ();
++
++    assign tcp_listen_req_valid = tcp_listen_req.valid;
++    assign tcp_listen_req_data  = tcp_listen_req.data;
++    assign tcp_listen_req.ready = tcp_listen_req_ready;
++
++    metaIntf #(.STYPE(tcp_listen_rsp_t))  tcp_listen_rsp ();
++    metaIntf #(.STYPE(tcp_listen_rsp_t))  tcp_listen_rsp_int ();
++
++    assign tcp_listen_rsp.valid  = tcp_listen_rsp_valid;
++    assign tcp_listen_rsp.data   = tcp_listen_rsp_data;
++    assign tcp_listen_rsp_ready  = tcp_listen_rsp.ready;
++
++    metaIntf #(.STYPE(tcp_open_req_t))    tcp_open_req   ();
++    metaIntf #(.STYPE(tcp_open_req_t))    tcp_open_req_int   ();
++
++    assign tcp_open_req_valid    = tcp_open_req.valid;
++    assign tcp_open_req_data     = tcp_open_req.data;
++    assign tcp_open_req.ready    = tcp_open_req_ready;
++
++    metaIntf #(.STYPE(tcp_open_rsp_t))    tcp_open_rsp   ();
++    metaIntf #(.STYPE(tcp_open_rsp_t))    tcp_open_rsp_int   ();
++
++    assign tcp_open_rsp.valid    = tcp_open_rsp_valid;
++    assign tcp_open_rsp.data     = tcp_open_rsp_data;
++    assign tcp_open_rsp_ready    = tcp_open_rsp.ready;
++
++    metaIntf #(.STYPE(tcp_close_req_t))   tcp_close_req  ();
++    metaIntf #(.STYPE(tcp_close_req_t))   tcp_close_req_int  ();
++
++    assign tcp_close_req_valid   = tcp_close_req.valid;
++    assign tcp_close_req_data    = tcp_close_req.data;
++    assign tcp_close_req.ready   = tcp_close_req_ready;
++
+     metaIntf #(.STYPE(tcp_notify_t))      tcp_notify     ();
+     metaIntf #(.STYPE(tcp_notify_t))      tcp_notify_int     ();
+ 
+@@ -552,9 +607,14 @@ module design_user_wrapper_{{ c_reg }} (
+ 
+ {% endif %}
+ {% if cnfg.en_tcp %}
+-    // TCP desc (data-path only; management handled by cnfg_slave)
++    // TCP desc (management + data path)
++    meta_reg #(.DATA_BITS($bits(tcp_listen_req_t))) inst_reg_tcp_listen_req (.aclk(aclk), .aresetn(aresetn), .s_meta(tcp_listen_req_int), .m_meta(tcp_listen_req));
++    meta_reg #(.DATA_BITS($bits(tcp_open_req_t))) inst_reg_tcp_open_req (.aclk(aclk), .aresetn(aresetn), .s_meta(tcp_open_req_int), .m_meta(tcp_open_req));
++    meta_reg #(.DATA_BITS($bits(tcp_close_req_t))) inst_reg_tcp_close_req (.aclk(aclk), .aresetn(aresetn), .s_meta(tcp_close_req_int), .m_meta(tcp_close_req));
+     meta_reg #(.DATA_BITS($bits(tcp_rd_pkg_t))) inst_reg_tcp_rd_pkg (.aclk(aclk), .aresetn(aresetn), .s_meta(tcp_rd_pkg_int), .m_meta(tcp_rd_pkg));
+     meta_reg #(.DATA_BITS($bits(tcp_tx_meta_t))) inst_reg_tcp_tx_meta (.aclk(aclk), .aresetn(aresetn), .s_meta(tcp_tx_meta_int), .m_meta(tcp_tx_meta));
++    meta_reg #(.DATA_BITS($bits(tcp_listen_rsp_t))) inst_reg_tcp_listen_rsp (.aclk(aclk), .aresetn(aresetn), .s_meta(tcp_listen_rsp), .m_meta(tcp_listen_rsp_int));
++    meta_reg #(.DATA_BITS($bits(tcp_open_rsp_t))) inst_reg_tcp_open_rsp (.aclk(aclk), .aresetn(aresetn),.s_meta(tcp_open_rsp), .m_meta(tcp_open_rsp_int));
+     meta_reg #(.DATA_BITS($bits(tcp_notify_t))) inst_reg_tcp_notify ( .aclk(aclk), .aresetn(aresetn), .s_meta(tcp_notify), .m_meta(tcp_notify_int));
+     meta_reg #(.DATA_BITS($bits(tcp_rx_meta_t))) inst_reg_tcp_rx_meta (.aclk(aclk), .aresetn(aresetn),.s_meta(tcp_rx_meta), .m_meta(tcp_rx_meta_int));
+     meta_reg #(.DATA_BITS($bits(tcp_tx_stat_t))) inst_reg_tcp_tx_stat (.aclk(aclk), .aresetn(aresetn),.s_meta(tcp_tx_stat), .m_meta(tcp_tx_stat_int));
+@@ -617,7 +677,14 @@ module design_user_wrapper_{{ c_reg }} (
+ 
+ {% endif %} 
+ {% if cnfg.en_tcp %}
+-    // TCP desc (data-path only)
++    // TCP desc (management + data path)
++    `META_ASSIGN(tcp_listen_req_int , tcp_listen_req)
++    `META_ASSIGN(tcp_listen_rsp     , tcp_listen_rsp_int)
++
++    `META_ASSIGN(tcp_open_req_int   , tcp_open_req)
++    `META_ASSIGN(tcp_open_rsp       , tcp_open_rsp_int)
++    `META_ASSIGN(tcp_close_req_int  , tcp_close_req)
++
+     `META_ASSIGN(tcp_notify         , tcp_notify_int)
+     `META_ASSIGN(tcp_rd_pkg_int     , tcp_rd_pkg)
+     `META_ASSIGN(tcp_rx_meta        , tcp_rx_meta_int)
+@@ -1128,6 +1195,11 @@ module design_user_wrapper_{{ c_reg }} (
+         .rq_rd(user_rq_rd_int),
+     {% endif %}        
+     {% if cnfg.en_tcp %}
++        .tcp_listen_req(tcp_listen_req_int),
++        .tcp_listen_rsp(tcp_listen_rsp_int),
++        .tcp_open_req  (tcp_open_req_int),
++        .tcp_open_rsp  (tcp_open_rsp_int),
++        .tcp_close_req (tcp_close_req_int),
+         .tcp_notify    (tcp_notify_int),
+         .tcp_rd_pkg    (tcp_rd_pkg_int),
+         .tcp_rx_meta   (tcp_rx_meta_int),
+diff --git a/util/program_hacc_local.sh b/util/program_hacc_local.sh
+old mode 100644
+new mode 100755

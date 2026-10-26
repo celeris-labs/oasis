@@ -1,0 +1,102 @@
+Oasis patch 0012 for parcore (base b3879a0): the column chunk decoder takes every chunk's value
+count exactly once (TypedNormalizeUntil keys on its skid buffer's head; ColumnChunkDecoder retires the
+count on its handshake and waits for it before the next chunk). Formerly the local commit 5dbca41.
+Applied by apply.sh.
+
+diff --git a/hardware/src/hdl/column_chunk_decoder.sv b/hardware/src/hdl/column_chunk_decoder.sv
+index 9674cd2..9966280 100644
+--- a/hardware/src/hdl/column_chunk_decoder.sv
++++ b/hardware/src/hdl/column_chunk_decoder.sv
+@@ -381,15 +381,30 @@ always_ff @(posedge clk) begin
+             end
+         endcase
+ 
+-        if (state != ST_IDLE) begin
+-            if (num_values.ready) begin
+-                num_values.valid <= 1'b0;
+-            end
++        // Retire the chunk's value count on its handshake, in ANY state. It used to be retired
++        // only outside ST_IDLE, but TypedNormalizeUntil takes the count when the chunk's first
++        // value reaches it, which is routinely after this FSM has dispatched the chunk's last page
++        // and returned to ST_IDLE -- and then `valid` stayed high and the same count was handed
++        // over a second time. See chunk_confs[0].ready below for the other half.
++        if (num_values.valid && num_values.ready) begin
++            num_values.valid <= 1'b0;
+         end
+     end
+ end
+ 
+-assign chunk_confs[0].ready = state == ST_IDLE;
++// Take the next chunk only once the output has taken this chunk's value count. Without the
++// `!num_values.valid` term a chunk whose output is a single beat (region's 5-row columns) can pass
++// the output multiplexer while TypedNormalizeUntil is still busy with the previous chunk, this FSM
++// returns to ST_IDLE, accepts the NEXT chunk's conf and overwrites the count that was never taken.
++// TypedNormalizeUntil then counts one chunk with another's num_values: its `remaining` misses 0 on
++// the page's last beat and either wraps (every later beat leaves with no tlast, so the host never
++// gets a completion) or stops short (the decoder waits for a count nobody sends). Nothing but a
++// reprogram resets it. Reproduced by hardware/unit-tests/decoder_numvalues (oasis repo), found on
++// build-124 under TPC-H sf30, 2026-09-23.
++// This gate relies on TypedNormalizeUntil taking the count from the beat at the head of its input
++// skid buffer (normalize_until.sv, same change). While it waited for `in.valid` instead, a one-beat
++// chunk sat inside that skid buffer, the count was never taken, and this FSM waited here for good.
++assign chunk_confs[0].ready = (state == ST_IDLE) && !num_values.valid;
+ assign page_conf.ready      = state == ST_CONFIGURED;
+ 
+ // ------ Stream profiling ------------------------
+diff --git a/hardware/src/hdl/normalize_until.sv b/hardware/src/hdl/normalize_until.sv
+index 9d06a94..c9a78b1 100644
+--- a/hardware/src/hdl/normalize_until.sv
++++ b/hardware/src/hdl/normalize_until.sv
+@@ -122,9 +122,18 @@ valid_i #(type_t) in_typ(clk, reset_synced), out_typ(clk, reset_synced);
+ logic unconfigured;
+ assign unconfigured = remaining == 0;
+ 
+-assign size.ready = unconfigured && in.valid;
+-
+-ndata_i #(data8_t, DATABEAT_SIZE) untyped_in(clk, reset_synced), in_inner(clk, reset_synced), normalizer_in(clk, reset_synced), out_inner(clk, reset_synced), untyped_out(clk, reset_synced);
++// The chunk's first beat is at the HEAD OF THE INPUT SKID BUFFER (in_inner), not at `in`: the skid
++// buffer takes up to two beats while the previous chunk is still being counted, and a chunk whose
++// output is a single beat is then wholly inside it with `in.valid` low. This used to key the size
++// handshake (and the type it latches) on `in`, so such a chunk waited for the NEXT chunk's first
++// beat to raise `in.valid`, and was then counted with whatever size was on offer and the next
++// chunk's type -- `remaining` missed 0 on its last beat and either wrapped (every later beat left
++// with no last) or stopped short. Found on build-124 under TPC-H sf30 (region's 5-row columns),
++// 2026-09-23; reproduced by hardware/unit-tests/decoder_numvalues in the oasis repo.
++assign size.ready = unconfigured && in_inner.valid;
++
++typed_ndata_i #(DATABEAT_SIZE) in_inner(clk, reset_synced);
++ndata_i #(data8_t, DATABEAT_SIZE) normalizer_in(clk, reset_synced), out_inner(clk, reset_synced), untyped_out(clk, reset_synced);
+ 
+ // This is on purpose 1 bit wider to account for the case where keep is 0xf..f
+ logic [$clog2(DATABEAT_SIZE):0] in_num_bytes;
+@@ -171,11 +180,11 @@ always_ff @(posedge clk) begin
+         fifo_typ.valid <= 1'b0;
+     end else begin
+         if (unconfigured) begin
+-            if (in.valid && size.valid) begin
++            if (in_inner.valid && size.valid) begin
+                 remaining <= size.data;
+-                in_typ.data  <= in.typ;
++                in_typ.data  <= in_inner.typ;
+                 in_typ.valid <= 1'b1;
+-                fifo_typ.data  <= in.typ;
++                fifo_typ.data  <= in_inner.typ;
+                 fifo_typ.valid <= 1'b1;
+             end
+         end else begin
+@@ -212,13 +221,11 @@ MehdiFIFO #(
+     .o_filling_level()
+ );
+ 
+-`DATA_ASSIGN(in, untyped_in);
+-
+-NDataSkidBuffer #(data8_t, DATABEAT_SIZE) inst_in_skid_buffer  (
++TypedNDataSkidBuffer #(DATABEAT_SIZE) inst_in_skid_buffer (
+     .clk(clk),
+     .rst_n(reset_synced),
+ 
+-    .in(untyped_in),
++    .in(in),
+     .out(in_inner)
+ );
+ 

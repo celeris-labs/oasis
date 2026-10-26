@@ -1,0 +1,62 @@
+Oasis patch 0011 for parcore/libstf/coyote (base 003c7344, branch dev/tcp): the shared receive FIFO
+behind the TOE goes from 1024 to 16384 beats of 64 B (1 MiB, the window of 0009), and the capacity the
+TOE is told (axis_max_data_count) moves with it. Formerly the local commits f248089d and b21b4ec6.
+Applied by apply.sh.
+
+diff --git a/hw/hdl/network/tcp/tcp_stack.sv b/hw/hdl/network/tcp/tcp_stack.sv
+index 08a86e6..f951443 100644
+--- a/hw/hdl/network/tcp/tcp_stack.sv
++++ b/hw/hdl/network/tcp/tcp_stack.sv
+@@ -541,7 +541,7 @@ toe_ip toe_inst_b (
+ .regSessionCount_ap_vld(session_count_valid),
+ //for external RX Buffer
+ .axis_data_count(rx_buffer_data_count_reg2),
+-.axis_max_data_count(16'd1024),
++.axis_max_data_count(16'd16384),
+ 
+ .ap_clk(nclk),                                                        // input aclk
+ .ap_rst_n(nresetn)    
+@@ -668,7 +668,7 @@ toe_ip toe_inst_b (
+ .regSessionCount_V_ap_vld(session_count_valid),
+ //for external RX Buffer
+ .axis_data_count_V(rx_buffer_data_count_reg2),
+-.axis_max_data_count_V(16'd1024),
++.axis_max_data_count_V(16'd16384),
+ 
+ .ap_clk(nclk),                                                        // input aclk
+ .ap_rst_n(nresetn)    
+@@ -678,7 +678,7 @@ end //RX_DDR_BYPASS_EN
+ 
+ if (RX_DDR_BYPASS_EN == 1) begin
+ //RX BUFFER FIFO
+-axis_data_fifo_512_d1024 rx_buffer_fifo (
++axis_data_fifo_512_d16384 rx_buffer_fifo (
+   .s_axis_aresetn(nresetn),          // input wire s_axis_aresetn
+   .s_axis_aclk(nclk),                // input wire s_axis_aclk
+   .s_axis_tvalid(axis_tcp2rxbuffer.tvalid),
+diff --git a/scripts/ip_inst/network_infrastructure.tcl b/scripts/ip_inst/network_infrastructure.tcl
+index fa4ff26..7dce8fd 100644
+--- a/scripts/ip_inst/network_infrastructure.tcl
++++ b/scripts/ip_inst/network_infrastructure.tcl
+@@ -352,8 +352,19 @@ set_property -dict [list  CONFIG.c_mm2s_stscmd_is_async {true} CONFIG.c_m_axi_mm
+ create_ip -name axi_datamover -vendor xilinx.com -library ip -version 5.1 -module_name axi_datamover_mem_unaligned 
+ set_property -dict [list  CONFIG.c_mm2s_stscmd_is_async {true} CONFIG.c_mm2s_include_sf {false} CONFIG.c_m_axi_mm2s_id_width {6} CONFIG.c_m_axi_s2mm_id_width {6} CONFIG.c_m_axi_mm2s_data_width {512} CONFIG.c_m_axis_mm2s_tdata_width {512} CONFIG.c_include_mm2s_dre {true} CONFIG.c_mm2s_burst_size {64} CONFIG.c_mm2s_btt_used {23} CONFIG.c_s2mm_stscmd_is_async {true} CONFIG.c_m_axi_s2mm_data_width {512} CONFIG.c_s_axis_s2mm_tdata_width {512} CONFIG.c_include_s2mm_dre {true} CONFIG.c_s2mm_burst_size {64} CONFIG.c_s2mm_btt_used {23} CONFIG.c_s2mm_include_sf {false} CONFIG.c_addr_width {64}] [get_ips axi_datamover_mem_unaligned]
+ 
+-create_ip -name axis_data_fifo -vendor xilinx.com -library ip -version 2.0 -module_name axis_data_fifo_512_d1024 
+-set_property -dict [list CONFIG.TDATA_NUM_BYTES {64} CONFIG.FIFO_DEPTH {1024} CONFIG.HAS_TKEEP {1} CONFIG.HAS_TLAST {1} CONFIG.HAS_WR_DATA_COUNT {1} CONFIG.HAS_RD_DATA_COUNT {1} ] [get_ips axis_data_fifo_512_d1024]
++# 16384 x 64 B = 1048576 B, which is EXACTLY BUFFER_SIZE = 1 << WINDOW_BITS (toe_config.hpp.in:34,
++# now with WINDOW_SCALE_BITS = 4). THIS NUMBER AND THAT ONE MOVE TOGETHER OR NOT AT ALL: the stack
++# advertises BUFFER_SIZE regardless of real free space, so a window bigger than this fifo invites the
++# peer to send what rx_engine must then drop, and with out-of-order buffering disabled on this path
++# every drop costs a go-back-N. That was the state before build-95 (1024 deep against a 256 KiB
++# advertisement, four times over) and it showed up as duplicate-ACK storms on the wire.
++#
++# 4096 (256 KiB) held from build-95. Raised to 16384 because the window is what caps the largest
++# ranged GET the host may ask for, and a GET costs ~1.4 ms of object-store latency whatever its size:
++# measured against MinIO, 256 KiB gives 179 MB/s on one connection, 512 KiB 294, and 1 MiB 423.
++# Cost is ~256 RAMB36 of 2016, or the equivalent in URAM if Vivado infers it.
++create_ip -name axis_data_fifo -vendor xilinx.com -library ip -version 2.0 -module_name axis_data_fifo_512_d16384 
++set_property -dict [list CONFIG.TDATA_NUM_BYTES {64} CONFIG.FIFO_DEPTH {16384} CONFIG.HAS_TKEEP {1} CONFIG.HAS_TLAST {1} CONFIG.HAS_WR_DATA_COUNT {1} CONFIG.HAS_RD_DATA_COUNT {1} ] [get_ips axis_data_fifo_512_d16384]
+ 
+ ##
+ ## Network top

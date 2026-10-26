@@ -1,9 +1,6 @@
-OASIS 0006 -- libstf StreamProfiler: register the observed stream's valid/ready/last and stop.
-Working-tree change to the parcore/libstf submodule (expected HEAD 31d98eb), made 2026-09-26 for the
-build-133 timing fixes. Apply from the repo root:
-    git -C parcore/libstf apply --check ../../hardware/patches/0006-libstf-stream-profiler-input-register.patch
-    git -C parcore/libstf apply         ../../hardware/patches/0006-libstf-stream-profiler-input-register.patch
-See hardware/patches/README.md, "The StreamProfiler input register (0006)".
+Oasis patch 0006 for parcore/libstf (base 7afc162): StreamProfiler takes the observed stream's
+valid, ready, last and its stop input through one register before counting (a timing fix: the same
+counts, one cycle later). Applied by apply.sh.
 
 diff --git a/hardware/src/hdl/util/stream_profiler.sv b/hardware/src/hdl/util/stream_profiler.sv
 index 48a14e1..840462f 100644
