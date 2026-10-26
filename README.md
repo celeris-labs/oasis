@@ -54,16 +54,12 @@ git submodule update --init --recursive parcore
 git submodule update --init celeris
 ```
 
-The TCP stack (`parcore/libstf/coyote/hw/services/network`) is pinned to a commit that is not
-upstream; it ships as `hardware/patches/oasis-cmake-defined-guard.bundle`. If the recursive update
-cannot find commit `e9edcc4` there, restore it from the bundle. Then, and after every later
-submodule update, apply the patches; every hardware build needs them:
+Every submodule is pinned to an upstream commit. The design also needs Coyote's `dev/tcp` branch and
+changes to ParCore, libstf, Coyote and its TCP stack; `apply.sh` checks out that branch and applies
+the changes. Run it after the clone and after every later submodule update; the hardware build and
+the Oasis library both need it:
 
 ```bash
-SM=parcore/libstf/coyote/hw/services/network
-git -C $SM fetch "$PWD/hardware/patches/oasis-cmake-defined-guard.bundle" \
-      'oasis/cmake-defined-guard:oasis/cmake-defined-guard'
-git -C $SM checkout oasis/cmake-defined-guard
 bash hardware/patches/apply.sh
 ```
 
