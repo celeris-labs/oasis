@@ -48,6 +48,11 @@ module axis_rewrite_last #(
     output logic                       s_tready,
     input  logic [AXI_DATA_BITS-1:0]   s_tdata,
     input  logic [AXI_DATA_BITS/8-1:0] s_tkeep,
+    // $countones(s_tkeep), counted where the beat is built (strip_http) and carried with it. The
+    // count is needed at the very start of the cycle: is_last compares it against remaining_q and
+    // picks the counter's next value, and a 64-bit popcount in front of that compare was the
+    // deepest path of the receive lane.
+    input  logic [$clog2(AXI_DATA_BITS/8):0] s_tbytes,
 
     output logic                       m_tvalid,
     input  logic                       m_tready,
@@ -95,7 +100,16 @@ module axis_rewrite_last #(
     logic        starved_q;
 
     logic [$clog2(LANES):0] beat_bytes;
-    assign beat_bytes = ($countones(s_tkeep));
+    assign beat_bytes = s_tbytes;
+
+`ifndef SYNTHESIS
+    // The carried count must be the keep's own: a wrong one moves every later tlast.
+    always @(posedge clk) begin
+        if (rst_n && s_tvalid && (s_tbytes !== ($clog2(LANES)+1)'($countones(s_tkeep))))
+            $error("axis_rewrite_last: s_tbytes=%0d, but s_tkeep has %0d bytes",
+                   s_tbytes, $countones(s_tkeep));
+    end
+`endif
 
     logic do_push, do_pop;
     assign do_push = cfg_valid && cfg_ready;

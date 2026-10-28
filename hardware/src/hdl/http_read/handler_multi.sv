@@ -411,6 +411,7 @@ module handler_multi #(
         logic                       raw_tvalid, raw_tready;
         logic [AXI_DATA_BITS-1:0]   raw_tdata;
         logic [AXI_DATA_BITS/8-1:0] raw_tkeep;
+        logic [$clog2(AXI_DATA_BITS/8):0] raw_tbytes;
 
         // -- request text out ---------------------------------------------------------------------
         http_req_stream #(.CHUNK_BYTES(TX_CHUNK_BYTES)) inst_req_stream (
@@ -467,6 +468,7 @@ module handler_multi #(
             .m_axis_body_tdata (raw_tdata),
             .m_axis_body_tkeep (raw_tkeep),
             .m_axis_body_tlast (),
+            .m_axis_body_tbytes(raw_tbytes),
 
             .done(lane_done[L]), .error(lane_error[L]), .error_dirty(lane_error_dirty[L]),
             .resp_error(lane_resp_error[L]),
@@ -498,6 +500,7 @@ module handler_multi #(
             .cfg_dest (1'b0),
             .s_tvalid(raw_tvalid), .s_tready(raw_tready),
             .s_tdata (raw_tdata),  .s_tkeep (raw_tkeep),
+            .s_tbytes(raw_tbytes),
             .m_tvalid(rwl_tvalid), .m_tready(rwl_tready),
             .m_tdata (rwl_tdata),  .m_tkeep (rwl_tkeep),
             .m_tlast (rwl_tlast),
@@ -508,7 +511,7 @@ module handler_multi #(
         // -- register slice on the body output ----------------------------------------------------
         //
         // Without it, strip_http's skid register -> axis_rewrite_last -> out is ONE combinational
-        // cone: rewrite_last derives tlast from $countones(tkeep) against a 32-bit remaining count,
+        // cone: rewrite_last derives tlast from the byte count against a 32-bit remaining count,
         // straight off strip_http's skid register. That cone runs into this module's lane_occ_q
         // (the chunk-retire pop below reads m_axis_body_tlast) and out through vfpga_top and
         // AXIToNData into the DataNormalizer's offset register (its "tlast resets the offset"), and
