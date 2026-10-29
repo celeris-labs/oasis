@@ -286,8 +286,8 @@ hardware/unit-tests/run_all.sh            # or: hardware/unit-tests/run_all.sh t
   output buffer (about one million 8-byte values per row group).
 - `read_parquet('httpfpga://...')` reads over a host socket; the FPGA is not involved. A bare
   `count(*)` is answered from the Parquet footer with the FPGA idle.
-- The host library drives the HTTP handler's CSR revision 2 and refuses an HTTP bitstream with any
-  other revision at startup.
+- At startup the host library reads the revision of the HTTP handler's register map
+  (`INFLIGHT[31:24]`). It accepts 2 and refuses a bitstream with any other value.
 
 ## License
 
