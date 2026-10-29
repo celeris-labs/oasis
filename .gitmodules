@@ -1,9 +1,9 @@
 [submodule "parcore"]
 	path = parcore
-	url = git@github.com:celeris-labs/parcore.git
+	url = https://github.com/celeris-labs/parcore.git
 [submodule "celeris"]
 	path = celeris
-	url = git@github.com:celeris-labs/celeris.git
+	url = https://github.com/celeris-labs/celeris.git
 [submodule "extension/duckdb"]
 	path = extension/duckdb
 	url = https://github.com/JonasDann/duckdb.git
