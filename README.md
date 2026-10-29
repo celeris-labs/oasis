@@ -1,79 +1,130 @@
 # Oasis -- Data Processing SmartNIC
 
-Oasis is a data processing SmartNIC for cloud-native data lakes. It offloads Parquet decoding into
-the network data path. The main components are a hardware design that embeds
-[ParCore](https://github.com/celeris-labs/parcore) into an RDMA-enabled
-[Coyote](https://github.com/fpgasystems/Coyote) vFPGA and a software abstraction for easy
-integration into query engines.
-
-This repository adds an HTTP mode for the AMD Alveo U55C: the vFPGA fetches the Parquet column
-chunks itself, with ranged HTTP `GET`s over the TCP/IP stack in the Coyote shell, from an
-S3-compatible object store such as MinIO, and streams the bodies into four ParCore column-chunk
-decoders (one TCP session per decoder); those bytes never touch host memory. The host
-library (`software/`) plans the requests and collects the decoded columns; the DuckDB extension
-(`extension/`) exposes it as the table function `read_oasis()`.
+Oasis offloads Parquet decoding into the network data path. It embeds
+[ParCore](https://github.com/celeris-labs/parcore) decoders into a
+[Coyote](https://github.com/fpgasystems/Coyote) vFPGA on an AMD Alveo U55C: the FPGA fetches the
+Parquet column chunks itself with ranged HTTP `GET`s over Coyote's TCP/IP stack from an
+S3-compatible object store such as MinIO, and streams the bodies into four column-chunk decoders,
+one TCP session each. The host library (`software/`) plans the requests and collects the decoded
+columns, and the DuckDB extension (`extension/`) exposes them as the table function `read_oasis()`.
 
 ## Repository layout
 
 | path | contents |
 | --- | --- |
-| `hardware/` | vFPGA design (`src/`), decoder floorplans (`constraints/`), patches to the submodules (`patches/`), RTL benches (`unit-tests/`), `CMakeLists.txt` for the Coyote build |
+| `hardware/` | vFPGA design (`src/`), decoder floorplan (`constraints/`), patches to the submodules (`patches/`), RTL benches (`unit-tests/`), `CMakeLists.txt` for the Coyote build |
 | `software/` | the Oasis host library (`oasis/`) and a board-free check (`tests/csr_decode_check.cpp`) |
 | `extension/` | the DuckDB extension (`src/`, SQL tests in `test/sql/`); submodules `duckdb` and `extension-ci-tools` |
-| `rdma_server/` | the file server for the RDMA mode |
-| `scripts/` | hardware build (`synthesize.sh`), TPC-H run (`tpch_demo.sh`, queries in `tpch/`), throughput harness (`throughput.sh`), simulation setup, Arrow install |
+| `rdma_server/` | the file server for the RDMA design |
+| `scripts/` | hardware build (`synthesize.sh`), TPC-H run (`tpch_demo.sh`, queries in `tpch/`), throughput harness (`throughput.sh`), simulation setup |
 | `parcore/` | submodule: ParCore, with libstf and Coyote nested in it (`parcore/libstf/coyote`) |
-| `celeris/` | submodule from the upstream project; no build below uses it |
+| `celeris/` | submodule: a private repository of the group, only needed for the RDMA mode |
 
-## Requirements
+## Prerequisites
 
-- Vivado and Vitis HLS 2024.2, and `tmux` (the hardware build runs in a detached session).
-- CMake 3.16 or newer and a C++17 compiler; jemalloc (`./parcore/libstf/scripts/install_jemalloc.sh`)
-  and Apache Arrow 24.0.0 (`./scripts/install_arrow.sh`). Both scripts install into `~/opt` by
-  default (`INSTALL_PATH` changes it).
-- An Alveo U55C with the Coyote driver, and 1 GiB huge pages on its host: the library maps 4 of them
-  by default (`LIBSTF_HUGE_PAGES=N` changes the count).
-- For the HTTP mode, an object store the FPGA's network port can reach that serves anonymous
-  ranged `GET`s with `Content-Length` (MinIO does).
+- Build host: Vivado and Vitis HLS 2024.2, `tmux`, CMake 3.16 or newer, a C++17 compiler, Boost
+  headers, and the OpenSSL and libcurl development files. Configuring the extension downloads
+  DuckDB's `httpfs` extension from GitHub, so it needs network access.
+- Board host: an Alveo U55C on the ETH Zurich HACC cluster (Coyote's programming script uses
+  `hdev`), `sudo`, and Vivado on `PATH`.
+- Object store: reachable from the FPGA's network port, listening on port 9000, serving anonymous
+  ranged `GET`s with `Content-Length` over keep-alive connections (MinIO does). To fill it: MinIO's
+  client `mc` and a stock DuckDB CLI with the `tpch` extension.
 
-## Getting the sources
+## Setup
 
-The hardware component requires the ParCore submodule and its dependencies to be loaded by either
-cloning this repo with submodules directly:
-
-```bash
-git clone --recurse-submodules git@github.com:celeris-labs/oasis.git
-```
-
-Or initializing the submodule as a step after cloning:
+Clone the repository, initialise ParCore and the two submodules the extension build needs, and
+apply the patches. Leave out `celeris`: it is only needed for the RDMA mode and is a private
+repository of the group.
 
 ```bash
-git submodule update --init extension/duckdb
-git submodule update --init extension/extension-ci-tools
+git clone https://github.com/celeris-labs/oasis.git
+cd oasis
 git submodule update --init --recursive parcore
-git submodule update --init celeris
-```
-
-Every submodule is pinned to an upstream commit. The design also needs Coyote's `dev/tcp` branch and
-changes to ParCore, libstf, Coyote and its TCP stack; `apply.sh` checks out that branch and applies
-the changes. Run it after the clone and after every later submodule update; the hardware build and
-the Oasis library both need it:
-
-```bash
+git submodule update --init extension/duckdb extension/extension-ci-tools
 bash hardware/patches/apply.sh
 ```
 
-`apply.sh` can be run any number of times. [hardware/patches/README.md](hardware/patches/README.md)
-lists what each patch changes.
+libstf refers to its Coyote submodule by an SSH URL. Without an SSH key for GitHub, initialise
+ParCore with this instead:
+
+```bash
+git -c url."https://github.com/".insteadOf=git@github.com: submodule update --init --recursive parcore
+```
+
+Every submodule is pinned to an upstream commit. `apply.sh` checks out Coyote's `dev/tcp` branch and
+applies the changes the design needs to ParCore, libstf, Coyote and its TCP stack;
+[hardware/patches/README.md](hardware/patches/README.md) lists them. Run it again after every
+submodule update; running it twice is safe.
+
+Build and install the host library. It builds Coyote's, libstf's and ParCore's host libraries from
+the submodules unless they are already installed, and installs all four into the prefix:
+
+```bash
+./parcore/libstf/scripts/install_jemalloc.sh    # once; installs into ~/opt (INSTALL_PATH changes it)
+export CMAKE_PREFIX_PATH=$HOME/opt
+cmake -S software -B software/build -DCMAKE_INSTALL_PREFIX=$HOME/opt -DOASIS_BUILD_TESTS=ON
+cmake --build software/build -j8
+cmake --install software/build
+./software/build/csr_decode_check               # csr_decode_check: 62 passed, 0 failed
+```
+
+`csr_decode_check` checks, without a board, how the library decodes the HTTP handler's registers.
+If it stops with `undefined symbol`, an older `liboasis.so` on `LD_LIBRARY_PATH` was loaded first.
+
+Build the DuckDB shell with the extension, in the same shell (`CMAKE_PREFIX_PATH` must point at the
+prefix):
+
+```bash
+cd extension
+CMAKE_BUILD_PARALLEL_LEVEL=8 make
+cd ..
+```
+
+This builds `extension/build/release/duckdb`, a DuckDB shell with the Oasis extension and `httpfs`
+(for the CPU baselines) built in. It finds the installed libraries through its RUNPATH, the
+prefix's `lib/`; `LD_LIBRARY_PATH` is searched first, so keep older copies off it. Building the
+extension does not rebuild the library: after a change in `software/`, rebuild and install it
+first. [extension/README.md](extension/README.md) has the extension's details and tests.
+
+## Object store and data sets
+
+Start MinIO on an address the FPGA can reach, on port 9000, with a one-hour idle timeout:
+
+```bash
+MINIO_IDLE_TIMEOUT=1h MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+    minio server <data directory> --address <store IP>:9000
+```
+
+The scripts read the eight TPC-H tables as `/throughput/tpch-<scale>/<table>.parquet`. Write them
+with a stock DuckDB CLI and upload them (`S=1` here; `S=30` for `tpch-30`):
+
+```bash
+S=1; mkdir tpch-$S
+{ echo "INSTALL tpch; LOAD tpch; CALL dbgen(sf = $S);"
+  for t in lineitem orders customer part partsupp supplier nation region; do
+    echo "COPY $t TO 'tpch-$S/$t.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880);"
+  done; } | duckdb
+mc alias set store http://<store IP>:9000 minioadmin minioadmin
+mc mb --ignore-existing store/throughput
+mc cp tpch-$S/*.parquet store/throughput/tpch-$S/
+mc anonymous set download store/throughput
+curl --noproxy '*' -s -o /dev/null -w '%{http_code}\n' -r 0-3 \
+    http://<store IP>:9000/throughput/tpch-$S/region.parquet      # 206
+```
+
+The FPGA's requests carry no credentials, so the bucket must allow anonymous reads. The decoder
+reads files written by DuckDB, SNAPPY-compressed or uncompressed, with PLAIN or dictionary
+encoding.
 
 ## Hardware
 
-### Synthesis
+### Bitstream
 
 From the repository root:
 
 ```bash
-./scripts/synthesize.sh --http --decoders 4                 # the HTTP design
+./scripts/synthesize.sh --http --decoders 4 --cores 16
 ```
 
 | option | meaning |
@@ -84,119 +135,95 @@ From the repository root:
 | `--build-num N` | build into `hardware/build-N` instead of the next free number |
 | `--no-rdma` | leave out the RDMA stack (`--http` already does) |
 
-With `--http` and four decoders, the decoders are pinned to SLRs by the floorplan in
-`hardware/constraints/decoder_pblocks.xdc`; the build hooks it in automatically
+The script configures `hardware/build-N`, records the configuration in
+`hardware/build-N/PROVENANCE.txt` and runs the build in a detached `tmux` session, so you can log
+out. It refuses to build into an existing directory. The build takes several hours; follow it in
+`hardware/build-N/bitgen.log`, which can stay silent for a long time. With `--http` and four
+decoders, the floorplan `hardware/constraints/decoder_pblocks.xdc` places the decoders
 (`ENABLE_DECODER_PBLOCKS`, on by default).
 
-The script spins off the synthesis in the background in a way that the user can disconnect from
-the server without the synthesis stopping (tmux session `bitgen-<build directory>`). You can check
-the progress in `hardware/build-N/bitgen.log`. It is expected that the synthesis takes multiple
-hours to finish, sometimes not printing anything new to the log for a while. The script refuses to
-build into an existing directory and records its configuration in `hardware/build-N/PROVENANCE.txt`.
+The bitstream is `hardware/build-N/bitstreams/cyt_top.bit`. Check
+`hardware/build-N/reports/shell_timing_summary.rpt` before you program it. At the end the script
+writes `timing_report.txt`, `utilization_report.txt` and `analysis.txt` into the build directory and
+mails the analysis if `BOT_GMAIL_USER`, `BOT_GMAIL_PASSWORD` and `BOT_RECIPIENT_EMAIL` are set.
 
-The result is `hardware/build-N/bitstreams/cyt_top.bit`. Read
-`hardware/build-N/reports/shell_timing_summary.rpt` before programming a build. Afterwards the
-script writes `timing_report.txt`, `utilization_report.txt` and `analysis.txt` into the build
-directory and, if `BOT_GMAIL_USER`, `BOT_GMAIL_PASSWORD` and `BOT_RECIPIENT_EMAIL` are set, mails
-the analysis.
+Without `--http` the build is the RDMA design: the FPGA reads the Parquet files over RDMA from
+`rdma_server` ([rdma_server/README.md](rdma_server/README.md)). Set `oasis_rdma_server` (and
+`oasis_rdma_port`) and read them with `read_oasis('rdma://<file>')`.
 
 ### Programming the board
 
-Build the Coyote driver once (`make` in `parcore/libstf/coyote/driver`, which writes
-`build/coyote_driver.ko` there). On the ETH Zurich HACC cluster, program the FPGA and insert the
-driver from the host with the board, using Coyote's script (it needs Vivado on `PATH`):
+On the board host, from a terminal (the commands need `sudo`), in the repository root. Provide
+1 GiB huge pages after every boot; drop the 2 MiB pool first, both count against one limit:
 
 ```bash
+sudo hdev set hugepages --num-2m 0
+sudo hdev set hugepages --num-1g 12
+cat /sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages   # 12
+```
+
+Build the Coyote driver on a host that runs the board host's kernel (the module is refused on any
+other kernel), then program the FPGA and insert the driver with Coyote's script. It removes a
+loaded driver first:
+
+```bash
+(cd parcore/libstf/coyote/driver && make)                          # build/coyote_driver.ko
+REPO=$PWD
 cd parcore/libstf/coyote/util
-./program_hacc_local.sh <repo>/hardware/build-N/bitstreams/cyt_top.bit \
-                        <repo>/parcore/libstf/coyote/driver/build/coyote_driver.ko
+./program_hacc_local.sh $REPO/hardware/build-N/bitstreams/cyt_top.bit \
+                        $REPO/parcore/libstf/coyote/driver/build/coyote_driver.ko
+cd $REPO
 ```
 
-The extension opens the FPGA when it loads, so program the board before starting DuckDB. The host
-library drives the HTTP handler's CSR revision 2 and refuses an HTTP bitstream with any other
-revision at startup.
+Then restart the object store: it still holds the connections of the previous bitstream. The
+extension opens the FPGA when it loads, so program the board before starting DuckDB.
 
-### Unit tests
+## Running
 
-To run the unit tests, the Vivado simulation project needs to be set up:
+On the board host, with the board programmed and the object store restarted:
 
 ```bash
-./scripts/setup_simulation.sh
+export OASIS_SERVER=<store IP> OASIS_PORT=9000 LIBSTF_HUGE_PAGES=10
+D=extension/build/release/duckdb
+$D -noheader -list -c "SET http_server='$OASIS_SERVER'; SET http_port=9000;
+  SELECT sum(r_regionkey) FROM read_oasis('httpfpga:///throughput/tpch-1/region.parquet');"   # 10
+$D -noheader -list -c "SET http_server='$OASIS_SERVER'; SET http_port=9000;
+  SELECT sum(l_orderkey) FROM read_oasis('httpfpga:///throughput/tpch-1/lineitem.parquet');"  # 18005322964949
 ```
 
-After this is finished, VSCode shows the unit tests as a test flask on the left side. The simulation
-project needs to be regenerated whenever new files are added (also for the dependencies).
+`LIBSTF_HUGE_PAGES` is the number of free 1 GiB huge pages the library maps (default 4); the scale
+30 `wide` workload needs 10.
 
-The HTTP client has standalone benches under `hardware/unit-tests/`, each with its own `run.sh`:
-`strip_http` (response framing), `tcp_read` (the receive side of one session), `http_req_stream`
-(request text to the TCP transmit path), `handler_multi` (N sessions end to end) and `lane_drain`
-(liveness and recovery of the handler). Run all of them with:
+`./scripts/tpch_demo.sh` runs the 22 TPC-H queries on `read_oasis()` views, then on stock DuckDB
+(httpfs and its Parquet reader, same objects), compares the answers cell for cell and sums the wall
+clock of both sides:
 
 ```bash
-hardware/unit-tests/run_all.sh            # or: hardware/unit-tests/run_all.sh tcp_read lane_drain
+./scripts/tpch_demo.sh --scale 1  --single-session --cache metadata --threads 1 --cpu-threads 0
+./scripts/tpch_demo.sh --scale 30 --single-session --cache metadata --threads 1 --cpu-threads 0
 ```
 
-The benches need Vivado's `xsim` (their `run.sh` sources `/tools/Xilinx/Vivado/2024.2/settings64.sh`
-if it is not on `PATH`).
+A good run prints `fpga session rc=0   cpu session rc=0` and ends its table with
+` pass 22   fail 0   skip 0`.
 
-## Software
-
-The software consists of the Oasis software library and a DuckDB extension.
-
-### Oasis library
-
-The Oasis software library has dependencies on the Coyote, libSTF, and ParCore software libraries to
-be installed or includes them from the submodules. In case they are not installed already, libSTF
-also has a dependency on jemalloc and ParCore on Arrow (see Requirements). The Oasis software
-library can be built and installed as follows:
+`./scripts/throughput.sh` runs `lineitem` scans (`--workload latency|q6|q1|wide|all`), three times
+on the FPGA and once on stock DuckDB, and reads the decoders' cycle counters around each FPGA run:
 
 ```bash
-cmake -S software -B software/build -DCMAKE_INSTALL_PREFIX=$HOME/opt
-cmake --build software/build -j
-cmake --install software/build
+./scripts/throughput.sh --scale 30 --workload wide
 ```
 
-Add `-DOASIS_BUILD_TESTS=ON` to the first command to also build `csr_decode_check`, a board-free
-check of how the library decodes the HTTP handler's registers: `./software/build/csr_decode_check`.
+Each FPGA run gets a verdict, and only `OK` runs count. `wall_MB/s` is the throughput; `intake_MB/s`
+is the decoders' rate while they had data:
 
-### DuckDB extension
-
-The DuckDB Oasis extension can be built as follows and requires the Oasis software library to be
-installed first:
-
-```bash
-export CMAKE_PREFIX_PATH=$HOME/opt
-cd extension
-make -j
+```
+  run 1: hs_total=52334581  wall_MB/s=619.7    intake_MB/s=703.5    decoders=4/4   OK
 ```
 
-This builds `extension/build/release/duckdb`, a DuckDB shell with the extension (and `httpfs`, for
-the CPU baselines) built in. It finds the installed libraries at run time through
-`LD_LIBRARY_PATH=$HOME/opt/lib`. Building the extension does not rebuild the library: after a
-change in `software/`, rebuild and re-install it first. More detail can be found in the
-`extension/README.md`.
+Both scripts take the object store from `OASIS_SERVER` and `OASIS_PORT` (or `--server`, `--port`),
+use `extension/build/release/duckdb` (`DUCKDB` overrides it) and print every option with `-h`.
 
-## Reading Parquet with read_oasis()
-
-The scripts expect the eight TPC-H tables as `/throughput/tpch-<scale>/<table>.parquet`, i.e. in a
-bucket `throughput` that allows anonymous reads. Any DuckDB (e.g. the stock CLI) writes them:
-
-```sql
-INSTALL tpch; LOAD tpch; CALL dbgen(sf = 1);
-COPY lineitem TO 'lineitem.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880);
--- ... the same for orders, customer, part, partsupp, supplier, nation, region
-```
-
-With MinIO's client: `mc mb <alias>/throughput`, `mc cp *.parquet <alias>/throughput/tpch-1/` and
-`mc anonymous set download <alias>/throughput` (the FPGA's requests carry no credentials).
-
-Then, on the host with the programmed board:
-
-```sql
-SET http_server = '<object store IP>';
-SET http_port = 9000;
-SELECT sum(l_extendedprice * l_discount) FROM read_oasis('httpfpga:///throughput/tpch-1/lineitem.parquet');
-```
+### Settings
 
 | setting | meaning |
 | --- | --- |
@@ -206,7 +233,7 @@ SELECT sum(l_extendedprice * l_discount) FROM read_oasis('httpfpga:///throughput
 | `oasis_scheduler_queue_depth` | work the scheduler keeps in flight per decoder (0 = the depth of the bitstream's config FIFO) |
 | `oasis_scan_groups_in_flight` | row groups a scan keeps submitted (default 16) |
 | `oasis_logging_level` | libSTF/ParCore log level (default `ERROR`) |
-| `oasis_rdma_server`, `oasis_rdma_port` | the RDMA file server (RDMA mode) |
+| `oasis_rdma_server`, `oasis_rdma_port` | the RDMA file server (RDMA design) |
 
 Environment variables of the library: `OASIS_HTTP_LANE_DEPTH` (column chunks one lane may owe,
 default 4), `OASIS_HTTP_MAX_INFLIGHT` (requests per stream, default the bitstream's queue depth),
@@ -216,39 +243,52 @@ refused on more), `OASIS_OBM_BUFFERS` (output buffers per stream, default 64), `
 (print a state dump after that many seconds without progress; off by default), `OASIS_DUMP_DIR`
 (also write that dump to a file there), `OASIS_EXIT_DUMP=1` (print it at exit).
 
-What runs where:
+## Simulation
 
+From the repository root, with Vivado on `PATH`, create the Vivado simulation project of the
+design in `hardware/build-sim` (create it again after adding source files):
+
+```bash
+./scripts/setup_simulation.sh
+```
+
+The HTTP client has standalone benches under `hardware/unit-tests/`, each with its own `run.sh`:
+`strip_http` (response framing), `tcp_read` (the receive side of one session), `http_req_stream`
+(request text to the TCP transmit path), `handler_multi` (N sessions end to end) and `lane_drain`
+(liveness and recovery of the handler). They need Vivado's `xsim` (their `run.sh` sources
+`/tools/Xilinx/Vivado/2024.2/settings64.sh` if it is not on `PATH`). Run all of them with:
+
+```bash
+hardware/unit-tests/run_all.sh            # or: hardware/unit-tests/run_all.sh tcp_read lane_drain
+```
+
+## Known issues and limits
+
+- Run one DuckDB process at a time: every `duckdb` built here opens the FPGA when it starts, the
+  CPU-baseline runs of the scripts included.
+- Stop a running query with SIGINT, once (`pkill -INT -x duckdb`), and wait for the process to
+  exit. Never `kill -9` a process that has the FPGA open: the driver can hang until the host
+  reboots.
+- After a failed query (an error, or a lane reported fatal or out of service), program the board
+  and restart the object store before the next run. If the first query after programming fails,
+  program the board again instead of retrying it.
+- The object store must listen on port 9000; other ports did not connect.
+- The FPGA keeps its four connections open between queries. MinIO's default idle timeout closes
+  them after 30 s, and the reconnects can leave a lane down; hence `MINIO_IDLE_TIMEOUT=1h`.
+- Restart the object store after every programming, before the first query: `ss -tan dst <FPGA IP>`
+  on the store host must show no connection to the board.
 - Fixed-width columns (BOOLEAN, INT32, INT64, FLOAT, DOUBLE) are fetched and decoded by the FPGA.
   String (BYTE_ARRAY) columns are decoded on the host from bytes fetched over a host socket. Other
   physical types are refused.
 - Only SNAPPY and uncompressed files are supported. A decoded column chunk must fit one 8 MiB
   output buffer (about one million 8-byte values per row group).
-- `read_parquet('httpfpga://...')` reads over a host socket; the FPGA is not involved.
-- A bare `count(*)` is answered from the Parquet footer with the FPGA idle.
-
-## Benchmarks
-
-Both scripts take the object store from `OASIS_SERVER` and `OASIS_PORT` (or `--server`, `--port`;
-the default address is the server they were developed against) and use
-`extension/build/release/duckdb` (`DUCKDB` overrides it). `-h` prints every option.
-
-- `./scripts/tpch_demo.sh` runs the 22 TPC-H queries on `read_oasis()` views and again on stock
-  DuckDB (httpfs and its parquet reader, same objects), compares the answers cell for cell and sums
-  the wall clock of both sides. For example
-  `./scripts/tpch_demo.sh --scale 30 --single-session --cache metadata --threads 1 --cpu-threads 0`.
-- `./scripts/throughput.sh` runs four `lineitem` scans (`--workload latency|q6|q1|wide`), reads the
-  decoders' cycle counters around each run, and reports the wall-clock rate, a completeness verdict
-  per run and a stock-DuckDB baseline.
-
-## RDMA mode
-
-Without `--http`, the build is the RDMA design: the vFPGA reads the Parquet files over RDMA from
-`rdma_server`, which hosts them in a Coyote RDMA memory region (see
-[rdma_server/README.md](rdma_server/README.md)). Set `oasis_rdma_server` (and `oasis_rdma_port`)
-and read them with `read_oasis('rdma://<file>')`.
+- `read_parquet('httpfpga://...')` reads over a host socket; the FPGA is not involved. A bare
+  `count(*)` is answered from the Parquet footer with the FPGA idle.
+- The host library drives the HTTP handler's CSR revision 2 and refuses an HTTP bitstream with any
+  other revision at startup.
 
 ## License
 
-The Oasis code is licensed under the terms in
-[LICENSE.md](https://github.com/fpgasystems/libstf/blob/master/LICENSE.md), which corresponds to the
-MIT Licence. Any contributions to libstf will be accepted under the terms of the same license.
+Oasis is licensed under the MIT License, see [LICENSE.md](LICENSE.md). The submodules are separate
+projects under their own terms, and `extension/` keeps the DuckDB extension template's license
+(`extension/LICENSE`).
