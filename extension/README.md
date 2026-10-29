@@ -70,6 +70,8 @@ Different tests can be created for DuckDB extensions. The primary way of testing
 ```sh
 make test
 ```
+The `httpfpga` tests also need a programmed board and run only when `OASIS_SERVER` holds the
+object server's address (`OASIS_SERVER=<ip> make test`).
 
 ### Installing the deployed binaries
 To install your extension binaries from S3, you will need to do two things. Firstly, DuckDB should be launched with the

@@ -8,7 +8,7 @@
 # group: [sql]
 #
 # Needs a programmed board (the extension opens the FPGA when it loads) and the object server:
-#   ./build/release/test/unittest test/sql/httpfpga.test
+#   OASIS_SERVER=<ip> ./build/release/test/unittest test/sql/httpfpga.test
 #
 # Every expected value was computed from the objects actually stored on the server, not from TPC-H
 # reference tables -- a mismatch means the bytes the host socket delivered differ from the bytes the
@@ -16,12 +16,14 @@
 
 require oasis
 
+require-env OASIS_SERVER
+
 statement ok
 SET enable_progress_bar=false;
 
-# The object server that holds the objects below (anonymous ranged GET): change it to yours.
+# The object server that holds the objects below (anonymous ranged GET).
 statement ok
-SET http_server='10.253.74.74';
+SET http_server='${OASIS_SERVER}';
 
 statement ok
 SET http_port=9000;
