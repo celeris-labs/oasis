@@ -196,6 +196,7 @@ RDMAReadConfig #(
     .out(rdma_conf)
 );
 
+// -- De-mux and arbiter the read send and completion queues ---------------------------------------
 metaIntf #(.STYPE(req_t)) sq_rd_strm [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 metaIntf #(.STYPE(ack_t)) cq_rd_strm [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 
@@ -234,6 +235,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     ndata_i       #(data8_t, DATABEAT_SIZE) out();
 
 `ifdef EN_RDMA
+    // AXI4SR to AXI4S
     `AXIS_ASSIGN(axis_rreq_recv[I], axi_in)
 
     RDMARead #(
@@ -252,6 +254,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .out(decoder_in)
     );
 `else
+    // AXI4SR to AXI4S
     `AXIS_ASSIGN(axis_host_recv[I], axi_in)
 
     AXIToNData #(data8_t, DATABEAT_SIZE) inst_axi_to_ndata (
@@ -276,6 +279,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .out(typed_out)
     );
 
+    // Discard typed
     `DATA_ASSIGN(typed_out, out);
 
     NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi (
@@ -446,9 +450,11 @@ end
 // No traffic on the bypass output stream in HTTP mode.
 always_comb axi_out[BYPASS_ID].tie_off_m();
 `elsif EN_RDMA
+// -- RDMA bypass stream (last stream slot, no decoder) --------------------------------------------
 AXI4S axi_in (.aclk(clk), .aresetn(rst_n));
 ndata_i #(data8_t, DATABEAT_SIZE) bypass_ndata();
 
+// AXI4SR to AXI4S
 `AXIS_ASSIGN(axis_rreq_recv[BYPASS_ID], axi_in)
 
 RDMARead #(
