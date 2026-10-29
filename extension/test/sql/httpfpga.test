@@ -14,9 +14,9 @@
 # reference tables -- a mismatch means the bytes the host socket delivered differ from the bytes the
 # server holds. Cases run smallest first so a broken datapath fails cheaply.
 
-require oasis
-
 require-env OASIS_SERVER
+
+require oasis
 
 statement ok
 SET enable_progress_bar=false;
@@ -28,7 +28,6 @@ SET http_server='${OASIS_SERVER}';
 statement ok
 SET http_port=9000;
 
-# 690 bytes.
 query I
 SELECT numbers FROM read_parquet('httpfpga:///testbench/dummy.parquet') ORDER BY numbers;
 ----

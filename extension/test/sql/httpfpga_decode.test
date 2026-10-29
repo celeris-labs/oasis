@@ -14,11 +14,11 @@
 #   answers straight from the Parquet footer. It passes with the FPGA idle. Every query below
 #   projects a real fixed-width column so the decoder actually runs.
 
+require-env OASIS_SERVER
+
 require oasis
 
 require parquet
-
-require-env OASIS_SERVER
 
 # The object server that holds the objects below (anonymous ranged GET).
 statement ok
