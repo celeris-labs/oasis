@@ -1,5 +1,5 @@
 Oasis patch 0009 for parcore/libstf/coyote/hw/services/network (base 20633d0): TCP window
-256 KiB -> 1 MiB (WINDOW_SCALE_BITS 2 -> 4). Formerly the local commit e9edcc4. Applied by apply.sh.
+256 KiB -> 1 MiB (WINDOW_SCALE_BITS 2 -> 4). Applied by apply.sh.
 
 diff --git a/hls/toe/toe_config.hpp.in b/hls/toe/toe_config.hpp.in
 index 5fe0fb6..e73d5aa 100644

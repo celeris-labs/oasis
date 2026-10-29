@@ -1,6 +1,6 @@
 Oasis patch 0010 for parcore/libstf/coyote (base 003c7344, branch dev/tcp): the TCP open, listen and
 close interfaces are wired to the user logic instead of the MMU, so the vFPGA opens and closes its own
-sessions. Formerly the local commit 46360d8c. Applied by apply.sh.
+sessions. Applied by apply.sh.
 
 diff --git a/hw/templates/common/dynamic_top_tmplt.txt b/hw/templates/common/dynamic_top_tmplt.txt
 index 287eca5..328b4d8 100644

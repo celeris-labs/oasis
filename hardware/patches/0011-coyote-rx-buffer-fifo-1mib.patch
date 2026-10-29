@@ -1,7 +1,6 @@
 Oasis patch 0011 for parcore/libstf/coyote (base 003c7344, branch dev/tcp): the shared receive FIFO
 behind the TOE goes from 1024 to 16384 beats of 64 B (1 MiB, the window of 0009), and the capacity the
-TOE is told (axis_max_data_count) moves with it. Formerly the local commits f248089d and b21b4ec6.
-Applied by apply.sh.
+TOE is told (axis_max_data_count) moves with it. Applied by apply.sh.
 
 diff --git a/hw/hdl/network/tcp/tcp_stack.sv b/hw/hdl/network/tcp/tcp_stack.sv
 index 08a86e6..f951443 100644

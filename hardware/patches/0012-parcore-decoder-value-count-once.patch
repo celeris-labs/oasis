@@ -1,7 +1,6 @@
 Oasis patch 0012 for parcore (base b3879a0): the column chunk decoder takes every chunk's value
 count exactly once (TypedNormalizeUntil keys on its skid buffer's head; ColumnChunkDecoder retires the
-count on its handshake and waits for it before the next chunk). Formerly the local commit 5dbca41.
-Applied by apply.sh.
+count on its handshake and waits for it before the next chunk). Applied by apply.sh.
 
 diff --git a/hardware/src/hdl/column_chunk_decoder.sv b/hardware/src/hdl/column_chunk_decoder.sv
 index 9674cd2..9966280 100644

@@ -1,6 +1,6 @@
 Oasis patch 0013 for parcore/libstf (base 7afc162): HugePageMemoryPool maps 4 free 1 GiB huge pages
 instead of every one; LIBSTF_HUGE_PAGES=N changes the count, 0 takes them all. Host library only.
-Formerly the local commits 21d8a39 and 307e90f. Applied by apply.sh.
+Applied by apply.sh.
 
 diff --git a/software/libstf/memory_pool.cpp b/software/libstf/memory_pool.cpp
 index 47aba8c..287fb55 100644
