@@ -89,7 +89,8 @@ first. [extension/README.md](extension/README.md) has the extension's details an
 
 ## Object store and data sets
 
-Start MinIO on an address the FPGA can reach, on port 9000, with a one-hour idle timeout:
+Start MinIO on an address the FPGA can reach, on port 9000, with a one-hour idle timeout, so that
+it keeps the FPGA's idle connections open:
 
 ```bash
 MINIO_IDLE_TIMEOUT=1h MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
@@ -177,12 +178,13 @@ cd parcore/libstf/coyote/util
 cd $REPO
 ```
 
-Then restart the object store: it still holds the connections of the previous bitstream. The
-extension opens the FPGA when it loads, so program the board before starting DuckDB.
+The extension opens the FPGA when it loads, so program the board before starting DuckDB. On
+opening it, the host library reads the register-map revision of the HTTP handler
+(`INFLIGHT[31:24]`) and refuses a bitstream that does not report 2.
 
 ## Running
 
-On the board host, with the board programmed and the object store restarted:
+On the board host, with the board programmed:
 
 ```bash
 export OASIS_SERVER=<store IP> OASIS_PORT=9000 LIBSTF_HUGE_PAGES=10
@@ -264,30 +266,27 @@ The HTTP client has standalone benches under `hardware/unit-tests/`, each with i
 hardware/unit-tests/run_all.sh            # or: hardware/unit-tests/run_all.sh tcp_read lane_drain
 ```
 
-## Known issues and limits
+## Limits
 
-- Run one DuckDB process at a time: every `duckdb` built here opens the FPGA when it starts, the
-  CPU-baseline runs of the scripts included.
-- Stop a running query with SIGINT, once (`pkill -INT -x duckdb`), and wait for the process to
-  exit. Never `kill -9` a process that has the FPGA open: the driver can hang until the host
-  reboots.
-- After a failed query (an error, or a lane reported fatal or out of service), program the board
-  and restart the object store before the next run. If the first query after programming fails,
-  program the board again instead of retrying it.
-- The object store must listen on port 9000; other ports did not connect.
-- The FPGA keeps its four connections open between queries. MinIO's default idle timeout closes
-  them after 30 s, and the reconnects can leave a lane down; hence `MINIO_IDLE_TIMEOUT=1h`.
-- Restart the object store after every programming, before the first query: `ss -tan dst <FPGA IP>`
-  on the store host must show no connection to the board.
-- Fixed-width columns (BOOLEAN, INT32, INT64, FLOAT, DOUBLE) are fetched and decoded by the FPGA.
-  String (BYTE_ARRAY) columns are decoded on the host from bytes fetched over a host socket. Other
-  physical types are refused.
-- Only SNAPPY and uncompressed files are supported. A decoded column chunk must fit one 8 MiB
-  output buffer (about one million 8-byte values per row group).
-- `read_parquet('httpfpga://...')` reads over a host socket; the FPGA is not involved. A bare
-  `count(*)` is answered from the Parquet footer with the FPGA idle.
-- At startup the host library reads the revision of the HTTP handler's register map
-  (`INFLIGHT[31:24]`). It accepts 2 and refuses a bitstream with any other value.
+- Every `duckdb` built here opens the FPGA when it starts, the scripts' CPU baselines included, so
+  only one may run at a time.
+- The FPGA fetches and decodes fixed-width columns (BOOLEAN, INT32, INT64, FLOAT, DOUBLE). The host
+  decodes string (BYTE_ARRAY) columns from bytes it reads over a host socket and refuses any other
+  physical type.
+- Only SNAPPY-compressed and uncompressed files are supported, and a decoded column chunk must fit
+  one 8 MiB output buffer (about one million 8-byte values per row group).
+- `read_parquet('httpfpga://...')` reads over a host socket without the FPGA, and `read_oasis()`
+  answers a bare `count(*)` from the Parquet footer with the FPGA idle.
+- The FPGA opens its connections, one per decoder, at the first `read_oasis()` query after
+  programming, to that query's `http_server` and `http_port`, and keeps them open between queries:
+  to read from another store, program the board again. Port 9000 is the tested configuration.
+- When the store closes an idle connection, the lane reopens it at once. A refused reopen leaves the
+  lane down until the board is programmed again.
+- Only programming resets the FPGA's HTTP client and decoders: after a query fails with an error
+  from an FPGA HTTP lane or a stream out of service, program the board again before the next query.
+- Stop a running query with SIGINT, once (Ctrl-C, or `pkill -INT -x duckdb`), and wait for the
+  process to exit. Never `kill -9` a process that has the FPGA open: a page fault the FPGA raises
+  for an exited process hangs the Coyote driver until the host reboots.
 
 ## License
 
