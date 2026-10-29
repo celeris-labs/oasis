@@ -1,3 +1,9 @@
+Oasis patch 0002 for parcore/libstf/coyote/hw/services/network (base 20633d0): the ephemeral-port
+cursor is loaded from a free-running counter at the first open request instead of starting at 32768
+after every reset, so a reprogrammed board does not reuse the previous load's 4-tuples. The object
+server still holds those connections and answers a SYN on one of them with an ACK for the old
+connection, so the new one never opens. Applied by apply.sh.
+
 diff --git a/hls/toe/port_table/port_table.cpp b/hls/toe/port_table/port_table.cpp
 index 8482a40..f5964ba 100755
 --- a/hls/toe/port_table/port_table.cpp

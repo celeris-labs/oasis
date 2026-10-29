@@ -1,3 +1,9 @@
+Oasis patch 0001 for parcore/libstf/coyote/hw/services/network (base 20633d0): rx_sar_table
+advertises a zero receive window while the shared rx FIFO has at most 375 * 64 + MSS bytes free, the
+level below which rx_engine drops arriving segments. Without it a window between 1 and 24000 bytes
+invites data that rx_engine then drops: a duplicate-ACK storm, go-back-N and exponential backoff.
+Applied by apply.sh.
+
 diff --git a/hls/toe/rx_sar_table/rx_sar_table.cpp b/hls/toe/rx_sar_table/rx_sar_table.cpp
 index 6039e25..e01775a 100755
 --- a/hls/toe/rx_sar_table/rx_sar_table.cpp
