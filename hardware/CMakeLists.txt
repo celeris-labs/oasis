@@ -60,9 +60,17 @@ set(TLBL_BITS 30)
 
 validation_checks_hw()
 
-load_apps (
-    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src"
-)
+# Source directories of the vFPGA. The RDMA and host-DMA configurations also take celeris's hardware
+# sources; the HTTP configuration does not.
+if(ENABLE_HTTP)
+    load_apps (
+        VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src"
+    )
+else()
+    load_apps (
+        VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src ../celeris/hardware/src"
+    )
+endif()
 
 create_hw()
 
