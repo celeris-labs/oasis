@@ -39,7 +39,7 @@
 #   idle        BETWEEN column chunks                            -> time to first byte + host round trip
 #
 # Next to the rate, look at idle/(total): the fraction of the query the decoder spent waiting for the
-# next request. Divide idle_cycles*4ns by the request count and you have the per-request dead time.
+# next request. (starved + idle) * 4 ns over the GET count is the per-request dead time.
 #
 # After the FPGA repeats, each workload runs once on stock DuckDB (its httpfs file system and its
 # parquet reader, built into the shell) against the same object, as the CPU baseline. It runs last,
@@ -350,7 +350,7 @@ Reading the counters (all cycles are 4 ns at the 250 MHz user clock):
   wall_MB/s            = bytes of all active decoders / query wall clock -- throughput
   FPGA-side wall time  = (hs + starved + stalled + idle) * 4 ns
   duty cycle           = hs / (hs + starved + stalled + idle)
-  per-request dead time = idle * 4 ns / (GETs - 1)
+  per-request dead time = (starved + idle) * 4 ns / GETs
 
 If idle dominates you are latency-bound between requests (the object store's
 time to first byte, the host round trip) and no amount of decoder speed helps.
