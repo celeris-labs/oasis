@@ -33,10 +33,9 @@ cmake_args+=(-DN_DECODERS="$decoders")
 
 pushd "$script_dir/../hardware" > /dev/null
 
-# Next build directory: highest existing build-N plus one. The glob needs two or more digits, so
-# build-100 and above are seen.
+# Next build directory: highest existing build-N plus one.
 n=0
-for d in build-[0-9][0-9]*; do
+for d in build-[0-9]*; do
     [ -d "$d" ] || continue
     num="${d#build-}"
     case "$num" in
