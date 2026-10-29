@@ -1,6 +1,10 @@
-Oasis patch 0010 for parcore/libstf/coyote (base 003c7344, branch dev/tcp): the TCP open, listen and
-close interfaces are wired to the user logic instead of the MMU, so the vFPGA opens and closes its own
-sessions, and util/program_hacc_local.sh is made executable. Applied by apply.sh.
+Oasis patch 0010 for parcore/libstf/coyote (base 003c7344, branch dev/tcp). Since b9663bf3, dev/tcp
+lets the host open, listen and close TCP sessions for the user logic through its software API and
+removed the user-logic ports. Oasis opens and closes its sessions in hardware, so a lane reconnects
+without the host: this patch puts the open, listen and close ports back on the user logic by editing
+three templates (dynamic_top, user_logic, user_wrapper) and routes the interfaces there. With it the
+host-side path is disabled: host requests are accepted and dropped. Listen is wired along although
+the design ties it off. util/program_hacc_local.sh is made executable. Applied by apply.sh.
 
 diff --git a/hw/templates/common/dynamic_top_tmplt.txt b/hw/templates/common/dynamic_top_tmplt.txt
 index 287eca5..328b4d8 100644
