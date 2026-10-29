@@ -69,7 +69,7 @@ void rev2_decoders() {
     CHECK(l.at(3).occ == 255 && l.at(3).arm_ready);
     CHECK(throws<std::out_of_range>([&] { (void)l.at(4); }));
 
-    // LANE_ERR bit 7 means RX_FIFO_STALL at revision 2.
+    // LANE_ERR bit 7 is RX_FIFO_STALL.
     const uint64_t err = 0x81ULL | (0x08ULL << 8);
     const auto     e   = HTTPReadConfig::DecodeLaneErrors(err, 4);
     CHECK(e.at(0).lane_dead && e.at(0).rx_fifo_stall);
@@ -116,7 +116,7 @@ std::string refusal(unsigned raw) {
     return "";
 }
 
-// Revision 2 is driven; every other one is refused at startup with the same message, naming it.
+// Revision 2 is driven; any other value is refused at startup with the same message, naming it.
 void revisions() {
     CHECK(oasis::HTTP_CSR_REVISION_MULTI == 2);
     const std::string three = refusal(3);

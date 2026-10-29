@@ -176,7 +176,7 @@ module handler_multi #(
     output logic [31:0] bodyRemainingWord,
     output logic [3:0]  state_debug,
 
-    // -- PER-LANE readback (CSR revision 2) --------------------------------------------------------
+    // -- PER-LANE readback -------------------------------------------------------------------------
     //
     // Everything above folds N lanes into one 32-bit window with OR, which answers "is anything
     // wrong" and nothing else. These five say WHICH LANE. They are 64 bits wide because eight lanes
@@ -874,8 +874,7 @@ module handler_multi #(
     //   [18] every lane is connected                  [19] req_ready for the lane last addressed
     //   [23:20] LANE COUNT -- how many sessions this bitstream has, which is what the host sizes
     //           its per-lane batches from
-    //   [31:24] CSR REVISION. The host reads it first and refuses a revision it does not know.
-    //           The write map is FROZEN and the revision does not touch it.
+    //   [31:24] CSR REVISION, 2. The host reads it first and refuses any other value.
     localparam logic [7:0] CSR_REVISION = 8'd2;
 
     assign inflightWord = {CSR_REVISION, 4'(NUM_CONNS), req_ready, (&conn_up_q),
@@ -897,7 +896,7 @@ module handler_multi #(
     assign state_debug       = lane_read_state[0];
 
     // =============================================================================================
-    // PER-LANE READBACK -- CSR revision 2
+    // PER-LANE READBACK
     //
     // The words above answer "is anything wrong". With N lanes that is not a useful question:
     // one dead lane sets |lane_fatal_q and the host learns that SOMETHING failed, then has to guess

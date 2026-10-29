@@ -356,7 +356,7 @@ void HTTPReadConfig::CheckRevision(uint8_t revision) {
 }
 
 uint8_t HTTPReadConfig::revision() {
-    // Read before anything touches read ids 16 to 20: below revision 2 those reads are a resp_error.
+    // Read once, before anything else touches the handler's registers (OasisContext::setup_http).
     if (revision_ == 0) {
         const uint8_t raw = inflight().revision;
         CheckRevision(raw);

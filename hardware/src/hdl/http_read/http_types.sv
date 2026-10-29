@@ -7,20 +7,23 @@
 // each field via AXI-Lite writes from the CPU and emits the whole struct as a
 // single beat on a ready/valid interface when the START register is written.
 // The host builds the request text itself; the handler reads only server_ip,
-// server_port, req_total_bytes, req_chunk_bytes and req_chunk_dest.
+// server_port, req_total_bytes, req_chunk_bytes and req_chunk_dest. The fields
+// from port_hex to time_in_seconds are reserved (write registers 2..38, see
+// http_config.sv).
 // =================================================================================================
 package http_types;
 
 typedef struct packed {
     logic [31:0] server_ip;     // TCP target, big-endian octets in low bytes
     logic [31:0] server_port;   // TCP target port (only [15:0] used)
-    logic [31:0] port_hex;      // ASCII bytes of the port (for the Host: header)
-    logic [7:0]  ip_hex_len;    // Number of ASCII bytes of the IP string (1..15)
+    // Reserved, write registers 2..38: latched and echoed, read by no handler.
+    logic [31:0] port_hex;
+    logic [7:0]  ip_hex_len;
     logic [31:0] ip_hex_w0;
     logic [31:0] ip_hex_w1;
     logic [31:0] ip_hex_w2;
     logic [31:0] ip_hex_w3;
-    logic [31:0] file_len;      // Number of bytes of the GET path (0..64)
+    logic [31:0] file_len;
     logic [31:0] file_w0;
     logic [31:0] file_w1;
     logic [31:0] file_w2;
@@ -37,19 +40,16 @@ typedef struct packed {
     logic [31:0] file_w13;
     logic [31:0] file_w14;
     logic [31:0] file_w15;
-    // Range endpoints are absolute file offsets, so they need to span the whole
-    // file: 4 words = 16 ASCII digits (~8.9 PiB).
-    logic [7:0]  range_begin_len; // ASCII digit count for Range start (0..16)
+    logic [7:0]  range_begin_len;
     logic [31:0] range_begin_w0;
     logic [31:0] range_begin_w1;
     logic [31:0] range_begin_w2;
     logic [31:0] range_begin_w3;
-    logic [7:0]  range_end_len;   // ASCII digit count for Range end (0..16)
+    logic [7:0]  range_end_len;
     logic [31:0] range_end_w0;
     logic [31:0] range_end_w1;
     logic [31:0] range_end_w2;
     logic [31:0] range_end_w3;
-    // Unused by the handler (the chunk boundary is req_chunk_bytes'). Kept so no address moves.
     logic [15:0] req_flags;
     logic [31:0] pkg_word_count;
     logic [31:0] user_frequency;
@@ -58,9 +58,8 @@ typedef struct packed {
     //
     // NON-ZERO MAKES THE BEAT AN ARM: the host has already built the text for every request of a
     // lane batch and hands it over as one byte stream on that lane's request stream. Zero makes the
-    // beat a chunk-length entry. No per-request field above is read by the handler -- only
-    // server_ip and server_port, to open the connection; the rest of the map is kept so no address
-    // moves.
+    // beat a chunk-length entry. Of the fields above the handler reads only server_ip and
+    // server_port, to open the connection.
     logic [31:0] req_total_bytes;
     // Bytes in one decoder stream, i.e. one column chunk's compressed extent.
     //
@@ -70,9 +69,8 @@ typedef struct packed {
     // that completes the chunk, so how many GETs it took is invisible downstream.
     logic [31:0] req_chunk_bytes;
     // Decoder lane this chunk belongs to. Carried in the SPARE UPPER BITS of the 64-bit
-    // req_chunk_bytes register rather than in a register of its own: the address map is full of
-    // traps (moving anything shifts every later parameter silently), and a chunk length has never
-    // needed more than 32 bits.
+    // req_chunk_bytes register (write register 41, bits [35:32]) rather than in a register of its
+    // own; a chunk length fits in 32 bits.
     logic [3:0]  req_chunk_dest;
 } http_config_t;
 

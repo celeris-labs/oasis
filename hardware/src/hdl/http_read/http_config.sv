@@ -20,35 +20,16 @@ import http_types::*;
 //   * Exposes a read register file so the host can poll status and identify
 //     the config (HTTP_CONFIG_ID).
 //
-// Register map (write side, addressed within this config's AXI-Lite space). The host writes
-// SERVER_IP, SERVER_PORT, REQ_TOTAL_BYTES, REQ_CHUNK_BYTES and START; it builds the request text
-// itself, so 2..38 are latched and echoed (read registers 3..9) but no handler reads them.
+// Register map (write side, addressed within this config's AXI-Lite space). The design uses
+// SERVER_IP, SERVER_PORT, START, REQ_TOTAL_BYTES and REQ_CHUNK_BYTES; the host builds the request
+// text itself. 2..38 are reserved: they are latched and echoed (read registers 3..9), and no
+// handler reads them.
 //   0  SERVER_IP        ([31:0])     -- TCP connect target, BE in low bytes
 //   1  SERVER_PORT      ([31:0])     -- TCP port (uses [15:0])
-//   2  PORT_HEX         ([31:0])     -- ASCII bytes of port
-//   3  IP_HEX_LEN       ([7:0])      -- Length of ASCII IP string
-//   4  IP_HEX_W0..7     ([31:0])     -- ASCII IP bytes packed little endian
-//   5  IP_HEX_W1
-//   6  IP_HEX_W2
-//   7  IP_HEX_W3
-//   8  FILE_LEN         ([31:0])     -- Length of a GET path
-//   9  FILE_W0          ([31:0])     -- Path bytes packed little endian
-//   .. FILE_W1..W14                     (9 + n for word n)
-//   24 FILE_W15
-//   25 REQ_FLAGS        ([15:0])
-//   26 PKG_WORD_COUNT   ([31:0])
-//   27 USER_FREQUENCY   ([31:0])
-//   28 TIME_IN_SECONDS  ([31:0])
-//   29 RANGE_BEGIN_LEN  ([7:0])
-//   30 RANGE_BEGIN_W0   ([31:0])
-//   31 RANGE_BEGIN_W1   ([31:0])
-//   32 RANGE_BEGIN_W2   ([31:0])
-//   33 RANGE_BEGIN_W3   ([31:0])
-//   34 RANGE_END_LEN    ([7:0])
-//   35 RANGE_END_W0     ([31:0])
-//   36 RANGE_END_W1     ([31:0])
-//   37 RANGE_END_W2     ([31:0])
-//   38 RANGE_END_W3     ([31:0])
+//   2..38               reserved     -- PORT_HEX, IP_HEX_LEN, IP_HEX_W0..3, FILE_LEN, FILE_W0..15,
+//                                       REQ_FLAGS, PKG_WORD_COUNT, USER_FREQUENCY, TIME_IN_SECONDS,
+//                                       RANGE_BEGIN_LEN, RANGE_BEGIN_W0..3, RANGE_END_LEN,
+//                                       RANGE_END_W0..3 (the ConfigWriteRegister list below)
 //   39 START            (ConfigWriteReadyRegister)  -- value ignored, write triggers
 //   41 REQ_CHUNK_BYTES  ([31:0] bytes, [35:32] lane) -- bytes in ONE decoder stream (a column
 //                                       chunk) and the lane it is for. Queued ahead of the data;
@@ -57,24 +38,21 @@ import http_types::*;
 //   40 REQ_TOTAL_BYTES  ([31:0])     -- 0: the START beat is a chunk-length ENTRY for the lane in
 //                                       REQ_CHUNK_BYTES[35:32]. Non-zero: the beat ARMS that lane,
 //                                       and this many bytes of request text follow on its host
-//                                       stream.
-//                                       Sits ABOVE START because 0..38 was full and moving START
-//                                       would shift the whole map; write it BEFORE START, which
-//                                       snapshots the live cfg.
+//                                       stream. Write it BEFORE START, which snapshots the
+//                                       live cfg.
 //
-// The 16 FILE_W words put the map past 32 registers, so HTTP_CONFIG_ADDR_SPACE in vfpga_top.svh
-// is 64. software/oasis/configuration.cpp mirrors these addresses.
+// With START at 39 and parameters up to 41 the map has 42 registers, so HTTP_CONFIG_ADDR_SPACE in
+// vfpga_top.svh is 64. software/oasis/configuration.cpp mirrors these addresses.
 //
-// Register map (read side), CSR revision 2 (handler_multi, INFLIGHT[31:24]). Bits not listed
-// read 0.
+// Register map (read side); INFLIGHT[31:24] carries its CSR revision, 2. Bits not listed read 0.
 //   0  HTTP_CONFIG_ID   "HTT"
 //   1  CLIENT_STATE     ([3:0])      -- lane 0's tcp_read state (also STATUS[11:8])
 //   2  STATUS           ([31:0])     -- the handler's totalWord: [7:4] tcp_init state, [11:8] lane
 //                                       0's tcp_read state, [18] every lane connected, [20] some
 //                                       lane fatal, [21] some TX reservation refused, [22] busy,
 //                                       [23] as STALL[24]
-//   3  ECHO_FILE_LEN    ([31:0])     -- registers 3..9 echo write registers the host does not
-//   4  ECHO_FILE_W0     ([31:0])        write, so they read 0
+//   3  ECHO_FILE_LEN    ([31:0])     -- 3..7 and 9 echo reserved write registers, so they read
+//   4  ECHO_FILE_W0     ([31:0])        0; 8 echoes the server
 //   5  ECHO_FILE_W4     ([31:0])
 //   6  ECHO_RANGE_BEGIN ([39:32] len, [31:0] first 4 ASCII digits)
 //   7  ECHO_RANGE_END   ([39:32] len, [31:0] first 4 ASCII digits)
@@ -109,8 +87,8 @@ import http_types::*;
 //                        down to zero and is meaningless once the response is over.
 //   15 QUEUE_DEPTH      ([31:0]) -- chunk entries per lane, untruncated (INFLIGHT[15:8] saturates)
 //
-// The host reads INFLIGHT[31:24] first and refuses a revision it does not know. The read register
-// file answers an address above 20 with resp_error, not with a plausible zero.
+// The host reads INFLIGHT[31:24] first and refuses any revision but 2. The read register file
+// answers an address above 20 with resp_error, not with a plausible zero.
 //
 // Registers 16..20 are indexed by LANE at a fixed stride of 8 lanes, whatever NUM_CONNS the
 // bitstream was built with. Lanes that do not exist read 0; INFLIGHT[23:20] says how many are real.
@@ -228,15 +206,10 @@ module HttpConfig #(
 localparam logic [AXIL_DATA_BITS - 1:0] HTTP_CONFIG_ID = 64'h0000_0000_0048_5454; // "HTT"
 
 // The map below is hardcoded in the ConfigWriteRegister instantiations, so these parameters cannot
-// move it -- they only place START and size the address space. An instantiation that leaves them at
-// a stale value drops START on top of a parameter register, and a write to that parameter then fires
-// the request mid-configuration: every register after it keeps its previous value while the
-// read-side echo, which reads the LIVE cfg rather than the snapshot the handler took, still shows
-// the correct values. Catch it at elaboration rather than on the wire.
-// Parameters occupy 0..38, 40 and 41. START sits at 39, in the gap between them, because 0..38 was
-// already full and moving START would shift every address after it -- exactly the failure described
-// above. So the guard is not "START is above every parameter": what has to hold is that START
-// ALIASES no parameter, and that the address space covers the highest one.
+// move it -- they only place START and size the address space. Parameters occupy 0..38, 40 and 41,
+// and START sits at 39, between them. The checks below hold that START aliases no parameter (a
+// START on a parameter register would fire the request on a write to that parameter) and that the
+// address space covers the highest parameter.
 localparam int LAST_PARAM_ADDR   = 38;   // highest contiguous parameter, below START
 localparam int STREAM_PARAM_ADDR = 41;   // req_total_bytes at 40, req_chunk_bytes at 41
 `ASSERT_ELAB(START_ADDR > LAST_PARAM_ADDR)
@@ -318,10 +291,8 @@ ConfigWriteRegister #(25, data64_t) inst_reg_req_flags        (clk, write_config
 ConfigWriteRegister #(26, data64_t) inst_reg_pkg_word_count   (clk, write_config, reg_pkg_word_count);
 ConfigWriteRegister #(27, data64_t) inst_reg_user_frequency   (clk, write_config, reg_user_frequency);
 ConfigWriteRegister #(28, data64_t) inst_reg_time_in_seconds  (clk, write_config, reg_time_in_seconds);
-// 40, ABOVE the START trigger at 39. Everything below 39 was taken, and moving START would shift
-// the whole map -- the one change this file exists to warn against. Writing a parameter above the
-// trigger is safe here only because the trigger reads the LIVE cfg: the host writes 40, then 39,
-// and the snapshot includes it.
+// 40, above the START trigger at 39. Writing a parameter above the trigger is safe because the
+// trigger reads the LIVE cfg: the host writes 40, then 39, and the snapshot includes it.
 ConfigWriteRegister #(40, data64_t) inst_reg_req_total_bytes (clk, write_config, reg_req_total_bytes);
 ConfigWriteRegister #(41, data64_t) inst_reg_req_chunk_bytes (clk, write_config, reg_req_chunk_bytes);
 ConfigWriteRegister #(29, data64_t) inst_reg_range_begin_len    (clk, write_config, reg_range_begin_len);
@@ -405,8 +376,8 @@ assign start_raw.ready = start_cfg.ready;
 // Read register file: host can poll status here.
 //
 // Registers 3..9 echo latched write parameters: the write registers are write-only, and an echo is
-// the only way to see what a register holds. The host does not write 2..38, so these read 0; 8
-// echoes the server it does write.
+// the only way to see what a register holds. The host does not write the reserved 2..38, so these
+// read 0; 8 echoes the server it does write.
 // -------------------------------------------------------------------------------------------------
 // 21 (0..20). The read register file answers anything above NUM_READ_REGS-1 with resp_error, which
 // is the whole compatibility scheme -- a host that reads a register this bitstream does not have
@@ -445,9 +416,9 @@ assign read_registers[15] = {32'b0, queue_depth_word};
 // Everything from 10 to 15 folds N lanes into one 32-bit window with OR: the host learns that
 // SOMETHING failed, not which lane to reissue. These five are indexed by lane at a fixed stride.
 //
-// They sit above 15 and nothing at 0..15 depends on them. Extend the map, never edit it: bitstreams
-// and libraries disagree about a map whenever it is edited, and that failure is silent in both
-// directions. The revision byte in INFLIGHT says which map a bitstream has.
+// They sit above 15 and nothing at 0..15 depends on them. Extend the map, never edit it: a
+// bitstream and a library that disagree about the map fail silently in both directions. The
+// revision byte in INFLIGHT names this map, and the host checks it first.
 // -------------------------------------------------------------------------------------------------
 assign read_registers[16] = lane_occ_word;
 assign read_registers[17] = lane_ready_word;

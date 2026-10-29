@@ -24,9 +24,8 @@ constexpr const uint64_t RDMA_READ_CONFIG_ID   = 0x2f966a70f04c0e93;
 // 39 to 41 and reads ids 0 to 20.
 constexpr const uint64_t HTTP_READ_CONFIG_ID = 0x0000000000485454;
 
-// The CSR revision this library drives, from inflightWord[31:24]: revision 2, handler_multi, whose
-// lanes share the TOE's receive fifo. Every other revision is refused at startup
-// (HTTPReadConfig::CheckRevision).
+// The CSR revision of the register map this library drives, from inflightWord[31:24]. Any other
+// value is refused at startup (HTTPReadConfig::CheckRevision).
 constexpr const uint8_t HTTP_CSR_REVISION_MULTI = 2;
 
 // Lanes the per-lane CSRs (read ids 16 to 20) address, at a fixed stride whatever the bitstream's lane
