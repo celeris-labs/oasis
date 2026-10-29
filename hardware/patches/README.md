@@ -1,6 +1,6 @@
 # Patches to the submodules
 
-The hardware build depends on changes to four nested submodules: ParCore (`parcore`), libstf
+The hardware build and the host library depend on changes to four nested submodules: ParCore (`parcore`), libstf
 (`parcore/libstf`), Coyote (`parcore/libstf/coyote`) and its TCP offload engine
 (`parcore/libstf/coyote/hw/services/network`, upstream
 [fpga-network-stack](https://github.com/fpgasystems/fpga-network-stack)). They live here because
