@@ -101,7 +101,7 @@ module lane_drain_tb #(
     logic [31:0] totalWord, inflightWord, queueDepthWord, stallWord, respWord,
                  contentLengthWord, bodyRemainingWord;
     logic [3:0]  state_debug;
-    // Per-lane readback, CSR revision 2. See the map in http_config.sv.
+    // Per-lane readback. See the map in http_config.sv.
     logic [63:0] laneOccWord, laneReadyWord, laneStateWord, laneErrWord, lanePolicyWord;
 
     // laneErrWord[8L+0]: rx_dispatch's head-of-line watchdog killed lane L. Latched in

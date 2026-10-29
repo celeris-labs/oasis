@@ -74,7 +74,7 @@ module handler_multi_tb;
     logic [3:0]  state_debug;
     logic [63:0] laneOccWord, laneReadyWord, laneStateWord, laneErrWord, lanePolicyWord;
 
-    // The per-lane readback map (CSR revision 2), as software will index it. Decoding it here rather
+    // The per-lane readback map, as software will index it. Decoding it here rather
     // than writing bit numbers into the checks is the point: if the packing and the host's idea of it
     // ever diverge, they diverge in one place.
     localparam int LANE_STALL_CYCLES_EXP = 65536;   // handler_multi's default, not overridden below
@@ -685,7 +685,7 @@ module handler_multi_tb;
         // "lane 0 owes eight responses and lane 2 owes one" from "some lane owes something" -- and
         // the second is not an answer to the question the host actually asks, which is per lane and
         // asked before every single config beat: may I push another entry on THIS lane, may I arm
-        // it. CSR revision 2 answers that; this case is what says the answer is true.
+        // it. The per-lane registers answer that; this case is what says the answer is true.
         //
         // The load is deliberately lopsided, and lane 0 is filled to QUEUE_DEPTH *exactly*. Filling
         // one lane is what makes the check sharp: ENTRY_READY must go LOW on lane 0 while staying
