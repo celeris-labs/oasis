@@ -53,8 +53,7 @@ echo "Building bitstream in $build_dir..."
 mkdir "$build_dir" || { echo "refusing to build into an existing directory: $build_dir" >&2; exit 1; }
 cmake -S . -B "$build_dir" "${cmake_args[@]}" || { echo "cmake configure failed (see above); nothing launched" >&2; exit 1; }
 
-# PROVENANCE.txt: what this directory was configured from. Operator notes go below the header.
-# Only plumbing commands here, no `git status`.
+# PROVENANCE.txt: what this directory was configured from.
 {
     echo "configured : $(date '+%Y-%m-%d %H:%M %Z') on $(hostname) by $(id -un)"
     echo "command    : scripts/synthesize.sh $orig_args"
