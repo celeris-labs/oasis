@@ -235,13 +235,11 @@ module tcp_read #(
         end
     end
 
-    // Room for everything already promised PLUS the segment this would admit, with every promised
-    // beat accepted even if the reader takes nothing: level + reserved + one segment must stay
-    // within RX_FIFO_DEPTH - AF_SLACK. Written as an addition, not as (DEPTH - level - reserved),
-    // because level + reserved may legitimately exceed the depth for a cycle and the subtraction
-    // would wrap to a huge unsigned "yes".
-    assign rx_space_ok = (RSV_BITS'(rx_fifo_level) + rsv_beats_q + RSV_BITS'(SEG_BEATS))
-                         <= RSV_BITS'(RX_FIFO_DEPTH - AF_SLACK);
+    // Room for everything already promised PLUS the segment this would admit. Written as an
+    // addition, not as (DEPTH - level - reserved), because level + reserved may legitimately exceed
+    // the depth for a cycle and the subtraction would wrap to a huge unsigned "yes".
+    assign rx_space_ok = (RSV_BITS'(rx_fifo_level) + rsv_beats_q + RSV_BITS'(MSS_BEATS))
+                         < RSV_BITS'(RX_FIFO_DEPTH);
 
     axis_fifo #(
         .DATA_BITS(AXI_DATA_BITS),

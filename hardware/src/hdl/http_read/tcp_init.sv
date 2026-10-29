@@ -59,8 +59,9 @@ module tcp_init (
                     // success == 1 means the connection was established (cThread::openConnTcp
                     // throws when this bit is clear), so an error is success == 0.
                     // The handler acts on this: an open that fails leaves nothing bound and
-                    // nothing sent. During bring-up it retries that lane after a backoff; a refused
-                    // reconnect makes the lane fatal. Either way it latches the lane's init error.
+                    // nothing sent. During bring-up it starts again at lane 0 after a backoff; a
+                    // refused reconnect leaves the lane down. Either way it latches the lane's
+                    // init error.
                     // Note the common connect failure -- ephemeral-port reuse against the peer's
                     // TIME_WAIT -- does NOT land here: there openStatus never arrives at all, the
                     // FSM waits in ST_WAIT, and the handler's connect watchdog is the only signal.

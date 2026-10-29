@@ -130,8 +130,7 @@ import http_types::*;
 //                                                 must be reissued.
 //                           [8L+1] DIRTY          the read aborted after body bytes had already
 //                                                 reached the decoder, so a replay would duplicate
-//                           [8L+2] INIT_ERR       an open for this lane was refused; with FATAL it
-//                                                 was the open of a reconnect
+//                           [8L+2] INIT_ERR       an open for this lane was refused
 //                           [8L+3] RESP_ERR       a response could not be framed (no
 //                                                 Content-Length)
 //                           [8L+4] STATUS_BAD     a response retired with a status read as neither
@@ -145,8 +144,8 @@ import http_types::*;
 //                                                 corrupt. Should never fire; see the reservation
 //                                                 in tcp_read.sv
 //                         FATAL lives in 17, not here. Fatal AND lane_dead is a HOL kill;
-//                         fatal and not lane_dead is a read that could not be replayed or a refused
-//                         reconnect, and the other bits say which.
+//                         fatal and not lane_dead is a read that could not be replayed, and the
+//                         other bits say why.
 //   20 LANE_POLICY     -- fixed at elaboration, for the host to sanity-check itself against:
 //                           [7:0]   CSR revision (same value as INFLIGHT[31:24])
 //                           [15:8]  NUM_CONNS

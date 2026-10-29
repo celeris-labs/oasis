@@ -61,8 +61,7 @@ import http_types::*;
 // counter is idle, its transmit side is idle and its chunk queue is empty -- and the failure was
 // clean rather than dirty. Then the bring-up FSM closes that session, releases it in rx_dispatch
 // (so a late notification for the dead id is dropped instead of becoming a readPkg the TOE cannot
-// answer) and opens a fresh one, one lane at a time because there is one tcp_init. If the TOE
-// refuses that open the lane goes fatal: it has no session, and nothing but the host reopens it.
+// answer) and opens a fresh one, one lane at a time because there is one tcp_init.
 //
 // The common case is not a fault at all: MinIO closes an idle connection after ~30 s, and with N
 // lanes a lane can easily sit idle that long while its neighbours work. Catching the FIN while the
@@ -612,20 +611,18 @@ module handler_multi #(
             BR_IDLE: begin
                 // The first arm is what says a server address exists. Open every lane then, not
                 // lazily per lane: a lane whose connection is opened only when it is first used
-                // pays a handshake in the middle of a query instead of before it. The walk starts
-                // at lane 0 (reset); after a refused open it resumes at the lane that was refused,
-                // because the lanes before it are up.
+                // pays a handshake in the middle of a query instead of before it.
                 if (any_armed_q && (retry_wait_q == '0)) begin
-                    br_d = BR_OPEN;
+                    bring_lane_d = '0;
+                    br_d         = BR_OPEN;
                 end
             end
             BR_OPEN: begin
                 if (init_done) begin
                     if (init_error) begin
                         // A refused open leaves nothing bound, so there is nothing to unwind.
-                        // During bring-up, back off in BR_IDLE and retry this same lane. After a
-                        // reconnect the lane is left without a session and goes fatal (below);
-                        // the others carry on from BR_DONE.
+                        // During bring-up, back off in BR_IDLE, which starts again at lane 0;
+                        // after a reconnect, come back to BR_DONE.
                         br_d = bringing_up_q ? BR_IDLE : BR_DONE;
                     end else begin
                         bind_en_w = 1'b1;
@@ -763,9 +760,6 @@ module handler_multi #(
             if ((br_q == BR_OPEN) && init_done && init_error) begin
                 retry_wait_q               <= '1;
                 lane_init_err_q[bring_lane_q] <= 1'b1;
-                // A refused reconnect: the lane has no session, nothing reopens it, and it owes
-                // the host a reissue. Fatal, so the host sees it and routes around it.
-                if (!bringing_up_q) lane_fatal_q[bring_lane_q] <= 1'b1;
             end
 
             // Per-lane chunk accounting, for the readback and the entry admission test.

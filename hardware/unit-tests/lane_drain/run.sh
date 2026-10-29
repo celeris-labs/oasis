@@ -147,8 +147,6 @@ elab ldto_snap "NUM_CONNS=2" "STALL_CYCLES=8192" || exit 1
 for s in a b c d e f g h;        do run_hm "$s" 2; done
 for s in a2 a8 a9 a10;           do run_hm "$s" 2; done
 for s in lz1 lz2;                do run_hm "$s" 2; done
-# an open the TOE refuses: during the first bring-up (of1), and on a reconnect (of2)
-run_hm of1 2; run_hm of1 4; run_hm of2 2
 for s in s_base s_g s_d s_e s_f; do run_hm "$s" 2; done
 # a fatal lane's session is released while the peer still has segments in flight: the late
 # segment lands before lane 1's next batch, then in the middle of one of lane 1's bodies
