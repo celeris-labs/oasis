@@ -1,17 +1,8 @@
 import lynxTypes::*;
 
-// =================================================================================================
-// Plain AXI4-Stream FIFO (tdata / tkeep / tlast).
-//
-// The decoupling fifo of a receive lane (tcp_read): it takes the beats the dispatcher routes to the
-// lane at line rate while the framer walks a header one byte per cycle, so the TCP stack's receive
-// path never waits on the parser. Plain inferred BRAM rather than xpm_fifo_axis or axis_data_fifo,
-// so the unit tests run in xsim straight from these sources with no IP catalog.
-//
-// Almost-full is what drives TREADY, and it leaves ALMOST_FULL_SLACK entries free. One slot would
-// be enough for a purely registered producer, but the TOE side is a long combinational path and the
-// slack costs nothing at this depth.
-// =================================================================================================
+// AXI4-Stream FIFO on inferred block RAM, so the unit tests run in xsim without the IP catalog.
+// tcp_read puts one in each receive lane so the TCP receive path never waits on the header parser.
+// TREADY drops ALMOST_FULL_SLACK entries early to give the combinational TOE path some room.
 module axis_fifo #(
     parameter int DATA_BITS         = AXI_DATA_BITS,
     parameter int DEPTH             = 1024,          // entries; x 64 B = 64 KiB at the default
@@ -19,8 +10,7 @@ module axis_fifo #(
 ) (
     input  logic                     clk,
     input  logic                     rst_n,
-    // Drop everything held. Used when a connection is torn down: the residue belongs to a stream
-    // that no longer exists.
+    // Drops everything held, used when the connection is torn down.
     input  logic                     clear,
 
     input  logic                     s_axis_tvalid,
@@ -35,10 +25,9 @@ module axis_fifo #(
     output logic [DATA_BITS/8-1:0]   m_axis_tkeep,
     output logic                     m_axis_tlast,
 
-    // Occupancy, for the stall watchdogs and for tests that assert the fifo never filled.
     output logic [$clog2(DEPTH+1)-1:0] level,
-    // Sticky: the producer was ever refused. The receive dispatchers do not hold a beat for TREADY,
-    // so in tcp_read a refused beat is lost and the stream is corrupt; it should never set.
+    // Sticky: the producer was refused at least once. tcp_read does not hold a beat for TREADY, so
+    // this means data was lost; it should never be set.
     output logic                     overflow_stall
 );
 
@@ -46,7 +35,6 @@ module axis_fifo #(
     localparam int WORD_BITS = DATA_BITS + KEEP_BITS + 1;
     localparam int PTR_BITS  = $clog2(DEPTH);
 
-    // Inferred as block RAM. No reset on the array: the pointers define what is valid.
     (* ram_style = "block" *) logic [WORD_BITS-1:0] mem [DEPTH];
 
     logic [PTR_BITS-1:0]        wr_ptr_q, rd_ptr_q;
@@ -64,9 +52,7 @@ module axis_fifo #(
     assign wr_fire = s_axis_tvalid && s_axis_tready;
     assign rd_fire = m_axis_tvalid && m_axis_tready;
 
-    // First-word-fall-through: the head is presented combinationally from a registered read of the
-    // memory. A one-entry output register keeps the BRAM read synchronous while still showing the
-    // head without a bubble.
+    // First-word-fall-through with a one-entry output register, so the BRAM read stays synchronous.
     logic [WORD_BITS-1:0] out_q;
     logic                 out_valid_q;
 
@@ -87,15 +73,13 @@ module axis_fifo #(
             rd_ptr_q         <= '0;
             level_q          <= '0;
             out_valid_q      <= 1'b0;
-            // Deliberately NOT cleared on `clear`: it is a run-level diagnostic, and a connection
-            // teardown must not erase the evidence that the fifo had already overflowed.
+            // Not cleared by clear, so a connection teardown cannot hide an earlier overflow.
             overflow_stall_q <= (!rst_n) ? 1'b0 : overflow_stall_q;
         end else begin
             if (wr_fire) wr_ptr_q <= (wr_ptr_q == PTR_BITS'(DEPTH-1)) ? '0 : wr_ptr_q + 1'b1;
             if (out_load) rd_ptr_q <= (rd_ptr_q == PTR_BITS'(DEPTH-1)) ? '0 : rd_ptr_q + 1'b1;
 
-            // level counts entries still in the memory; the output register is not one of them,
-            // so it is decremented on the memory read, not on the downstream handshake.
+            // level counts the entries in the memory, not the one in the output register.
             case ({wr_fire, out_load})
                 2'b10:   level_q <= level_q + 1'b1;
                 2'b01:   level_q <= level_q - 1'b1;

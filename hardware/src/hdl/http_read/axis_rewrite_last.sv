@@ -2,46 +2,24 @@
 
 import lynxTypes::*;
 
-// Marks the end of a decoder stream by COUNTING BYTES, not by trusting a per-response flag.
-//
-// WHY A BYTE COUNT
-// ----------------
-// The decoder needs to know where one column chunk stops and the next begins; the DataNormalizer
-// resets its running byte offset on tlast, so exactly one tlast per chunk is the contract.
-//
-// Carrying that per RESPONSE -- a body_last bit on the last ranged GET of each chunk, travelling
-// with the request, strip_http asserting tlast when it frames that response -- makes the
-// bookkeeping scale with the number of REQUESTS: one bit per outstanding response, thousands of them
-// once requests are pushed in bulk, and the queue holding them an arbitrary limit.
-//
-// A byte count scales with the number of COLUMN CHUNKS instead. A row group has a handful of those
-// however finely each one is split into ranged GETs, so CFG_DEPTH can be small and never fill. How
-// many GETs a chunk took becomes invisible to everything downstream.
-//
-// The same idea as libstf's RewriteLastCore (hardware/src/hdl/stream/data_rewrite_last.sv), written
-// against AXI-Stream because that is what the body path speaks; adapting the ndata_i wrappers would
-// have been more plumbing than the counter itself.
+// Sets tlast at the end of each decoder stream by counting bytes: the host queues one length (and
+// decoder lane) per column chunk, and the beat that completes it gets tlast. That takes one queue
+// entry per column chunk rather than one flag per ranged GET, so how many GETs a chunk took is
+// invisible downstream. Same idea as libstf's RewriteLastCore, on AXI4-Stream ports.
 module axis_rewrite_last #(
-    // Column chunks that may be configured ahead of the data. A row group's worth is a handful, so
-    // this exists to decouple the host from the wire, not to bound anything.
+    // Column chunks that can be queued ahead of the data.
     parameter int CFG_DEPTH = 64,
-    // Decoder lanes the body stream can be routed to. handler_multi uses 1 (one instance per lane),
-    // which costs nothing.
     parameter int NUM_DEST  = 1,
-    // Derived, but a parameter so the ports can use it.
     parameter int DEST_BITS = (NUM_DEST > 1) ? $clog2(NUM_DEST) : 1
 ) (
     input  logic clk,
     input  logic rst_n,
 
-    // Length of the next logical stream, in bytes. One per column chunk.
+    // Length of the next stream in bytes, one per column chunk.
     input  logic        cfg_valid,
     output logic        cfg_ready,
     input  logic [31:0] cfg_len,
-    // Which decoder lane this chunk belongs to. The HOST decides -- it is the same stream index it
-    // enqueued the chunk's decoder configuration on -- and the hardware must not second-guess it.
-    // Round-robin in hardware would work only while host and hardware never disagree, and a single
-    // dropped or retried chunk would desynchronise them permanently.
+    // Decoder lane of the chunk. The host chooses it; the hardware does not second-guess it.
     input  logic [DEST_BITS-1:0] cfg_dest,
 
     input  logic                       s_tvalid,
@@ -54,17 +32,13 @@ module axis_rewrite_last #(
     output logic [AXI_DATA_BITS-1:0]   m_tdata,
     output logic [AXI_DATA_BITS/8-1:0] m_tkeep,
     output logic                       m_tlast,
-    // Lane of the chunk currently streaming. Valid whenever m_tvalid is high, and constant for a
-    // whole chunk, so a demux downstream can hold its selection until tlast.
+    // Constant for a whole chunk, so a demux can hold its selection until tlast.
     output logic [DEST_BITS-1:0]       m_tdest,
 
-    // High while any configured chunk is still incomplete. This is what tells the handler that more
-    // responses are coming: the module knows exactly how many bytes are still owed, so nothing else
-    // has to count responses.
+    // High while a queued chunk is still incomplete, i.e. more response bytes are owed.
     output logic        busy,
 
-    // Sticky: data arrived with no length configured. Means the host queued fewer chunk lengths
-    // than the responses it asked for, which would silently merge two columns into one stream.
+    // Sticky: data arrived with no length queued, i.e. the host queued too few chunk lengths.
     output logic        starved,
     output logic [31:0] remaining_dbg
 );
@@ -78,7 +52,6 @@ module axis_rewrite_last #(
             $error("axis_rewrite_last: CFG_DEPTH must be a power of two >= 2");
     end
 
-    // Length queue, and the lane each length belongs to.
     logic [31:0]          len_mem  [CFG_DEPTH];
     logic [DEST_BITS-1:0] dest_mem [CFG_DEPTH];
     logic [PTR_BITS-1:0]  wr_ptr_q, rd_ptr_q;
@@ -88,7 +61,6 @@ module axis_rewrite_last #(
     assign q_full   = (cnt_q == CNT_BITS'(CFG_DEPTH));
     assign cfg_ready = !q_full;
 
-    // Bytes still owed on the stream currently being counted. Loaded from the queue head.
     logic [31:0] remaining_q;
     logic [DEST_BITS-1:0] dest_q;
     logic        active_q;
@@ -102,8 +74,7 @@ module axis_rewrite_last #(
     assign do_pop  = !active_q && !q_empty;
 
     logic beat_fire, is_last;
-    // A beat may only pass once a length is loaded: without one there is no way to know whether it
-    // ends a stream, and guessing merges columns.
+    // No beat passes before a length is loaded: without one there is no telling where it ends.
     assign m_tvalid = s_tvalid && active_q;
     assign s_tready = m_tready && active_q;
     assign beat_fire = m_tvalid && m_tready;
@@ -128,8 +99,6 @@ module axis_rewrite_last #(
             active_q    <= 1'b0;
             starved_q   <= 1'b0;
         end else begin
-            // Push and pop can happen in the same cycle, so the count is adjusted ONCE from both
-            // rather than by two assignments where the later silently wins.
             if (do_push) begin
                 len_mem [wr_ptr_q] <= cfg_len;
                 dest_mem[wr_ptr_q] <= cfg_dest;
@@ -137,8 +106,6 @@ module axis_rewrite_last #(
             end
             if (do_pop) begin
                 remaining_q <= len_mem [rd_ptr_q];
-                // dest_q holds for the whole chunk, so a demux can latch it on the first beat and
-                // keep it until tlast without re-deciding mid-stream.
                 dest_q      <= dest_mem[rd_ptr_q];
                 active_q    <= 1'b1;
                 rd_ptr_q    <= rd_ptr_q + 1'b1;
@@ -146,10 +113,9 @@ module axis_rewrite_last #(
             case ({do_push, do_pop})
                 2'b10:   cnt_q <= cnt_q + 1'b1;
                 2'b01:   cnt_q <= cnt_q - 1'b1;
-                default: cnt_q <= cnt_q;   // both or neither
+                default: cnt_q <= cnt_q;
             endcase
 
-            // count down
             if (beat_fire) begin
                 if (is_last) begin
                     active_q    <= 1'b0;
@@ -159,7 +125,6 @@ module axis_rewrite_last #(
                 end
             end
 
-            // data with nothing configured: the host under-queued.
             if (s_tvalid && !active_q && q_empty) starved_q <= 1'b1;
         end
     end

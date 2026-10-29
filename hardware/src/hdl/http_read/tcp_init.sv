@@ -1,5 +1,7 @@
 import lynxTypes::*;
 
+// Opens one TCP connection through the TOE. On start it sends the open request and waits for the
+// open status; done then stays high, with session_id and error, until start drops.
 module tcp_init (
     input  logic                                      clk,
     input  logic                                      rst_n,
@@ -55,16 +57,10 @@ module tcp_init (
                 s_axis_open_status_TREADY = 1'b1;
                 if (s_axis_open_status_TVALID && s_axis_open_status_TREADY) begin
                     session_id_d = s_axis_open_status_TDATA[15:0];
-                    // tcp_open_rsp_t = {ip_port[71:56], ip_address[55:24], success[23:16], sid[15:0]}.
-                    // success == 1 means the connection was established (cThread::openConnTcp
-                    // throws when this bit is clear), so an error is success == 0.
-                    // The handler acts on this: an open that fails leaves nothing bound and
-                    // nothing sent. During bring-up it starts again at lane 0 after a backoff; a
-                    // refused reconnect leaves the lane down. Either way it latches the lane's
-                    // init error.
-                    // Note the common connect failure -- ephemeral-port reuse against the peer's
-                    // TIME_WAIT -- does NOT land here: there openStatus never arrives at all, the
-                    // FSM waits in ST_WAIT, and the handler's connect watchdog is the only signal.
+                    // tcp_open_rsp_t: ip_port[71:56], ip_address[55:24], success[23:16], sid[15:0].
+                    // A refused open sets error. An open that never gets a status (port reuse
+                    // against the peer's TIME_WAIT) waits in ST_WAIT, where only the handler's
+                    // connect watchdog sees it.
                     error_d = (s_axis_open_status_TDATA[23:16] == 8'd0);
                     state_d = ST_DONE;
                 end

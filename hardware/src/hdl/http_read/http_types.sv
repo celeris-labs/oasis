@@ -1,16 +1,7 @@
 `timescale 1ns / 1ps
 
-// =================================================================================================
-// HTTP client configuration types
-//
-// One packed struct with every HttpConfig write register. HttpConfig latches
-// each field via AXI-Lite writes from the CPU and emits the whole struct as a
-// single beat on a ready/valid interface when the START register is written.
-// The host builds the request text itself; the handler reads only server_ip,
-// server_port, req_total_bytes, req_chunk_bytes and req_chunk_dest. The fields
-// from port_hex to time_in_seconds are reserved (write registers 2..38, see
-// http_config.sv).
-// =================================================================================================
+// The HttpConfig write registers as one packed struct, emitted as one beat when START is written.
+// The handler reads only server_ip, server_port and the req_* fields (see http_config.sv).
 package http_types;
 
 typedef struct packed {
@@ -54,23 +45,12 @@ typedef struct packed {
     logic [31:0] pkg_word_count;
     logic [31:0] user_frequency;
     logic [31:0] time_in_seconds;
-    // Total bytes of pre-built request text the host is about to stream in over axis_host_recv.
-    //
-    // NON-ZERO MAKES THE BEAT AN ARM: the host has already built the text for every request of a
-    // lane batch and hands it over as one byte stream on that lane's request stream. Zero makes the
-    // beat a chunk-length entry. Of the fields above the handler reads only server_ip and
-    // server_port, to open the connection.
+    // Non-zero arms a lane with this many bytes of host-built request text; zero makes the beat a
+    // chunk-length entry.
     logic [31:0] req_total_bytes;
-    // Bytes in one decoder stream, i.e. one column chunk's compressed extent.
-    //
-    // A byte count scales with the number of COLUMN CHUNKS, of which a row group has a handful
-    // however finely each is split into ranged GETs, where a per-response flag would scale with
-    // the number of REQUESTS. axis_rewrite_last counts the bytes down and asserts tlast on the beat
-    // that completes the chunk, so how many GETs it took is invisible downstream.
+    // Bytes in one decoder stream (one column chunk); axis_rewrite_last counts them down for tlast.
     logic [31:0] req_chunk_bytes;
-    // Decoder lane this chunk belongs to. Carried in the SPARE UPPER BITS of the 64-bit
-    // req_chunk_bytes register (write register 41, bits [35:32]) rather than in a register of its
-    // own; a chunk length fits in 32 bits.
+    // Decoder lane of the chunk, from bits [35:32] of the 64-bit write register 41.
     logic [3:0]  req_chunk_dest;
 } http_config_t;
 
