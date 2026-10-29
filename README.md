@@ -18,7 +18,7 @@ columns, and the DuckDB extension (`extension/`) exposes them as the table funct
 | `rdma_server/` | the file server for the RDMA design |
 | `scripts/` | hardware build (`synthesize.sh`), TPC-H run (`tpch_demo.sh`, queries in `tpch/`), throughput harness (`throughput.sh`), simulation setup |
 | `parcore/` | submodule: ParCore, with libstf and Coyote nested in it (`parcore/libstf/coyote`) |
-| `celeris/` | submodule: a private repository of the group, only needed for the RDMA mode |
+| `celeris/` | submodule: a private repository of the group; builds without `--http` list its hardware sources, the HTTP design does not use it |
 
 ## Prerequisites
 
@@ -34,8 +34,8 @@ columns, and the DuckDB extension (`extension/`) exposes them as the table funct
 ## Setup
 
 Clone the repository, initialise ParCore and the two submodules the extension build needs, and
-apply the patches. Leave out `celeris`: it is only needed for the RDMA mode and is a private
-repository of the group.
+apply the patches. Leave out `celeris`, a private repository of the group: the HTTP design does not
+use it, and only builds without `--http` list its hardware sources.
 
 ```bash
 git clone https://github.com/celeris-labs/oasis.git
@@ -149,7 +149,9 @@ mails the analysis if `BOT_GMAIL_USER`, `BOT_GMAIL_PASSWORD` and `BOT_RECIPIENT_
 
 Without `--http` the build is the RDMA design: the FPGA reads the Parquet files over RDMA from
 `rdma_server` ([rdma_server/README.md](rdma_server/README.md)). Set `oasis_rdma_server` (and
-`oasis_rdma_port`) and read them with `read_oasis('rdma://<file>')`.
+`oasis_rdma_port`) and read them with `read_oasis('rdma://<file>')`. Builds without `--http` also
+list the hardware sources of `celeris`, so initialise it first with
+`git submodule update --init celeris` (it needs access to the private repository).
 
 ### Programming the board
 
