@@ -11,8 +11,6 @@ import lynxTypes::*;
 // handler_multi puts one on each lane's body output (see the instantiation there for the timing
 // report it answers). It is a boundary, not a buffer: its whole job is to end the forward cone out
 // of strip_http + axis_rewrite_last at a register, and to end the decoder's tready chain at one.
-// tcp_read puts another between its decoupling fifo and strip_http, for the same two reasons on the
-// framer's input side.
 //
 // WHERE IT COMES FROM
 // -------------------

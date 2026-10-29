@@ -23,32 +23,25 @@ import lynxTypes::*;
 //
 // STRUCTURE
 // ---------
-// One input beat is held in a residue register (res_data_q) that is kept SHIFTED TO THE CURSOR: its
-// low byte is always the next byte not yet consumed. That one register serves both roles at once --
-// its low byte is the next header character, and the whole word is the already-bottom-justified
-// body beat -- and both read it straight off flops. The header is matched one byte at a time, an
-// 8-bit compare against a 14-byte ROM, so no wide parallel "\r\n\r\n" search is needed either.
+// One input beat is held in a residue register (res_data_q) and consumed through a byte cursor
+// (res_cur_q). Everything reads the residue through ONE 512-bit barrel shift:
 //
-// The shifting is done where bytes are consumed, in the residue's next-state logic, by the ONE
-// 512-bit barrel shift:
+//     shifted_w = res_data_q >> (res_cur_q * 8)
 //
-//     res_data_q <= res_data_q >> (step_w * 8)
-//
-// step_w is the cursor's step when the residue is not used up: one byte in a header, and in a body
-// the body bytes left (a body that ends inside the beat; one that does not uses the beat up). It
-// comes from registers, and so does everything the beat's keep, byte count, tlast and the
-// residue's drain are derived from (avail_q, body_left_q, body_big_q), which keeps the per-beat
-// loop through the residue at a few logic levels instead of a subtract, a 32-bit compare and a
-// mux in front of the shifter's mask.
+// which serves both roles at once -- its low byte is the next header character, and the whole word
+// is the already-bottom-justified body beat. The header is matched one byte at a time, an 8-bit
+// compare against a 14-byte ROM, so no wide parallel "\r\n\r\n" search sits in front of the
+// shifter.
 //
 // Header parsing is byte-serial, so a ~200-byte response header costs ~200 cycles (0.8 us at
-// 250 MHz). Bodies move a full 64-byte beat per cycle.
+// 250 MHz). Bodies move a full 64-byte beat per cycle: in the body the cursor is 0 and the shift is
+// a no-op except on the first beat after a header.
 //
 // BOTTOM-JUSTIFICATION IS THE CONTRACT
 // ------------------------------------
 // Downstream is the pipelined DataNormalizer with ENABLE_COMPACTOR=0, which places bytes using
 // $countones(tkeep) and therefore requires every beat's valid bytes to start at lane 0. Beats are
-// emitted as res_data_q masked to body_n_w bytes, so that holds for every beat, not just the first.
+// emitted as `shifted_w` masked to body_n_w bytes, so that holds for every beat, not just the first.
 //
 // THE tlast CONTRACT (body_last)
 // ------------------------------
@@ -95,10 +88,6 @@ module strip_http (
     input  logic                           s_axis_tvalid,
     input  logic [AXI_DATA_BITS-1:0]       s_axis_tdata,
     input  logic [AXI_DATA_BITS/8-1:0]     s_axis_tkeep,
-    // $countones(s_axis_tkeep), counted by the stage that registered the beat (tcp_read's count
-    // register), so the residue's byte count is loaded from a flop. s_axis_tkeep is only checked
-    // against it, in simulation.
-    input  logic [6:0]                     s_axis_tbytes,
     input  logic                           s_axis_tlast,   // ignored: framing is by Content-Length
     output logic                           s_axis_tready,
 
@@ -107,9 +96,6 @@ module strip_http (
     output logic [AXI_DATA_BITS-1:0]       m_axis_tdata,
     output logic [AXI_DATA_BITS/8-1:0]     m_axis_tkeep,
     output logic                           m_axis_tlast,
-    // $countones(m_axis_tkeep), carried with the beat, so the consumer does not have to count it
-    // (axis_rewrite_last's s_tbytes).
-    output logic [6:0]                     m_axis_tbytes,
     input  logic                           m_axis_tready,
 
     // Debug words
@@ -160,20 +146,28 @@ module strip_http (
     logic [AXI_DATA_BITS-1:0] skid_data_q,  skid_data2_q;
     logic [BYTE_LANES-1:0]    skid_keep_q,  skid_keep2_q;
     logic                     skid_last_q,  skid_last2_q;
-    logic [6:0]               skid_bytes_q, skid_bytes2_q;
     logic                     skid_valid_q, skid_valid2_q;
 
     // ---------------------------------------------------------------------------------------------
-    // Residue: one input beat, shifted to the cursor, and how much of it is left.
+    // Residue: one input beat plus the byte cursor into it.
     // ---------------------------------------------------------------------------------------------
     logic                     res_valid_q;
-    logic [AXI_DATA_BITS-1:0] res_data_q;  // the held beat; byte 0 is the next one not consumed
-    logic [6:0]               avail_q;     // bytes of it not yet consumed (0..64)
-    logic [6:0]               res_cur_q;   // bytes already consumed (for out_payload_idx)
+    logic [AXI_DATA_BITS-1:0] res_data_q;
+    logic [6:0]               res_len_q;   // valid bytes in the held beat (0..64)
+    logic [6:0]               res_cur_q;   // bytes already consumed
 
-    // Low byte = next header character; whole word = bottom-justified body.
+    logic [6:0] avail_w;
+    assign avail_w = res_len_q - res_cur_q;
+
+    // The one barrel shift. Low byte = next header character; whole word = bottom-justified body.
+    // Only res_cur_q[5:0] is used: the cursor is strictly below res_len_q (<= 64) whenever anything
+    // reads this, so 0..63 covers every real case, and a 6-bit shift amount is an ordinary 64-way
+    // byte barrel shifter instead of the 10-bit one the full-width cursor would infer.
+    logic [AXI_DATA_BITS-1:0] shifted_w;
+    assign shifted_w = res_data_q >> {res_cur_q[5:0], 3'b000};
+
     logic [7:0] cur_byte_w;
-    assign cur_byte_w = res_data_q[7:0];
+    assign cur_byte_w = shifted_w[7:0];
 
     // ---------------------------------------------------------------------------------------------
     // Framer mode
@@ -183,18 +177,6 @@ module strip_http (
 
     logic        mode_q;
     logic [31:0] body_left_q;
-    // "Is the body longer than any beat?", answered from a flop, so that the beat's byte count,
-    // keep and tlast and the residue's drain compare 7-bit registers (body_left_q[6:0] against
-    // avail_q) instead of the 32-bit count. It is a one-sided summary of body_left_q:
-    //
-    //     body_big_q = 1  =>  body_left_q >= 65   (more than a beat holds: the beat goes whole)
-    //     body_big_q = 0  =>  body_left_q <= 127  (so body_left_q[6:0] IS the count)
-    //
-    // A body fire consumes 1..64 bytes, so setting it from body_left_q > 128 BEFORE the fire keeps
-    // both after it, and entering a body sets it from Content-Length > 64. Between 65 and 127
-    // either value is true, which is what lets it be computed from the old count instead of from
-    // the subtraction's result.
-    logic        body_big_q;
 
     // ---------------------------------------------------------------------------------------------
     // Byte-serial header parser.
@@ -285,27 +267,15 @@ module strip_http (
     logic       body_fire_w;
 
     assign take_hdr_w = enable && res_valid_q && !error_q && (mode_q == M_HDR) &&
-                        (avail_q != 0) && !hdr_block_w;
+                        (avail_w != 0) && !hdr_block_w;
 
-    // The body against the residue, from 7-bit registers only (see body_big_q).
-    logic body_on_w;    // in a body, with a residue to take from
-    logic body_ends_w;  // body_left_q <  avail_q: the body ends inside this beat
-    logic body_fits_w;  // body_left_q <= avail_q: this beat carries the body's last byte
-    logic body_nz_w;    // body_left_q != 0
-    assign body_on_w   = (mode_q == M_BODY) && res_valid_q && !error_q;
-    assign body_ends_w = !body_big_q && (body_left_q[6:0] <  avail_q);
-    assign body_fits_w = !body_big_q && (body_left_q[6:0] <= avail_q);
-    assign body_nz_w   = body_big_q || (body_left_q[6:0] != 7'd0);
-
-    // min(body_left_q, avail_q): the bytes this beat moves.
-    assign body_n_w = (body_on_w && (avail_q != 0)) ? (body_ends_w ? body_left_q[6:0] : avail_q)
-                                                    : 7'd0;
-
-    // The cursor's step on a cycle that consumes without using the residue up: a header byte, or
-    // the rest of a body that ends inside the beat (under 64, see below). Chosen by the mode, a
-    // register, rather than by which of the two fired, so the shifter does not wait for either.
-    logic [6:0] step_w;
-    assign step_w = (mode_q == M_HDR) ? 7'd1 : body_left_q[6:0];
+    always_comb begin
+        if ((mode_q == M_BODY) && res_valid_q && !error_q && (avail_w != 0)) begin
+            body_n_w = (body_left_q < 32'(avail_w)) ? body_left_q[6:0] : avail_w;
+        end else begin
+            body_n_w = 7'd0;
+        end
+    end
 
     // ---------------------------------------------------------------------------------------------
     // Stage-2 stream into the skid buffer
@@ -316,26 +286,21 @@ module strip_http (
     logic                     fsm_tvalid;
     logic                     fsm_tready;
 
-    // keep_from_count(body_n_w), as the AND of the two counts' own keeps (the keep of a minimum is
-    // the AND of the keeps), so no decode waits for body_n_w.
-    assign fsm_tkeep   = body_on_w ? (keep_from_count(avail_q) &
-                                      (body_big_q ? {BYTE_LANES{1'b1}}
-                                                  : keep_from_count(body_left_q[6:0])))
-                                   : '0;
-    assign fsm_tdata   = mask_bytes(res_data_q, fsm_tkeep);
-    // body_left_q == body_n_w, for either value of body_n_w.
-    assign fsm_tlast   = ((body_on_w && (avail_q != 0)) ? body_fits_w : !body_nz_w) && body_last;
-    assign fsm_tvalid  = enable && body_on_w && (avail_q != 0) && body_nz_w;
+    assign fsm_tkeep   = keep_from_count(body_n_w);
+    assign fsm_tdata   = mask_bytes(shifted_w, fsm_tkeep);
+    assign fsm_tlast   = (body_left_q == 32'(body_n_w)) && body_last;
+    assign fsm_tvalid  = enable && (body_n_w != 0);
     assign fsm_tready  = !skid_valid2_q;
     assign body_fire_w = fsm_tvalid && fsm_tready;
 
+    // Bytes retired from the residue this cycle.
+    logic [6:0] consumed_w;
+    assign consumed_w = take_hdr_w ? 7'd1 : (body_fire_w ? body_n_w : 7'd0);
+
     // The residue is finished when it holds no more useful bytes: either it never had any (a beat
-    // with no keep bits, which would otherwise wedge the cursor) or this cycle consumes the rest --
-    // its last header byte, or a body that does not end inside it.
+    // with no keep bits, which would otherwise wedge the cursor) or this cycle consumes the rest.
     logic res_drain_w;
-    assign res_drain_w = res_valid_q && ((avail_q == 0) ||
-                                         (take_hdr_w  && (avail_q == 7'd1)) ||
-                                         (body_fire_w && !body_ends_w));
+    assign res_drain_w = res_valid_q && ((avail_w == 0) || (consumed_w == avail_w));
 
     // Slave-side ready: two registers plus the skid's ready. No dependence on the parser FSM.
     assign s_axis_tready = enable && (!res_valid_q || res_drain_w);
@@ -344,20 +309,11 @@ module strip_http (
     assign in_fire = s_axis_tvalid && s_axis_tready;
 
     logic [6:0] in_len_w;
-    assign in_len_w = s_axis_tbytes;
-
-`ifndef SYNTHESIS
-    // The carried count must be the keep's own: a wrong one shifts every later byte of the stream.
-    always @(posedge clk) begin
-        if (rst_n && !clear && s_axis_tvalid && (s_axis_tbytes !== 7'($countones(s_axis_tkeep))))
-            $error("strip_http: s_axis_tbytes=%0d, but s_axis_tkeep has %0d bytes",
-                   s_axis_tbytes, $countones(s_axis_tkeep));
-    end
-`endif
+    assign in_len_w = 7'($countones(s_axis_tkeep));
 
     // This response's body has just been fully emitted.
     logic resp_complete_w;
-    assign resp_complete_w = body_fire_w && body_fits_w;
+    assign resp_complete_w = body_fire_w && (body_left_q == 32'(body_n_w));
 
     // ---------------------------------------------------------------------------------------------
     // Debug capture: first two emitted body beats of the stream.
@@ -373,11 +329,10 @@ module strip_http (
         if (!rst_n || clear) begin
             res_valid_q   <= 1'b0;
             res_data_q    <= '0;
-            avail_q       <= '0;
+            res_len_q     <= '0;
             res_cur_q     <= '0;
             mode_q        <= M_HDR;
             body_left_q   <= '0;
-            body_big_q    <= 1'b0;
             hs_q          <= HS_STATUS;
             name_pos_q    <= '0;
             name_is_cl_q  <= 1'b0;
@@ -409,18 +364,14 @@ module strip_http (
             // -- residue --------------------------------------------------------------------------
             if (in_fire) begin
                 res_data_q  <= s_axis_tdata;
-                avail_q     <= in_len_w;
+                res_len_q   <= in_len_w;
                 res_cur_q   <= '0;
                 res_valid_q <= 1'b1;
             end else if (res_drain_w) begin
                 res_valid_q <= 1'b0;
                 res_cur_q   <= '0;
-            end else if (take_hdr_w || body_fire_w) begin
-                // One header byte, or the end of a body inside the beat (a body that does not end
-                // inside it has drained it, above): fewer than 64 bytes either way.
-                res_data_q  <= res_data_q >> {step_w[5:0], 3'b000};
-                avail_q     <= avail_q - step_w;
-                res_cur_q   <= res_cur_q + step_w;
+            end else begin
+                res_cur_q   <= res_cur_q + consumed_w;
             end
 
             // -- header parser --------------------------------------------------------------------
@@ -477,7 +428,6 @@ module strip_http (
                         end else begin
                             mode_q        <= M_BODY;
                             body_left_q   <= cl_q;
-                            body_big_q    <= (cl_q > 32'd64);
                             payload_idx_q <= res_cur_q + 7'd1;
                         end
                     end
@@ -517,10 +467,7 @@ module strip_http (
 
             // -- body -----------------------------------------------------------------------------
             if (body_fire_w) begin
-                // body_left_q - body_n_w, with the subtrahend a register: the beat either carries
-                // the body's last byte (body_n_w = body_left_q) or goes whole (body_n_w = avail_q).
-                body_left_q <= body_fits_w ? 32'd0 : (body_left_q - 32'(avail_q));
-                body_big_q  <= (body_left_q > 32'd128);
+                body_left_q <= body_left_q - 32'(body_n_w);
                 dirty_q     <= 1'b1;
 
                 if (!w0_valid_q) begin
@@ -546,14 +493,13 @@ module strip_http (
     end
 
     // ---------------------------------------------------------------------------------------------
-    // Registered output: 2-slot AXI-Stream skid buffer. It registers m_axis_* so the framer's cone
-    // ends at a flop here.
+    // Registered output: 2-slot AXI-Stream skid buffer. It registers m_axis_* so the barrel-shift
+    // cone ends at a flop here.
     // ---------------------------------------------------------------------------------------------
     assign m_axis_tvalid = skid_valid_q;
     assign m_axis_tdata  = skid_data_q;
     assign m_axis_tkeep  = skid_keep_q;
     assign m_axis_tlast  = skid_last_q;
-    assign m_axis_tbytes = skid_bytes_q;
 
     always_ff @(posedge clk) begin
         if (!rst_n || clear) begin
@@ -564,21 +510,18 @@ module strip_http (
                 skid_data_q   <= skid_data2_q;
                 skid_keep_q   <= skid_keep2_q;
                 skid_last_q   <= skid_last2_q;
-                skid_bytes_q  <= skid_bytes2_q;
                 skid_valid_q  <= 1'b1;
                 skid_valid2_q <= 1'b0;
             end else begin
                 skid_data_q  <= fsm_tdata;
                 skid_keep_q  <= fsm_tkeep;
                 skid_last_q  <= fsm_tlast;
-                skid_bytes_q <= body_n_w;
                 skid_valid_q <= fsm_tvalid;
             end
         end else if (fsm_tvalid && fsm_tready) begin
             skid_data2_q  <= fsm_tdata;
             skid_keep2_q  <= fsm_tkeep;
             skid_last2_q  <= fsm_tlast;
-            skid_bytes2_q <= body_n_w;
             skid_valid2_q <= 1'b1;
         end
     end

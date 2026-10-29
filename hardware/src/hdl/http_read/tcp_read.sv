@@ -84,8 +84,6 @@ module tcp_read #(
     output logic [AXI_DATA_BITS-1:0]   m_axis_body_tdata,
     output logic [AXI_DATA_BITS/8-1:0] m_axis_body_tkeep,
     output logic                       m_axis_body_tlast,
-    // $countones(m_axis_body_tkeep), carried with the beat from strip_http.
-    output logic [$clog2(AXI_DATA_BITS/8):0] m_axis_body_tbytes,
 
     output logic                                      done,
     output logic                                      error,
@@ -144,27 +142,12 @@ module tcp_read #(
     logic sh_resp_dirty;
     logic sh_resp_error;
 
-    // The decoupling fifo's output, into the input slice (inst_rx_slice).
-    logic                       fifo_m_tvalid;
-    logic                       fifo_m_tready;
-    logic [AXI_DATA_BITS-1:0]   fifo_m_tdata;
-    logic [AXI_DATA_BITS/8-1:0] fifo_m_tkeep;
-    logic                       fifo_m_tlast;
-
-    // The input slice's output, into the count register.
-    logic                       slc_tvalid;
-    logic                       slc_tready;
-    logic [AXI_DATA_BITS-1:0]   slc_tdata;
-    logic [AXI_DATA_BITS/8-1:0] slc_tkeep;
-    logic                       slc_tlast;
-
-    // strip_http slave-side stream: the count register, the beat and its byte count in flops.
+    // strip_http slave-side stream, fed from the decoupling fifo (inst_rx_fifo).
     logic                       sh_s_tvalid;
     logic                       sh_s_tready;
     logic [AXI_DATA_BITS-1:0]   sh_s_tdata;
     logic [AXI_DATA_BITS/8-1:0] sh_s_tkeep;
     logic                       sh_s_tlast;
-    logic [6:0]                 sh_s_tbytes;
 
     // TOE-side of the fifo.
     logic                       fifo_s_tvalid;
@@ -274,58 +257,18 @@ module tcp_read #(
         .s_axis_tdata(s_axis_rx_data_TDATA),
         .s_axis_tkeep(s_axis_rx_data_TKEEP),
         .s_axis_tlast(s_axis_rx_data_TLAST),
-        .m_axis_tvalid(fifo_m_tvalid),
-        .m_axis_tready(fifo_m_tready),
-        .m_axis_tdata(fifo_m_tdata),
-        .m_axis_tkeep(fifo_m_tkeep),
-        .m_axis_tlast(fifo_m_tlast),
+        .m_axis_tvalid(sh_s_tvalid),
+        .m_axis_tready(sh_s_tready),
+        .m_axis_tdata(sh_s_tdata),
+        .m_axis_tkeep(sh_s_tkeep),
+        .m_axis_tlast(sh_s_tlast),
         .level(rx_fifo_level),
         .overflow_stall(rx_fifo_stall)
     );
 
-    // Two register stages between the fifo and the framer, one cycle each, one beat per cycle.
-    //
-    // The input slice: ready and data both registered. Without it the framer's per-beat "residue
-    // used up, take the next beat" decision is the fifo's pop -- the block RAM read enable, the
-    // read pointer and the level. It only drains the fifo; what the fifo admits, and so the readPkg
-    // reservation above, does not change.
-    //
-    // The count register: the beat again, with its byte count. The framer's per-beat loop starts
-    // from the byte count of the beat it loads, and a 64-bit popcount in that loop was its deepest
-    // path; here the count is taken one stage earlier, from the slice's flops, and handed over in a
-    // flop. A plain pipeline register: it takes a beat whenever it is empty or the framer takes the
-    // one it holds, and strip_http's ready reaches its clock enables and the slice's overflow flop.
-    //
-    // Both are cleared with the fifo and the framer: what they hold belongs to the same stream.
-    axis_skid #(.DATA_BITS(AXI_DATA_BITS)) inst_rx_slice (
-        .clk(clk),
-        .rst_n(rst_n && !clear_framing),
-        .s_tvalid(fifo_m_tvalid), .s_tready(fifo_m_tready),
-        .s_tdata (fifo_m_tdata),  .s_tkeep (fifo_m_tkeep), .s_tlast(fifo_m_tlast),
-        .m_tvalid(slc_tvalid),    .m_tready(slc_tready),
-        .m_tdata (slc_tdata),     .m_tkeep (slc_tkeep),   .m_tlast(slc_tlast)
-    );
-
-    assign slc_tready = !sh_s_tvalid || sh_s_tready;
-
-    always_ff @(posedge clk) begin
-        if (!rst_n || clear_framing) sh_s_tvalid <= 1'b0;
-        else if (slc_tready)         sh_s_tvalid <= slc_tvalid;
-    end
-
-    always_ff @(posedge clk) begin
-        if (slc_tready) begin
-            sh_s_tdata  <= slc_tdata;
-            sh_s_tkeep  <= slc_tkeep;
-            sh_s_tlast  <= slc_tlast;
-            sh_s_tbytes <= 7'($countones(slc_tkeep));
-        end
-    end
-
-    // The fifo is empty and its output register, the input slice and the count register have been
-    // taken. strip_http may still hold a residue beat and its skid; ST_DRAIN gives it DRAIN_SETTLE
-    // more cycles before it trusts resp_dirty.
-    assign parser_quiet_w  = (rx_fifo_level == '0) && !fifo_m_tvalid && !slc_tvalid && !sh_s_tvalid;
+    // The fifo is empty and its output register has been taken. strip_http may still hold a residue
+    // beat and its skid; ST_DRAIN gives it DRAIN_SETTLE more cycles before it trusts resp_dirty.
+    assign parser_quiet_w  = (rx_fifo_level == '0) && !sh_s_tvalid;
     assign drain_settled_w = parser_quiet_w && (drain_cnt_q == 8'd0);
 
     // One cycle in ST_ARM retires the previous response and re-arms the framer for this one.
@@ -341,14 +284,12 @@ module tcp_read #(
         .s_axis_tvalid(sh_s_tvalid),
         .s_axis_tdata(sh_s_tdata),
         .s_axis_tkeep(sh_s_tkeep),
-        .s_axis_tbytes(sh_s_tbytes),
         .s_axis_tlast(sh_s_tlast),
         .s_axis_tready(sh_s_tready),
         .m_axis_tvalid(m_axis_body_tvalid),
         .m_axis_tdata(m_axis_body_tdata),
         .m_axis_tkeep(m_axis_body_tkeep),
         .m_axis_tlast(m_axis_body_tlast),
-        .m_axis_tbytes(m_axis_body_tbytes),
         .m_axis_tready(m_axis_body_tready),
         .out_w0(payload_w0),
         .out_w1(payload_w1),
