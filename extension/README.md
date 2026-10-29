@@ -55,11 +55,15 @@ Building this extension does **not** rebuild the Oasis library in `../software`.
 there, rebuild and re-install it first, or the extension keeps using the old `liboasis.so`.
 
 ## Running the tests
-The SQL tests in `./test/sql` read objects from the object store: `httpfpga.test` over a host
-socket with `read_parquet()`, `httpfpga_decode.test` through the FPGA with `read_oasis()`. Like every
-process that loads the extension, they need a programmed board and free 1 GiB huge pages, so run
-them on the board host. They run only when `OASIS_SERVER` holds the object server's address:
+The SQL tests in `./test/sql` read objects from the object server: `httpfpga.test` over a host
+socket with `read_parquet()`, `httpfpga_decode.test` through the FPGA with `read_oasis()`. Run them
+on the board host with the board programmed: loading the extension maps 1 GiB huge pages and opens
+the FPGA, and on any other host it stops with `Your system has 0 free 1GiB huge pages`. Set
+`OASIS_SERVER` to the object server's IP address, without a port (the tests use port 9000); without
+it both tests are skipped. From this directory:
 ```sh
-OASIS_SERVER=<object server IP> make test
-OASIS_SERVER=<object server IP> ./build/release/test/unittest test/sql/httpfpga_decode.test   # one file
+OASIS_SERVER=<object server IP> ./build/release/test/unittest --test-dir "$PWD" "test/*"
+OASIS_SERVER=<object server IP> ./build/release/test/unittest --test-dir "$PWD" test/sql/httpfpga_decode.test
 ```
+`--test-dir` makes `test/*` select this extension's tests; without it the pattern can select
+DuckDB's own tests instead.

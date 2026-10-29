@@ -1,7 +1,8 @@
 # name: test/sql/httpfpga_decode.test
 # description: Smallest end-to-end check of the FPGA HTTP -> ColumnChunkDecoder -> host path.
 #   HARDWARE-GATED: needs an ENABLE_HTTP bitstream programmed AND the object server reachable.
-#   Run on the host with the board:  OASIS_SERVER=<ip> ./build/release/test/unittest "test/sql/httpfpga_decode.test"
+#   Run on the host with the board, from extension/:
+#     OASIS_SERVER=<ip> ./build/release/test/unittest --test-dir "$PWD" test/sql/httpfpga_decode.test
 #
 # Why read_oasis and not read_parquet:
 #   read_parquet('httpfpga://...') only uses httpfpga:// as a byte source and parses on the CPU.

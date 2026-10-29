@@ -8,7 +8,7 @@
 # group: [sql]
 #
 # Needs a programmed board (the extension opens the FPGA when it loads) and the object server:
-#   OASIS_SERVER=<ip> ./build/release/test/unittest test/sql/httpfpga.test
+#   OASIS_SERVER=<ip> ./build/release/test/unittest --test-dir "$PWD" test/sql/httpfpga.test   (from extension/)
 #
 # Every expected value was computed from the objects actually stored on the server, not from TPC-H
 # reference tables -- a mismatch means the bytes the host socket delivered differ from the bytes the
