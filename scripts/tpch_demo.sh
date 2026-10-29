@@ -424,38 +424,38 @@ if [ "$PHASES" = 1 ]; then
         [ "$sess_rc" = 0 ] || echo "  FPGA session did not complete -- trace: $TRACE_DIR/oasis-session-fpga.txt"
         [ "$cpu_sess_rc" = 0 ] || echo "  CPU session did not complete -- trace: $TRACE_DIR/oasis-session-cpu.txt"
     else
-    echo "phase 1/2: FPGA, all queries back to back (keeps the connection from going idle)"
-    ct=0
-    for f in "$ROOT"/scripts/tpch/q*.sql; do
-        n=$(basename "$f" .sql); n=${n#q}; n=$((10#$n))
-        if [ -n "$ONLY" ] && ! printf ',%s,' "$ONLY" | grep -q ",$n,"; then continue; fi
-        sql_body=$(cat "$f")
-        run_fpga
-        P_S[$n]=$fpga_s; P_RC[$n]=$fpga_rc; P_MIB[$n]=$hw_mib
-        cp "$FPGA_ROWS" "$PHASE_CACHE/q$n.rows"
-        cp "$FPGA_RAW"  "$PHASE_CACHE/q$n.raw"
-        printf '  q%-3s %8ss  rc=%s\n' "$n" "$fpga_s" "$fpga_rc"
-        # Keep the raw output of ANY failure in TRACE_DIR, outside the phase cache (a mktemp -d
-        # removed on exit), so it survives a run that does not complete.
-        if [ "$fpga_rc" != 0 ]; then
-            cp "$FPGA_RAW" "$TRACE_DIR/oasis-q$n-fpga-raw.txt"
-            echo "    rc=$fpga_rc -- trace kept: $TRACE_DIR/oasis-q$n-fpga-raw.txt"
-            grep -E 'oasis-http|stalled|Error|rror' "$FPGA_RAW" | tail -6 | sed 's/^/      /'
-        fi
-        if [ "$fpga_rc" = 124 ]; then
-            # Keep the output: the raw file is a mktemp the next query overwrites. With
-            # OASIS_HTTP_DEBUG=1 it holds the per-batch lane state right up to the moment the query
-            # stopped, which is otherwise unreadable -- the wedged process still owns the vFPGA.
-            cp "$FPGA_RAW" "$TRACE_DIR/oasis-q$n-timeout.txt"
-            echo "  timed out -- trace kept: $TRACE_DIR/oasis-q$n-timeout.txt"
-            echo "  last lines:"
-            grep -E 'oasis-http|stalled|batch' "$FPGA_RAW" | tail -6 | sed 's/^/    /'
-            ct=$((ct+1))
-            [ "$ct" -ge 2 ] && { echo "  two consecutive timeouts -- stopping the FPGA phase."; break; }
-        else
-            ct=0
-        fi
-    done
+        echo "phase 1/2: FPGA, all queries back to back (keeps the connection from going idle)"
+        ct=0
+        for f in "$ROOT"/scripts/tpch/q*.sql; do
+            n=$(basename "$f" .sql); n=${n#q}; n=$((10#$n))
+            if [ -n "$ONLY" ] && ! printf ',%s,' "$ONLY" | grep -q ",$n,"; then continue; fi
+            sql_body=$(cat "$f")
+            run_fpga
+            P_S[$n]=$fpga_s; P_RC[$n]=$fpga_rc; P_MIB[$n]=$hw_mib
+            cp "$FPGA_ROWS" "$PHASE_CACHE/q$n.rows"
+            cp "$FPGA_RAW"  "$PHASE_CACHE/q$n.raw"
+            printf '  q%-3s %8ss  rc=%s\n' "$n" "$fpga_s" "$fpga_rc"
+            # Keep the raw output of ANY failure in TRACE_DIR, outside the phase cache (a mktemp -d
+            # removed on exit), so it survives a run that does not complete.
+            if [ "$fpga_rc" != 0 ]; then
+                cp "$FPGA_RAW" "$TRACE_DIR/oasis-q$n-fpga-raw.txt"
+                echo "    rc=$fpga_rc -- trace kept: $TRACE_DIR/oasis-q$n-fpga-raw.txt"
+                grep -E 'oasis-http|stalled|Error|rror' "$FPGA_RAW" | tail -6 | sed 's/^/      /'
+            fi
+            if [ "$fpga_rc" = 124 ]; then
+                # Keep the output: the raw file is a mktemp the next query overwrites. With
+                # OASIS_HTTP_DEBUG=1 it holds the per-batch lane state right up to the moment the query
+                # stopped, which is otherwise unreadable -- the wedged process still owns the vFPGA.
+                cp "$FPGA_RAW" "$TRACE_DIR/oasis-q$n-timeout.txt"
+                echo "  timed out -- trace kept: $TRACE_DIR/oasis-q$n-timeout.txt"
+                echo "  last lines:"
+                grep -E 'oasis-http|stalled|batch' "$FPGA_RAW" | tail -6 | sed 's/^/    /'
+                ct=$((ct+1))
+                [ "$ct" -ge 2 ] && { echo "  two consecutive timeouts -- stopping the FPGA phase."; break; }
+            else
+                ct=0
+            fi
+        done
     fi
     [ "${SINGLE_SESSION:-0}" = 1 ] || echo "phase 2/2: CPU baseline"
     echo
@@ -474,7 +474,7 @@ query_errored() {   # $1 = captured rows file
     grep -qE '^[A-Za-z][A-Za-z ]*Error: ' "$1"
 }
 
-# Replays what phase 1 measured. Defined AFTER run_fpga so it wins the name.
+# Replays what phase 1 measured.
 replay_fpga() {
     fpga_s=${P_S[$n]:-0}; fpga_rc=${P_RC[$n]:-1}; hw_mib=${P_MIB[$n]:-}
     # One session = one profiler window for all 22 queries, so a per-query hw_MiB does not exist.
