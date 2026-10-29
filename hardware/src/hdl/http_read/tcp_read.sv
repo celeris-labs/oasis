@@ -143,9 +143,9 @@ module tcp_read #(
         end
     end
 
-    // An addition, not DEPTH - level - reserved: level + reserved can exceed the depth for a cycle.
-    assign rx_space_ok = (RSV_BITS'(rx_fifo_level) + rsv_beats_q + RSV_BITS'(MSS_BEATS))
-                         < RSV_BITS'(RX_FIFO_DEPTH);
+    // The fifo refuses beats from DEPTH - AF_SLACK on. An addition: level + reserved can exceed it.
+    assign rx_space_ok = (RSV_BITS'(rx_fifo_level) + rsv_beats_q + RSV_BITS'(SEG_BEATS))
+                         <= RSV_BITS'(RX_FIFO_DEPTH - AF_SLACK);
 
     axis_fifo #(
         .DATA_BITS(AXI_DATA_BITS),

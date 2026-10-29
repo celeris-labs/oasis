@@ -19,8 +19,8 @@
 //      stream and cannot be unsent, so replaying would duplicate them: error=1, error_dirty=1. This
 //      is the guard that keeps a lost connection from silently corrupting a column.
 //
-//   4. THE READPKG RESERVATION: one MSS per readPkg (dut_m). Every beat the lane has promised room
-//      for must be accepted.
+//   4. THE READPKG RESERVATION: one MSS per readPkg (dut_m, including the exact fifo level where
+//      admission has to stop). Every beat the lane has promised room for must be accepted.
 //
 // The dispatcher model for the default DUT is deliberately small: a
 // byte stream and a queue of announced segment lengths; a segment is delivered whole, in order,
@@ -116,7 +116,7 @@ module tcp_read_tb;
     // ---------------------------------------------------------------------------------------------
     // SECOND DUT: handler_multi's lane (rx_dispatch, TOE in bypass mode) with a small
     // fifo (MDEPTH), so the one-MSS-per-readPkg reservation can be driven to its limit with the
-    // decoder held off. See case_rsv_mss.
+    // decoder held off. See case_rsv_mss and case_rsv_mss_edge.
     // ---------------------------------------------------------------------------------------------
     localparam int MDEPTH = 256;
     localparam int MLB    = $clog2(MDEPTH + 1);
@@ -648,6 +648,105 @@ module tcp_read_tb;
         end
     endtask
 
+    // ---------------------------------------------------------------------------------------------
+    // dut_m: the admission edge.
+    //
+    // rx_space_ok may admit a segment only if every beat of it is accepted with the reader taking
+    // nothing. The fifo refuses a beat at level >= DEPTH - ALMOST_FULL_SLACK (4), so with nothing
+    // else reserved a 64-beat segment fits up to level DEPTH - 68 and not from DEPTH - 67 on. For
+    // each level around that edge, with the decoder held off: fill the fifo to exactly that level
+    // with beats nobody reserved (so the reservation is 0), then, if rx_space_ok says yes, issue one
+    // readPkg and deliver one full segment back to back, not held for TREADY. Every admitted
+    // segment must be accepted whole, and DEPTH - 68 must still be admitted.
+    // ---------------------------------------------------------------------------------------------
+    int m_ptr;
+
+    task automatic m_drive_beat(input logic last);
+        automatic logic [AXI_DATA_BITS-1:0] d = '0;
+        for (int b = 0; b < LANES; b++) d[b*8 +: 8] = m_wire[m_ptr + b];
+        m_ptr += LANES;
+        m_ddata <= d; m_dkeep <= '1; m_dlast <= last; m_dvalid <= 1'b1;
+        @(posedge clk);
+        m_dvalid <= 1'b0; m_dlast <= 1'b0;
+    endtask
+
+    task automatic case_rsv_mss_edge();
+        int levels [4];
+        int target, refused, guard;
+        bit admitted, ok, setup_ok;
+        levels = '{MDEPTH - 69, MDEPTH - 68, MDEPTH - 67, MDEPTH - 66};
+        $display("--- case_rsv_mss_edge (DEPTH %0d, refusal at level %0d) ---", MDEPTH, MDEPTH - 4);
+        m_wire.delete();
+        begin
+            string h;
+            h = $sformatf("HTTP/1.1 206 Partial Content\015\012Content-Length: %0d\015\012\015\012", 1000000);
+            for (int i = 0; i < h.len(); i++) m_wire.push_back(8'(h.getc(i)));
+            while (m_wire.size() < (MDEPTH + 128) * LANES) m_wire.push_back(8'h5A);
+        end
+        ok = 1'b1;
+        for (int k = 0; k < 4; k++) begin
+            target = levels[k];
+            // a fresh connection: fifo, framer and reservation cleared, decoder held off
+            m_start = 1'b0; m_bready = 1'b0;
+            m_clear = 1'b1; repeat (3) @(posedge clk);
+            m_clear = 1'b0; @(posedge clk);
+            m_start = 1'b1;
+            m_ptr   = 0;
+            // the header and a few body beats, until the framer stalls on the held decoder
+            for (int i = 0; i < 8; i++) m_drive_beat(1'b1);
+            repeat (300) @(posedge clk);
+            // then one beat at a time up to the level
+            for (guard = 0; guard < MDEPTH; guard++) begin
+                if (int'(m_level) >= target) break;
+                m_drive_beat(1'b1);
+                repeat (8) @(posedge clk);
+            end
+            repeat (100) @(posedge clk);
+            setup_ok = (int'(m_level) == target) && (dut_m.rsv_beats_q == 0);
+            admitted = 1'b0;
+            refused  = 0;
+            if (!setup_ok) begin
+                $error("[rsv_mss_edge] setup: level %0d rsv %0d, wanted level %0d rsv 0",
+                       m_level, dut_m.rsv_beats_q, target);
+                fails++;
+                ok = 1'b0;
+            end else begin
+                admitted = m_space;
+                if (admitted) begin
+                    m_pkg <= 1'b1;
+                    @(posedge clk);
+                    m_pkg <= 1'b0;
+                    repeat (2) @(posedge clk);
+                    m_refused = 0;
+                    for (int i = 0; i < 4096 / LANES; i++) m_drive_beat(i == 4096 / LANES - 1);
+                    repeat (2) @(posedge clk);
+                    refused = m_refused;
+                end
+                $display("  level %0d: rx_space_ok=%0b%s", target, admitted,
+                         admitted ? $sformatf(", %0d of %0d beats refused", refused, 4096 / LANES) : "");
+                if (refused != 0) begin
+                    $error("[rsv_mss_edge] level %0d admitted a segment and the fifo refused %0d of its beats -- each one is lost",
+                           target, refused);
+                    fails++;
+                    ok = 1'b0;
+                end
+                if (target <= MDEPTH - 68 && !admitted) begin
+                    $error("[rsv_mss_edge] level %0d has room for a whole segment and was not admitted", target);
+                    fails++;
+                    ok = 1'b0;
+                end
+            end
+        end
+        if (ok) begin
+            $display("[PASS] rsv_mss_edge (admitted up to level %0d, every admitted segment accepted whole)", MDEPTH - 68);
+            passes++;
+        end
+        m_start = 1'b0;
+        m_bready = 1'b1;
+        m_clear = 1'b1; repeat (3) @(posedge clk);
+        m_clear = 1'b0; repeat (3) @(posedge clk);
+    endtask
+
     initial begin
         m_start = 1'b0; m_clear = 1'b1; m_pkg = 1'b0;
         m_dvalid = 1'b0; m_dlast = 1'b0; m_ddata = '0; m_dkeep = '0; m_bready = 1'b1;
@@ -673,6 +772,8 @@ module tcp_read_tb;
         case_read_watchdog();
         repeat (5) @(posedge clk);
         case_rsv_mss();
+        repeat (5) @(posedge clk);
+        case_rsv_mss_edge();
 
         // Every case above ran a real response through the header parser. If the parser were still
         // in the TCP stack's back-pressure path, each one would have contributed hundreds of stall
