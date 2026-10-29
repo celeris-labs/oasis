@@ -8,7 +8,7 @@
 # parcore/libstf/coyote at 003c7344 and its network submodule at 20633d0 (the commit 003c7344
 # pins), and then applies
 #     parcore  0012
-#     libstf   0006 0013
+#     libstf   0006
 #     Coyote   0010 0011
 #     network  0009 0001 0002
 #
@@ -110,7 +110,7 @@ move "${COYOTE}" "${COYOTE_BASE}" "${COYOTE_BRANCH}"
 move "${NETWORK}" "${NETWORK_BASE}" "${NETWORK_BRANCH}"
 
 apply_in "${PARCORE}" 0012-parcore-decoder-value-count-once.patch
-apply_in "${LIBSTF}"  0006-libstf-stream-profiler-input-register.patch 0013-libstf-huge-page-cap.patch
+apply_in "${LIBSTF}"  0006-libstf-stream-profiler-input-register.patch
 apply_in "${COYOTE}"  0010-coyote-tcp-management-ports.patch 0011-coyote-rx-buffer-fifo-1mib.patch
 apply_in "${NETWORK}" 0009-toe-window-1mib.patch 0001-toe-rx-window-clamp.patch 0002-toe-seed-ephemeral-port-cursor.patch
 

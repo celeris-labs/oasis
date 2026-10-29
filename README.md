@@ -187,7 +187,7 @@ opening it, the host library reads the register-map revision of the HTTP handler
 On the board host, with the board programmed:
 
 ```bash
-export OASIS_SERVER=<store IP> OASIS_PORT=9000 LIBSTF_HUGE_PAGES=10
+export OASIS_SERVER=<store IP> OASIS_PORT=9000
 D=extension/build/release/duckdb
 $D -noheader -list -c "SET http_server='$OASIS_SERVER'; SET http_port=9000;
   SELECT sum(r_regionkey) FROM read_oasis('httpfpga:///throughput/tpch-1/region.parquet');"   # 10
@@ -195,8 +195,8 @@ $D -noheader -list -c "SET http_server='$OASIS_SERVER'; SET http_port=9000;
   SELECT sum(l_orderkey) FROM read_oasis('httpfpga:///throughput/tpch-1/lineitem.parquet');"  # 18005322964949
 ```
 
-`LIBSTF_HUGE_PAGES` is the number of free 1 GiB huge pages the library maps (default 4); the scale
-30 `wide` workload needs 10.
+When the extension loads, the host library maps every free 1 GiB huge page; the scale 30 `wide`
+workload needs 10.
 
 `./scripts/tpch_demo.sh` runs the 22 TPC-H queries on `read_oasis()` views, then on stock DuckDB
 (httpfs and its Parquet reader, same objects), compares the answers cell for cell and sums the wall
