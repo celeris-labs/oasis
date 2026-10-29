@@ -3,20 +3,19 @@ valid, ready, last and its stop input through one register before counting (a ti
 counts, one cycle later). Applied by apply.sh.
 
 diff --git a/hardware/src/hdl/util/stream_profiler.sv b/hardware/src/hdl/util/stream_profiler.sv
-index 48a14e1..840462f 100644
+index 48a14e1..645916f 100644
 --- a/hardware/src/hdl/util/stream_profiler.sv
 +++ b/hardware/src/hdl/util/stream_profiler.sv
-@@ -36,6 +36,29 @@ data64_t stalled_reg,    n_stalled_reg;
+@@ -36,6 +36,28 @@ data64_t stalled_reg,    n_stalled_reg;
  data64_t idle_reg,       n_idle_reg;
  data64_t idle_acc_reg,   n_idle_acc_reg;
  
-+// The inputs, REGISTERED before anything counts them (oasis, 2026-09-26). The observed stream's
-+// ready is usually a deep cone of its consumer (ColumnChunkDecoder's in.ready comes from the page
-+// header parser's byte counter), and it fanned out into the clock enables of the 64-bit counters
-+// below -- on a placed 4-decoder build that was the worst path of the design, across an SLR
-+// boundary (-2.188 ns: page_header_parser -> inst_profile_in handshakes CE). With every input,
-+// stop included, taken through one register the profiler is exactly its old self delayed by one
-+// cycle: the same counts, reported one cycle later. Nothing observed is touched.
++// The inputs, REGISTERED before anything counts them. The observed stream's ready is usually a
++// deep cone of its consumer (ColumnChunkDecoder's in.ready comes from the page header parser's
++// byte counter), and unregistered it fans out into the clock enables of the 64-bit counters below,
++// a long path that can cross an SLR boundary. With every input, stop included, taken through one
++// register the profiler counts exactly what it would count unregistered, one cycle later. Nothing
++// observed is touched.
 +logic last_q, valid_q, ready_q, stop_q;
 +
 +always_ff @(posedge clk) begin
@@ -36,7 +35,7 @@ index 48a14e1..840462f 100644
  always_ff @(posedge clk) begin
      if (!rst_n) begin
          state <= WAIT;
-@@ -67,7 +90,7 @@ always_comb begin
+@@ -67,7 +89,7 @@ always_comb begin
  
      case (state)
          WAIT: begin
@@ -45,7 +44,7 @@ index 48a14e1..840462f 100644
                  n_state = STREAM;
  
                  n_handshakes_reg = '0;
-@@ -76,7 +99,7 @@ always_comb begin
+@@ -76,7 +98,7 @@ always_comb begin
                  n_idle_reg       = '0;
                  n_idle_acc_reg   = '0;
  
@@ -54,7 +53,7 @@ index 48a14e1..840462f 100644
                      n_handshakes_reg = 1;
                  end else begin
                      n_stalled_reg = 1;
-@@ -84,11 +107,11 @@ always_comb begin
+@@ -84,11 +106,11 @@ always_comb begin
              end
          end
          STREAM: begin
@@ -69,7 +68,7 @@ index 48a14e1..840462f 100644
                          n_state = IDLE;
                      end
                  end else begin
-@@ -99,16 +122,16 @@ always_comb begin
+@@ -99,16 +121,16 @@ always_comb begin
              end
          end
          IDLE: begin
@@ -89,7 +88,7 @@ index 48a14e1..840462f 100644
                          n_state = IDLE;
                      end
                  end else begin
-@@ -120,7 +143,7 @@ always_comb begin
+@@ -120,7 +142,7 @@ always_comb begin
          end
      endcase
  

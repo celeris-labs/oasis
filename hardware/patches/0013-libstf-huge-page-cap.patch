@@ -3,7 +3,7 @@ instead of every one; LIBSTF_HUGE_PAGES=N changes the count, 0 takes them all. H
 Applied by apply.sh.
 
 diff --git a/software/libstf/memory_pool.cpp b/software/libstf/memory_pool.cpp
-index 47aba8c..287fb55 100644
+index 47aba8c..2d55c04 100644
 --- a/software/libstf/memory_pool.cpp
 +++ b/software/libstf/memory_pool.cpp
 @@ -2,6 +2,7 @@
@@ -14,7 +14,7 @@ index 47aba8c..287fb55 100644
  #include <fstream>
  #include <memory>
  
-@@ -99,8 +100,39 @@ HugePageMemoryPool::HugePageMemoryPool() {
+@@ -99,8 +100,36 @@ HugePageMemoryPool::HugePageMemoryPool() {
      // Immediately reuse pages
      je_mallctl_write<ssize_t>("arenas.dirty_decay_ms", 0);
  
@@ -24,22 +24,19 @@ index 47aba8c..287fb55 100644
 +    // Taking them all makes the pool hostile to everything else on the machine, including the next
 +    // instance of itself: a process that grabs all 8 leaves free_hugepages at 0, and the very next
 +    // one throws "Your system has 0 free 1GiB huge pages" before it can do anything. Two Oasis
-+    // processes could never coexist, a run immediately following another could fail depending on how
-+    // fast the kernel reclaimed, and a killed process poisoned the machine until it did. That
-+    // repeatedly looked like an FPGA fault and was not one.
++    // processes cannot coexist, a run right after another can fail depending on how fast the kernel
++    // reclaims, and a killed process blocks the machine until it does.
 +    //
 +    // It also costs time: OasisContext pre-maps the WHOLE pool into the FPGA TLB
 +    // (ensure_tlb_mapping(initial_address, total_capacity)), so an 8 GiB pool means mapping 8 GiB
 +    // before the first query, on every process.
 +    //
-+    // Four, from measurement rather than arithmetic. Sizing this against the output buffer manager's
-+    // own buffers (streams x 2 x 8 MiB) suggested two pages was already 100x headroom, and that was
-+    // wrong: an 8-column scan asks jemalloc for a single 384 MiB extent, and a 2 GiB pool could not
-+    // serve it once its own allocations had fragmented the arena. Four carries the widest workload
-+    // here and still leaves half of an 8-page system free for another process.
++    // The default is four pages. An 8-column scan asks jemalloc for a single 384 MiB extent, which a
++    // 2 GiB pool cannot serve once its own allocations have fragmented the arena, and four leave half
++    // of an 8-page system free for another process. A wider scan can need more.
 +    //
-+    // LIBSTF_HUGE_PAGES overrides it; LIBSTF_HUGE_PAGES=0 restores taking every free page, which is
-+    // what this used to do and what made a single crash poison the machine.
++    // LIBSTF_HUGE_PAGES=N takes N pages instead, so it raises the count for a wider scan;
++    // LIBSTF_HUGE_PAGES=0 takes every free page.
      auto num_huge_pages = get_number_of_available_huge_pages();
 +    {
 +        int wanted = 4;

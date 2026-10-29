@@ -2,19 +2,17 @@ Oasis patch 0009 for parcore/libstf/coyote/hw/services/network (base 20633d0): T
 256 KiB -> 1 MiB (WINDOW_SCALE_BITS 2 -> 4). Applied by apply.sh.
 
 diff --git a/hls/toe/toe_config.hpp.in b/hls/toe/toe_config.hpp.in
-index 5fe0fb6..e73d5aa 100644
+index 5fe0fb6..73d40e9 100644
 --- a/hls/toe/toe_config.hpp.in
 +++ b/hls/toe/toe_config.hpp.in
-@@ -23,7 +23,17 @@ const unsigned DATA_KEEP_BITS = ConstLog2(DATA_WIDTH/8);
+@@ -23,7 +23,15 @@ const unsigned DATA_KEEP_BITS = ConstLog2(DATA_WIDTH/8);
  
  //TCP window scaling option
  #define WINDOW_SCALE ${TCP_STACK_WINDOW_SCALING_EN}
 -const unsigned WINDOW_SCALE_BITS = 2;
-+// Raised 2 -> 4 for oasis (window 256 KiB -> 1 MiB, BUFFER_SIZE below follows).
-+//
-+// A ranged GET costs ~1.4 ms of object-store time-to-first-byte no matter how big it is, so
-+// single-connection throughput is very nearly linear in how much may be asked for at once, and this
-+// is what caps that. Measured against MinIO: 256 KiB -> 179 MB/s, 512 KiB -> 294, 1 MiB -> 423.
++// Raised 2 -> 4 for oasis (window 256 KiB -> 1 MiB, BUFFER_SIZE below follows). The window, the
++// receive buffer size and each connection's transmit ring grow four times with it, and a connection
++// may have up to 1 MiB of a response in flight before the reader has to reopen the window.
 +//
 +// The receive fifo MUST be resized to match (rx_buffer_fifo in hw/hdl/network/tcp/tcp_stack.sv, and
 +// the axis_max_data_count constants feeding the TOE). The stack advertises BUFFER_SIZE regardless of

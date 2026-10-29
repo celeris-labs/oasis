@@ -5,7 +5,7 @@ invites data that rx_engine then drops: a duplicate-ACK storm, go-back-N and exp
 Applied by apply.sh.
 
 diff --git a/hls/toe/rx_sar_table/rx_sar_table.cpp b/hls/toe/rx_sar_table/rx_sar_table.cpp
-index 6039e25..e01775a 100755
+index 6039e25..a5d3a86 100755
 --- a/hls/toe/rx_sar_table/rx_sar_table.cpp
 +++ b/hls/toe/rx_sar_table/rx_sar_table.cpp
 @@ -67,12 +67,39 @@ void rx_sar_table(	stream<rxSarRecvd>&			rxEng2rxSar_upd_req,
@@ -24,9 +24,9 @@ index 6039e25..e01775a 100755
 +		// such event costs up to 13 s of dead air, and a receiver that is slower than the sender
 +		// reaches that band eventually every time.
 +		//
-+		// A ZERO window is the state TCP already handles correctly: the sender stops, its persist
-+		// timer probes every ~200 ms, and it resumes the moment the application drains. Same
-+		// throttling, without the storm. So collapse the whole refuse-band to zero.
++		// A ZERO window stops the sender instead, so collapse the whole refuse-band to zero. It
++		// reopens when this side next transmits on the connection: rx_engine ACKs only segments
++		// with payload, so the sender's zero-window probes get no answer.
 +		//
 +		// One MSS of margin, because free space can shrink between advertising and arrival.
 +		const ap_uint<WINDOW_BITS> RX_ENGINE_ACCEPT_FLOOR = 375 * 64;   // beats * bytes-per-beat
