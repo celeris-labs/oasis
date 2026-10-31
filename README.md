@@ -279,7 +279,7 @@ hardware/unit-tests/run_all.sh            # or: hardware/unit-tests/run_all.sh t
   answers a bare `count(*)` from the Parquet footer with the FPGA idle.
 - The FPGA opens its connections, one per decoder, at the first `read_oasis()` query after
   programming, to that query's `http_server` and `http_port`, and keeps them open between queries:
-  to read from another store, program the board again. Port 9000 is the tested configuration.
+  to read from another store, program the board again.
 - When the store closes an idle connection, the lane reopens it at once. A refused reopen leaves the
   lane down until the board is programmed again.
 - Only programming resets the FPGA's HTTP client and decoders: after a query fails with an error
