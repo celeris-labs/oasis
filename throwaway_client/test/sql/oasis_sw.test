@@ -1,0 +1,91 @@
+# name: test/sql/oasis_sw.test
+# description: read_parquet over s3:// through the RDMA stand-in client. run_tests.sh starts the server.
+# group: [oasis_sw]
+
+require oasis_sw
+
+require parquet
+
+# By default the runner skips the whole file when an error mentions "HTTP", so a broken server would
+# look like a pass. Nothing here should ever do that.
+set ignore_error_messages never-ignore-an-error
+
+# -- Configuration --------------------------------------------------------------------------------
+statement error
+SELECT * FROM read_parquet('s3://oasis/int32.parquet');
+----
+oasis_sw_endpoint
+
+statement ok
+SET oasis_sw_endpoint = '127.0.0.1:9200';
+
+# Local reads are untouched
+query I
+SELECT count(*) FROM read_parquet('../extension/data/int32.parquet');
+----
+1000
+
+# -- Differential: every fixture reads the same over RDMA as from disk ----------------------------
+foreach file int32 float32 test float4_small float4_large mixed_int_small mixed_int_large mixed_small huge
+
+query I
+SELECT (SELECT count(*) FROM read_parquet('s3://oasis/{file}.parquet')) = (SELECT count(*) FROM read_parquet('../extension/data/{file}.parquet'));
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT * FROM read_parquet('s3://oasis/{file}.parquet') EXCEPT ALL SELECT * FROM read_parquet('../extension/data/{file}.parquet'));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM read_parquet('../extension/data/{file}.parquet') EXCEPT ALL SELECT * FROM read_parquet('s3://oasis/{file}.parquet'));
+----
+0
+
+endloop
+
+# -- Structural: known values, so failures do not depend on the local reader ----------------------
+query IIII
+SELECT count(*), min(c_int32), max(c_int32), sum(c_int64) FROM read_parquet('s3://oasis/mixed_small.parquet');
+----
+65536	0	65535	2147450880000000
+
+# Projection and filter pushdown still work, and they only touch part of the file
+query I
+SELECT count(*) FROM read_parquet('s3://oasis/mixed_small.parquet') WHERE c_int32 BETWEEN 8192 AND 16383;
+----
+8192
+
+# Footer access
+query I
+SELECT count(*) FROM parquet_metadata('s3://oasis/mixed_small.parquet') WHERE column_id = 0;
+----
+8
+
+# -- Globs go through ListObjectsV2 ---------------------------------------------------------------
+query I
+SELECT count(*) FROM glob('s3://oasis/float4_*.parquet');
+----
+2
+
+query I
+SELECT count(DISTINCT filename) FROM read_parquet('s3://oasis/mixed_int_*.parquet', filename = true);
+----
+2
+
+query I
+SELECT count(*) FROM glob('s3://oasis/does_not_exist_*.parquet');
+----
+0
+
+# -- Errors ---------------------------------------------------------------------------------------
+statement error
+SELECT * FROM read_parquet('s3://oasis/missing.parquet');
+----
+No files found
+
+statement error
+SELECT * FROM read_parquet('s3://no-such-bucket/missing.parquet');
+----
+No files found

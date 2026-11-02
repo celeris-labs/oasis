@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(oasis_rdma_server VERSION 0.1.0 LANGUAGES CXX)
+project(oasis_s3_server VERSION 0.1.0 LANGUAGES CXX)
 
 # Default to a Release build (optimized) unless the user specifies otherwise.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -17,7 +17,11 @@ find_package(Threads REQUIRED)
 find_library(IBVERBS_LIBRARY NAMES ibverbs REQUIRED)
 find_path(IBVERBS_INCLUDE_DIR NAMES infiniband/verbs.h REQUIRED)
 
-add_executable(oasis_rdma_server src/main.cpp)
-
-target_include_directories(oasis_rdma_server PRIVATE ${IBVERBS_INCLUDE_DIR})
-target_link_libraries(oasis_rdma_server PUBLIC ${IBVERBS_LIBRARY} Boost::program_options Threads::Threads)
+add_executable(oasis_s3_server
+    src/s3_main.cpp
+    src/s3_server.cpp
+    src/rdma_engine.cpp
+    src/object_store.cpp
+    src/arena.cpp)
+target_include_directories(oasis_s3_server PRIVATE ${IBVERBS_INCLUDE_DIR})
+target_link_libraries(oasis_s3_server PRIVATE ${IBVERBS_LIBRARY} Boost::program_options Threads::Threads)
