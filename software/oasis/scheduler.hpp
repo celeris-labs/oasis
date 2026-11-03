@@ -26,14 +26,32 @@ class OasisContext;
  * Describes one hardware stream the scheduler dispatches onto: the capability it provides and the
  * hardware bounds of its pipeline. For now OasisContext hardcodes the descriptions from the
  * synthesized configuration; eventually they could be auto-discovered from the hardware.
+ *
+ * The three max_* FIFO bounds below are hard limits: the hardware's write FIFOs have no
+ * backpressure, so an entry written beyond the depth is silently lost and its flow never
+ * completes. The scheduler therefore never places a flow whose demand (see FlowDemand) does not fit.
  */
 struct StreamDescription {
     StreamCapability capability = StreamCapability::DECODE;
-    // Maximum in-flight flows (the hardware request/config FIFO depth). For DECODE streams this
-    // seeds the runtime-tunable pipeline depth.
+    // Cap on flows in flight. Not a hardware bound itself (the FIFOs below are, and a flow takes
+    // several entries); for DECODE streams it seeds the runtime-tunable pipeline depth.
     size_t max_flows = 1;
+    // Decoder config FIFO depth: one entry per DecodeColumnChunkOperator of an in-flight flow.
+    size_t max_configs = 1;
+    // Read request FIFO depth: one entry per source operator of an in-flight flow.
+    size_t max_reads = 1;
     // Maximum in-flight output buffers (the hardware output-writer FIFO depth).
     size_t max_buffers = 1;
+};
+
+/**
+ * What one flow occupies in its stream's hardware FIFOs from dispatch until its last interrupt.
+ * Computed once from the flow's operators (Scheduler::demand_of).
+ */
+struct FlowDemand {
+    size_t configs = 0; // decoder configs: one per DecodeColumnChunkOperator
+    size_t reads   = 0; // read requests: one per SourceOperator
+    size_t buffers = 0; // output-writer buffers: all buffers of all sinks
 };
 
 /**
@@ -45,6 +63,10 @@ struct StreamDescription {
  * across the DECODE streams, raw source->sink flows can only run on a BYPASS stream. Each
  * capability has its own dispatch queue so a capability whose streams are full never head-of-line
  * blocks the other.
+ *
+ * A flow is placed on a stream only when its whole demand (decoder configs, read requests and
+ * output buffers, see FlowDemand) fits what the stream's FIFOs have left. Everything it reserved is
+ * released when the flow completes.
  *
  * Two knobs are tunable at runtime and apply to the DECODE streams: the number of *active* streams
  * (the span the dispatcher load-balances across) and the per-stream pipeline depth. Streams of
@@ -99,6 +121,7 @@ class Scheduler {
     struct InFlight {
         OperatorFlow                        flow;
         std::shared_ptr<SplinterCompletion> completion;
+        FlowDemand                          demand; // released when the flow's last interrupt lands
         bool                                done = false;
     };
 
@@ -118,31 +141,35 @@ class Scheduler {
     };
 
     // A queued flow waiting for the dispatcher to place it on a stream providing its capability.
-    // Carries the shared completion record of the splinter it belongs to and the total buffer
-    // count across all of its sinks (the buffer-slot dispatch gate needs it before the flow is
-    // placed).
+    // Carries the shared completion record of the splinter it belongs to and its demand (the
+    // dispatch gates need it before the flow is placed).
     struct Pending {
         OperatorFlow                        flow;
         std::shared_ptr<SplinterCompletion> completion;
-        StreamCapability                    capability  = StreamCapability::DECODE;
-        size_t                              num_buffers = 0;
+        StreamCapability                    capability = StreamCapability::DECODE;
+        FlowDemand                          demand;
     };
 
     // Per-stream pipeline: The stream's bounds (from its StreamDescription), the list of in-flight
-    // flows, and the count of flows/buffers currently enqueued on this stream. `enqueued` is the
-    // load-balancing metric and the flow FIFO gate. `enqueued_buffers` gates the OutputWRiter
-    // FIFO. Both are atomic and held under no lock: the dispatcher bumps them when it places a flow
-    // and the interrupt thread decrements them as completions land. Keeping them lock-free is what
-    // breaks the lock cycle -- handle_completion must never take dispatch_mutex_ while the
-    // dispatcher holds dispatch_mutex_ and is waiting for the stream mutex. `in_flight`/`done` are
-    // guarded by the stream mutex.
+    // flows, and what the in-flight flows currently occupy on this stream. `enqueued` is the
+    // load-balancing metric and the flow gate; `enqueued_configs`, `enqueued_reads` and
+    // `enqueued_buffers` gate the decoder config, read request and output-writer FIFOs. All are
+    // atomic and held under no lock: the dispatcher bumps them when it places a flow and the
+    // interrupt thread decrements them as completions land. Keeping them lock-free is what breaks
+    // the lock cycle -- handle_completion must never take dispatch_mutex_ while the dispatcher holds
+    // dispatch_mutex_ and is waiting for the stream mutex. `in_flight`/`done` are guarded by the
+    // stream mutex.
     struct StreamState {
         std::mutex                    mutex;
         std::list<InFlight>           in_flight;
         std::deque<PendingCompletion> completions; // enqueued buffers awaiting interrupts, in order
         std::atomic<size_t>           enqueued{0};
+        std::atomic<size_t>           enqueued_configs{0};
+        std::atomic<size_t>           enqueued_reads{0};
         std::atomic<size_t>           enqueued_buffers{0};
         size_t                        max_flows   = 1;
+        size_t                        max_configs = 1;
+        size_t                        max_reads   = 1;
         size_t                        max_buffers = 1;
     };
 
@@ -169,17 +196,17 @@ class Scheduler {
     // slots before measuring load.
     void dispatch_loop();
 
-    // Returns the least-loaded stream providing `capability` that can accept a flow whose sink
-    // spans `num_buffers` buffers (its flow gate and buffer gate both have room). For DECODE the
+    // Returns the least-loaded stream providing `capability` that can accept a flow with `demand`
+    // (its flow gate and its config, read and buffer gates all have room). For DECODE the
     // candidates are the active span and the flow gate is the runtime pipeline depth; for other
     // capabilities every providing stream is a candidate, gated by its hardware bounds. nullopt if
     // none. Must be called holding dispatch_mutex_.
     std::optional<libstf::stream_t> pick_stream(StreamCapability capability,
-                                                size_t           num_buffers) const;
+                                                const FlowDemand &demand) const;
 
     // Applies a flow on `stream`: Records a pending completion per sink buffer and enqueues the
     // buffers to the FPGA, parking the flow in the stream's in-flight list. Called only by the
-    // dispatcher, with a slot already reserved (enqueued/enqueued_buffers atomically bumped).
+    // dispatcher, with the demand already reserved on the stream's counters.
     void dispatch_to(libstf::stream_t stream, Pending &pending);
 
     // Splices `done` in-flight slots into `finished` (without destroying them, so the caller can
