@@ -78,9 +78,8 @@ public:
 		return (read_register(9).value() & 0b11ULL) != 0;
 	}
 
-	// Mirrors celeris's BFConfig::fetch_perf_counters: build counters at registers 1-4 (+ causes at
-	// 10-12), probe at 5-8 (+ 13-15), the run's at 16-24. They hold the last run's values until the
-	// next run starts.
+	// Mirrors celeris's BFConfig::fetch_perf_counters: build counters at registers 1-4, probe at 5-8,
+	// the run's at 10-18. They hold the last run's values until the next run starts.
 	//
 	// A phase's `cycles` increments every cycle until the phase's END beat is accepted, and the
 	// END is written to a command queue just before this is called. So the probe `cycles` is read
@@ -96,30 +95,27 @@ public:
 private:
 	BloomPerfCounters fetch_perf_counters_once() {
 		BloomPerfCounters perf;
-		perf.build = fetch_phase_perf(1, 10);
-		perf.probe = fetch_phase_perf(5, 13);
-		perf.run.cycles = read_register(16).value();
-		perf.run.keys_in_beats = read_register(17).value();
-		perf.run.values_in_beats = read_register(18).value();
-		perf.run.kept_out_beats = read_register(19).value();
-		perf.run.mat_out_beats = read_register(20).value();
-		perf.run.mask_out_beats = read_register(21).value();
-		perf.run.out_cycles = read_register(22).value();
-		perf.run.first_out_cycles = read_register(23).value();
-		perf.run.probe_start_cycles = read_register(24).value();
+		perf.build = fetch_phase_perf(1);
+		perf.probe = fetch_phase_perf(5);
+		perf.run.cycles = read_register(10).value();
+		perf.run.keys_in_beats = read_register(11).value();
+		perf.run.values_in_beats = read_register(12).value();
+		perf.run.kept_out_beats = read_register(13).value();
+		perf.run.mat_out_beats = read_register(14).value();
+		perf.run.mask_out_beats = read_register(15).value();
+		perf.run.out_cycles = read_register(16).value();
+		perf.run.first_out_cycles = read_register(17).value();
+		perf.run.probe_start_cycles = read_register(18).value();
 		perf.command_queue_overflowed = command_queue_overflowed();
 		return perf;
 	}
 
-	BloomPhasePerf fetch_phase_perf(uint32_t first_reg, uint32_t first_cause_reg) {
+	BloomPhasePerf fetch_phase_perf(uint32_t first_reg) {
 		BloomPhasePerf perf;
 		perf.cycles = read_register(first_reg).value();
 		perf.idle_cycles = read_register(first_reg + 1).value();
 		perf.stalled_cycles = read_register(first_reg + 2).value();
 		perf.cmd_wait_cycles = read_register(first_reg + 3).value();
-		perf.stalled_mat_cycles = read_register(first_cause_reg).value();
-		perf.stalled_out_cycles = read_register(first_cause_reg + 1).value();
-		perf.stalled_credit_cycles = read_register(first_cause_reg + 2).value();
 		return perf;
 	}
 };

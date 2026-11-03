@@ -14,15 +14,7 @@ struct BloomPhasePerf {
 	uint64_t idle_cycles = 0;            // Cycles without an accepted beat
 	uint64_t stalled_cycles = 0;         // Idle: a beat was offered but the filter was not ready
 	uint64_t cmd_wait_cycles = 0;        // Idle: no input command was available yet (host too slow)
-	uint64_t stalled_mat_cycles = 0;     // Stalled: the mask buffer refuses a mask value
-	uint64_t stalled_out_cycles = 0;     // Stalled: raw_out or mask_out is not drained by the host
-	uint64_t stalled_credit_cycles = 0;  // Stalled: all credits of the probe creditor are in flight
 
-	// Stalled for reasons inside the filter's pipeline (e.g. bank conflicts)
-	uint64_t StalledInternalCycles() const {
-		const uint64_t causes = stalled_mat_cycles + stalled_out_cycles + stalled_credit_cycles;
-		return stalled_cycles > causes ? stalled_cycles - causes : 0;
-	}
 	// Idle because the host has not delivered the data of a beat yet
 	uint64_t DataWaitCycles() const {
 		const uint64_t other = stalled_cycles + cmd_wait_cycles;
