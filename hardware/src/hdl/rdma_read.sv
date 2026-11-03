@@ -36,13 +36,11 @@ module RDMARead #(
 
 `RESET_RESYNC // Reset pipelining
 
-localparam RDMA_READ = 12;
-
 // -- Request generation ---------------------------------------------------------------------------
 ready_valid_i #(read_req_t) req (clk, reset_synced);
 
 ReadReqGenerator #(
-    .OPCODE(RDMA_READ),
+    .OPCODE(lynxTypes::RDMA_READ),
     .DEST(AXI_STRM_ID),
     .PAD_LEN_TO(DATABEAT_SIZE) // Pad request length to DATABEAT_SIZE
 ) inst_req_gen (

@@ -18,8 +18,9 @@ localparam BF_NUM_OUT_CHANNELS = 3;
 localparam NUM_STREAMS        = N_STRM_AXI; // Host streams, i.e. output channels
 localparam NUM_IN_STREAMS     = N_STRM_AXI - BF_NUM_OUT_CHANNELS;
 localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
-// MemConfig write side needs NUM_STREAMS+1 regs, read side needs 3 (ID, num_streams, max_enqueued).
-localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
+// MemConfig write side needs NUM_STREAMS+1 regs, read side needs 4 (ID, num_streams, max_enqueued,
+// empty_stream_consumes_buffer).
+localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 4) ? NUM_STREAMS + 1 : 4;
 
 localparam BF_STREAM_RAW          = NUM_IN_STREAMS;
 localparam BF_STREAM_MASK         = NUM_IN_STREAMS + 1;
@@ -104,8 +105,13 @@ GlobalConfig #(
     .read_configs(read_configs)
 );
 
+// The scheduler (software/oasis/scheduler.cpp) enqueues one output buffer per transfer ahead of time,
+// to the stream of the transfer's output channel, and matches the n-th interrupt of a stream with its
+// n-th buffer. So a transfer that is empty (e.g. a materialized column of which the Bloom filter kept
+// no row) has to use up its buffer too.
 MemConfig #(
-    .NUM_STREAMS(NUM_STREAMS)
+    .NUM_STREAMS(NUM_STREAMS),
+    .EMPTY_STREAM_CONSUMES_BUFFER(1)
 ) inst_mem_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -156,10 +162,10 @@ BFConfig inst_bf_config (
     .perf_counters(bf_perf_counters)
 );
 
-// One select per flow on decoder stream 0: as many can be enqueued as the decoder takes flows
+// One select per flow on decoder stream 0: StreamConfig's default depth (MAXIMUM_NUM_ENQUEUED_STREAMS, 64)
+// is the depth of the decoder's config queue, so as many can be enqueued as the decoder takes flows
 StreamConfig #(
-    .NUM_STREAMS(1),
-    .MAX_OUTSTANDING_STREAMS(COLUMN_CHUNK_DECODER_MAX_ENQUEUED_CONFIGS)
+    .NUM_STREAMS(1)
 ) inst_bf_stream_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -309,7 +315,13 @@ ready_valid_i #(select_t) bf_mux_select_mapped();
 `CONFIG_SIGNALS_TO_INTF(bf_stream_conf[0].select, bf_select)
 assign bf_stream_conf[0].data_type_ready = 1'b1; // unused
 
-`READY_DUPLICATE(2, bf_select, {bf_demux_select, bf_mux_select})
+ReadyValidDuplicator #(2) inst_bf_select_duplicate (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .in(bf_select),
+    .out({bf_demux_select, bf_mux_select})
+);
 
 // The demultiplexer only has three paths: BUILD goes into the Bloom filter like FILTER
 always_comb begin
@@ -527,13 +539,7 @@ NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_bypass (
 `endif
 
 // -- Output writer --------------------------------------------------------------------------------
-// The scheduler (software/oasis/scheduler.cpp) enqueues one output buffer per transfer ahead of time,
-// to the stream of the transfer's output channel, and matches the n-th interrupt of a stream with its
-// n-th buffer. So a transfer that is empty (e.g. a materialized column of which the Bloom filter kept
-// no row) has to use up its buffer too.
-OutputWriter #(
-    .EMPTY_TRANSFER_TAKES_BUFFER(1)
-) inst_output_writer (
+OutputWriter inst_output_writer (
     .clk(clk),
     .rst_n(rst_n),
 

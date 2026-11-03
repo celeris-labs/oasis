@@ -95,6 +95,7 @@ OperatorFlow make_flow(const std::vector<SinkSpec> &sinks, size_t decodes = 1) {
     for (size_t i = 0; i < decodes; i++) {
         flow.push_back(std::make_unique<RDMASourceOperator>(0, 64));
         flow.push_back(std::make_unique<DecodeColumnChunkOperator>(parcore::metadata::Compression::RAW, 8,
+                                                                  libstf::type_t::INT64_T, false,
                                                                   libstf::type_t::INT64_T));
     }
     for (const auto &spec : sinks) {

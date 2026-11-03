@@ -50,7 +50,11 @@ for (genvar I = 0; I < NUM_STREAMS; I++) begin
     ready_valid_i #(size_t) len(clk, reset_synced);
     ConfigWriteFIFO #(I * NUM_WRITE_REGS + 1, MAX_NUM_ENQUEUED_REQUESTS, size_t) inst_len_reg (clk, reset_synced, write_config, len);
 
-    `READY_COMBINE(vaddr, len, out[I])
+    ReadyValidCombiner inst_combine (
+        .left(vaddr),
+        .right(len),
+        .out(out[I])
+    );
 
     ConfigWriteRegister #(I * NUM_WRITE_REGS + 2, logic [PID_BITS-1:0]) inst_ctid_reg (clk, write_config, ctid[I]);
 end

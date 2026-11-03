@@ -347,7 +347,8 @@ BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisCo
 			flow.push_back(MakeHostSource(fetcher.Resolve(range))); // Keeps the read bytes alive
 		}
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
-		    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type)));
+		    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type), cc.is_required,
+		    cc.logical_type()));
 		// The oasis top answers a build chunk with a one-byte ack
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(64), k));
 		splinter.streams.push_back(std::move(flow));
@@ -565,7 +566,8 @@ void AppendDecodeChunk(oasis::OperatorFlow &flow,
 		flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 	}
 	flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
-	    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type)));
+	    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type), cc.is_required,
+	    cc.logical_type()));
 }
 
 // A sink for one transfer of at most `size` bytes: on the Bloom filter's output channel (or, without
