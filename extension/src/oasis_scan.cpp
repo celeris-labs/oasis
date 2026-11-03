@@ -886,7 +886,9 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		bloom_kept = ComputeBloomSliceSelection(*lstate.current_bloom_mask, lstate.current_buf_offset, emit, bloom_sel);
 	}
 
-	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+	// A slice whose rows the mask dropped has nothing to point the vectors at
+	const bool slice_empty = bloom && bloom_kept == 0;
+	for (size_t i = 0; i < gstate.projected_columns.size() && !slice_empty; i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
 			continue; // Decoded by DecodeAndFilterSlice below.
