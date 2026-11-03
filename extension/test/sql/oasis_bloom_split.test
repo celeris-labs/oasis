@@ -1,0 +1,226 @@
+# name: test/sql/oasis_bloom_split.test
+# description: Runtime Bloom filter smoke test: kept keys, mask and materialized columns on their own channels
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# The Bloom filter's three outputs, the kept probe keys, the mask and the materialized columns, come
+# back over output channels of their own, and the probe key is sent to the hardware once (as the
+# FILTER chunk, its kept values are the raw output). This is the smallest test that covers it: two
+# probe row groups of 16 rows, one of which the filter keeps no row of (empty transfers on the kept
+# keys and materialized channels), and a build side of 16 keys. In simulation every read_oasis scan
+# costs a hardware flow per row group and hardware column, so there are only two of them. The
+# larger oasis_bloom.test has the rest.
+#
+# Fixtures are written the way oasis_bloom.test explains: an extra all-NULL row keeps the statistics
+# from making the columns REQUIRED, which it leaves out of the COPY again by selecting on g.
+#
+# sp_build: b_key = 3 * b_val for b_val = 0..15, one row group of 16 rows.
+# sp_probe: sp_id = 0..31 in two row groups of 16 rows, sp_key:
+#   - row group 0 (sp_id 0..15):  3 * sp_id for sp_id < 6 (these match), otherwise 3 * sp_id + 1
+#   - row group 1 (sp_id 16..31): (3 * (sp_id - 16)) % 45 + 1, never a multiple of 3 and within the
+#                                 build keys' min/max, so the row group can't be skipped: the filter
+#                                 drops all its rows
+# and sp_val = 10 * sp_id, sp_int = sp_id (INTEGER: not materialized, so it is decoded around the filter).
+
+statement ok
+CALL enable_logging(level = 'debug');
+
+statement ok
+CREATE TABLE got (placeholder INTEGER);
+
+statement ok
+CREATE TABLE want (placeholder INTEGER);
+
+statement ok
+CREATE MACRO bag_diff() AS (
+    (SELECT count(*) FROM (FROM got EXCEPT ALL FROM want)) +
+    (SELECT count(*) FROM (FROM want EXCEPT ALL FROM got)));
+
+statement ok
+CREATE MACRO bloom_used() AS (
+    SELECT count(*) FROM duckdb_logs WHERE message LIKE 'Runtime Bloom filter: submitted%');
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE sp_build_t (b_key BIGINT, b_val BIGINT, g INTEGER);
+
+statement ok
+INSERT INTO sp_build_t SELECT i * 3, i, 0 FROM range(16) t(i);
+
+statement ok
+INSERT INTO sp_build_t VALUES (NULL, NULL, NULL);
+
+statement ok
+COPY (SELECT b_key, b_val FROM sp_build_t WHERE g = 0) TO '{TEST_DIR}/sp_build.parquet' (FORMAT parquet);
+
+statement ok
+CREATE TABLE sp_probe_t (sp_id BIGINT, sp_key BIGINT, sp_val BIGINT, sp_int INTEGER, g INTEGER);
+
+statement ok
+INSERT INTO sp_probe_t
+SELECT i,
+       CASE WHEN i < 6 THEN 3 * i WHEN i < 16 THEN 3 * i + 1 ELSE (3 * (i - 16)) % 45 + 1 END,
+       10 * i,
+       i,
+       CASE WHEN i < 16 THEN 0 ELSE 1 END
+FROM range(32) t(i);
+
+statement ok
+INSERT INTO sp_probe_t VALUES (NULL, NULL, NULL, NULL, NULL);
+
+statement ok
+COPY (SELECT sp_id, sp_key, sp_val, sp_int FROM sp_probe_t WHERE g = 0
+      UNION ALL SELECT sp_id, sp_key, sp_val, sp_int FROM sp_probe_t WHERE g = 1)
+TO '{TEST_DIR}/sp_probe.parquet' (FORMAT parquet, ROW_GROUP_SIZE 1);
+
+statement ok
+RESET threads;
+
+# The fixtures have the layout the test relies on
+query I
+SELECT list(num_rows ORDER BY row_group_id) FROM (
+    SELECT DISTINCT row_group_id, row_group_num_rows AS num_rows FROM parquet_metadata('{TEST_DIR}/sp_probe.parquet'));
+----
+[16, 16]
+
+query I
+SELECT count(*) FROM (
+    FROM parquet_schema('{TEST_DIR}/sp_probe.parquet') UNION ALL FROM parquet_schema('{TEST_DIR}/sp_build.parquet'))
+WHERE num_children IS NULL AND repetition_type <> 'OPTIONAL';
+----
+0
+
+query I
+SELECT count(*) FROM (
+    FROM parquet_metadata('{TEST_DIR}/sp_probe.parquet') UNION ALL FROM parquet_metadata('{TEST_DIR}/sp_build.parquet'))
+WHERE stats_null_count IS DISTINCT FROM 0;
+----
+0
+
+# ---------------------------------------------------------------------------
+# Only the probe key is projected: nothing to materialize with the mask (a materialization command of
+# 0 columns), so a key chunk yields the kept keys and the mask, and nothing else
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT sp_key FROM read_oasis('{TEST_DIR}/sp_probe.parquet') JOIN read_oasis('{TEST_DIR}/sp_build.parquet') ON sp_key = b_key;
+
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom_split] done: only the probe key is projected') TO '/tmp/oasis_bloom_split_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
+query I
+SELECT bloom_used();
+----
+1
+
+query II
+SELECT count(*), sum(sp_key) FROM got;
+----
+6	45
+
+statement ok
+CREATE OR REPLACE TABLE want AS
+SELECT sp_key FROM read_parquet('{TEST_DIR}/sp_probe.parquet') JOIN read_parquet('{TEST_DIR}/sp_build.parquet') ON sp_key = b_key;
+
+query I
+SELECT bag_diff();
+----
+0
+
+# ---------------------------------------------------------------------------
+# The key and two more 64-bit columns: the key's kept values come from the raw output, the others
+# from the materializer, and row group 1 has no kept row at all
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT sp_id, sp_key, sp_val, b_val
+FROM read_oasis('{TEST_DIR}/sp_probe.parquet') JOIN read_oasis('{TEST_DIR}/sp_build.parquet') ON sp_key = b_key;
+
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom_split] done: the key and two materialized columns') TO '/tmp/oasis_bloom_split_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
+query I
+SELECT bloom_used();
+----
+1
+
+query IIII
+SELECT count(*), sum(sp_id), sum(sp_val), sum(b_val) FROM got;
+----
+6	15	150	15
+
+# Every row carries its own values: the kept keys, ids and values stay aligned with each other
+query I
+SELECT count(*) FROM got WHERE sp_key <> 3 * sp_id OR sp_val <> 10 * sp_id OR b_val <> sp_id;
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE want AS
+SELECT sp_id, sp_key, sp_val, b_val
+FROM read_parquet('{TEST_DIR}/sp_probe.parquet') JOIN read_parquet('{TEST_DIR}/sp_build.parquet') ON sp_key = b_key;
+
+query I
+SELECT bag_diff();
+----
+0
+
+# ---------------------------------------------------------------------------
+# A column that is decoded around the filter (INTEGER) next to the key and a materialized column: its
+# BYPASS flows share the decoder stream (and its output) with the FILTER and MATERIALIZE flows
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE OR REPLACE TABLE got AS
+SELECT sp_id, sp_key, sp_int, sp_val
+FROM read_oasis('{TEST_DIR}/sp_probe.parquet') JOIN read_oasis('{TEST_DIR}/sp_build.parquet') ON sp_key = b_key;
+
+# progress marker
+statement ok
+COPY (SELECT '[oasis_bloom_split] done: a bypassed column next to the materialized ones') TO '/tmp/oasis_bloom_split_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
+query I
+SELECT bloom_used();
+----
+1
+
+query IIII
+SELECT count(*), sum(sp_id), sum(sp_int), sum(sp_val) FROM got;
+----
+6	15	15	150
+
+query I
+SELECT count(*) FROM got WHERE sp_key <> 3 * sp_id OR sp_int <> sp_id OR sp_val <> 10 * sp_id;
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE want AS
+SELECT sp_id, sp_key, sp_int, sp_val
+FROM read_parquet('{TEST_DIR}/sp_probe.parquet') JOIN read_parquet('{TEST_DIR}/sp_build.parquet') ON sp_key = b_key;
+
+query I
+SELECT bag_diff();
+----
+0
+
+statement ok
+COPY (SELECT '[oasis_bloom_split] done: end of test file') TO '/tmp/oasis_bloom_split_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');

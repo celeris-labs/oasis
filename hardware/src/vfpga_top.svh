@@ -5,6 +5,35 @@ import parcore::*;
 import libstf::*;
 import common::*;
 
+// -- Streams --------------------------------------------------------------------------------------
+// The Bloom filter has three host output channels of its own (see the Bloom filter section below), on
+// top of the host streams with an input side. Those input streams are the column chunk decoders and,
+// with RDMA, the bypass stream. The channels are the last host streams, so the ids of the others do
+// not change:
+//   [0, NUM_DECODERS)          decoder streams
+//   [NUM_DECODERS]             RDMA bypass stream (only with RDMA)
+//   NUM_IN_STREAMS + 0 .. 2    BF_STREAM_RAW, BF_STREAM_MASK, BF_STREAM_MATERIALIZED (output only)
+localparam BF_NUM_OUT_CHANNELS = 3;
+
+localparam NUM_STREAMS        = N_STRM_AXI; // Host streams, i.e. output channels
+localparam NUM_IN_STREAMS     = N_STRM_AXI - BF_NUM_OUT_CHANNELS;
+localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
+// MemConfig write side needs NUM_STREAMS+1 regs, read side needs 3 (ID, num_streams, max_enqueued).
+localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
+
+localparam BF_STREAM_RAW          = NUM_IN_STREAMS;
+localparam BF_STREAM_MASK         = NUM_IN_STREAMS + 1;
+localparam BF_STREAM_MATERIALIZED = NUM_IN_STREAMS + 2;
+
+`ASSERT_ELAB(N_STRM_AXI > BF_NUM_OUT_CHANNELS)
+
+localparam NUM_CONFIGS   = 5;
+`ifdef EN_RDMA
+localparam NUM_DECODERS  = NUM_IN_STREAMS - 1;
+`else
+localparam NUM_DECODERS  = NUM_IN_STREAMS;
+`endif
+
 // -- Tie-off unused interfaces and signals --------------------------------------------------------
 always_comb cq_rd.tie_off_s();
 
@@ -22,19 +51,13 @@ for (genvar I = 0; I < N_RDMA_AXI; I++) begin
     always_comb axis_rreq_send[I].tie_off_m();
 end
 
-`ASSERT_ELAB(N_STRM_AXI == N_RDMA_AXI)
-`endif
-
-localparam NUM_STREAMS        = N_STRM_AXI;
-localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
-// MemConfig write side needs NUM_STREAMS+1 regs, read side needs 3 (ID, num_streams, max_enqueued).
-localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
-
-localparam NUM_CONFIGS   = 5;
-`ifdef EN_RDMA
-localparam NUM_DECODERS  = NUM_STREAMS - 1;
+// RDMA streams are the input streams, the output channels have no RDMA side
+`ASSERT_ELAB(NUM_IN_STREAMS == N_RDMA_AXI)
 `else
-localparam NUM_DECODERS  = NUM_STREAMS;
+// The output channels have no input
+for (genvar I = NUM_IN_STREAMS; I < N_STRM_AXI; I++) begin
+    always_comb axis_host_recv[I].tie_off_s();
+end
 `endif
 
 // BFConfig (the Bloom filter's per-chunk materialization and input commands) + a 1-stream
@@ -53,8 +76,8 @@ assign rst_n = aresetn;
 write_config_i                       write_configs[NUM_CONFIGS](.*);
 read_config_i                        read_configs [NUM_CONFIGS](.*);
 mem_config_i                         mem_conf[NUM_STREAMS](.*);
-ready_valid_i #(read_req_t)          read_conf[NUM_STREAMS](.*);
-logic [PID_BITS-1:0]                 read_ctid[NUM_STREAMS];
+ready_valid_i #(read_req_t)          read_conf[NUM_IN_STREAMS](.*);
+logic [PID_BITS-1:0]                 read_ctid[NUM_IN_STREAMS];
 ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
 decoder_profile_i                    decoder_profiles[NUM_DECODERS]();
 bloomfilter_config_i                 bloomfilter_conf();
@@ -66,7 +89,7 @@ GlobalConfig #(
     .ADDR_SPACE_SIZES({
         MEM_CONFIG_NUM_REGS,
         COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS),
-        NUM_READ_REQ_CONFIG_REGS * NUM_STREAMS,
+        NUM_READ_REQ_CONFIG_REGS * NUM_IN_STREAMS,
         BLOOMFILTER_NUM_CONFIG_REGS,
         STREAM_CFG_REGS
     }),
@@ -108,7 +131,7 @@ ColumnChunkDecoderConfig #(
 );
 
 ReadReqConfig #(
-    .NUM_STREAMS(NUM_STREAMS)
+    .NUM_STREAMS(NUM_IN_STREAMS)
 ) inst_read_req_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -148,10 +171,10 @@ StreamConfig #(
 );
 
 // -- Arbiter the read send queue ------------------------------------------------------------------
-metaIntf #(.STYPE(req_t)) sq_rd_strm [NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+metaIntf #(.STYPE(req_t)) sq_rd_strm [NUM_IN_STREAMS](.aclk(clk), .aresetn(rst_n));
 
 MetaIntfArbiter #(
-    .N_INTERFACES(NUM_STREAMS),
+    .N_INTERFACES(NUM_IN_STREAMS),
     .STYPE(req_t)
 ) inst_sq_wr_arbiter (
     .clk(clk),
@@ -241,18 +264,28 @@ if (NUM_DECODERS != 1) $error({"The Bloom filter requires exactly one decoder: s
     "queue and misroute its transfers."});
 
 // The stream config's `select` chooses, per flow, where decoder-stream 0's transfer goes. Pushed
-// per flow by BloomFilterStreamSelectOperator (oasis_scan.cpp):
-//   0 (FILTER): through the Bloom filter as a probe key chunk, yields its mask (axi_bf_mask)
-//   1 (BYPASS): around the Bloom filter, yields decoded_axi[0] unchanged (axi_bf_bypass)
-//   2 (BUILD):  through the Bloom filter as a build key chunk, yields a one-byte ack (axi_bf_ack)
+// per flow by BloomFilterStreamSelectOperator (oasis_hardware_bloom.cpp):
+//   0 (FILTER): through the Bloom filter as a probe key chunk, yields two transfers, each on a host
+//               output channel of its own: the kept probe keys (axi_bf_out, BF_STREAM_RAW) and its
+//               mask (axi_bf_mask, BF_STREAM_MASK)
+//   1 (BYPASS): around the Bloom filter, yields decoded_axi[0] unchanged (axi_bf_bypass), on the
+//               output of decoder-stream 0
+//   2 (BUILD):  through the Bloom filter as a build key chunk, yields a one-byte ack (axi_bf_ack),
+//               on the output of decoder-stream 0
 //   3 (MATERIALIZE): into the Bloom filter's materializer as a column of 64-bit probe values,
-//               yields the values of the rows its probe key chunk's mask kept (axi_bf_mat)
+//               yields the values of the rows its probe key chunk's mask kept (axi_bf_mat,
+//               BF_STREAM_MATERIALIZED)
 // FILTER and BUILD transfers look the same to the Bloom filter: the input commands in its own config
 // (CONTINUE per transfer, END after a side, pushed with the select) decide the phase. BUILD only
 // exists because a build chunk has no output, while every flow needs one output transfer to
 // complete (and the multiplexer needs one per select): the ack stands in for it.
 // A probe key chunk is followed by the MATERIALIZE transfers of its columns (as many as its
-// materialization command in the Bloom filter's config says), before the next probe key chunk.
+// materialization command in the Bloom filter's config says, which does not include the key
+// column: its kept values come out of the filter as the raw output), before the next probe key chunk.
+//
+// The outputs of the Bloom filter are independent host streams, so the host reads them in parallel.
+// Only the transfers of BYPASS and BUILD are multiplexed onto the output of decoder-stream 0, in
+// select order. Every channel has exactly one transfer (possibly empty) per select it takes part in.
 localparam select_t BF_SELECT_FILTER      = 0;
 localparam select_t BF_SELECT_BYPASS      = 1;
 localparam select_t BF_SELECT_BUILD       = 2;
@@ -263,10 +296,15 @@ localparam select_t BF_DEMUX_KEYS         = 0;
 localparam select_t BF_DEMUX_BYPASS       = 1;
 localparam select_t BF_DEMUX_PROBE_VALUES = 2;
 
+// Multiplexer inputs, the outputs that share the output of decoder-stream 0
+localparam select_t BF_MUX_BYPASS         = 0;
+localparam select_t BF_MUX_ACK            = 1;
+
 ready_valid_i #(select_t) bf_select();
 ready_valid_i #(select_t) bf_demux_select();
 ready_valid_i #(select_t) bf_demux_select_mapped();
 ready_valid_i #(select_t) bf_mux_select();
+ready_valid_i #(select_t) bf_mux_select_mapped();
 
 `CONFIG_SIGNALS_TO_INTF(bf_stream_conf[0].select, bf_select)
 assign bf_stream_conf[0].data_type_ready = 1'b1; // unused
@@ -283,6 +321,28 @@ always_comb begin
 end
 assign bf_demux_select_mapped.valid = bf_demux_select.valid;
 assign bf_demux_select.ready        = bf_demux_select_mapped.ready;
+
+// The multiplexer only has BYPASS and BUILD (ack) transfers. A FILTER or MATERIALIZE select has no
+// transfer on the output of decoder-stream 0 (its outputs have a host stream each), so it is taken
+// right away and does not wait for one.
+logic bf_mux_select_used;
+always_comb begin
+    bf_mux_select_used        = 1'b0;
+    bf_mux_select_mapped.data = BF_MUX_BYPASS;
+    case (bf_mux_select.data)
+        BF_SELECT_BYPASS: begin
+            bf_mux_select_used        = 1'b1;
+            bf_mux_select_mapped.data = BF_MUX_BYPASS;
+        end
+        BF_SELECT_BUILD: begin
+            bf_mux_select_used        = 1'b1;
+            bf_mux_select_mapped.data = BF_MUX_ACK;
+        end
+        default: ;
+    endcase
+end
+assign bf_mux_select_mapped.valid = bf_mux_select.valid && bf_mux_select_used;
+assign bf_mux_select.ready        = !bf_mux_select_used || bf_mux_select_mapped.ready;
 
 AXI4S axi_bf_in    (.aclk(clk), .aresetn(rst_n));
 AXI4S axi_bf_out   (.aclk(clk), .aresetn(rst_n));
@@ -363,8 +423,10 @@ BloomfilterOperator inst_bloomfilter_operator (
     .probe_mat_out(bf_probe_mat_out)
 );
 
-// We don't use it -- drain it unconditionally. The surviving keys are materialized like any other probe column instead.
-assign axi_bf_out.tready = 1'b1;
+// The surviving probe keys: one transfer per FILTER transfer, with only the kept keys. It has to be read
+// like the mask is: the filter's raw and mask outputs advance in lock-step, so an unread raw channel
+// stalls the whole filter.
+`AXIS_ASSIGN(axi_bf_out, axi_out[BF_STREAM_RAW])
 
 // The materialized probe values: one transfer per MATERIALIZE transfer, with only the kept rows
 AXI4S axi_bf_mat(.aclk(clk), .aresetn(rst_n));
@@ -409,15 +471,18 @@ NDataToAXI #(
     .out(axi_bf_mask)
 );
 
+`AXIS_ASSIGN(axi_bf_mask, axi_out[BF_STREAM_MASK])
+`AXIS_ASSIGN(axi_bf_mat, axi_out[BF_STREAM_MATERIALIZED])
+
 AXIMultiplexer #(
-    .NUM_STREAMS(4)
+    .NUM_STREAMS(2)
 ) inst_bf_mux (
     .clk(clk),
     .rst_n(rst_n),
 
-    .select(bf_mux_select),
+    .select(bf_mux_select_mapped),
 
-    .in({axi_bf_mask, axi_bf_bypass, axi_bf_ack, axi_bf_mat}), // In select order: FILTER, BYPASS, BUILD, MATERIALIZE
+    .in({axi_bf_bypass, axi_bf_ack}), // In BF_MUX_* order
     .out(axi_out[0])
 );
 
@@ -428,7 +493,7 @@ end : gen_bf_passthrough
 
 // -- RDMA bypass stream (last stream slot, no decoder) --------------------------------------------
 `ifdef EN_RDMA
-localparam BYPASS_ID = NUM_STREAMS - 1;
+localparam BYPASS_ID = NUM_IN_STREAMS - 1;
 
 AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
 ndata_i #(data8_t, DATABEAT_SIZE) bypass_ndata();
@@ -462,9 +527,10 @@ NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_bypass (
 `endif
 
 // -- Output writer --------------------------------------------------------------------------------
-// The scheduler (software/oasis/scheduler.cpp) enqueues one output buffer per flow ahead of time and
-// matches the n-th interrupt of a stream with its n-th buffer. So a flow with an empty output (e.g.
-// a materialized column of which the Bloom filter kept no row) has to use up its buffer too.
+// The scheduler (software/oasis/scheduler.cpp) enqueues one output buffer per transfer ahead of time,
+// to the stream of the transfer's output channel, and matches the n-th interrupt of a stream with its
+// n-th buffer. So a transfer that is empty (e.g. a materialized column of which the Bloom filter kept
+// no row) has to use up its buffer too.
 OutputWriter #(
     .EMPTY_TRANSFER_TAKES_BUFFER(1)
 ) inst_output_writer (

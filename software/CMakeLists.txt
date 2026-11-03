@@ -54,6 +54,18 @@ find_package(Threads REQUIRED)
 target_link_libraries(oasis PRIVATE Coyote libstf parcore Threads::Threads)
 target_include_directories(oasis PRIVATE ${COYOTE_INCLUDE_DIRS} ${LIBSTF_INCLUDE_DIRS} ${PARCORE_INCLUDE_DIRS})
 
+# Hardware-free test of the scheduler's output channels. Not built by default:
+#   cmake --build build --target scheduler_channels_test && timeout 120 build/scheduler_channels_test
+# It compiles the scheduler itself and stubs the operators' hardware side (test/ defines it).
+add_executable(scheduler_channels_test EXCLUDE_FROM_ALL
+    test/scheduler_channels_test.cpp
+    oasis/scheduler.cpp
+)
+target_include_directories(scheduler_channels_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${COYOTE_INCLUDE_DIRS} ${LIBSTF_INCLUDE_DIRS} ${PARCORE_INCLUDE_DIRS}
+)
+target_link_libraries(scheduler_channels_test PRIVATE Coyote libstf parcore Threads::Threads)
+
 include(GNUInstallDirs)
 
 # Install the library
