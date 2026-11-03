@@ -78,12 +78,6 @@ public:
 		return (read_register(9).value() & 0b11ULL) != 0;
 	}
 
-	// Mirrors celeris's BFConfig::fetch_perf_counters: build counters at registers 1-4, probe at 5-8,
-	// the run's at 10-18. They hold the last run's values until the next run starts.
-	//
-	// A phase's `cycles` increments every cycle until the phase's END beat is accepted, and the
-	// END is written to a command queue just before this is called. So the probe `cycles` is read
-	// once more after everything else: if it moved, the END was not through yet, and we read again.
 	BloomPerfCounters fetch_perf_counters() {
 		BloomPerfCounters perf = fetch_perf_counters_once();
 		for (int retry = 0; retry < 16 && read_register(5).value() != perf.probe.cycles; retry++) {

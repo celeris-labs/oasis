@@ -158,12 +158,6 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint64_t> filter_time_ns {0};
 	std::atomic<uint64_t> string_decode_time_ns {0};
 
-	// Runtime Bloom filter (bind.runtime_bloom_enabled). There is a single hardware Bloom filter, so
-	// only one scan at a time can use it: bloom_filter_held says this scan holds it (see
-	// TryAcquireBloomFilter, released in the destructor). When bloom_active, the
-	// build side was submitted as bloom_build (see SubmitBloomBuild) and every probe key chunk of
-	// this scan is also sent through the filter for its mask (projected column bloom_probe_key_slot).
-	// The probe side is ended in the destructor, once all probe chunks were sent.
 	bool bloom_active = false;
 	size_t bloom_probe_key_slot = 0;
 	bool bloom_filter_held = false;
