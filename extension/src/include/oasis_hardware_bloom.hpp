@@ -93,7 +93,6 @@ private:
 struct BloomBuildPlan {
 	size_t probe_key_slot;
 	parcore::metadata::Metadata build_meta;
-	std::vector<bool> build_dense_columns; // see ComputeBloomDenseColumns
 	size_t build_key_col_id;
 };
 

@@ -1,4 +1,5 @@
 #include "oasis_optimizer.hpp"
+#include "oasis_hardware_bloom.hpp"
 #include "oasis_scan.hpp"
 
 #include "duckdb/common/enum_util.hpp"
@@ -136,6 +137,14 @@ static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimize
 
 		if (!normal && !swapped) {
 			DUCKDB_LOG_DEBUG(context, "condition skipped: equality is not left read_oasis col = right read_oasis col");
+			continue;
+		}
+
+		// The Bloom filter only takes NULL-free INT64 keys, another equality may still have them
+		if (!IsBloomKeyColumn(left_bind->metadata, left_bind->bloom_dense_columns, left_key_idx) ||
+		    !IsBloomKeyColumn(right_bind->metadata, right_bind->bloom_dense_columns, right_key_idx)) {
+			DUCKDB_LOG_DEBUG(context, "condition skipped: key '%s' or '%s' is not a NULL-free INT64 column",
+			                 left_key.c_str(), right_key.c_str());
 			continue;
 		}
 

@@ -325,7 +325,6 @@ std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t prob
 	ParquetOptions parquet_opts(context);
 	ParquetReader build_reader(context, OpenFileInfo {build_filename}, parquet_opts);
 	auto build_meta = BuildParcoreMetadata(build_reader);
-	auto build_dense_columns = ComputeBloomDenseColumns(build_reader);
 	auto build_col = std::find(build_meta.column_names.begin(), build_meta.column_names.end(), build_key);
 	if (build_col == build_meta.column_names.end()) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' not found in '%s'.",
@@ -333,13 +332,8 @@ std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t prob
 		return std::nullopt;
 	}
 	const size_t build_key_col_id = static_cast<size_t>(build_col - build_meta.column_names.begin());
-	if (!IsBloomKeyColumn(build_meta, build_dense_columns, build_key_col_id)) {
-		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' is not a NULL-free INT64 column.",
-		                 build_key.c_str());
-		return std::nullopt;
-	}
 
-	return BloomBuildPlan {probe_key_slot, std::move(build_meta), std::move(build_dense_columns), build_key_col_id};
+	return BloomBuildPlan {probe_key_slot, std::move(build_meta), build_key_col_id};
 }
 
 BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisContext &ctx,

@@ -554,7 +554,7 @@ SELECT x_key, count(*) FROM got GROUP BY x_key ORDER BY x_key;
 9223372036854775807	1
 
 # ---------------------------------------------------------------------------
-# Keys the Bloom filter can't take: the join is rewritten, but the scan runs without the filter
+# Keys the Bloom filter can't take: the join is not rewritten
 # ---------------------------------------------------------------------------
 
 # INTEGER keys (s_int = s_id, unique)
@@ -573,9 +573,23 @@ COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is 
 COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is rewritten, but the scan | SELECT count(*), sum(a.s_id) FROM bf_skip a JOIN bf_skip b ON a.s_int = b.s_int') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
 
 query II
-SELECT bloom_used(), bloom_skipped('not a NULL-free INT64 column');
+SELECT bloom_used(), bloom_rewrites();
 ----
-0	1
+0	0
+
+# Another equality of the join has keys it can take (EXPLAIN, no scan runs)
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT count(*)
+FROM read_oasis('{TEST_DIR}/bf_skip.parquet') a JOIN read_oasis('{TEST_DIR}/bf_skip.parquet') b
+ON a.s_int = b.s_int AND a.s_id = b.s_id;
+
+query I
+SELECT bloom_rewrites();
+----
+1
 
 # ---------------------------------------------------------------------------
 # Two joins in one query
