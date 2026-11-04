@@ -155,17 +155,20 @@ static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimize
 		OasisScanBindData *probe_bind;
 		string build_key;
 		string probe_key;
+		idx_t build_key_idx;
 
 		if (left_score <= right_score) {
 			build_bind = left_bind;
 			probe_bind = right_bind;
 			build_key = left_key;
 			probe_key = right_key;
+			build_key_idx = left_key_idx;
 		} else {
 			build_bind = right_bind;
 			probe_bind = left_bind;
 			build_key = right_key;
 			probe_key = left_key;
+			build_key_idx = right_key_idx;
 		}
 
 		if (probe_bind->runtime_bloom_enabled) {
@@ -182,7 +185,9 @@ static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimize
 
 		probe_bind->runtime_bloom_enabled = true;
 		probe_bind->runtime_bloom_build_filename = build_bind->filename;
-		probe_bind->runtime_bloom_build_key = build_key;
+		for (const auto &group : build_bind->metadata.groups) {
+			probe_bind->runtime_bloom_build_key_chunks.push_back(group.chunks[build_key_idx]);
+		}
 		probe_bind->runtime_bloom_probe_key = probe_key;
 
 		DUCKDB_LOG_DEBUG(context,

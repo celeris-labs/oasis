@@ -90,14 +90,8 @@ private:
 	bool                    end_side_;
 };
 
-struct BloomBuildPlan {
-	size_t probe_key_slot;
-	parcore::metadata::Metadata build_meta;
-	size_t build_key_col_id;
-};
-
 // BLOOM_MAX_PROBE_ROWS equals MASK_BUFF_SZ * MASK_WIDTH.
-// see hardware/src/hdl/bloomfilter/mask_materializer.sv).
+// see celeris/hardware/src/hdl/bloomfilter/mask_materializer.sv.
 constexpr size_t BLOOM_MAX_PROBE_ROWS = (size_t(1) << 14) * 8;
 
 // Per file column: whether the hardware delivers exactly one value per row for it, which is what the
@@ -119,7 +113,7 @@ bool IsBloomKeyColumn(const parcore::metadata::Metadata &meta, const std::vector
 size_t CountBloomKeptRows(const libstf::Buffer &mask, size_t num_rows);
 
 // Atomic hardware lock ensuring only one scan uses the physical Bloom filter at a time.
-bool TryAcquireBloomFilter();
+bool TryAcquireBloomFilterLock();
 void ReleaseBloomFilter();
 
 class ClientContext;
@@ -133,7 +127,7 @@ struct BloomBuildSubmission {
 };
 
 BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisContext &ctx,
-                                         const std::string &build_filename, const BloomBuildPlan &plan);
+                                         const OasisScanBindData &bind);
 
 void TeardownHardwareBloom(oasis::OasisContext *ctx, oasis::SplinterResultHandle &bloom_build,
                            bool bloom_filter_held, bool bloom_active, bool bloom_build_submitted);
@@ -148,15 +142,14 @@ void VerifyBloomMaterializedBuffers(const libstf::Buffer &mask_buf, size_t num_r
                                    const std::vector<bool> &materialized,
                                    const std::vector<std::shared_ptr<libstf::Buffer>> &hw_buffers);
 
-// Validates the probe table and and builds the BloomBuildPlan from the build Parquet file. 
-// Returns std::nullopt if the probe key is missing or incompatible.
-std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
+// Returns the probe key's projected column, or std::nullopt if the scan can't use the filter.
+std::optional<size_t> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
                                                const OasisScanGlobalState &gstate);
 
 bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate);
 
 void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
-                      const BloomBuildPlan &plan, OasisScanGlobalState &gstate);
+                      size_t probe_key_slot, OasisScanGlobalState &gstate);
 
 void DrainInFlightBloomProbeSplinters(OasisScanLocalState &lstate);
 

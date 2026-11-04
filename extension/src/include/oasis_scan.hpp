@@ -5,6 +5,7 @@
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis/operator.hpp"
 #include "oasis/splinter_result.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "parcore/metadata/metadata.hpp"
@@ -22,6 +23,7 @@
 namespace duckdb {
 
 class PhysicalTableScan;
+class RDMAFileHandle;
 
 // Adds the lifetime of the scope to `target_ns`.
 class ScopedTimer {
@@ -87,7 +89,7 @@ struct OasisScanBindData : public TableFunctionData {
 	// Set by the Oasis optimizer extension
 	bool runtime_bloom_enabled = false;
 	string runtime_bloom_build_filename;
-	string runtime_bloom_build_key;
+	std::vector<parcore::metadata::ColumnChunk> runtime_bloom_build_key_chunks; // One per row group
 	string runtime_bloom_probe_key;
 };
 
@@ -273,5 +275,11 @@ void RegisterOasisScanFunction(ExtensionLoader &loader);
 
 // read_oasis's cardinality callback: the file's total row count (from the Parquet metadata).
 unique_ptr<NodeStatistics> OasisScanCardinality(ClientContext &context, const FunctionData *bind_data);
+
+// A source that reads the column chunk's bytes over RDMA.
+std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdma, const parcore::metadata::ColumnChunk &cc);
+
+// Every column chunk in a row group shares its row count. Take it from the first chunk.
+uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group);
 
 } // namespace duckdb

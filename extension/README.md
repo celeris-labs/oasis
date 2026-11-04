@@ -22,6 +22,8 @@ reads from the configured RDMA file server.
 | `oasis_rdma_port` | Coyote default | TCP port for the QP exchange |
 | `oasis_narrow_transfer` | `false` | Decode BIGINT/DECIMAL column chunks whose statistics fit as INT32 and widen them on the CPU |
 | `oasis_cast_pushdown` | `false` | Accept integer narrowing casts pushed into the scan when the file statistics fit, and decode the column to the narrow type |
+| `oasis_runtime_bloom_filter` | `true` | Filter the probe side of inner joins between two `read_oasis` scans with the hardware Bloom filter |
+| `oasis_duckdb_bloom_filter` | `false` | Keep DuckDB's own join Bloom filters on `read_oasis` scans |
 
 ## Building
 

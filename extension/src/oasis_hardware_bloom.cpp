@@ -15,7 +15,6 @@
 #include "filter_pushdown.hpp"
 #include "parquet_reader.hpp"
 #include "parcore/configuration.hpp"
-#include "parcore_metadata_util.hpp"
 #include "rdma_file_system.hpp"
 
 #include <coyote/cThread.hpp>
@@ -69,7 +68,7 @@ public:
 		write_register(libstf::ConfigRegister(1, static_cast<uint64_t>(cmd)));
 	}
 
-	// see celeris/hardware/src/hdl/config/bloomfilter_config.sv): sticky command queue overflows,
+	// see celeris/hardware/src/hdl/config/bloomfilter_config.sv: sticky command queue overflows,
 	// bit 0 input commands, bit 1 materialization commands
 	bool command_queue_overflowed() {
 		return (read_register(9).value() & 0b11ULL) != 0;
@@ -130,11 +129,6 @@ public:
 };
 
 static std::atomic<bool> bloom_filter_in_use {false};
-
-std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdma,
-                                                      const parcore::metadata::ColumnChunk &cc) {
-	return std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + cc.offset, cc.total_compressed_size);
-}
 
 std::unique_ptr<oasis::SourceOperator> MakeHostSource(const CoalescedFetcher::RangeView &view) {
 	auto *slice_ptr = static_cast<uint8_t *>(view.buffer->ptr) + view.offset;
@@ -220,8 +214,7 @@ bool BloomFilterStreamSelectOperator::IsKeyChunk() const {
 	return select_ == BloomStreamSelect::FILTER || select_ == BloomStreamSelect::BUILD;
 }
 
-// Marks the leaves that carry a definition-level section but no repetition-level one. `column_index` is
-// the leaf's position in the file, which is also its index into RowGroup::columns.
+// Marks the leaves that carry a definition-level section but no repetition-level one.
 static void MarkBloomLevelLayout(const ParquetColumnSchema &schema, std::vector<bool> &dense) {
 	if (schema.children.empty()) {
 		if (schema.schema_type != ParquetColumnSchemaType::COLUMN) {
@@ -306,7 +299,7 @@ size_t CountBloomKeptRows(const libstf::Buffer &mask, size_t num_rows) {
 	return kept;
 }
 
-bool TryAcquireBloomFilter() {
+bool TryAcquireBloomFilterLock() {
 	bool in_use = false;
 	return bloom_filter_in_use.compare_exchange_strong(in_use, true, std::memory_order_acquire);
 }
@@ -315,36 +308,16 @@ void ReleaseBloomFilter() {
 	bloom_filter_in_use.store(false, std::memory_order_release);
 }
 
-std::optional<BloomBuildPlan> BuildBloomPlan(ClientContext &context, size_t probe_key_slot,
-                                             const std::string &build_filename,
-                                             const std::string &build_key) {
-	ParquetOptions parquet_opts(context);
-	ParquetReader build_reader(context, OpenFileInfo {build_filename}, parquet_opts);
-	auto build_meta = BuildParcoreMetadata(build_reader);
-	auto build_col = std::find(build_meta.column_names.begin(), build_meta.column_names.end(), build_key);
-	if (build_col == build_meta.column_names.end()) {
-		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: build key '%s' not found in '%s'.",
-		                 build_key.c_str(), build_filename.c_str());
-		return std::nullopt;
-	}
-	const size_t build_key_col_id = static_cast<size_t>(build_col - build_meta.column_names.begin());
-
-	return BloomBuildPlan {probe_key_slot, std::move(build_meta), build_key_col_id};
-}
-
 BloomBuildSubmission SubmitBloomBuildSide(ClientContext &context, oasis::OasisContext &ctx,
-                                         const std::string &build_filename, const BloomBuildPlan &plan) {
-	const auto &build_meta = plan.build_meta;
-	const size_t build_key_col_id = plan.build_key_col_id;
-
+                                         const OasisScanBindData &bind) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto build_handle = fs.OpenFile(build_filename, FileOpenFlags::FILE_FLAGS_READ);
+	auto build_handle = fs.OpenFile(bind.runtime_bloom_build_filename, FileOpenFlags::FILE_FLAGS_READ);
 	auto *rdma = dynamic_cast<RDMAFileHandle *>(build_handle.get());
 
 	std::vector<const parcore::metadata::ColumnChunk *> build_chunks;
-	for (const auto &group : build_meta.groups) {
-		if (group.chunks[build_key_col_id].num_values != 0) {
-			build_chunks.push_back(&group.chunks[build_key_col_id]);
+	for (const auto &chunk : bind.runtime_bloom_build_key_chunks) {
+		if (chunk.num_values != 0) {
+			build_chunks.push_back(&chunk);
 		}
 	}
 
@@ -464,11 +437,6 @@ void VerifyBloomMaterializedBuffers(const libstf::Buffer &mask_buf, size_t num_r
 
 namespace {
 
-uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
-	const auto &chunks = bind.metadata.groups[group].chunks;
-	return chunks.empty() ? 0 : chunks[0].num_values;
-}
-
 std::optional<size_t> ObtainBloomProbeKeySlot(ClientContext &context, const OasisScanBindData &bind,
                                           const OasisScanGlobalState &gstate) {
 	std::optional<size_t> probe_key_slot;
@@ -480,11 +448,6 @@ std::optional<size_t> ObtainBloomProbeKeySlot(ClientContext &context, const Oasi
 	}
 	if (!probe_key_slot) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a hardware column of this scan.",
-		                 bind.runtime_bloom_probe_key.c_str());
-		return std::nullopt;
-	}
-	if (!IsBloomKeyColumn(bind.metadata, bind.bloom_dense_columns, gstate.projected_columns[*probe_key_slot].column_id)) {
-		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: probe key '%s' is not a NULL-free INT64 column.",
 		                 bind.runtime_bloom_probe_key.c_str());
 		return std::nullopt;
 	}
@@ -505,7 +468,7 @@ void CheckBloomRowGroupSizes(const OasisScanBindData &bind) {
 
 } // namespace
 
-std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
+std::optional<size_t> PrepareBloomBuild(ClientContext &context, const OasisScanBindData &bind,
                                                const OasisScanGlobalState &gstate) {
 	auto probe_key_slot = ObtainBloomProbeKeySlot(context, bind, gstate);
 	if (!probe_key_slot) {
@@ -514,11 +477,11 @@ std::optional<BloomBuildPlan> PrepareBloomBuild(ClientContext &context, const Oa
 
 	CheckBloomRowGroupSizes(bind);
 
-	return BuildBloomPlan(context, *probe_key_slot, bind.runtime_bloom_build_filename, bind.runtime_bloom_build_key);
+	return probe_key_slot;
 }
 
 bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate) {
-	if (!duckdb::TryAcquireBloomFilter()) {
+	if (!TryAcquireBloomFilterLock()) {
 		DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter skipped: the hardware Bloom filter is in use by another scan.");
 		return false;
 	}
@@ -527,13 +490,13 @@ bool TryAcquireBloomFilter(ClientContext &context, OasisScanGlobalState &gstate)
 }
 
 void SubmitBloomBuild(ClientContext &context, oasis::OasisContext &ctx, const OasisScanBindData &bind,
-                      const BloomBuildPlan &plan, OasisScanGlobalState &gstate) {
+                      size_t probe_key_slot, OasisScanGlobalState &gstate) {
 	D_ASSERT(gstate.bloom_filter_held);
-	auto submission = SubmitBloomBuildSide(context, ctx, bind.runtime_bloom_build_filename, plan);
+	auto submission = SubmitBloomBuildSide(context, ctx, bind);
 	gstate.bloom_build = std::move(submission.handle);
 	gstate.bloom_build_submitted = submission.submitted;
 	gstate.bloom_active = true;
-	gstate.bloom_probe_key_slot = plan.probe_key_slot;
+	gstate.bloom_probe_key_slot = probe_key_slot;
 	DUCKDB_LOG_DEBUG(context, "Runtime Bloom filter: submitted %llu build key chunk(s) of '%s'.",
 	                 (unsigned long long)submission.num_chunks, bind.runtime_bloom_build_filename.c_str());
 }
@@ -640,7 +603,7 @@ oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
 			mat_k.push_back(k);
 		}
 	}
-	D_ASSERT(probe_k); // The probe key is a hardware column (see SubmitBloomBuild)
+	D_ASSERT(probe_k); // The probe key is a hardware column (see ObtainBloomProbeKeySlot)
 
 	oasis::OperatorFlow bloom_flow;
 

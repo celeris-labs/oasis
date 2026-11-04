@@ -15,9 +15,9 @@ require parquet
 # the optimizer runs and logs, but executes no scan).
 #
 # Decisions are checked in duckdb_logs: the optimizer logs "Runtime Bloom filter rewrite: ..." for a
-# join it rewrites and "join skipped: ..." for one it doesn't. The probe scan logs "Runtime Bloom
-# filter: submitted ..." when it sends the build side through the filter, and "Runtime Bloom filter
-# skipped: ..." when it can't use it.
+# join it rewrites, "condition skipped: ..." for an equality it can't use and "join skipped: ..." for
+# a join it doesn't rewrite. The probe scan logs "Runtime Bloom filter: submitted ..." when it sends
+# the build side through the filter, and "Runtime Bloom filter skipped: ..." when it can't use it.
 
 statement ok
 CALL enable_logging(level = 'debug');
@@ -569,8 +569,8 @@ FROM read_oasis('{TEST_DIR}/bf_skip.parquet') a JOIN read_oasis('{TEST_DIR}/bf_s
 
 # progress marker
 statement ok
-COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is rewritten, but the scan | SELECT count(*), sum(a.s_id) FROM bf_skip a JOIN bf_skip b ON a.s_int = b.s_int') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
-COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is rewritten, but the scan | SELECT count(*), sum(a.s_id) FROM bf_skip a JOIN bf_skip b ON a.s_int = b.s_int') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is not rewritten | SELECT count(*), sum(a.s_id) FROM bf_skip a JOIN bf_skip b ON a.s_int = b.s_int') TO '/dev/stderr' (FORMAT csv, HEADER false, DELIMITER '|');
+COPY (SELECT '[oasis_bloom] done: Keys the Bloom filter can t take: the join is not rewritten | SELECT count(*), sum(a.s_id) FROM bf_skip a JOIN bf_skip b ON a.s_int = b.s_int') TO '/tmp/oasis_bloom_progress.txt' (FORMAT csv, HEADER false, DELIMITER '|');
 
 query II
 SELECT bloom_used(), bloom_rewrites();
@@ -726,7 +726,7 @@ SELECT bloom_used();
 # A star join where the same table acts as a probe for multiple build tables.
 # The optimizer visits the innermost join directly between two scans and rewrites it.
 # The outer join's left child is the inner join, so it's not directly between two scans.
-# Our patch prevents any silent overwrite if the optimizer were to visit it again.
+# A scan that is already rewritten would keep its first build side if another join reached it.
 statement ok
 CALL truncate_duckdb_logs();
 

@@ -263,9 +263,9 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	// The runtime Bloom filter's build side goes to the hardware once per scan, before any worker
 	// submits a probe key chunk. The filter is only taken if the scan can use it.
 	if (bind_data.runtime_bloom_enabled) {
-		auto plan = PrepareBloomBuild(context, bind_data, *gstate);
-		if (plan && TryAcquireBloomFilter(context, *gstate)) {
-			SubmitBloomBuild(context, ctx, bind_data, *plan, *gstate);
+		auto probe_key_slot = PrepareBloomBuild(context, bind_data, *gstate);
+		if (probe_key_slot && TryAcquireBloomFilter(context, *gstate)) {
+			SubmitBloomBuild(context, ctx, bind_data, *probe_key_slot, *gstate);
 		}
 	}
 	// The Bloom filter only takes 64-bit values, so a scan that uses it transfers its columns as they are
@@ -386,13 +386,11 @@ static bool ChunkFitsInt32(OasisScanLocalState &lstate, size_t group, size_t col
 	       NumericStats::GetMax<int64_t>(*stats) <= NumericLimits<int32_t>::Maximum();
 }
 
-static std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdma,
-                                                             const parcore::metadata::ColumnChunk &cc) {
+std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdma, const parcore::metadata::ColumnChunk &cc) {
 	return std::make_unique<oasis::RDMASourceOperator>(rdma.remote_offset + cc.offset, cc.total_compressed_size);
 }
 
-// Every column chunk in a row group shares its row count. Take it from the first chunk.
-static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
+uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 	const auto &chunks = bind.metadata.groups[group].chunks;
 	return chunks.empty() ? 0 : chunks[0].num_values;
 }
@@ -408,7 +406,7 @@ OasisScanLocalState::~OasisScanLocalState() {
 }
 
 
-// Submits the whole row group as one QuerySplinter: one decode flow per hardware column and, on
+// Submits the whole row group as one QuerySplinter: one decode flow for the hardware columns and, on
 // the RDMA path, one raw bypass flow per CPU column fetching its compressed bytes. Each flow's
 // sink is tagged with the projection index. The consumer places the tagged batches into
 // hw_buffers[projection_index] / cpu_buffers[projection_index]. For RDMA, the hardware pulls bytes
