@@ -50,9 +50,7 @@ const char *BloomStreamSelectName(BloomStreamSelect select) {
 
 namespace {
 
-// Mirrors celeris's BFConfig (celeris/hardware/src/hdl/config/bloomfilter_config.sv): register 0
-// takes the materialization commands (one per probe chunk, see PushBloomMaterializeCommand),
-// register 1 the input commands.
+// Mirrors celeris's BFConfig (celeris/hardware/src/hdl/config/bloomfilter_config.sv)
 class BloomFilterConfig : public libstf::Config {
 public:
 	static constexpr uint64_t ID = 6; // BLOOMFILTER_CONFIG_ID (celeris/hardware/src/hdl/common.sv)
@@ -71,8 +69,7 @@ public:
 		write_register(libstf::ConfigRegister(1, static_cast<uint64_t>(cmd)));
 	}
 
-	// Read register 9 (the last "status" register of celeris's BFConfig, see
-	// celeris/hardware/src/hdl/config/bloomfilter_config.sv): sticky command queue overflows,
+	// see celeris/hardware/src/hdl/config/bloomfilter_config.sv): sticky command queue overflows,
 	// bit 0 input commands, bit 1 materialization commands
 	bool command_queue_overflowed() {
 		return (read_register(9).value() & 0b11ULL) != 0;
@@ -115,8 +112,7 @@ private:
 };
 
 // Mirrors celeris's StreamConfig (parcore/libstf/hardware/src/hdl/config/stream_config.sv)
-// instantiated with NUM_STREAMS=1 in vfpga_top.svh, selecting where decoder-stream 0 routes its
-// transfer (see BloomStreamSelect).
+// instantiated with NUM_STREAMS=1 in vfpga_top.svh
 class BloomFilterStreamConfig : public libstf::Config {
 public:
 	static constexpr uint64_t ID = 1; // STREAM_CONFIG_ID (parcore/libstf/hardware/src/hdl/common.sv)

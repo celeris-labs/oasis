@@ -197,8 +197,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 
 	const idx_t scan_count = candidate_sel ? candidate_count : emit;
 	if (scan_count == 0) {
-		// Nothing survives (the Bloom filter's mask kept no row of this slice): no filter has any
-		// row to evaluate, only the CPU columns' readers have to move past the slice.
+		// Nothing survives: no filter has any row to evaluate, only the CPU columns' readers have to move past the slice.
 		if (gstate.has_cpu_columns) {
 			ScopedTimer timer(lstate.string_decode_time_ns);
 			for (size_t i = 0; i < gstate.projected_columns.size(); i++) {

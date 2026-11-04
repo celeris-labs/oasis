@@ -495,18 +495,6 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	std::vector<bool> is_bypassed(pending.hw_slot.size(), true);
 	size_t bloom_mask_flows = 0;
 
-	// The runtime Bloom filter filters the whole row group. Its probe key chunk goes through the
-	// filter (FILTER) once, which returns its mask (one bit per row) and the kept key values, each
-	// over an output channel of its own. The other 64-bit columns follow it into the filter's
-	// materializer (MATERIALIZE), which only returns their kept rows, over a third channel.
-	// All Bloom filter transfers for this row group are unified into a single OperatorFlow. Because
-	// a flow is scheduled atomically onto a single stream, no other flow can be interleaved between
-	// the FILTER transfer and its subsequent MATERIALIZE transfers.
-	// The other columns are decoded as usual and dropped by the mask on the CPU (see EmitOneSlice).
-	//
-	// Every probe chunk is sent with CONTINUE: no worker knows which chunk will be the last one
-	// (groups are claimed dynamically and pruned), so the probe side is ended with END once
-	// the whole scan is done (see ~OasisScanGlobalState).
 	if (gstate.bloom_active) {
 		splinter.streams.push_back(ConstructBloomProbeFlow(ctx, pending, rdma,
 		                                                   gstate.bloom_probe_key_slot, gstate.projected_columns,
