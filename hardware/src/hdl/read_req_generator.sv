@@ -37,9 +37,6 @@ module ReadReqGenerator #(
 
 localparam IS_LOCAL = (OPCODE == LOCAL_READ);
 localparam STRM     = IS_LOCAL ? STRM_HOST : STRM_RDMA;
-localparam MODE     = IS_LOCAL ? 1'b0 : 1'b1;
-localparam RDMA     = IS_LOCAL ? 1'b0 : 1'b1;
-localparam REMOTE   = IS_LOCAL ? 1'b0 : 1'b1;
 
 // Length padding and address alignment interact (the stripped head bytes would feed into the length
 // rounding), so only one may be active at a time for now.
@@ -57,9 +54,6 @@ always_comb begin
 
     sq_rd.data.opcode = OPCODE;
     sq_rd.data.strm   = STRM;
-    sq_rd.data.mode   = MODE;
-    sq_rd.data.rdma   = RDMA;
-    sq_rd.data.remote = REMOTE;
 
     sq_rd.data.pid  = ctid;
     sq_rd.data.dest = DEST;

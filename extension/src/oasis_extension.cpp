@@ -1,6 +1,8 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "oasis_extension.hpp"
+#include "oasis_hardware_bloom.hpp"
+#include "oasis_optimizer.hpp"
 #include "oasis_profile.hpp"
 #include "oasis_scan.hpp"
 #include "oasis_context_cache_entry.hpp"
@@ -35,7 +37,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Number of streams the scheduler drives (0 = all available)", LogicalType::UBIGINT,
 	                          Value::UBIGINT(0), SetSchedulerNumStreams);
 	config.AddExtensionOption("oasis_scheduler_queue_depth",
-	                          "Max splinters in flight per stream (0 = hardware config-FIFO depth)",
+	                          "Max flows in flight per stream (0 = hardware config-FIFO depth, which is also the upper bound). "
+	                          "Independent of this cap, a flow is only placed when its decoder configs, read requests and "
+	                          "output buffers fit the stream's hardware FIFOs",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0), SetSchedulerQueueDepth);
 	config.AddExtensionOption(
 	    "oasis_prefetch_depth",
@@ -63,8 +67,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "to INT32.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	config.AddExtensionOption("oasis_runtime_bloom_filter",
+	                          "Filter the probe side of inner joins between two read_oasis scans with the hardware "
+	                          "Bloom filter (decided when the query is planned)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
+	config.AddExtensionOption("oasis_duckdb_bloom_filter",
+	                          "Enable DuckDB's native join Bloom filters on read_oasis scans",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
+
+	// Detects read_oasis-to-read_oasis equi-joins and marks the probe-side scan for runtime Bloom
+	// filter pushdown.
+	RegisterOasisOptimizer(loader);
 
 	// Stream profiler readout table function
 	RegisterOasisProfileFunction(loader);
@@ -81,7 +98,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Get the OasisContext to establish the connection to the FPGA.
 	Connection conn(instance);
-	GetOrCreateOasisContext(*conn.context);
+	auto &oasis_ctx = GetOrCreateOasisContext(*conn.context);
+
+	// Fail early if the hardware design does not fit the Bloom filter integration.
+	CheckOasisHardwareBloom(oasis_ctx);
 }
 
 void OasisExtension::Load(ExtensionLoader &loader) {

@@ -37,7 +37,8 @@ find_package(oasis REQUIRED)
 # ---------------------------------------------------------------------------
 set(EXTENSION_SOURCES src/oasis_extension.cpp src/oasis_scan.cpp src/oasis_profile.cpp
                       src/rdma_file_system.cpp src/filter_pushdown.cpp src/parcore_metadata_util.cpp
-                      src/oasis_settings.cpp src/coalesced_fetcher.cpp)
+                      src/oasis_settings.cpp src/coalesced_fetcher.cpp src/oasis_optimizer.cpp
+                      src/oasis_hardware_bloom.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -47,6 +48,11 @@ target_link_libraries(${EXTENSION_NAME} Coyote libstf parcore oasis)
 # static extension gets it from the DuckDB it is linked into. The loadable extension carries its own
 # copy, hidden like the copy of DuckDB it carries, so it loads into any DuckDB of the same version.
 target_link_libraries(${LOADABLE_EXTENSION_NAME} Coyote libstf parcore oasis parquet_extension)
+
+# Line-table debug info (function names and source lines, no types or locals) for the extension's own
+# sources only, enough for perf; DuckDB keeps its plain release flags.
+target_compile_options(${EXTENSION_NAME} PRIVATE -g1)
+target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -g1)
 
 install(
     TARGETS ${EXTENSION_NAME}

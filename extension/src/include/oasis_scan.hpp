@@ -5,6 +5,7 @@
 #include "duckdb.hpp"
 #include "libstf_buffer_vector_buffer.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis/operator.hpp"
 #include "oasis/splinter_result.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "parcore/metadata/metadata.hpp"
@@ -22,6 +23,7 @@
 namespace duckdb {
 
 class PhysicalTableScan;
+class RDMAFileHandle;
 
 // Adds the lifetime of the scope to `target_ns`.
 class ScopedTimer {
@@ -80,6 +82,15 @@ struct OasisScanBindData : public TableFunctionData {
 	// Reader over parquet_metadata that does not open the file. It answers statistics questions at
 	// plan time, and must outlive the partition statistics it hands out (they reference it).
 	shared_ptr<ParquetReader> metadata_reader;
+	// Per file column: delivers exactly one value per row, so the Bloom filter can take it (see
+	// ComputeBloomDenseColumns).
+	std::vector<bool> bloom_dense_columns;
+
+	// Set by the Oasis optimizer extension
+	bool runtime_bloom_enabled = false;
+	string runtime_bloom_build_filename;
+	std::vector<parcore::metadata::ColumnChunk> runtime_bloom_build_key_chunks; // One per row group
+	string runtime_bloom_probe_key;
 };
 
 struct ProjectedColumn {
@@ -146,9 +157,17 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	std::atomic<uint64_t> filter_time_ns {0};
 	std::atomic<uint64_t> string_decode_time_ns {0};
 
+	bool bloom_active = false;
+	size_t bloom_probe_key_slot = 0;
+	bool bloom_filter_held = false;
+	oasis::SplinterResultHandle bloom_build;
+	bool bloom_build_submitted = false; // false if the build side had no rows
+
 	idx_t MaxThreads() const override {
 		return total_groups == 0 ? 1 : total_groups;
 	}
+
+	~OasisScanGlobalState() override;
 };
 
 // Per-worker scan state. Owns this worker's file handle (DuckDB FileHandles are not safe to share
@@ -159,7 +178,12 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 // exactly one buffer, and we then slice all columns' buffers in lockstep. The next group is loaded
 // only once the current buffers are fully emitted.
 struct OasisScanLocalState : public LocalTableFunctionState {
+	~OasisScanLocalState() override;
+
 	unique_ptr<FileHandle> file_handle;
+
+	// Copy of gstate.bloom_active: this worker's groups send probe key chunks through the filter.
+	bool bloom_active = false;
 
 	unique_ptr<ParquetReader> parquet_reader;
 	unique_ptr<ParquetReaderScanState> scan_state;
@@ -208,6 +232,14 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
 		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> cpu_buffers;
+
+		// Set only when gstate.bloom_active: the runtime Bloom filter's match mask for the
+		// probe key column, one bit per row, least significant bit first.
+		std::shared_ptr<libstf::Buffer> bloom_mask_buffer;
+
+		// Per projected column: whether the Bloom filter materialized it, i.e. hw_buffers holds only
+		// the values of the rows the mask kept (see PrefetchGroup).
+		std::vector<bool> materialized;
 	};
 
 	std::deque<unique_ptr<PendingGroup>> inflight;
@@ -218,6 +250,13 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 	// The current group's narrowed flags (see PendingGroup).
 	std::vector<bool> current_narrowed;
+	// The current group's runtime Bloom filter match mask (see PendingGroup::bloom_mask_buffer),
+	// null when gstate.bloom_active is false.
+	std::shared_ptr<libstf::Buffer> current_bloom_mask;
+	// The current group's materialized columns (see PendingGroup::materialized), and the number of
+	// kept rows before the current slice: where the slice starts in their buffers.
+	std::vector<bool> current_materialized;
+	size_t current_kept_offset = 0;
 
 	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
 	std::vector<bool> current_needs_row_filter;
@@ -233,5 +272,14 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 };
 
 void RegisterOasisScanFunction(ExtensionLoader &loader);
+
+// read_oasis's cardinality callback: the file's total row count (from the Parquet metadata).
+unique_ptr<NodeStatistics> OasisScanCardinality(ClientContext &context, const FunctionData *bind_data);
+
+// A source that reads the column chunk's bytes over RDMA.
+std::unique_ptr<oasis::SourceOperator> MakeRDMASource(RDMAFileHandle &rdma, const parcore::metadata::ColumnChunk &cc);
+
+// Every column chunk in a row group shares its row count. Take it from the first chunk.
+uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group);
 
 } // namespace duckdb
