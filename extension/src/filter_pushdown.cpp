@@ -5,7 +5,6 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
@@ -235,8 +234,6 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 
 			auto &vec = scan_chunk.data[scan_filter.filter_idx];
 			ColumnSegment::FilterSelection(sel, vec, *scan_filter.filter_state, scan_count, approved_tuple_count);
-			ColumnReader::ApplyFilter(vec, scan_filter.filter, *scan_filter.filter_state, scan_count, sel,
-			                          approved_tuple_count);
 		}
 	}
 

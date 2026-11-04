@@ -185,47 +185,6 @@ static bool OasisScanPushdownCast(ClientContext &context, const TableFunctionPro
 	                 source.ToString().c_str(), target.ToString().c_str());
 	return true;
 }
-// DuckDB type whose physical layout matches what the FPGA writes for a libstf type.
-static LogicalType HardwareOutputType(libstf::type_t type) {
-	switch (type) {
-	case libstf::type_t::BYTE_T:
-		return LogicalType::BOOLEAN;
-	case libstf::type_t::INT32_T:
-		return LogicalType::INTEGER;
-	case libstf::type_t::INT64_T:
-		return LogicalType::BIGINT;
-	case libstf::type_t::FLOAT_T:
-		return LogicalType::FLOAT;
-	case libstf::type_t::DOUBLE_T:
-		return LogicalType::DOUBLE;
-	default:
-		throw InternalException("Unexpected libstf type");
-	}
-}
-// What the runtime Bloom filter's build side needs, see PrepareBloomBuild
-struct BloomBuildPlan {
-	size_t probe_slot;                      // Projected column of the probe key
-	parcore::metadata::Metadata build_meta; // Of the build file
-	size_t build_col_id;                    // Build key column in build_meta
-};
-
-// DuckDB type whose physical layout matches what the FPGA writes for a libstf type.
-static LogicalType HardwareOutputType(libstf::type_t type) {
-	switch (type) {
-	case libstf::type_t::BYTE_T:
-		return LogicalType::BOOLEAN;
-	case libstf::type_t::INT32_T:
-		return LogicalType::INTEGER;
-	case libstf::type_t::INT64_T:
-		return LogicalType::BIGINT;
-	case libstf::type_t::FLOAT_T:
-		return LogicalType::FLOAT;
-	case libstf::type_t::DOUBLE_T:
-		return LogicalType::DOUBLE;
-	default:
-		throw InternalException("Unexpected libstf type");
-	}
-}
 
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
@@ -301,6 +260,15 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 		}
 	}
 
+	// The runtime Bloom filter's build side goes to the hardware once per scan, before any worker
+	// submits a probe key chunk. The filter is only taken if the scan can use it.
+	if (bind_data.runtime_bloom_enabled) {
+		auto plan = PrepareBloomBuild(context, bind_data, *gstate);
+		if (plan && TryAcquireBloomFilter(context, *gstate)) {
+			SubmitBloomBuild(context, ctx, bind_data, *plan, *gstate);
+		}
+	}
+
 	// Register a cold-start yield budget -- roughly one yield per prospective worker, so during cold
 	// start workers step aside to let others prime the pipeline breadth-first. DuckDB clamps this
 	// scan's parallelism to min(MaxThreads(), scheduler threads), and MaxThreads() is total_groups.
@@ -308,23 +276,6 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	// worker executes. Budget is consumed only by yields that actually happen, so any unused
 	// remainder is harmless -- no reconciliation needed.
 	if (gstate->yield_enabled && !gstate->synchronous) {
-	// The runtime Bloom filter's build side goes to the hardware once per scan, before any worker
-	// submits a probe key chunk. The filter is only taken if the scan can use it.
-	if (bind_data.runtime_bloom_enabled && !gstate->emit_cardinality_only) {
-		auto plan = PrepareBloomBuild(context, bind_data, *gstate);
-		if (plan && TryAcquireBloomFilter(context, *gstate)) {
-			SubmitBloomBuild(context, ctx, bind_data, *plan, *gstate);
-		}
-	}
-
-	// Register a cold-start yield budget for hardware scans -- roughly one yield per prospective
-	// worker, so during cold start workers step aside to let others prime the pipeline breadth-first.
-	// The cardinality-only path never touches the hardware, so it registers nothing. DuckDB clamps
-	// this scan's parallelism to min(MaxThreads(), scheduler threads), and MaxThreads() is
-	// total_groups; INITIALIZE_ON_SCHEDULE runs this eagerly at schedule time so we know that count
-	// before any worker executes. Budget is consumed only by yields that actually happen, so any
-	// unused remainder is harmless -- no reconciliation needed.
-	if (!gstate->emit_cardinality_only && gstate->yield_enabled && !gstate->synchronous) {
 		size_t const num_threads =
 		    std::max<size_t>(1, static_cast<size_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
 		size_t const yield_budget = std::max<size_t>(1, std::min<size_t>(gstate->total_groups, num_threads));
@@ -533,39 +484,6 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// load-balances the flows across the hardware streams and closes the handle once all finish.
 	oasis::QuerySplinter splinter;
 	splinter.streams.reserve(pending.hw_slot.size() + pending.cpu_slot.size() + 1);
-
-	// Every hardware column-chunk decode flow lands on a DECODE-capability stream, and stream 0
-	// always routes through the Bloom filter's select-gated demultiplexer, so it needs its own
-	// queued select decision -- pushed first, before the source triggers the transfer, so it's
-	// queued ahead of any data that could reach the demultiplexer.
-	auto append_decode_chunk = [&](oasis::OperatorFlow &flow, size_t k,
-	                               std::unique_ptr<BloomFilterStreamSelectOperator> select, size_t sink_size,
-	                               size_t tag) {
-		const auto &cc = *pending.hw_chunks[k];
-		const auto &col = gstate.projected_columns[pending.hw_slot[k]];
-		auto type = parcore::metadata::to_libstf_type(cc.type);
-		auto logical_type =
-		    pending.narrowed[pending.hw_slot[k]] ? libstf::type_t::INT32_T : col.cast_type.value_or(cc.logical_type());
-
-		oasis::OperatorFlow flow;
-		flow.push_back(std::move(select));
-		if (rdma) {
-			flow.push_back(MakeRDMASource(*rdma, cc));
-		} else {
-			flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
-		}
-		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
-		                                                                   cc.is_required, logical_type));
-		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(logical_type));
-		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
-		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
-		    cc.compression, cc.num_values, parcore::metadata::to_libstf_type(cc.type)));
-		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(ctx.allocate_output_buffer(sink_size), tag));
-	};
-	auto decoded_size = [&](size_t k) {
-		const auto &cc = *pending.hw_chunks[k];
-		return cc.num_values * libstf::size_of(parcore::metadata::to_libstf_type(cc.type));
-	};
 
 	pending.materialized.assign(gstate.projected_columns.size(), false);
 	std::vector<bool> is_bypassed(pending.hw_slot.size(), true);
@@ -897,9 +815,6 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		}
 
 		auto &buf = lstate.current_buffers[i];
-		const bool narrowed = lstate.current_narrowed[i];
-		const size_t transfer_size = narrowed ? sizeof(int32_t) : col.elem_size;
-		if (buf->size / transfer_size != total_elements) {
 		if (bloom && lstate.current_materialized[i]) {
 			// The values of the slice's kept rows (all checked in GetNextGroup), zero-copy as well
 			if (bloom_kept == 0) {
@@ -912,7 +827,9 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 			vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
 			continue;
 		}
-		if (buf->size / col.elem_size != total_elements) {
+		const bool narrowed = lstate.current_narrowed[i];
+		const size_t transfer_size = narrowed ? sizeof(int32_t) : col.elem_size;
+		if (buf->size / transfer_size != total_elements) {
 			throw InternalException(
 			    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
 			    (unsigned long long)i, (unsigned long long)(buf->size / transfer_size),

@@ -39,7 +39,7 @@ static LogicalGet *FindSingleGet(LogicalOperator &op) {
 }
 
 static bool IsOasisGet(LogicalGet &get) {
-	return get.function.name == "read_oasis";
+	return get.function.GetName() == "read_oasis";
 }
 
 static bool TryExtractColumnRef(const Expression &expr, LogicalGet &get, string &column_name, idx_t &column_idx) {
