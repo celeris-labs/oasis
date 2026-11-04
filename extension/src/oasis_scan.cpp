@@ -268,6 +268,12 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			SubmitBloomBuild(context, ctx, bind_data, *plan, *gstate);
 		}
 	}
+	// The Bloom filter only takes 64-bit values, so a scan that uses it transfers its columns as they are
+	if (gstate->bloom_active) {
+		for (auto &col : gstate->projected_columns) {
+			col.narrowable = false;
+		}
+	}
 
 	// Register a cold-start yield budget -- roughly one yield per prospective worker, so during cold
 	// start workers step aside to let others prime the pipeline breadth-first. DuckDB clamps this
@@ -510,7 +516,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		if (is_bypassed[k]) {
-			splinter.streams.push_back(ConstructBypassFlow(ctx, pending, rdma, k));
+			splinter.streams.push_back(ConstructBypassFlow(ctx, pending, rdma, gstate.projected_columns, k));
 		}
 	}
 	pending.batches_remaining = pending.hw_slot.size() + bloom_mask_flows;

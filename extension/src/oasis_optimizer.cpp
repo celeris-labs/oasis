@@ -163,6 +163,14 @@ static bool TryApplyOasisBloomRewrite(LogicalComparisonJoin &join, OasisOptimize
 			continue;
 		}
 
+		// The Bloom filter only takes 64-bit values. A cast pushed into the probe scan narrows its key or
+		// a column for the filter's materializer. The build side is read from the file by the filter.
+		if (probe_bind->output_types != probe_bind->column_types) {
+			DUCKDB_LOG_DEBUG(context, "join skipped: a cast is pushed into the probe scan of '%s'",
+			                 probe_bind->filename.c_str());
+			return false;
+		}
+
 		probe_bind->runtime_bloom_enabled = true;
 		probe_bind->runtime_bloom_build_filename = build_bind->filename;
 		probe_bind->runtime_bloom_build_key = build_key;

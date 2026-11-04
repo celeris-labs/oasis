@@ -178,6 +178,7 @@ oasis::OperatorFlow ConstructBloomProbeFlow(oasis::OasisContext &ctx,
 oasis::OperatorFlow ConstructBypassFlow(oasis::OasisContext &ctx,
                                         const OasisScanLocalState::PendingGroup &pending,
                                         RDMAFileHandle *rdma,
+                                        const std::vector<ProjectedColumn> &projected_columns,
                                         size_t k);
 
 } // namespace duckdb

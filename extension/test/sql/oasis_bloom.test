@@ -151,6 +151,20 @@ INSERT INTO bf_skip_t VALUES (NULL, NULL, NULL);
 statement ok
 COPY (SELECT s_id, s_int FROM bf_skip_t WHERE g = 0) TO '{TEST_DIR}/bf_skip.parquet' (FORMAT parquet);
 
+# Keys and values that fit INT32, for the narrowing tests: n_key = i % 16 and n_val = 10 * i for
+# i = 0..15, one row group. With more rows than bf_skip (16 > 8), it is the probe side
+statement ok
+CREATE TABLE bf_narrow_t (n_key BIGINT, n_val BIGINT, g INTEGER);
+
+statement ok
+INSERT INTO bf_narrow_t SELECT i % 16, i * 10, 0 FROM range(16) t(i);
+
+statement ok
+INSERT INTO bf_narrow_t VALUES (NULL, NULL, NULL);
+
+statement ok
+COPY (SELECT n_key, n_val FROM bf_narrow_t WHERE g = 0) TO '{TEST_DIR}/bf_narrow.parquet' (FORMAT parquet);
+
 # A probe side with a row group larger than the hardware Bloom filter supports (131072 rows)
 statement ok
 CREATE TABLE bf_big_t (k BIGINT, g INTEGER);
@@ -718,6 +732,66 @@ query II
 SELECT bloom_used(), bloom_rewrites();
 ----
 1	1
+
+# ---------------------------------------------------------------------------
+# Narrowing: oasis_narrow_transfer and oasis_cast_pushdown
+# ---------------------------------------------------------------------------
+
+statement ok
+SET oasis_narrow_transfer = true;
+
+statement ok
+SET oasis_cast_pushdown = true;
+
+# The Bloom filter only takes 64-bit values: its scan transfers the columns as they are, and the
+# plain join has no cast to push.
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+SELECT count(*), sum(n_key), sum(n_val)
+FROM read_oasis('{TEST_DIR}/bf_narrow.parquet') JOIN read_oasis('{TEST_DIR}/bf_skip.parquet') ON n_key = s_id;
+----
+8	28	280
+
+query II
+SELECT bloom_used(), bloom_rewrites();
+----
+1	1
+
+# Without the Bloom filter, the same columns are narrowed
+statement ok
+SET oasis_runtime_bloom_filter = false;
+
+query II
+SELECT sum(n_key), sum(n_val) FROM read_oasis('{TEST_DIR}/bf_narrow.parquet');
+----
+120	1200
+
+statement ok
+RESET oasis_runtime_bloom_filter;
+
+# A cast pushed into the probe scan narrows its key, so the join runs without the Bloom filter
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(n_val)
+FROM (SELECT CAST(n_key AS INTEGER) AS n_key, n_val FROM read_oasis('{TEST_DIR}/bf_narrow.parquet'))
+JOIN read_oasis('{TEST_DIR}/bf_skip.parquet') ON n_key = s_id;
+----
+8	280
+
+query III
+SELECT (SELECT count(*) FROM duckdb_logs WHERE message LIKE 'Pushed cast of column ''n_key''%'), bloom_used(), bloom_rewrites();
+----
+1	0	0
+
+statement ok
+RESET oasis_cast_pushdown;
+
+statement ok
+RESET oasis_narrow_transfer;
 
 # progress marker
 statement ok
