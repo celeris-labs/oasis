@@ -10,6 +10,7 @@
 #include "parcore/metadata/metadata.hpp"
 #include "parquet_reader.hpp"
 
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 
@@ -108,6 +109,10 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	// (oasis_narrow_transfer).
 	bool narrow_transfer = false;
 
+	// Whether chunks whose data pages are all dictionary-encoded are transferred as their dictionary
+	// and indices, and emitted as dictionary vectors (oasis_defer_dict_decoding).
+	bool defer_dict_decoding = false;
+
 	// filter_prune support. When the plan consumes fewer columns than the scan reads (some are
 	// filter-only), can_prune is set, projection_ids holds the indices (into projected_columns)
 	// of the consumed columns in output order, and column_emitted marks which projected columns
@@ -197,6 +202,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		// Per projection index: whether the column's chunk of this group is transferred as INT32.
 		std::vector<bool> narrowed;
 
+		// Per projection index: whether the column's chunk of this group is transferred as its
+		// dictionary and indices.
+		std::vector<bool> deferred;
+
 		// CPU (string) columns of this group: Fetched over RDMA as raw bypass flows: cpu_slot[k]
         // is the projection index, cpu_chunks[k] the chunk.
 		std::vector<size_t> cpu_slot;
@@ -218,6 +227,16 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 	// The current group's narrowed flags (see PendingGroup).
 	std::vector<bool> current_narrowed;
+
+	// The current group's deferred chunks, per projection index (null entry otherwise): The
+	// dictionary, copied into a DuckDB dictionary, and the indices in the chunk's buffer.
+	struct DictionaryColumn {
+		buffer_ptr<DictionaryEntry> entry;
+		idx_t size = 0;
+		const_data_ptr_t indices = nullptr;
+		idx_t index_width = 0;
+	};
+	std::vector<DictionaryColumn> current_dictionaries;
 
 	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
 	std::vector<bool> current_needs_row_filter;

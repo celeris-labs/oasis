@@ -62,6 +62,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "column directly to the narrow type. BIGINT columns need a bitstream whose decoders cast INT64 "
 	    "to INT32.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption(
+	    "oasis_defer_dict_decoding",
+	    "Whether read_oasis transfers column chunks whose data pages are all dictionary-encoded as their "
+	    "dictionary and indices instead of their values, and emits them as dictionary vectors.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);

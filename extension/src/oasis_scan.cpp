@@ -209,6 +209,10 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	context.TryGetCurrentSetting("oasis_narrow_transfer", narrow_val);
 	gstate->narrow_transfer = !narrow_val.IsNull() && narrow_val.GetValue<bool>();
 
+	Value defer_val;
+	context.TryGetCurrentSetting("oasis_defer_dict_decoding", defer_val);
+	gstate->defer_dict_decoding = !defer_val.IsNull() && defer_val.GetValue<bool>();
+
 	for (auto col_id : input.column_ids) {
 		const auto &chunk = bind_data.metadata.groups[0].chunks[col_id];
 		if (parcore::metadata::is_libstf_type(chunk.type)) {
@@ -389,6 +393,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	pending.hw_slot.reserve(gstate.projected_columns.size());
 	pending.hw_chunks.reserve(gstate.projected_columns.size());
 	pending.narrowed.assign(gstate.projected_columns.size(), false);
+	pending.deferred.assign(gstate.projected_columns.size(), false);
+	std::vector<size_t> output_sizes(gstate.projected_columns.size(), 0);
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
 		if (col.is_cpu) {
@@ -401,11 +407,25 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 
 		const auto &cc = bind.metadata.groups[group].chunks[col.column_id];
 
-		pending.narrowed[i] = gstate.narrow_transfer && col.narrowable && ChunkFitsInt32(lstate, group, col.column_id);
+		// A deferred chunk's output is the dictionary, at most the chunk's uncompressed size, and an
+		// index of at most 4 bytes per value.
+		const auto &cmd = lstate.parquet_reader->GetFileMetadata()->row_groups[group].columns[col.column_id].meta_data;
+		const size_t deferred_size =
+		    static_cast<size_t>(cmd.total_uncompressed_size) + cc.num_values * sizeof(uint32_t);
+		// The scan converts the dictionary to its type by keeping the low bytes, like the decoders do
+		const size_t value_width = libstf::size_of(parcore::metadata::to_libstf_type(cc.type));
+		pending.deferred[i] = gstate.defer_dict_decoding && HasOnlyDictionaryPages(cmd) &&
+		                      value_width >= sizeof(int32_t) && col.elem_size <= value_width &&
+		                      deferred_size <= libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE;
+		pending.narrowed[i] = !pending.deferred[i] && gstate.narrow_transfer && col.narrowable &&
+		                      ChunkFitsInt32(lstate, group, col.column_id);
 
 		// Enforce the one-buffer-per-chunk invariant: the decoded output must fit in a single FPGA
 		// output buffer. num_values is the row count, the element width is the transfer width.
-		const size_t decoded_size = cc.num_values * (pending.narrowed[i] ? sizeof(int32_t) : col.elem_size);
+		const size_t decoded_size =
+		    pending.deferred[i] ? deferred_size
+		                        : cc.num_values * (pending.narrowed[i] ? sizeof(int32_t) : col.elem_size);
+		output_sizes[i] = decoded_size;
 		if (decoded_size > libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE) {
 			throw NotImplementedException(
 			    "Column '%s' row group %llu decodes to %llu bytes, exceeding the %llu byte maximum "
@@ -458,8 +478,11 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		const auto &cc = *pending.hw_chunks[k];
 		const auto &col = gstate.projected_columns[pending.hw_slot[k]];
 		auto type = parcore::metadata::to_libstf_type(cc.type);
-		auto logical_type =
-		    pending.narrowed[pending.hw_slot[k]] ? libstf::type_t::INT32_T : col.cast_type.value_or(cc.logical_type());
+		const bool deferred = pending.deferred[pending.hw_slot[k]];
+		// A deferred chunk keeps the physical type, the scan converts the dictionary
+		auto logical_type = deferred                               ? type
+		                    : pending.narrowed[pending.hw_slot[k]] ? libstf::type_t::INT32_T
+		                                                           : col.cast_type.value_or(cc.logical_type());
 
 		oasis::OperatorFlow flow;
 		if (rdma) {
@@ -468,8 +491,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 			flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 		}
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
-		                                                                   cc.is_required, logical_type));
-		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(logical_type));
+		                                                                   cc.is_required, logical_type, deferred));
+		auto sink_buffer = ctx.allocate_output_buffer(output_sizes[pending.hw_slot[k]]);
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
 		splinter.streams.push_back(std::move(flow));
 	}
@@ -637,6 +660,76 @@ static void TopUpPrefetch(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	}
 }
 
+// Copies the dictionary page's values (`width` bytes each) into `result`. A scan type narrower than
+// the physical type (an integer logical type, or a cast pushed into the scan) keeps the low bytes of
+// every value, like the decoders' cast.
+static void CopyDictionaryValues(const_data_ptr_t values, idx_t width, Vector &result, idx_t count) {
+	const idx_t result_width = GetTypeIdSize(result.GetType().InternalType());
+	auto dst = FlatVector::GetDataMutable(result);
+	if (result_width == width) {
+		memcpy(dst, values, count * width);
+		return;
+	}
+	for (idx_t i = 0; i < count; i++) {
+		memcpy(dst + i * result_width, values + i * width, result_width);
+	}
+}
+
+// Splits the output of a deferred chunk: The dictionary page's values (`value_width` bytes
+// each), followed by one index per value, 1, 2 or 4 bytes wide for up to 256, 65,536 or more
+// dictionary entries (see ColumnChunkDecoder). The buffer only reports its size, and exactly one
+// split of it follows that rule.
+static OasisScanLocalState::DictionaryColumn SplitDeferredOutput(const libstf::Buffer &buffer, idx_t num_values,
+                                                                 idx_t value_width, const LogicalType &type) {
+	for (idx_t index_width : {1, 2, 4}) {
+		if (buffer.size < num_values * index_width || (buffer.size - num_values * index_width) % value_width != 0) {
+			continue;
+		}
+		const idx_t dictionary_bytes = buffer.size - num_values * index_width;
+		const idx_t size = dictionary_bytes / value_width;
+		if (size == 0 || index_width != (size <= 256 ? 1 : size <= 65536 ? 2 : 4)) {
+			continue;
+		}
+		OasisScanLocalState::DictionaryColumn dictionary;
+		dictionary.entry = DictionaryVector::CreateReusableDictionary(type, size);
+		dictionary.size = size;
+		dictionary.indices = reinterpret_cast<const_data_ptr_t>(buffer.ptr) + dictionary_bytes;
+		dictionary.index_width = index_width;
+		CopyDictionaryValues(reinterpret_cast<const_data_ptr_t>(buffer.ptr), value_width, dictionary.entry->data, size);
+		return dictionary;
+	}
+	throw InternalException("read_oasis: deferred dictionary output of %llu bytes does not hold %llu indices",
+	                        (unsigned long long)buffer.size, (unsigned long long)num_values);
+}
+
+template <class INDEX>
+static void SelectIndices(const OasisScanLocalState::DictionaryColumn &dictionary, idx_t offset, idx_t count,
+                          SelectionVector &sel) {
+	auto indices = reinterpret_cast<const INDEX *>(dictionary.indices) + offset;
+	for (idx_t r = 0; r < count; r++) {
+		if (indices[r] >= dictionary.size) {
+			throw InternalException("read_oasis: dictionary index %llu out of range for a dictionary of %llu entries",
+			                        (unsigned long long)indices[r], (unsigned long long)dictionary.size);
+		}
+		sel.set_index(r, indices[r]);
+	}
+}
+
+static void SelectDictionaryIndices(const OasisScanLocalState::DictionaryColumn &dictionary, idx_t offset,
+                                    idx_t count, SelectionVector &sel) {
+	switch (dictionary.index_width) {
+	case 1:
+		SelectIndices<uint8_t>(dictionary, offset, count, sel);
+		break;
+	case 2:
+		SelectIndices<uint16_t>(dictionary, offset, count, sel);
+		break;
+	default:
+		SelectIndices<uint32_t>(dictionary, offset, count, sel);
+		break;
+	}
+}
+
 static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                                OasisScanLocalState &lstate, const OasisScanBindData &bind,
                                std::vector<unique_ptr<AsyncTask>> &out_tasks) {
@@ -671,6 +764,17 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	lstate.current_buffers = std::move(head.hw_buffers);
 	lstate.current_narrowed = std::move(head.narrowed);
+	lstate.current_dictionaries.assign(gstate.projected_columns.size(), {});
+	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+		if (head.deferred.empty() || !head.deferred[i]) {
+			continue;
+		}
+		const auto column_id = gstate.projected_columns[i].column_id;
+		const auto &cc = bind.metadata.groups[head.group].chunks[column_id];
+		lstate.current_dictionaries[i] =
+		    SplitDeferredOutput(*lstate.current_buffers[i], cc.num_values,
+		                          libstf::size_of(parcore::metadata::to_libstf_type(cc.type)), bind.output_types[column_id]);
+	}
 	lstate.current_needs_row_filter = std::move(head.needs_row_filter);
 	lstate.current_buf_offset = 0;
 	lstate.current_group_num_rows = head.num_rows;
@@ -741,6 +845,16 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 			continue; // Decoded by DecodeAndFilterSlice below.
 		}
 
+		auto &vec = scan_chunk.data[i];
+
+		const auto &dictionary = lstate.current_dictionaries[i];
+		if (dictionary.entry) {
+			SelectionVector sel(emit);
+			SelectDictionaryIndices(dictionary, lstate.current_buf_offset, emit, sel);
+			vec.Dictionary(dictionary.entry, sel, emit);
+			continue;
+		}
+
 		auto &buf = lstate.current_buffers[i];
 		const bool narrowed = lstate.current_narrowed[i];
 		const size_t transfer_size = narrowed ? sizeof(int32_t) : col.elem_size;
@@ -751,7 +865,6 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 			    (unsigned long long)total_elements);
 		}
 
-		auto &vec = scan_chunk.data[i];
 		vec.SetVectorType(VectorType::FLAT_VECTOR);
 
 		// A chunk transferred as INT32 is sign-extended into the vector's own memory (the reset
@@ -801,6 +914,7 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	lstate.current_buf_offset += emit;
 	if (lstate.current_buf_offset >= total_elements) {
 		lstate.current_buffers.assign(gstate.projected_columns.size(), nullptr);
+		lstate.current_dictionaries.assign(gstate.projected_columns.size(), {});
 		lstate.current_buf_offset = 0;
 		lstate.current_group_num_rows = 0;
 	}
