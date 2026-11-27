@@ -77,14 +77,16 @@ class LocalSourceOperator final : public SourceOperator {
 
 /**
  * Programs the configuration (compression, value count, physical type, whether the column is
- * REQUIRED, logical type) via ColumnChunkDecoderConfig::enqueue_column_chunk.
+ * REQUIRED, logical type, deferred dictionary decoding) via ColumnChunkDecoderConfig::enqueue_column_chunk.
  */
 class DecodeColumnChunkOperator final : public Operator {
   public:
     DecodeColumnChunkOperator(parcore::metadata::Compression compression, uint64_t num_values,
-                              libstf::type_t type, bool is_required, libstf::type_t logical_type)
+                              libstf::type_t type, bool is_required, libstf::type_t logical_type,
+                              bool defer_dict_decoding = false)
         : compression_(compression), num_values_(num_values), type_(type),
-          is_required_(is_required), logical_type_(logical_type) {}
+          is_required_(is_required), logical_type_(logical_type),
+          defer_dict_decoding_(defer_dict_decoding) {}
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
@@ -95,6 +97,7 @@ class DecodeColumnChunkOperator final : public Operator {
     libstf::type_t                 type_;
     bool                           is_required_;
     libstf::type_t                 logical_type_;
+    bool                           defer_dict_decoding_;
 };
 
 /**

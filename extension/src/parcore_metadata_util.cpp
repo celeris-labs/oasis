@@ -137,4 +137,31 @@ parcore::metadata::Metadata BuildParcoreMetadata(ParquetReader &parquet_reader) 
 	return meta;
 }
 
+bool HasOnlyDictionaryPages(const duckdb_parquet::ColumnMetaData &cmd) {
+	using duckdb_parquet::Encoding;
+	using duckdb_parquet::PageType;
+	if (!cmd.__isset.dictionary_page_offset) {
+		return false;
+	}
+	auto is_dictionary = [](Encoding::type encoding) {
+		return encoding == Encoding::PLAIN_DICTIONARY || encoding == Encoding::RLE_DICTIONARY;
+	};
+	if (cmd.__isset.encoding_stats) {
+		for (const auto &stats : cmd.encoding_stats) {
+			bool const data_page = stats.page_type == PageType::DATA_PAGE || stats.page_type == PageType::DATA_PAGE_V2;
+			if (data_page && stats.count > 0 && !is_dictionary(stats.encoding)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	for (auto encoding : cmd.encodings) {
+		// RLE and BIT_PACKED encode the levels
+		if (!is_dictionary(encoding) && encoding != Encoding::RLE && encoding != Encoding::BIT_PACKED) {
+			return false;
+		}
+	}
+	return true;
+}
+
 } // namespace duckdb

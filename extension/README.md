@@ -22,6 +22,7 @@ reads from the configured RDMA file server.
 | `oasis_rdma_port` | Coyote default | TCP port for the QP exchange |
 | `oasis_narrow_transfer` | `false` | Decode BIGINT/DECIMAL column chunks whose statistics fit as INT32 and widen them on the CPU |
 | `oasis_cast_pushdown` | `false` | Accept integer narrowing casts pushed into the scan when the file statistics fit, and decode the column to the narrow type |
+| `oasis_defer_dict_decoding` | `false` | Transfer column chunks whose data pages are all dictionary-encoded as their dictionary and indices, and emit dictionary vectors |
 
 ## Building
 
